@@ -9,15 +9,11 @@
 # the embedded bitmaps are the public-domain font8x8 basic set (Daniel Hepper,
 # from Marcel Sondaar's IBM VGA fonts); each glyph is 8 row bytes, bit 0 leftmost.
 
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
 
 use allo: std.allocator;
 use page: std.allocator.page;
@@ -154,15 +150,15 @@ var atlas_buf: *u8 = nil;
 # lives for the process lifetime and is shared by every consumer.
 # ---
 # a:   allocator for the atlas buffer (ATLAS_W * ATLAS_H * 4 bytes)
-# ret: none on success, some(message) on allocation failure
-pub fun build_atlas(a: *allo.Allocator) Option[str] {
-    if (atlas_buf != nil) { ret none[str](); }
+# ret: ok, or the allocator's refusal with no atlas built
+pub fun build_atlas(a: *allo.Allocator) err[allo.Error] {
+    if (atlas_buf != nil) { ret err[allo.Error].ok{}; }
 
     val npx:    usize = ATLAS_W * ATLAS_H;
     val nbytes: usize = npx * 4;
-    val r: Result[*u8, str] = allo.allocate[u8](a, nbytes);
-    if (is_err[*u8, str](r)) { ret some[str]("font: atlas alloc failed"); }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
+    val r: res[*u8, allo.Error] = allo.allocate[u8](a, nbytes);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    val buf: *u8 = r.ok;
 
     # white rgb everywhere with zero alpha, lit pixels turn alpha on below,
     # so linear filtering never bleeds a dark fringe into glyph edges
@@ -210,7 +206,7 @@ pub fun build_atlas(a: *allo.Allocator) Option[str] {
     }
 
     atlas_buf = buf;
-    ret none[str]();
+    ret err[allo.Error].ok{};
 }
 
 # pointer to the RGBA8 atlas (ATLAS_W * ATLAS_H * 4 bytes)
@@ -296,10 +292,11 @@ test "font: white_uv lies inside the atlas" {
 
 test "font: build_atlas fills consistent dimensions and an opaque white texel" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
 
-    val e: Option[str] = build_atlas(?a);
-    if (e.has_value) { ret 1; }
+    val e: err[allo.Error] = build_atlas(?a);
+    if (sel e.err) { ret 1; }
     if (atlas_pixels() == nil) { ret 1; }
 
     if (ATLAS_W != ATLAS_COLS * GLYPH_PX) { ret 1; }
