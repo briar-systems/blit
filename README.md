@@ -10,8 +10,9 @@ rendering.
 ```mach
 use blit;
 
-# once, at startup:
-blit.font.build_atlas(?a);            # rasterize the font atlas
+# once, at startup (fallible calls return err[allocator.Error]):
+val built: err[allocator.Error] = blit.font.build_atlas(?a);
+if (sel built.err) { ... }
 # upload blit.font.atlas_pixels() as an RGBA8 texture (see Rendering)
 
 # per frame:
@@ -55,7 +56,8 @@ blit emits one vertex stream that draws both solid rectangles and text through
 a single shader and texture. Solid quads sample a reserved white texel, so
 `color * texel` is the flat color; glyph quads sample the glyph's cell.
 
-- **Atlas.** `blit.font.build_atlas(?a)` rasterizes the font once;
+- **Atlas.** `blit.font.build_atlas(?a)` rasterizes the font once and returns
+  the allocator's refusal as `err[allocator.Error]`;
   `blit.font.atlas_pixels()` returns RGBA8, `ATLAS_W`×`ATLAS_H` (128×48). Use
   nearest filtering.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
@@ -74,12 +76,14 @@ a single shader and texture. Solid quads sample a reserved white texel, so
 ## Build & test
 
 ```
-mach build
-mach test --bin blit
+mach dep pull .
+mach build .
+mach test .
 ```
 
-Tests are hosted by the `[bin.blit]` harness — a static library has no entry
-point to link a test runner against.
+The `[artifact.harness]` bin drives a headless frame end to end. It imports the
+library entry as `use blit.blit;`, because inside this project a bare `use blit;`
+binds the artifact being built.
 
 ## Conventions
 
