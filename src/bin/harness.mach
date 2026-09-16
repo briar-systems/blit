@@ -5,29 +5,31 @@
 # exercises the public surface end to end and prints the resulting vertex count.
 
 use std.runtime;
+use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
 use print: std.print;
 use allo:  std.allocator;
 use page:  std.allocator.page;
 
-use blit;
+use blit.blit;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { print.println("allocator init failed"); ret 1; }
 
-    val ae: Option[str] = blit.font.build_atlas(?a);
-    if (ae.has_value) { print.println("atlas build failed"); ret 1; }
+    val ae: err[allo.Error] = blit.font.build_atlas(?a);
+    if (sel ae.err) { print.println("atlas build failed"); ret 1; }
 
     var ctx: blit.context.Context;
-    if (blit.context.init(?ctx, ?a).has_value) { print.println("context init failed"); ret 1; }
+    val ce: err[allo.Error] = blit.context.init(?ctx, ?a);
+    if (sel ce.err) { print.println("context init failed"); ret 1; }
 
     var checked: u8 = 1;
     var amount:  f32 = 0.5::f32;
-    var sel:     usize = 0;
+    var picked:  usize = 0;
     var opts:    [3]str;
     opts[0] = "add"; opts[1] = "sub"; opts[2] = "mul";
 
@@ -63,7 +65,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
     # an accordion dropdown in its own panel
     val p2: usize = blit.widget.begin_panel(?ctx, 8.0::f32, 220.0::f32, 200.0::f32);
-    blit.widget.dropdown(?ctx, "op", ?sel, ?opts[0], 3);
+    blit.widget.dropdown(?ctx, "op", ?picked, ?opts[0], 3);
     blit.widget.end_panel(?ctx, p2);
 
     # a draggable, collapsible window with a couple of widgets
@@ -79,6 +81,7 @@ fun main(argc: i64, argv: **u8) i64 {
                  blit.context.draw_count(?ctx),
                  blit.context.ok(?ctx)::u64);
 
-    blit.context.free(?ctx);
+    val freed: err[allo.Error] = blit.context.free(?ctx);
+    if (sel freed.err) { print.println("context free failed"); ret 1; }
     ret 0;
 }

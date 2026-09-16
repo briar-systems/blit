@@ -5,9 +5,10 @@ src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os  = "linux"
-abi = "sysv64"
+isa     = "x86_64"
+os      = "linux"
+abi     = "sysv64"
+default = true
 
 [target.windows-x86_64]
 isa = "x86_64"
@@ -20,17 +21,23 @@ os  = "darwin"
 abi = "sysv64"
 
 [profile.debug]
-opt   = 0
-debug = true
-simd = "scalarize"
+opt           = 0
+debug         = true
+simd          = "scalarize"
+vectorize     = false
+float_reassoc = false
+default       = true
 
 [profile.release]
-opt   = 2
-debug = false
-simd = "scalarize"
+opt           = 2
+debug         = false
+simd          = "scalarize"
+vectorize     = true
+float_reassoc = false
 
 [artifact.blit]
 kind    = "static"
+default = true
 entry   = "blit.mach"
 out     = "lib/blit"
 targets = ["*"]
@@ -45,6 +52,6 @@ targets = ["*"]
 link    = []
 need    = []
 
-[dep.mach-std]
+[dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+ref = "tag/v2.1.0"

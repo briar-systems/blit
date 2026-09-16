@@ -13,10 +13,9 @@
 # uvs interpolated, so all clipping stays geometric and backend-agnostic. push a
 # sub-surface (begin_surface) to draw custom content in a scrolled local space.
 
+use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.none;
 
 use allo:  std.allocator;
 use page:  std.allocator.page;
@@ -118,10 +117,10 @@ pub rec Context {
 # ---
 # ctx: context to initialize
 # a:   allocator backing the draw list
-# ret: none on success, some(message) on allocation failure
-pub fun init(ctx: *Context, a: *allo.Allocator) Option[str] {
-    val e: Option[str] = draw.init(?ctx.dl, a);
-    if (e.has_value) { ret e; }
+# ret: ok, or the allocator's refusal of the draw list
+pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
+    val e: err[allo.Error] = draw.init(?ctx.dl, a);
+    if (sel e.err) { ret e; }
 
     ctx.in.mx = 0.0::f32;
     ctx.in.my = 0.0::f32;
@@ -153,14 +152,15 @@ pub fun init(ctx: *Context, a: *allo.Allocator) Option[str] {
     ctx.run_start = 0;
     ctx.run_len = 0;
     ctx.oom = 0;
-    ret none[str]();
+    ret err[allo.Error].ok{};
 }
 
 # release the context's draw list
 # ---
 # ctx: context to free
-pub fun free(ctx: *Context) {
-    draw.free(?ctx.dl);
+# ret: ok, or the allocator's refusal with the draw list still owned
+pub fun free(ctx: *Context) err[allo.Error] {
+    ret draw.free(?ctx.dl);
 }
 
 # start a frame: store input (carrying the previous button state into
@@ -246,8 +246,8 @@ pub fun draw_count(ctx: *Context) usize {
 }
 
 # fold a draw-list result into the context's oom flag
-fun record(ctx: *Context, e: Option[str]) {
-    if (e.has_value) { ctx.oom = 1; }
+fun record(ctx: *Context, e: err[allo.Error]) {
+    if (sel e.err) { ctx.oom = 1; }
 }
 
 # sample subsequent geometry from one consumer texture, nil for the atlas
@@ -568,10 +568,11 @@ pub fun end_surface(ctx: *Context, surf: Surface) {
 
 test "context: begin resets seq and draw list, next_id increments" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    val e: Option[str] = init(?ctx, ?a);
-    if (e.has_value) { ret 1; }
+    val e: err[allo.Error] = init(?ctx, ?a);
+    if (sel e.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 1.0::f32; in.my = 2.0::f32; in.down = 0; in.prev_down = 0;
@@ -594,15 +595,18 @@ test "context: begin resets seq and draw list, next_id increments" {
     if (draw_count(?ctx) != 0) { ret 1; }
     if (ctx.seq != 0) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: prev_down carried across begin drives press and release" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.prev_down = 0;
@@ -626,15 +630,18 @@ test "context: prev_down carried across begin drives press and release" {
     if (input.released(ctx.in) != 1) { ret 1; }
     end(?ctx);
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: text_at emits a quad per character" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -646,15 +653,18 @@ test "context: text_at emits a quad per character" {
     if (draw_count(?ctx) != 12) { ret 1; }
     if (ok(?ctx) != 1) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: push_clip intersects nested rects and pop restores them" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -675,15 +685,18 @@ test "context: push_clip intersects nested rects and pop restores them" {
     if (ctx.clip_x1 != 100.0::f32) { ret 1; }
     if (ctx.clip_sp != 0) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: clip halves a glyph and interpolates its uvs" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -712,15 +725,18 @@ test "context: clip halves a glyph and interpolates its uvs" {
     if (draw_count(?ctx) != 6) { ret 1; }
 
     pop_clip(?ctx);
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: input_visible follows the clip stack" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -735,15 +751,18 @@ test "context: input_visible follows the clip stack" {
     pop_clip(?ctx);
     if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 1) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: begin_surface maps the cursor to local coords and clips content" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 60.0::f32; in.my = 70.0::f32; in.down = 0; in.prev_down = 0;
@@ -775,15 +794,18 @@ test "context: begin_surface maps the cursor to local coords and clips content" 
     if (ctx.lx != 0.0::f32) { ret 1; }
     if (ctx.clip_x1 != 200.0::f32) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: begin_surface reports the cursor outside its region" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 60.0::f32; in.my = 70.0::f32; in.down = 0; in.prev_down = 0;
@@ -793,15 +815,18 @@ test "context: begin_surface reports the cursor outside its region" {
     if (s.inside != 0) { ret 1; }
     end_surface(?ctx, s);
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: texture runs divide the draw list in draw order" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -825,15 +850,18 @@ test "context: texture runs divide the draw list in draw order" {
     val tail: Run = run_at(?ctx, 2);
     if (tail.tex != nil || tail.start != 12 || tail.count != 6) { ret 1; }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "context: images through one texture merge into one span" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: Context;
-    if (init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -857,6 +885,7 @@ test "context: images through one texture merge into one span" {
         ret 1;
     }
 
-    free(?ctx);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }

@@ -7,6 +7,7 @@
 # and persists until the button releases. ids come from call order via next_id, so
 # the UI must be built with a stable sequence of calls each frame.
 
+use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.bool.bool;
@@ -476,9 +477,11 @@ pub fun end_window(ctx: *context.Context, win: *Window, handle: usize) {
 
 test "widget: text advances the cursor by one row" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
@@ -493,7 +496,8 @@ test "widget: text advances the cursor by one row" {
     if (ctx.cx != ctx.ox) { ret 1; }
     if (context.draw_count(?ctx) <= n0) { ret 1; }
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
@@ -506,9 +510,11 @@ test "widget: public row metrics match layout advancement" {
 
 test "widget: button is true only on release inside after press" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.mx = 10.0::f32; in.my = 5.0::f32; in.prev_down = 0;
@@ -529,15 +535,18 @@ test "widget: button is true only on release inside after press" {
     if (button(?ctx, "ok") != true) { ret 1; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: button is false when released outside" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.prev_down = 0;
@@ -556,15 +565,18 @@ test "widget: button is false when released outside" {
     if (button(?ctx, "ok") != false) { ret 1; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: checkbox toggles state on click" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var st: u8 = 0;
     var in: input.Input;
@@ -586,15 +598,18 @@ test "widget: checkbox toggles state on click" {
     if (st != 1) { ret 1; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: slider maps the cursor linearly across the track" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.my = 5.0::f32; in.down = 1; in.prev_down = 1;
@@ -627,21 +642,24 @@ test "widget: slider maps the cursor linearly across the track" {
     if (v != 10.0::f32) { ret 1; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: dropdown opens on click and selects an option" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var opts: [3]str;
     opts[0] = "a";
     opts[1] = "bb";
     opts[2] = "ccc";
-    var sel: usize = 0;
+    var picked: usize = 0;
 
     var in: input.Input;
     in.prev_down = 0;
@@ -650,14 +668,14 @@ test "widget: dropdown opens on click and selects an option" {
     in.mx = 10.0::f32; in.my = 8.0::f32; in.down = 1;
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    dropdown(?ctx, "pick", ?sel, ?opts[0], 3);
+    dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
     context.end(?ctx);
 
     # frame 2: release over the header -> opens, no selection change
     in.down = 0;
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (dropdown(?ctx, "pick", ?sel, ?opts[0], 3) != 0) { ret 1; }
+    if (dropdown(?ctx, "pick", ?picked, ?opts[0], 3) != 0) { ret 1; }
     if (ctx.open_dropdown != 1) { ret 1; }
     context.end(?ctx);
 
@@ -665,27 +683,30 @@ test "widget: dropdown opens on click and selects an option" {
     in.mx = 10.0::f32; in.my = 48.0::f32; in.down = 1;
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    dropdown(?ctx, "pick", ?sel, ?opts[0], 3);
+    dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
     context.end(?ctx);
 
     # frame 4: release over it -> selects index 1 and closes
     in.down = 0;
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (dropdown(?ctx, "pick", ?sel, ?opts[0], 3) != 1) { ret 1; }
-    if (sel != 1) { ret 1; }
+    if (dropdown(?ctx, "pick", ?picked, ?opts[0], 3) != 1) { ret 1; }
+    if (picked != 1) { ret 1; }
     if (ctx.open_dropdown != 0) { ret 1; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: adjacent dropdown ids stay stable when one expands" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var opts: [3]str;
     opts[0] = "a";
@@ -718,15 +739,18 @@ test "widget: adjacent dropdown ids stay stable when one expands" {
     if (ctx.seq != 8 || ctx.open_dropdown != 5) { ret 4; }
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: region_clicked fires on release inside after press" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var in: input.Input;
     in.prev_down = 0;
@@ -751,15 +775,18 @@ test "widget: region_clicked fires on release inside after press" {
     context.pop_clip(?ctx);
     context.end(?ctx);
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "widget: window drags by the titlebar and collapses" {
     var a: allo.Allocator;
-    page.make(?a);
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var ctx: context.Context;
-    if (context.init(?ctx, ?a).has_value) { ret 1; }
+    val ie: err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
 
     var win: Window;
     win.x = 50.0::f32; win.y = 50.0::f32; win.w = 120.0::f32; win.open = 1; win.title = "w";
@@ -805,6 +832,7 @@ test "widget: window drags by the titlebar and collapses" {
     context.end(?ctx);
     if (win.open != 0) { ret 1; }
 
-    context.free(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
