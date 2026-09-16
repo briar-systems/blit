@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-16
+
 ### Added
 - manifest: `linux-arm64` and `darwin-aarch64` targets, so the native aarch64 hosts build and test for themselves instead of falling back to linux-x86_64.
 ### Changed
@@ -18,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - context: `init` returns `err[allocator.Error]` instead of `Option[str]`, and `free` returns `err[allocator.Error]` instead of nothing.
 
 ### Fixed
-- version: `VERSION` reports 0.2.1, matching `mach.toml`.
+- version: `VERSION` matches `mach.toml` again. v0.2.1 shipped reporting 0.2.0.
 
 ## [0.2.1] - 2026-08-09
 
