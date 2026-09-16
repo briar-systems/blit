@@ -17,11 +17,11 @@ use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 
-use allo:  std.allocator;
-use page:  std.allocator.page;
-use draw:  blit.draw;
-use input: blit.input;
-use font:  blit.font;
+use blit.draw;
+use blit.font;
+use blit.input;
+use allo: std.allocator;
+use std.allocator.page;
 
 # maximum nesting of pushed clip rects and local origins
 pub val CLIP_DEPTH: usize = 16;
@@ -122,36 +122,36 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     val e: err[allo.Error] = draw.init(?ctx.dl, a);
     if (sel e.err) { ret e; }
 
-    ctx.in.mx = 0.0::f32;
-    ctx.in.my = 0.0::f32;
-    ctx.in.down = 0;
+    ctx.in.mx        = 0.0::f32;
+    ctx.in.my        = 0.0::f32;
+    ctx.in.down      = 0;
     ctx.in.prev_down = 0;
 
-    ctx.sw = 0.0::f32;
-    ctx.sh = 0.0::f32;
-    ctx.ox = 0.0::f32;
-    ctx.oy = 0.0::f32;
-    ctx.cx = 0.0::f32;
-    ctx.cy = 0.0::f32;
-    ctx.pw = 0.0::f32;
-    ctx.seq = 0;
-    ctx.hot = 0;
-    ctx.active = 0;
+    ctx.sw            = 0.0::f32;
+    ctx.sh            = 0.0::f32;
+    ctx.ox            = 0.0::f32;
+    ctx.oy            = 0.0::f32;
+    ctx.cx            = 0.0::f32;
+    ctx.cy            = 0.0::f32;
+    ctx.pw            = 0.0::f32;
+    ctx.seq           = 0;
+    ctx.hot           = 0;
+    ctx.active        = 0;
     ctx.open_dropdown = 0;
-    ctx.drag_off_x = 0.0::f32;
-    ctx.drag_off_y = 0.0::f32;
-    ctx.lx = 0.0::f32;
-    ctx.ly = 0.0::f32;
-    ctx.clip_x0 = 0.0::f32;
-    ctx.clip_y0 = 0.0::f32;
-    ctx.clip_x1 = 0.0::f32;
-    ctx.clip_y1 = 0.0::f32;
-    ctx.clip_sp = 0;
-    ctx.org_sp = 0;
-    ctx.tex = nil;
-    ctx.run_start = 0;
-    ctx.run_len = 0;
-    ctx.oom = 0;
+    ctx.drag_off_x    = 0.0::f32;
+    ctx.drag_off_y    = 0.0::f32;
+    ctx.lx            = 0.0::f32;
+    ctx.ly            = 0.0::f32;
+    ctx.clip_x0       = 0.0::f32;
+    ctx.clip_y0       = 0.0::f32;
+    ctx.clip_x1       = 0.0::f32;
+    ctx.clip_y1       = 0.0::f32;
+    ctx.clip_sp       = 0;
+    ctx.org_sp        = 0;
+    ctx.tex           = nil;
+    ctx.run_start     = 0;
+    ctx.run_len       = 0;
+    ctx.oom           = 0;
     ret err[allo.Error].ok{};
 }
 
@@ -172,32 +172,32 @@ pub fun free(ctx: *Context) err[allo.Error] {
 # sh:  screen height in pixels
 pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     val prev: u8 = ctx.in.down;
-    ctx.in = in;
+    ctx.in           = in;
     ctx.in.prev_down = prev;
 
-    ctx.sw = sw;
-    ctx.sh = sh;
-    ctx.ox = 0.0::f32;
-    ctx.oy = 0.0::f32;
-    ctx.cx = 0.0::f32;
-    ctx.cy = 0.0::f32;
-    ctx.pw = 0.0::f32;
+    ctx.sw  = sw;
+    ctx.sh  = sh;
+    ctx.ox  = 0.0::f32;
+    ctx.oy  = 0.0::f32;
+    ctx.cx  = 0.0::f32;
+    ctx.cy  = 0.0::f32;
+    ctx.pw  = 0.0::f32;
     ctx.seq = 0;
     ctx.hot = 0;
     ctx.oom = 0;
 
-    ctx.lx = 0.0::f32;
-    ctx.ly = 0.0::f32;
+    ctx.lx      = 0.0::f32;
+    ctx.ly      = 0.0::f32;
     ctx.clip_x0 = 0.0::f32;
     ctx.clip_y0 = 0.0::f32;
     ctx.clip_x1 = sw;
     ctx.clip_y1 = sh;
     ctx.clip_sp = 0;
-    ctx.org_sp = 0;
+    ctx.org_sp  = 0;
 
-    ctx.tex = nil;
+    ctx.tex       = nil;
     ctx.run_start = 0;
-    ctx.run_len = 0;
+    ctx.run_len   = 0;
 
     draw.reset(?ctx.dl);
 }
@@ -269,10 +269,10 @@ pub fun set_texture(ctx: *Context, tex: ptr) {
     if (len == ctx.run_start && ctx.run_len > 0
         && ctx.runs[ctx.run_len - 1].tex == tex
         && ctx.runs[ctx.run_len - 1].start
-            + ctx.runs[ctx.run_len - 1].count == len) {
-        ctx.run_len = ctx.run_len - 1;
+        + ctx.runs[ctx.run_len - 1].count == len) {
+        ctx.run_len   = ctx.run_len - 1;
         ctx.run_start = ctx.runs[ctx.run_len].start;
-        ctx.tex = tex;
+        ctx.tex       = tex;
         ret;
     }
     flush_run(ctx);
@@ -302,11 +302,12 @@ pub fun run_at(ctx: *Context, index: usize) Run {
 # close the span being accumulated, if it holds any vertices
 fun flush_run(ctx: *Context) {
     val len: usize = draw.count(?ctx.dl);
-    if (len == ctx.run_start) { ret; }
+    if (len == ctx.run_start)     { ret; }
     if (ctx.run_len >= RUN_DEPTH) { ret; }
     ctx.runs[ctx.run_len] = Run{
-        tex: ctx.tex, start: ctx.run_start, count: len - ctx.run_start};
-    ctx.run_len = ctx.run_len + 1;
+        tex: ctx.tex, start: ctx.run_start, count: len - ctx.run_start
+    };
+    ctx.run_len   = ctx.run_len + 1;
     ctx.run_start = len;
 }
 
@@ -328,7 +329,7 @@ fun flush_run(ctx: *Context) {
 # v1:  bottom v in the texture
 # c:   multiplicative tint
 pub fun image_at(ctx: *Context, tex: ptr, x0: f32, y0: f32, x1: f32, y1: f32,
-                 u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
+    u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
     set_texture(ctx, tex);
     emit(ctx, x0, y0, x1, y1, u0, v0, u1, v1, c);
     set_texture(ctx, nil);
@@ -394,8 +395,8 @@ fun push_origin(ctx: *Context, nx: f32, ny: f32) {
         ctx.org_ys[ctx.org_sp] = ctx.ly;
     }
     ctx.org_sp = ctx.org_sp + 1;
-    ctx.lx = nx;
-    ctx.ly = ny;
+    ctx.lx     = nx;
+    ctx.ly     = ny;
 }
 
 # restore the local origin saved by the matching push_origin
@@ -442,7 +443,7 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 
     var nu0: f32 = u0;
     var nu1: f32 = u1;
-    val w: f32 = sx1 - sx0;
+    val w:   f32 = sx1 - sx0;
     if (w > 0.0::f32) {
         nu0 = u0 + (u1 - u0) * (nx0 - sx0) / w;
         nu1 = u0 + (u1 - u0) * (nx1 - sx0) / w;
@@ -450,7 +451,7 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 
     var nv0: f32 = v0;
     var nv1: f32 = v1;
-    val h: f32 = sy1 - sy0;
+    val h:   f32 = sy1 - sy0;
     if (h > 0.0::f32) {
         nv0 = v0 + (v1 - v0) * (ny0 - sy0) / h;
         nv1 = v0 + (v1 - v0) * (ny1 - sy0) / h;
@@ -498,12 +499,12 @@ pub fun glyph(ctx: *Context, ch: u8, x: f32, y: f32, c: draw.Color) {
 # y:   top y in pixels
 # c:   tint color
 pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
-    var i: usize = 0;
-    var px: f32 = x;
+    var i:  usize = 0;
+    var px: f32   = x;
     for (s[i] != 0) {
         glyph(ctx, s[i], px, y, c);
         px = px + font.GLYPH_W;
-        i = i + 1;
+        i  = i + 1;
     }
 }
 
@@ -547,13 +548,13 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
     push_origin(ctx, x - scroll_x, y - scroll_y);
 
     var s: Surface;
-    s.x = x;
-    s.y = y;
-    s.w = w;
-    s.h = h;
+    s.x        = x;
+    s.y        = y;
+    s.w        = w;
+    s.h        = h;
     s.local_mx = ctx.in.mx - ctx.lx;
     s.local_my = ctx.in.my - ctx.ly;
-    s.inside = input_visible(ctx, ctx.in.mx, ctx.in.my);
+    s.inside   = input_visible(ctx, ctx.in.mx, ctx.in.my);
     ret s;
 }
 
@@ -567,25 +568,28 @@ pub fun end_surface(ctx: *Context, surf: Surface) {
 }
 
 test "context: begin resets seq and draw list, next_id increments" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val e: err[allo.Error] = init(?ctx, ?a);
+    val e:   err[allo.Error] = init(?ctx, ?a);
     if (sel e.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 1.0::f32; in.my = 2.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 1.0::f32;
+    in.my        = 2.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 800.0::f32, 600.0::f32);
 
-    if (ctx.seq != 0) { ret 1; }
+    if (ctx.seq != 0)          { ret 1; }
     if (draw_count(?ctx) != 0) { ret 1; }
-    if (ctx.sw != 800.0::f32) { ret 1; }
-    if (ctx.sh != 600.0::f32) { ret 1; }
+    if (ctx.sw != 800.0::f32)  { ret 1; }
+    if (ctx.sh != 600.0::f32)  { ret 1; }
 
     if (next_id(?ctx) != 1) { ret 1; }
     if (next_id(?ctx) != 2) { ret 1; }
-    if (ctx.seq != 2) { ret 1; }
+    if (ctx.seq != 2)       { ret 1; }
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
@@ -593,7 +597,7 @@ test "context: begin resets seq and draw list, next_id increments" {
 
     begin(?ctx, in, 800.0::f32, 600.0::f32);
     if (draw_count(?ctx) != 0) { ret 1; }
-    if (ctx.seq != 0) { ret 1; }
+    if (ctx.seq != 0)          { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -601,32 +605,34 @@ test "context: begin resets seq and draw list, next_id increments" {
 }
 
 test "context: prev_down carried across begin drives press and release" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.prev_down = 0;
 
     in.down = 1;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.down != 1) { ret 1; }
-    if (ctx.in.prev_down != 0) { ret 1; }
+    if (ctx.in.down != 1)           { ret 1; }
+    if (ctx.in.prev_down != 0)      { ret 1; }
     if (input.pressed(ctx.in) != 1) { ret 1; }
     end(?ctx);
 
     in.down = 1;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.prev_down != 1) { ret 1; }
+    if (ctx.in.prev_down != 1)      { ret 1; }
     if (input.pressed(ctx.in) != 0) { ret 1; }
     end(?ctx);
 
     in.down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.prev_down != 1) { ret 1; }
+    if (ctx.in.prev_down != 1)       { ret 1; }
     if (input.released(ctx.in) != 1) { ret 1; }
     end(?ctx);
 
@@ -636,22 +642,25 @@ test "context: prev_down carried across begin drives press and release" {
 }
 
 test "context: text_at emits a quad per character" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val c: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     text_at(?ctx, "hi", 0.0::f32, 0.0::f32, c);
     # two glyphs, six verts each
     if (draw_count(?ctx) != 12) { ret 1; }
-    if (ok(?ctx) != 1) { ret 1; }
+    if (ok(?ctx) != 1)          { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -659,15 +668,18 @@ test "context: text_at emits a quad per character" {
 }
 
 test "context: push_clip intersects nested rects and pop restores them" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     push_clip(?ctx, 0.0::f32, 0.0::f32, 60.0::f32, 60.0::f32);
@@ -679,11 +691,11 @@ test "context: push_clip intersects nested rects and pop restores them" {
 
     pop_clip(?ctx);
     if (ctx.clip_x1 != 60.0::f32) { ret 1; }
-    if (ctx.clip_x0 != 0.0::f32) { ret 1; }
+    if (ctx.clip_x0 != 0.0::f32)  { ret 1; }
 
     pop_clip(?ctx);
     if (ctx.clip_x1 != 100.0::f32) { ret 1; }
-    if (ctx.clip_sp != 0) { ret 1; }
+    if (ctx.clip_sp != 0)          { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -691,15 +703,18 @@ test "context: push_clip intersects nested rects and pop restores them" {
 }
 
 test "context: clip halves a glyph and interpolates its uvs" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
@@ -714,7 +729,10 @@ test "context: clip halves a glyph and interpolates its uvs" {
     # left edge and its u untouched
     if (p[0].x != 0.0::f32) { ret 1; }
 
-    var u0: f32; var v0: f32; var u1: f32; var v1: f32;
+    var u0: f32;
+    var v0: f32;
+    var u1: f32;
+    var v1: f32;
     font.glyph_uv('A', ?u0, ?v0, ?u1, ?v1);
     if (p[0].u != u0) { ret 1; }
     # clipped edge u interpolated to the cell midpoint
@@ -731,18 +749,21 @@ test "context: clip halves a glyph and interpolates its uvs" {
 }
 
 test "context: input_visible follows the clip stack" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
-    if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 1) { ret 1; }
+    if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 1)  { ret 1; }
     if (input_visible(?ctx, 150.0::f32, 50.0::f32) != 0) { ret 1; }
 
     push_clip(?ctx, 0.0::f32, 0.0::f32, 40.0::f32, 40.0::f32);
@@ -757,15 +778,18 @@ test "context: input_visible follows the clip stack" {
 }
 
 test "context: begin_surface maps the cursor to local coords and clips content" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 60.0::f32; in.my = 70.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 60.0::f32;
+    in.my        = 70.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 200.0::f32, 200.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
@@ -773,7 +797,7 @@ test "context: begin_surface maps the cursor to local coords and clips content" 
     val s: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 100.0::f32, 100.0::f32, 10.0::f32, 20.0::f32);
     if (s.local_mx != 20.0::f32) { ret 1; }
     if (s.local_my != 40.0::f32) { ret 1; }
-    if (s.inside != 1) { ret 1; }
+    if (s.inside != 1)           { ret 1; }
 
     # content at local (20,30)-(40,50) lands at screen (60,60)-(80,80), inside the clip
     quad(?ctx, 20.0::f32, 30.0::f32, 40.0::f32, 50.0::f32, white);
@@ -789,9 +813,9 @@ test "context: begin_surface maps the cursor to local coords and clips content" 
     if (draw_count(?ctx) != 6) { ret 1; }
 
     end_surface(?ctx, s);
-    if (ctx.clip_sp != 0) { ret 1; }
-    if (ctx.org_sp != 0) { ret 1; }
-    if (ctx.lx != 0.0::f32) { ret 1; }
+    if (ctx.clip_sp != 0)          { ret 1; }
+    if (ctx.org_sp != 0)           { ret 1; }
+    if (ctx.lx != 0.0::f32)        { ret 1; }
     if (ctx.clip_x1 != 200.0::f32) { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
@@ -800,15 +824,18 @@ test "context: begin_surface maps the cursor to local coords and clips content" 
 }
 
 test "context: begin_surface reports the cursor outside its region" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 60.0::f32; in.my = 70.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 60.0::f32;
+    in.my        = 70.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 200.0::f32, 200.0::f32);
 
     val s: Surface = begin_surface(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, 0.0::f32, 0.0::f32);
@@ -821,24 +848,27 @@ test "context: begin_surface reports the cursor outside its region" {
 }
 
 test "context: texture runs divide the draw list in draw order" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64 = 7;
+    var sheet: u64        = 7;
 
     # atlas span, one image span, then atlas again
     quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
     image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-             0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
     quad(?ctx, 20.0::f32, 0.0::f32, 30.0::f32, 10.0::f32, white);
     end(?ctx);
 
@@ -856,25 +886,28 @@ test "context: texture runs divide the draw list in draw order" {
 }
 
 test "context: images through one texture merge into one span" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
-    val ie: err[allo.Error] = init(?ctx, ?a);
+    val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
     var in: input.Input;
-    in.mx = 0.0::f32; in.my = 0.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64 = 7;
+    var sheet: u64        = 7;
 
     # two images through the same texture, nothing on the atlas between
     image_at(?ctx, (?sheet)::ptr, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32,
-             0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
     image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-             0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
     end(?ctx);
 
     # one span: the second image reopened the first's rather than closing
