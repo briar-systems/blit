@@ -5,17 +5,12 @@
 # pixel space, u/v index the font atlas in [0, 1], and rgba is straight (not
 # premultiplied) with each channel in [0, 1].
 
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
 
 use allo: std.allocator;
-use page: std.allocator.page;
+use std.allocator.page;
 
 # vertex capacity allocated by init before any growth
 pub val INIT_CAP: usize = 1024;
@@ -87,29 +82,33 @@ pub rec DrawList {
 # ---
 # dl:  draw list to initialize
 # a:   allocator to back the buffer
-# ret: none on success, some(message) on allocation failure
-pub fun init(dl: *DrawList, a: *allo.Allocator) Option[str] {
+# ret: ok, or the allocator's refusal with the draw list left empty
+pub fun init(dl: *DrawList, a: *allo.Allocator) err[allo.Error] {
     dl.a     = a;
     dl.len   = 0;
     dl.cap   = 0;
     dl.verts = nil;
 
-    val r: Result[*Vert, str] = allo.allocate[Vert](a, INIT_CAP);
-    if (is_err[*Vert, str](r)) { ret some[str]("draw: vertex buffer alloc failed"); }
-    dl.verts = unwrap_ok[*Vert, str](r);
+    val r: res[*Vert, allo.Error] = allo.allocate[Vert](a, INIT_CAP);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    dl.verts = r.ok;
     dl.cap   = INIT_CAP;
-    ret none[str]();
+    ret err[allo.Error].ok{};
 }
 
 # release the backing buffer and reset the draw list to empty
 # ---
-# dl: draw list to free
-pub fun free(dl: *DrawList) {
-    if (dl == nil) { ret; }
-    allo.deallocate[Vert](dl.a, dl.verts, dl.cap);
+# dl:  draw list to free
+# ret: ok, or the allocator's refusal with the draw list still owning its buffer
+pub fun free(dl: *DrawList) err[allo.Error] {
+    if (dl == nil) { ret err[allo.Error].ok{}; }
+
+    val freed: err[allo.Error] = allo.deallocate[Vert](dl.a, dl.verts, dl.cap);
+    if (sel freed.err) { ret freed; }
     dl.verts = nil;
     dl.cap   = 0;
     dl.len   = 0;
+    ret err[allo.Error].ok{};
 }
 
 # clear the draw list for a new frame, keeping allocated capacity
@@ -139,31 +138,31 @@ pub fun data(dl: *DrawList) *Vert {
 # ensure room for at least one more vertex, doubling capacity when full
 # ---
 # dl:  draw list to grow
-# ret: none on success, some(message) on allocation failure
-fun grow(dl: *DrawList) Option[str] {
-    if (dl.len < dl.cap) { ret none[str](); }
+# ret: ok, or the allocator's refusal with the buffer left as it was
+fun grow(dl: *DrawList) err[allo.Error] {
+    if (dl.len < dl.cap) { ret err[allo.Error].ok{}; }
 
     var new_cap: usize = dl.cap * 2;
     if (new_cap == 0) { new_cap = INIT_CAP; }
 
-    val r: Result[*Vert, str] = allo.reallocate[Vert](dl.a, dl.verts, dl.cap, new_cap);
-    if (is_err[*Vert, str](r)) { ret some[str]("draw: vertex buffer grow failed"); }
-    dl.verts = unwrap_ok[*Vert, str](r);
+    val r: res[*Vert, allo.Error] = allo.reallocate[Vert](dl.a, dl.verts, dl.cap, new_cap);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    dl.verts = r.ok;
     dl.cap   = new_cap;
-    ret none[str]();
+    ret err[allo.Error].ok{};
 }
 
 # append one vertex, growing the buffer if full
 # ---
 # dl:  draw list to append to
 # v:   vertex to append
-# ret: none on success, some(message) on allocation failure
-pub fun push_vert(dl: *DrawList, v: Vert) Option[str] {
-    val g: Option[str] = grow(dl);
-    if (g.has_value) { ret g; }
+# ret: ok, or the allocator's refusal with the vertex not appended
+pub fun push_vert(dl: *DrawList, v: Vert) err[allo.Error] {
+    val g: err[allo.Error] = grow(dl);
+    if (sel g.err) { ret g; }
     dl.verts[dl.len] = v;
-    dl.len = dl.len + 1;
-    ret none[str]();
+    dl.len           = dl.len + 1;
+    ret err[allo.Error].ok{};
 }
 
 # append an axis-aligned quad as two triangles (6 vertices)
@@ -181,38 +180,72 @@ pub fun push_vert(dl: *DrawList, v: Vert) Option[str] {
 # u1:  right atlas u
 # v1:  bottom atlas v
 # c:   fill color
-# ret: none on success, some(message) on allocation failure
-pub fun push_quad(dl: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: Color) Option[str] {
+# ret: ok, or the allocator's refusal after the vertices that fit
+pub fun push_quad(dl: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: Color) err[allo.Error] {
     var tl: Vert;
-    tl.x = x0; tl.y = y0; tl.u = u0; tl.v = v0; tl.r = c.r; tl.g = c.g; tl.b = c.b; tl.a = c.a;
+    tl.x = x0;
+    tl.y = y0;
+    tl.u = u0;
+    tl.v = v0;
+    tl.r = c.r;
+    tl.g = c.g;
+    tl.b = c.b;
+    tl.a = c.a;
     var tr: Vert;
-    tr.x = x1; tr.y = y0; tr.u = u1; tr.v = v0; tr.r = c.r; tr.g = c.g; tr.b = c.b; tr.a = c.a;
+    tr.x = x1;
+    tr.y = y0;
+    tr.u = u1;
+    tr.v = v0;
+    tr.r = c.r;
+    tr.g = c.g;
+    tr.b = c.b;
+    tr.a = c.a;
     var br: Vert;
-    br.x = x1; br.y = y1; br.u = u1; br.v = v1; br.r = c.r; br.g = c.g; br.b = c.b; br.a = c.a;
+    br.x = x1;
+    br.y = y1;
+    br.u = u1;
+    br.v = v1;
+    br.r = c.r;
+    br.g = c.g;
+    br.b = c.b;
+    br.a = c.a;
     var bl: Vert;
-    bl.x = x0; bl.y = y1; bl.u = u0; bl.v = v1; bl.r = c.r; bl.g = c.g; bl.b = c.b; bl.a = c.a;
+    bl.x = x0;
+    bl.y = y1;
+    bl.u = u0;
+    bl.v = v1;
+    bl.r = c.r;
+    bl.g = c.g;
+    bl.b = c.b;
+    bl.a = c.a;
 
-    var e: Option[str];
-    e = push_vert(dl, tl); if (e.has_value) { ret e; }
-    e = push_vert(dl, tr); if (e.has_value) { ret e; }
-    e = push_vert(dl, br); if (e.has_value) { ret e; }
-    e = push_vert(dl, tl); if (e.has_value) { ret e; }
-    e = push_vert(dl, br); if (e.has_value) { ret e; }
-    e = push_vert(dl, bl); if (e.has_value) { ret e; }
-    ret none[str]();
+    val e0: err[allo.Error] = push_vert(dl, tl);
+    if (sel e0.err) { ret e0; }
+    val e1: err[allo.Error] = push_vert(dl, tr);
+    if (sel e1.err) { ret e1; }
+    val e2: err[allo.Error] = push_vert(dl, br);
+    if (sel e2.err) { ret e2; }
+    val e3: err[allo.Error] = push_vert(dl, tl);
+    if (sel e3.err) { ret e3; }
+    val e4: err[allo.Error] = push_vert(dl, br);
+    if (sel e4.err) { ret e4; }
+    val e5: err[allo.Error] = push_vert(dl, bl);
+    if (sel e5.err) { ret e5; }
+    ret err[allo.Error].ok{};
 }
 
 test "draw: push_quad adds six verts at the right corners" {
-    var a: allo.Allocator;
-    page.make(?a);
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
 
     var dl: DrawList;
-    val ie: Option[str] = init(?dl, ?a);
-    if (ie.has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?dl, ?a);
+    if (sel ie.err) { ret 1; }
 
-    val c: Color = rgba(1.0::f32, 0.5::f32, 0.25::f32, 1.0::f32);
-    val pe: Option[str] = push_quad(?dl, 10.0::f32, 20.0::f32, 30.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
-    if (pe.has_value) { ret 1; }
+    val c:  Color           = rgba(1.0::f32, 0.5::f32, 0.25::f32, 1.0::f32);
+    val pe: err[allo.Error] = push_quad(?dl, 10.0::f32, 20.0::f32, 30.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
+    if (sel pe.err) { ret 1; }
 
     if (count(?dl) != 6) { ret 1; }
 
@@ -225,60 +258,66 @@ test "draw: push_quad adds six verts at the right corners" {
     if (p[2].y != 40.0::f32) { ret 1; }
     if (p[5].x != 10.0::f32) { ret 1; }
     if (p[5].y != 40.0::f32) { ret 1; }
-    if (p[0].r != 1.0::f32) { ret 1; }
-    if (p[0].a != 1.0::f32) { ret 1; }
+    if (p[0].r != 1.0::f32)  { ret 1; }
+    if (p[0].a != 1.0::f32)  { ret 1; }
 
-    free(?dl);
+    val freed: err[allo.Error] = free(?dl);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "draw: growth past initial cap preserves earlier verts" {
-    var a: allo.Allocator;
-    page.make(?a);
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
 
     var dl: DrawList;
-    val ie: Option[str] = init(?dl, ?a);
-    if (ie.has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?dl, ?a);
+    if (sel ie.err) { ret 1; }
 
     var i: usize = 0;
     for (i < INIT_CAP + 10) {
         var v: Vert;
         v.x = i::f32;
         v.y = 0.0::f32;
-        val e: Option[str] = push_vert(?dl, v);
-        if (e.has_value) { ret 1; }
+        val e: err[allo.Error] = push_vert(?dl, v);
+        if (sel e.err) { ret 1; }
         i = i + 1;
     }
 
     if (count(?dl) != INIT_CAP + 10) { ret 1; }
-    if (dl.cap <= INIT_CAP) { ret 1; }
+    if (dl.cap <= INIT_CAP)          { ret 1; }
 
     val p: *Vert = data(?dl);
-    if (p[0].x != 0.0::f32) { ret 1; }
+    if (p[0].x != 0.0::f32)                       { ret 1; }
     if (p[INIT_CAP - 1].x != (INIT_CAP - 1)::f32) { ret 1; }
     if (p[INIT_CAP + 9].x != (INIT_CAP + 9)::f32) { ret 1; }
 
-    free(?dl);
+    val freed: err[allo.Error] = free(?dl);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
 test "draw: reset zeroes len keeps cap" {
-    var a: allo.Allocator;
-    page.make(?a);
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
 
     var dl: DrawList;
-    val ie: Option[str] = init(?dl, ?a);
-    if (ie.has_value) { ret 1; }
+    val ie: err[allo.Error] = init(?dl, ?a);
+    if (sel ie.err) { ret 1; }
 
-    val c: Color = rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    push_quad(?dl, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
+    val c:  Color           = rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val pe: err[allo.Error] = push_quad(?dl, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
+    if (sel pe.err)      { ret 1; }
     if (count(?dl) != 6) { ret 1; }
 
     val cap_before: usize = dl.cap;
     reset(?dl);
-    if (count(?dl) != 0) { ret 1; }
+    if (count(?dl) != 0)      { ret 1; }
     if (dl.cap != cap_before) { ret 1; }
 
-    free(?dl);
+    val freed: err[allo.Error] = free(?dl);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }

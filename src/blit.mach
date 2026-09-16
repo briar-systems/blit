@@ -14,4 +14,4 @@ fwd blit.context;
 fwd blit.widget;
 
 # blit library version
-pub val VERSION: str = "0.2.0";
+pub val VERSION: str = "0.3.0";
