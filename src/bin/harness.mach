@@ -4,40 +4,58 @@
 #
 # exercises the public surface end to end and prints the resulting vertex count.
 
+use allo: std.allocator;
+use std.allocator.page;
+use std.print;
 use std.runtime;
 use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
-use print: std.print;
-use allo:  std.allocator;
-use page:  std.allocator.page;
 
 use blit.blit;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { print.println("allocator init failed"); ret 1; }
+    if (sel made.err) {
+        print.println("allocator init failed");
+        ret 1;
+    }
 
     val ae: err[allo.Error] = blit.font.build_atlas(?a);
-    if (sel ae.err) { print.println("atlas build failed"); ret 1; }
+    if (sel ae.err) {
+        print.println("atlas build failed");
+        ret 1;
+    }
 
     var ctx: blit.context.Context;
-    val ce: err[allo.Error] = blit.context.init(?ctx, ?a);
-    if (sel ce.err) { print.println("context init failed"); ret 1; }
+    val ce:  err[allo.Error] = blit.context.init(?ctx, ?a);
+    if (sel ce.err) {
+        print.println("context init failed");
+        ret 1;
+    }
 
-    var checked: u8 = 1;
-    var amount:  f32 = 0.5::f32;
+    var checked: u8    = 1;
+    var amount:  f32   = 0.5::f32;
     var picked:  usize = 0;
     var opts:    [3]str;
-    opts[0] = "add"; opts[1] = "sub"; opts[2] = "mul";
+    opts[0] = "add";
+    opts[1] = "sub";
+    opts[2] = "mul";
 
     var win: blit.widget.Window;
-    win.x = 380.0::f32; win.y = 8.0::f32; win.w = 180.0::f32; win.open = 1; win.title = "tools";
+    win.x     = 380.0::f32;
+    win.y     = 8.0::f32;
+    win.w     = 180.0::f32;
+    win.open  = 1;
+    win.title = "tools";
 
     var in: blit.input.Input;
-    in.mx = 20.0::f32; in.my = 30.0::f32; in.down = 0; in.prev_down = 0;
+    in.mx        = 20.0::f32;
+    in.my        = 30.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
 
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
     val panel: usize = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
@@ -48,9 +66,9 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.widget.end_panel(?ctx, panel);
 
     # sub-surface: a 4x4 grid drawn in local coords, clipped to a short region
-    val cell: blit.draw.Color = blit.draw.rgba(0.4::f32, 0.6::f32, 0.9::f32, 1.0::f32);
+    val cell: blit.draw.Color      = blit.draw.rgba(0.4::f32, 0.6::f32, 0.9::f32, 1.0::f32);
     val surf: blit.context.Surface = blit.context.begin_surface(?ctx, 240.0::f32, 8.0::f32, 120.0::f32, 80.0::f32, 0.0::f32, 0.0::f32);
-    var gy: usize = 0;
+    var gy:   usize                = 0;
     for (gy < 4) {
         var gx: usize = 0;
         for (gx < 4) {
@@ -77,11 +95,14 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.context.end(?ctx);
 
     print.printf("blit {}: {} vertices, ok={}\n",
-                 blit.VERSION,
-                 blit.context.draw_count(?ctx),
-                 blit.context.ok(?ctx)::u64);
+        blit.VERSION,
+        blit.context.draw_count(?ctx),
+        blit.context.ok(?ctx)::u64);
 
     val freed: err[allo.Error] = blit.context.free(?ctx);
-    if (sel freed.err) { print.println("context free failed"); ret 1; }
+    if (sel freed.err) {
+        print.println("context free failed");
+        ret 1;
+    }
     ret 0;
 }

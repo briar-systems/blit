@@ -10,7 +10,7 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use allo: std.allocator;
-use page: std.allocator.page;
+use std.allocator.page;
 
 # vertex capacity allocated by init before any growth
 pub val INIT_CAP: usize = 1024;
@@ -161,7 +161,7 @@ pub fun push_vert(dl: *DrawList, v: Vert) err[allo.Error] {
     val g: err[allo.Error] = grow(dl);
     if (sel g.err) { ret g; }
     dl.verts[dl.len] = v;
-    dl.len = dl.len + 1;
+    dl.len           = dl.len + 1;
     ret err[allo.Error].ok{};
 }
 
@@ -183,25 +183,59 @@ pub fun push_vert(dl: *DrawList, v: Vert) err[allo.Error] {
 # ret: ok, or the allocator's refusal after the vertices that fit
 pub fun push_quad(dl: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: Color) err[allo.Error] {
     var tl: Vert;
-    tl.x = x0; tl.y = y0; tl.u = u0; tl.v = v0; tl.r = c.r; tl.g = c.g; tl.b = c.b; tl.a = c.a;
+    tl.x = x0;
+    tl.y = y0;
+    tl.u = u0;
+    tl.v = v0;
+    tl.r = c.r;
+    tl.g = c.g;
+    tl.b = c.b;
+    tl.a = c.a;
     var tr: Vert;
-    tr.x = x1; tr.y = y0; tr.u = u1; tr.v = v0; tr.r = c.r; tr.g = c.g; tr.b = c.b; tr.a = c.a;
+    tr.x = x1;
+    tr.y = y0;
+    tr.u = u1;
+    tr.v = v0;
+    tr.r = c.r;
+    tr.g = c.g;
+    tr.b = c.b;
+    tr.a = c.a;
     var br: Vert;
-    br.x = x1; br.y = y1; br.u = u1; br.v = v1; br.r = c.r; br.g = c.g; br.b = c.b; br.a = c.a;
+    br.x = x1;
+    br.y = y1;
+    br.u = u1;
+    br.v = v1;
+    br.r = c.r;
+    br.g = c.g;
+    br.b = c.b;
+    br.a = c.a;
     var bl: Vert;
-    bl.x = x0; bl.y = y1; bl.u = u0; bl.v = v1; bl.r = c.r; bl.g = c.g; bl.b = c.b; bl.a = c.a;
+    bl.x = x0;
+    bl.y = y1;
+    bl.u = u0;
+    bl.v = v1;
+    bl.r = c.r;
+    bl.g = c.g;
+    bl.b = c.b;
+    bl.a = c.a;
 
-    val e0: err[allo.Error] = push_vert(dl, tl); if (sel e0.err) { ret e0; }
-    val e1: err[allo.Error] = push_vert(dl, tr); if (sel e1.err) { ret e1; }
-    val e2: err[allo.Error] = push_vert(dl, br); if (sel e2.err) { ret e2; }
-    val e3: err[allo.Error] = push_vert(dl, tl); if (sel e3.err) { ret e3; }
-    val e4: err[allo.Error] = push_vert(dl, br); if (sel e4.err) { ret e4; }
-    val e5: err[allo.Error] = push_vert(dl, bl); if (sel e5.err) { ret e5; }
+    val e0: err[allo.Error] = push_vert(dl, tl);
+    if (sel e0.err) { ret e0; }
+    val e1: err[allo.Error] = push_vert(dl, tr);
+    if (sel e1.err) { ret e1; }
+    val e2: err[allo.Error] = push_vert(dl, br);
+    if (sel e2.err) { ret e2; }
+    val e3: err[allo.Error] = push_vert(dl, tl);
+    if (sel e3.err) { ret e3; }
+    val e4: err[allo.Error] = push_vert(dl, br);
+    if (sel e4.err) { ret e4; }
+    val e5: err[allo.Error] = push_vert(dl, bl);
+    if (sel e5.err) { ret e5; }
     ret err[allo.Error].ok{};
 }
 
 test "draw: push_quad adds six verts at the right corners" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
 
@@ -209,7 +243,7 @@ test "draw: push_quad adds six verts at the right corners" {
     val ie: err[allo.Error] = init(?dl, ?a);
     if (sel ie.err) { ret 1; }
 
-    val c: Color = rgba(1.0::f32, 0.5::f32, 0.25::f32, 1.0::f32);
+    val c:  Color           = rgba(1.0::f32, 0.5::f32, 0.25::f32, 1.0::f32);
     val pe: err[allo.Error] = push_quad(?dl, 10.0::f32, 20.0::f32, 30.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
     if (sel pe.err) { ret 1; }
 
@@ -224,8 +258,8 @@ test "draw: push_quad adds six verts at the right corners" {
     if (p[2].y != 40.0::f32) { ret 1; }
     if (p[5].x != 10.0::f32) { ret 1; }
     if (p[5].y != 40.0::f32) { ret 1; }
-    if (p[0].r != 1.0::f32) { ret 1; }
-    if (p[0].a != 1.0::f32) { ret 1; }
+    if (p[0].r != 1.0::f32)  { ret 1; }
+    if (p[0].a != 1.0::f32)  { ret 1; }
 
     val freed: err[allo.Error] = free(?dl);
     if (sel freed.err) { ret 1; }
@@ -233,7 +267,7 @@ test "draw: push_quad adds six verts at the right corners" {
 }
 
 test "draw: growth past initial cap preserves earlier verts" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
 
@@ -252,10 +286,10 @@ test "draw: growth past initial cap preserves earlier verts" {
     }
 
     if (count(?dl) != INIT_CAP + 10) { ret 1; }
-    if (dl.cap <= INIT_CAP) { ret 1; }
+    if (dl.cap <= INIT_CAP)          { ret 1; }
 
     val p: *Vert = data(?dl);
-    if (p[0].x != 0.0::f32) { ret 1; }
+    if (p[0].x != 0.0::f32)                       { ret 1; }
     if (p[INIT_CAP - 1].x != (INIT_CAP - 1)::f32) { ret 1; }
     if (p[INIT_CAP + 9].x != (INIT_CAP + 9)::f32) { ret 1; }
 
@@ -265,7 +299,7 @@ test "draw: growth past initial cap preserves earlier verts" {
 }
 
 test "draw: reset zeroes len keeps cap" {
-    var a: allo.Allocator;
+    var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
 
@@ -273,14 +307,14 @@ test "draw: reset zeroes len keeps cap" {
     val ie: err[allo.Error] = init(?dl, ?a);
     if (sel ie.err) { ret 1; }
 
-    val c: Color = rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val c:  Color           = rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     val pe: err[allo.Error] = push_quad(?dl, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
-    if (sel pe.err) { ret 1; }
+    if (sel pe.err)      { ret 1; }
     if (count(?dl) != 6) { ret 1; }
 
     val cap_before: usize = dl.cap;
     reset(?dl);
-    if (count(?dl) != 0) { ret 1; }
+    if (count(?dl) != 0)      { ret 1; }
     if (dl.cap != cap_before) { ret 1; }
 
     val freed: err[allo.Error] = free(?dl);
