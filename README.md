@@ -40,10 +40,28 @@ are dropped and partial ones are shrunk with their uvs interpolated, and a
 clipped-out widget never becomes hot.
 
 `blit.context.begin_surface(?ctx, x, y, w, h, scroll_x, scroll_y)` opens a
-clipped region with its own scrolled local coordinate space: emit content at
-local coordinates and read the returned `Surface`'s `local_mx`/`local_my`/
-`inside` to hit-test custom content against `blit.input`. Close it with
-`end_surface`.
+clipped region with its own scrolled local coordinate space: emit content and
+place widgets at local coordinates, and read the returned `Surface`'s
+`local_mx`/`local_my`/`inside` to hit-test custom content against `blit.input`.
+Close it with `end_surface`.
+
+Coordinates compose one way:
+
+- **Every rect you pass is local.** Geometry, widgets, `region_clicked`,
+  `push_clip` and `begin_surface` all take coordinates in the current local
+  space, which is screen space shifted by the current origin. At the root the
+  origin is zero, so local and screen coordinates are the same there.
+- **Surfaces nest.** A surface's origin is its parent's origin plus
+  `(x - scroll_x, y - scroll_y)`, so a surface opened inside another is placed
+  relative to the outer surface's content.
+- **A child never draws outside its parent.** Clips are kept in screen space
+  and every new clip, including a surface's region, is intersected with the
+  active one, whatever rect you pass.
+- **A layer is a new root.** Inside `push_layer` (and so inside a popup) the
+  origin is zero and the clip is the whole screen.
+- **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
+  screen pixels. Use a `Surface`'s `local_mx`/`local_my` for the cursor in its
+  local space.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, `blit.widget.begin_window`/`end_window` is a

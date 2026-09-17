@@ -550,8 +550,8 @@ pub fun region_clicked(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32
 
 # consumer-owned state for a draggable, collapsible titled window
 # ---
-# x:     window left in screen pixels, updated while dragging the titlebar
-# y:     window top in screen pixels, updated while dragging the titlebar
+# x:     window left in local pixels, updated while dragging the titlebar
+# y:     window top in local pixels, updated while dragging the titlebar
 # w:     window width in pixels
 # open:  1 if the body is expanded, 0 if collapsed to the titlebar
 # title: titlebar text
@@ -1360,6 +1360,42 @@ test "widget: a drag continues over a higher claimant and clipped rects stay col
     frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 1), 1);
     if (ctx.hot != 0 || ctx.active != 0)                               { ret 6; }
     if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 1) != 0) { ret 7; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a region at local (0, 0)-(10, 10) inside surface B nested in
+# surface A, which paints at screen (60, 60)-(70, 70)
+fun frame_nested_region(ctx: *context.Context, in: input.Input) u8 {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val sa:      context.Surface = context.begin_surface(ctx, 50.0::f32, 50.0::f32, 100.0::f32, 100.0::f32, 10.0::f32, 10.0::f32);
+    val sb:      context.Surface = context.begin_surface(ctx, 20.0::f32, 20.0::f32, 30.0::f32, 30.0::f32, 0.0::f32, 0.0::f32);
+    val clicked: u8              = region_clicked(ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    context.end_surface(ctx, sb);
+    context.end_surface(ctx, sa);
+    context.end(ctx);
+    ret clicked;
+}
+
+# fails before 0.5.0, where the inner surface's clip and origin were in screen space
+test "widget: a widget in a nested surface is clicked where it paints" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    frame_nested_region(?ctx, input_at(65.0::f32, 65.0::f32, 0));
+    frame_nested_region(?ctx, input_at(65.0::f32, 65.0::f32, 1));
+    if (frame_nested_region(?ctx, input_at(65.0::f32, 65.0::f32, 0)) != 1) { ret 2; }
+
+    # where screen-space arithmetic would have put it, (20, 20)-(30, 30), is dead
+    frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 0));
+    frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 1));
+    if (frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 0)) != 0) { ret 3; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
