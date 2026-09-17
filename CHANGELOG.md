@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - draw: `reserve` grows a draw list to a known vertex count.
 
 ### Changed
+- context: **a press in the first frame a widget exists does nothing.** Input in frame N is routed by the rects widgets claimed in frame N-1, so a widget becomes clickable one frame after it first appears. A widget that appears in response to a click (a popup, a newly revealed button) cannot be pressed in the frame it appears. This is a deliberate property of topmost-at-point routing, not a bug.
 - widget: **the dropdown's option list is now an overlay popup.** It no longer pushes the widgets after it down, so the layout continues directly under the header whether the dropdown is open or not. A layout that relied on the open dropdown's extra height needs its own spacing. A press outside the open list closes it without reaching what lies beneath.
 - widget: `begin_panel` and `begin_window` return a `Block`, and `end_panel`/`end_window` take it, instead of a `usize` vertex handle.
 - widget: panels, windows and popups claim their whole rect, so a click on their empty area no longer reaches the widget they cover.

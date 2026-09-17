@@ -68,10 +68,18 @@ click is always the one visibly on top.
   their children and `fill_claim` at their end, so their empty areas stop input
   instead of letting it reach what they cover.
 - **Routing.** Frame N's input goes only to the topmost of frame N-1's claims
-  under frame N's cursor, resolved once in `begin`. A widget is therefore
-  interactive from the frame after it first appears, by design. If the topmost
-  claimant disappears, nothing is hovered for one frame rather than the click
-  reaching whatever was beneath it.
+  under frame N's cursor, resolved once in `begin`. If the topmost claimant
+  disappears, nothing is hovered for one frame rather than the click reaching
+  whatever was beneath it.
+- **A press in the first frame a widget exists does nothing.** Which widget is
+  on top can only be known from rects that already exist, so routing uses the
+  previous frame's claims. A widget that appears this frame has no claim there
+  yet, so it becomes hoverable and clickable from the next frame. A popup opened
+  by a click cannot be pressed in the same frame it opens. The next press always
+  comes at least one frame later, since it needs the button to go up and down
+  again. In tests, hover for one frame before the first press. This is chosen:
+  the alternatives (a second pass over the widgets, or letting some widgets jump
+  the queue) would make some widgets special.
 - **Popups.** A press anywhere outside an open popup dismisses it (`Popup.dismissed`)
   and is consumed: it does not activate the widget underneath.
 
