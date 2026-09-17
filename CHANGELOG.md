@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- context: **`begin_surface` and `push_clip` take local coordinates, and surface origins accumulate** (#38). Every rect a caller passes is now in the current local space, so a surface opened inside another is placed and scrolled relative to the outer surface's content. **Root-level calls are unaffected**, because the origin is zero there. Only `begin_surface` or `push_clip` calls made inside a surface change: pass the rect in that surface's local space instead of converting it to screen space. Clips are still kept in screen space and always intersect with the active clip, so a nested region or clip can never draw outside its parent. A layer (and so a popup) remains a root at the screen origin. `Surface.x`/`y` now echo the rect as passed, in the parent's local space. The cursor, `input_visible` and `Window.x`/`y` are unchanged, and their docs now say which space they use.
+- widget: migrating from 0.3.x: `region_clicked` and every widget hit-test inside a surface use local coordinates since 0.4.0. See the note under 0.4.0.
+
 ## [0.4.0] - 2026-09-17
 
 ### Added
@@ -21,12 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - widget: `begin_panel` and `begin_window` return a `Block`, and `end_panel`/`end_window` take it, instead of a `usize` vertex handle.
 - widget: panels, windows and popups claim their whole rect, so a click on their empty area no longer reaches the widget they cover.
 - widget: each dropdown takes one more id (its popup), so ids after a dropdown shift by one.
+- widget: **`region_clicked` takes local coordinates inside a surface** (added to these notes after release; it shipped in 0.4.0 unlisted). Through 0.3.x it compared its rect with the cursor in screen space, as its docs said. In 0.4.0 it hit-tests like every other widget, shifted by the surface origin. At the root nothing changes. Inside a surface, pass the same local rect you draw the affordance with, not a screen-space rect.
 - manifest: `[project]` declares the compiler range `mach = "^5.3"`, so mach 5.3 and later no longer warn about a missing range.
 - license: copyright is attributed to Briar Systems LLC.
 - ci: releases are published by the family release workflow (`briar-systems/.github` `mach-release.yml`). Pushing a `v*` tag runs verify, the full CI tier and publish, and `workflow_dispatch` rehearses the same path. `ci.yml` accepts `heavy` as a `workflow_call` input, and pull requests run as before.
 
 ### Fixed
 - widget: an open dropdown no longer loses its click to a window called after it (#1). Input goes to whatever is painted on top.
+- widget: widgets inside a surface are clickable where they paint (added to these notes after release; fixed in 0.4.0 unlisted). Through 0.3.x a button, checkbox, slider or dropdown in a surface painted at its local position plus the surface origin but hit-tested its unshifted rect, so it did not respond where it appeared. That was measured with a button in a surface at (100, 100). Any workaround that passed shifted coordinates to widgets inside a surface should be removed.
 - context: a frame that closes more than `RUN_DEPTH` spans no longer leaves the extra vertices outside every span. The last span absorbs them, as documented.
 - widget: a panel or window background that could not be emitted no longer lets its end call rewrite some other quad.
 
