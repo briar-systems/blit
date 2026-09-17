@@ -7,10 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- context: layers. `push_layer`/`pop_layer` open a screen-space overlay, `end()` composes the draw list by layer, and `Run` carries its `layer`.
+- context: claim-based input routing. `claim`, `reserve_claim` and `fill_claim` record interactive rects, and `hover` holds the topmost claimant under the cursor. Frame N's input is routed by frame N-1's claims at frame N's cursor, so a widget is interactive from the frame after it first appears. `blit.hit` holds the claim list and resolver.
+- widget: `begin_popup`/`end_popup` open an overlay column. A press outside an open popup dismisses it and is consumed.
+- draw: `reserve` grows a draw list to a known vertex count.
+
 ### Changed
+- context: **a press in the first frame a widget exists does nothing.** Input in frame N is routed by the rects widgets claimed in frame N-1, so a widget becomes clickable one frame after it first appears. A widget that appears in response to a click (a popup, a newly revealed button) cannot be pressed in the frame it appears. This is a deliberate property of topmost-at-point routing, not a bug.
+- widget: **the dropdown's option list is now an overlay popup.** It no longer pushes the widgets after it down, so the layout continues directly under the header whether the dropdown is open or not. A layout that relied on the open dropdown's extra height needs its own spacing. A press outside the open list closes it without reaching what lies beneath.
+- widget: `begin_panel` and `begin_window` return a `Block`, and `end_panel`/`end_window` take it, instead of a `usize` vertex handle.
+- widget: panels, windows and popups claim their whole rect, so a click on their empty area no longer reaches the widget they cover.
+- widget: each dropdown takes one more id (its popup), so ids after a dropdown shift by one.
 - manifest: `[project]` declares the compiler range `mach = "^5.3"`, so mach 5.3 and later no longer warn about a missing range.
 - license: copyright is attributed to Briar Systems LLC.
 - ci: releases are published by the family release workflow (`briar-systems/.github` `mach-release.yml`). Pushing a `v*` tag runs verify, the full CI tier and publish, and `workflow_dispatch` rehearses the same path. `ci.yml` accepts `heavy` as a `workflow_call` input, and pull requests run as before.
+
+### Fixed
+- widget: an open dropdown no longer loses its click to a window called after it (#1). Input goes to whatever is painted on top.
+- context: a frame that closes more than `RUN_DEPTH` spans no longer leaves the extra vertices outside every span. The last span absorbs them, as documented.
+- widget: a panel or window background that could not be emitted no longer lets its end call rewrite some other quad.
 
 ## [0.3.1] - 2026-09-16
 

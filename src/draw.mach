@@ -152,6 +152,24 @@ fun grow(dl: *DrawList) err[allo.Error] {
     ret err[allo.Error].ok{};
 }
 
+# ensure capacity for at least n vertices in total
+# ---
+# dl:  draw list to grow
+# n:   vertex count the buffer must hold
+# ret: ok, or the allocator's refusal with the buffer left as it was
+pub fun reserve(dl: *DrawList, n: usize) err[allo.Error] {
+    if (n <= dl.cap) { ret err[allo.Error].ok{}; }
+
+    var new_cap: usize = dl.cap * 2;
+    if (new_cap < n) { new_cap = n; }
+
+    val r: res[*Vert, allo.Error] = allo.reallocate[Vert](dl.a, dl.verts, dl.cap, new_cap);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    dl.verts = r.ok;
+    dl.cap   = new_cap;
+    ret err[allo.Error].ok{};
+}
+
 # append one vertex, growing the buffer if full
 # ---
 # dl:  draw list to append to
@@ -316,6 +334,31 @@ test "draw: reset zeroes len keeps cap" {
     reset(?dl);
     if (count(?dl) != 0)      { ret 1; }
     if (dl.cap != cap_before) { ret 1; }
+
+    val freed: err[allo.Error] = free(?dl);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test "draw: reserve grows to the requested capacity and keeps verts" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+
+    var dl: DrawList;
+    val ie: err[allo.Error] = init(?dl, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var v: Vert;
+    v.x = 3.0::f32;
+    val pe: err[allo.Error] = push_vert(?dl, v);
+    if (sel pe.err) { ret 1; }
+
+    val small: err[allo.Error] = reserve(?dl, 10);
+    if (sel small.err || dl.cap != INIT_CAP) { ret 2; }
+    val big: err[allo.Error] = reserve(?dl, INIT_CAP * 3);
+    if (sel big.err || dl.cap < INIT_CAP * 3)          { ret 3; }
+    if (count(?dl) != 1 || data(?dl)[0].x != 3.0::f32) { ret 4; }
 
     val freed: err[allo.Error] = free(?dl);
     if (sel freed.err) { ret 1; }

@@ -1,11 +1,18 @@
-# the v0 widgets: panel, text, button, checkbox, slider
+# the widgets: panel, window, popup, text, button, checkbox, slider, dropdown
 #
 # each widget places itself at the layout cursor, advances the cursor for the
-# next one, emits its geometry through the context painter, and hit-tests against
-# the context input. interaction uses the classic hot/active id pair: `hot` is the
-# widget under the cursor this frame, `active` is the one being pressed or dragged
-# and persists until the button releases. ids come from call order via next_id, so
-# the UI must be built with a stable sequence of calls each frame.
+# next one, emits its geometry through the context painter, and claims its
+# interactive rect through context.claim. interaction uses the classic hot/active
+# id pair: `hot` is the widget hovered this frame, meaning the topmost claimant
+# under the cursor (see blit.context), and `active` is the one being pressed or
+# dragged, which persists until the button releases. ids come from call order via
+# next_id, so the UI must be built with a stable sequence of calls each frame.
+#
+# containers (panels, windows, popups) claim their whole rect beneath their
+# children, so input over their empty areas stops at them instead of reaching
+# whatever they cover. a popup paints and claims on a layer above everything
+# drawn so far. a press anywhere outside an open popup dismisses it, and that
+# press is consumed rather than delivered to what lies beneath.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -26,6 +33,9 @@ val PAD: f32 = 4.0;
 
 # slider handle width in pixels
 val HANDLE_W: f32 = 6.0;
+
+# the vertex handle of a container whose background could not be emitted
+pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
 
 # height of an interactive row (a glyph plus padding above and below)
 fun row_h() f32 {
@@ -108,42 +118,38 @@ fun advance(ctx: *context.Context, h: f32) {
     ctx.cy = ctx.cy + h + PAD;
 }
 
-# start a layout column at (x, y) of width w and emit its background
+# claim a widget's rect and apply the hot/active rules to it
 #
-# the background height is unknown until the panel's widgets are placed, so a
-# zero-height placeholder is emitted now and grown to fit by end_panel. the
-# returned handle identifies that background quad; pass it to end_panel.
+# the widget becomes hot when hovered and active when pressed while hovered.
 # ---
 # ctx: context
-# x:   panel left in pixels
-# y:   panel top in pixels
-# w:   panel width in pixels
-# ret: a handle for end_panel
-pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) usize {
-    ctx.ox = x;
-    ctx.oy = y;
-    ctx.cx = x;
-    ctx.cy = y;
-    ctx.pw = w;
-
-    val handle: usize = context.draw_count(ctx);
-    context.quad(ctx, x, y, x + w, y, c_panel());
-    ret handle;
+# id:  the widget's id
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# ret: 1 if the widget is hovered this frame, else 0
+fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
+    val hov: u8 = context.claim(ctx, id, x0, y0, x1, y1);
+    if (hov != 0)                               { ctx.hot = id; }
+    if (hov != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    ret hov;
 }
 
-# grow the panel background to enclose every widget placed since begin_panel
-#
-# a no-op if the background was never emitted (allocation failure).
+# emit a zero-height background quad to grow later with grow_background
 # ---
-# ctx:    context
-# handle: the value returned by begin_panel
-pub fun end_panel(ctx: *context.Context, handle: usize) {
-    if (handle + 6 > context.draw_count(ctx)) { ret; }
+# ret: its vertex handle, or NO_VERTS if the quad was not emitted whole
+fun place_background(ctx: *context.Context, x0: f32, y0: f32, x1: f32, c: draw.Color) usize {
+    val before: usize = context.draw_count(ctx);
+    context.quad(ctx, x0, y0, x1, y0, c);
+    if (context.draw_count(ctx) != before + 6) { ret NO_VERTS; }
+    ret before;
+}
 
-    val x0: f32 = ctx.ox;
-    val y0: f32 = ctx.oy;
-    val x1: f32 = ctx.ox + ctx.pw;
-    val y1: f32 = ctx.cy + PAD;
+# stretch a background placed by place_background over (x0,y0)-(x1,y1)
+fun grow_background(ctx: *context.Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if (handle == NO_VERTS)                   { ret; }
+    if (handle + 6 > context.draw_count(ctx)) { ret; }
 
     val p: *draw.Vert = context.draw_verts(ctx);
     p[handle + 0].x = x0;
@@ -160,6 +166,53 @@ pub fun end_panel(ctx: *context.Context, handle: usize) {
     p[handle + 5].y = y1;
 }
 
+# the handle begin_panel and begin_window return for their matching end
+# ---
+# verts: background vertex handle, NO_VERTS when there is none
+# claim: the container's reserved claim, context.NO_CLAIM when refused
+pub rec Block {
+    verts: usize;
+    claim: usize;
+}
+
+# start a layout column at (x, y) of width w and emit its background
+#
+# the background height is unknown until the panel's widgets are placed, so a
+# zero-height placeholder is emitted now and grown to fit by end_panel, and the
+# panel's claim is reserved now, beneath its widgets, and given its rect then.
+# ---
+# ctx: context
+# x:   panel left in pixels
+# y:   panel top in pixels
+# w:   panel width in pixels
+# ret: a handle for end_panel
+pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) Block {
+    ctx.ox = x;
+    ctx.oy = y;
+    ctx.cx = x;
+    ctx.cy = y;
+    ctx.pw = w;
+
+    var b: Block;
+    b.claim = context.reserve_claim(ctx, 0);
+    b.verts = place_background(ctx, x, y, x + w, c_panel());
+    ret b;
+}
+
+# grow the panel background and claim to enclose every widget placed since
+# begin_panel
+# ---
+# ctx: context
+# b:   the value returned by begin_panel
+pub fun end_panel(ctx: *context.Context, b: Block) {
+    val x0: f32 = ctx.ox;
+    val y0: f32 = ctx.oy;
+    val x1: f32 = ctx.ox + ctx.pw;
+    val y1: f32 = ctx.cy + PAD;
+    grow_background(ctx, b.verts, x0, y0, x1, y1);
+    context.fill_claim(ctx, b.claim, x0, y0, x1, y1);
+}
+
 # draw a line of text at the cursor and advance to the next row
 # ---
 # ctx: context
@@ -171,8 +224,8 @@ pub fun text(ctx: *context.Context, s: str) {
 
 # a full-width clickable button with a centered label
 #
-# returns true on the frame the button is released while the cursor is still
-# over it, after having been pressed on it.
+# returns true on the frame the button is released while hovered, after having
+# been pressed on it.
 # ---
 # ctx:   context
 # label: button text
@@ -185,13 +238,10 @@ pub fun button(ctx: *context.Context, label: str) bool {
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hovered: u8 = input.in_rect(ctx.in, x0, y0, x1, y1);
-    val vis:     u8 = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-    if (hovered != 0 && vis != 0)                               { ctx.hot = id; }
-    if (hovered != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
 
     var clicked: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hovered != 0 && vis != 0) {
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
         clicked = true;
     }
 
@@ -223,15 +273,12 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val bx1: f32 = x0 + box;
     val y1:  f32 = y0 + box;
 
-    val tw:      f32 = font.text_width(label);
-    val rx1:     f32 = bx1 + PAD + tw;
-    val hovered: u8  = input.in_rect(ctx.in, x0, y0, rx1, y1);
-    val vis:     u8  = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-    if (hovered != 0 && vis != 0)                               { ctx.hot = id; }
-    if (hovered != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    val tw:  f32 = font.text_width(label);
+    val rx1: f32 = bx1 + PAD + tw;
+    val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
 
     var toggled: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hovered != 0 && vis != 0) {
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -254,8 +301,8 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
 
 # a horizontal slider mapping @v linearly onto [lo, hi]
 #
-# while the handle is held, @v tracks the cursor's x within the track. the label
-# is drawn on the left of the track.
+# while the handle is held, @v tracks the cursor's x within the track, wherever
+# the cursor goes. the label is drawn on the left of the track.
 # ---
 # ctx:   context
 # label: slider text
@@ -271,10 +318,7 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hovered: u8 = input.in_rect(ctx.in, x0, y0, x1, y1);
-    val vis:     u8 = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-    if (hovered != 0 && vis != 0)                               { ctx.hot = id; }
-    if (hovered != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
 
     var changed: bool = false;
     if (ctx.active == id && ctx.in.down != 0) {
@@ -307,13 +351,107 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
     ret changed;
 }
 
-# an accordion select: shows the current option and, while open, lays
-# out the options as selectable rows beneath it
+# the handle begin_popup returns for end_popup
+# ---
+# open:      1 if the popup is drawn this frame, else 0
+# dismissed: 1 if a press outside the popup dismissed it this frame
+# verts:     background vertex handle, NO_VERTS when there is none
+# claim:     the popup body's reserved claim
+# ox:        the parent layout's origin x, restored by end_popup
+# oy:        the parent layout's origin y
+# cx:        the parent layout's cursor x
+# cy:        the parent layout's cursor y
+# pw:        the parent layout's width
+pub rec Popup {
+    open:      u8;
+    dismissed: u8;
+    verts:     usize;
+    claim:     usize;
+    ox:        f32;
+    oy:        f32;
+    cx:        f32;
+    cy:        f32;
+    pw:        f32;
+}
+
+# open a popup column at (x, y) of width w on a layer above everything drawn so
+# far, when @open is nonzero
 #
-# clicking the header toggles the open state (persisted on the context, so only
-# one dropdown is open at a time). clicking an option sets @selected and closes.
-# the open rows advance the layout cursor, pushing later widgets down rather than
-# overlaying them, which keeps it free of immediate-mode overlay ordering.
+# (x, y) is in the caller's local coordinates. inside the popup the layout cursor
+# is in screen pixels, so widgets placed between begin_popup and end_popup land in
+# the popup and paint and claim above what they overlap. the popup also claims
+# the whole screen beneath its body: a press outside the body sets `dismissed`
+# and is consumed, so it never activates what lies under it. the caller owns the
+# open state and closes it on dismissal. one id is taken whether or not the popup
+# is open, so later ids stay stable. pair every begin_popup with an end_popup.
+# ---
+# ctx:  context
+# open: nonzero to draw the popup this frame
+# x:    popup left in local pixels
+# y:    popup top in local pixels
+# w:    popup width in pixels
+# ret:  a handle for end_popup
+pub fun begin_popup(ctx: *context.Context, open: u8, x: f32, y: f32, w: f32) Popup {
+    val outside: u64 = context.next_id(ctx);
+
+    var p: Popup;
+    p.verts = NO_VERTS;
+    p.claim = context.NO_CLAIM;
+    if (open == 0) { ret p; }
+    p.open = 1;
+    p.ox   = ctx.ox;
+    p.oy   = ctx.oy;
+    p.cx   = ctx.cx;
+    p.cy   = ctx.cy;
+    p.pw   = ctx.pw;
+
+    val sx: f32 = x + ctx.lx;
+    val sy: f32 = y + ctx.ly;
+    context.push_layer(ctx);
+
+    val out_hov: u8 = interact(ctx, outside, 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
+    if (out_hov != 0 && input.pressed(ctx.in) != 0) { p.dismissed = 1; }
+
+    p.claim = context.reserve_claim(ctx, 0);
+    ctx.ox  = sx;
+    ctx.oy  = sy;
+    ctx.cx  = sx;
+    ctx.cy  = sy;
+    ctx.pw  = w;
+    p.verts = place_background(ctx, sx, sy, sx + w, c_window());
+    ret p;
+}
+
+# close a popup opened by begin_popup: grow its background and claim over its
+# widgets, leave its layer and restore the parent layout
+# ---
+# ctx: context
+# p:   the value returned by begin_popup
+pub fun end_popup(ctx: *context.Context, p: Popup) {
+    if (p.open == 0) { ret; }
+
+    val x0: f32 = ctx.ox;
+    val y0: f32 = ctx.oy;
+    val x1: f32 = ctx.ox + ctx.pw;
+    val y1: f32 = ctx.cy + PAD;
+    grow_background(ctx, p.verts, x0, y0, x1, y1);
+    context.fill_claim(ctx, p.claim, x0, y0, x1, y1);
+    context.pop_layer(ctx);
+
+    ctx.ox = p.ox;
+    ctx.oy = p.oy;
+    ctx.cx = p.cx;
+    ctx.cy = p.cy;
+    ctx.pw = p.pw;
+}
+
+# a select: shows the current option and, while open, lists the options in a
+# popup directly beneath it
+#
+# clicking the header opens it (the open state lives on the context, so only one
+# dropdown is open at a time). clicking an option sets @selected and closes it,
+# and a press anywhere else closes it without reaching what lies beneath. the
+# option list overlays later widgets rather than pushing them down.
 # ---
 # ctx:      context
 # label:    text drawn on the left of the header
@@ -329,11 +467,8 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hovered: u8 = input.in_rect(ctx.in, x0, y0, x1, y1);
-    val vis:     u8 = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-    if (hovered != 0 && vis != 0)                               { ctx.hot = id; }
-    if (hovered != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
-    if (ctx.active == id && input.released(ctx.in) != 0 && hovered != 0 && vis != 0) {
+    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
         if (ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
         or                           { ctx.open_dropdown = id; }
     }
@@ -353,21 +488,22 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
     advance(ctx, h);
 
+    var open: u8 = 0;
+    if (ctx.open_dropdown == id) { open = 1; }
+    val pop: Popup = begin_popup(ctx, open, ctx.cx, ctx.cy, ctx.pw);
+
     var changed: u8    = 0;
     var i:       usize = 0;
     for (i < count) {
         val oid: u64 = context.next_id(ctx);
-        if (ctx.open_dropdown == id) {
+        if (pop.open != 0) {
             val ox0: f32 = ctx.cx;
             val oy0: f32 = ctx.cy;
             val ox1: f32 = ctx.cx + ctx.pw;
             val oy1: f32 = oy0 + h;
 
-            val ohov: u8 = input.in_rect(ctx.in, ox0, oy0, ox1, oy1);
-            val ovis: u8 = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-            if (ohov != 0 && ovis != 0)                               { ctx.hot = oid; }
-            if (ohov != 0 && ovis != 0 && input.pressed(ctx.in) != 0) { ctx.active = oid; }
-            if (ctx.active == oid && input.released(ctx.in) != 0 && ohov != 0 && ovis != 0) {
+            val ohov: u8 = interact(ctx, oid, ox0, oy0, ox1, oy1);
+            if (ctx.active == oid && input.released(ctx.in) != 0 && ohov != 0) {
                 @selected         = i;
                 ctx.open_dropdown = 0;
                 changed           = 1;
@@ -382,30 +518,31 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
         }
         i = i + 1;
     }
+    end_popup(ctx, pop);
+
+    if (pop.dismissed != 0 && ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
     ret changed;
 }
 
-# hit-test an arbitrary screen rect with button click semantics
+# hit-test an arbitrary rect with button click semantics
 #
-# returns 1 on the frame the primary button releases inside the rect after being
-# pressed inside it. emits no geometry, the consumer draws the affordance (an
-# icon, a corner toggle) itself. respects the active clip stack.
+# returns 1 on the frame the primary button releases while the rect is hovered,
+# after being pressed on it. emits no geometry, the consumer draws the affordance
+# (an icon, a corner toggle) itself. the rect is in local coordinates and is
+# clipped and layered like geometry.
 # ---
 # ctx: context
-# x0:  left x in screen pixels
-# y0:  top y in screen pixels
-# x1:  right x in screen pixels
-# y1:  bottom y in screen pixels
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
 # ret: 1 if the rect was clicked this frame, else 0
 pub fun region_clicked(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val id:      u64 = context.next_id(ctx);
-    val hovered: u8  = input.in_rect(ctx.in, x0, y0, x1, y1);
-    val vis:     u8  = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
-    if (hovered != 0 && vis != 0)                               { ctx.hot = id; }
-    if (hovered != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    val id:  u64 = context.next_id(ctx);
+    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
 
     var clicked: u8 = 0;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hovered != 0 && vis != 0) {
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
         clicked = 1;
     }
     ret clicked;
@@ -431,41 +568,43 @@ pub rec Window {
 # the titlebar drags the window (press and move updates win.x/win.y) and carries a
 # collapse box on the left that toggles win.open. when open, the layout cursor is
 # placed below the titlebar so the consumer's widgets fill the body, which
-# end_window grows to enclose. multiple windows coexist by call order. returns a
-# handle to pass to end_window.
+# end_window grows to enclose. windows stack by call order: a later window paints
+# over, and takes input from, an earlier one, and its whole rect stops input to
+# what it covers. returns a handle to pass to end_window.
 # ---
 # ctx: context
 # win: pointer to the window state, mutated by dragging and collapsing
 # ret: a handle for end_window
-pub fun begin_window(ctx: *context.Context, win: *Window) usize {
+pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     val th:      f32 = row_h();
     val drag_id: u64 = context.next_id(ctx);
     val col_id:  u64 = context.next_id(ctx);
+
+    var b: Block;
+    b.verts = NO_VERTS;
+    b.claim = context.reserve_claim(ctx, 0);
+
+    # follow a drag before claiming, so the claims match where the window paints
+    if (ctx.active == drag_id && ctx.in.down != 0) {
+        win.x = ctx.in.mx - ctx.drag_off_x;
+        win.y = ctx.in.my - ctx.drag_off_y;
+    }
 
     val bx1: f32 = win.x + th;
     val ty0: f32 = win.y;
     val ty1: f32 = win.y + th;
     val dx1: f32 = win.x + win.w;
-    val vis: u8  = context.input_visible(ctx, ctx.in.mx, ctx.in.my);
 
-    val chov: u8 = input.in_rect(ctx.in, win.x, ty0, bx1, ty1);
-    if (chov != 0 && vis != 0)                               { ctx.hot = col_id; }
-    if (chov != 0 && vis != 0 && input.pressed(ctx.in) != 0) { ctx.active = col_id; }
-    if (ctx.active == col_id && input.released(ctx.in) != 0 && chov != 0 && vis != 0) {
+    val chov: u8 = interact(ctx, col_id, win.x, ty0, bx1, ty1);
+    if (ctx.active == col_id && input.released(ctx.in) != 0 && chov != 0) {
         if (win.open == 0) { win.open = 1; }
         or                 { win.open = 0; }
     }
 
-    val dhov: u8 = input.in_rect(ctx.in, bx1, ty0, dx1, ty1);
-    if (dhov != 0 && vis != 0) { ctx.hot = drag_id; }
-    if (dhov != 0 && vis != 0 && input.pressed(ctx.in) != 0) {
-        ctx.active     = drag_id;
+    val dhov: u8 = interact(ctx, drag_id, bx1, ty0, dx1, ty1);
+    if (dhov != 0 && input.pressed(ctx.in) != 0) {
         ctx.drag_off_x = ctx.in.mx - win.x;
         ctx.drag_off_y = ctx.in.my - win.y;
-    }
-    if (ctx.active == drag_id && ctx.in.down != 0) {
-        win.x = ctx.in.mx - ctx.drag_off_x;
-        win.y = ctx.in.my - ctx.drag_off_y;
     }
 
     var tbg: draw.Color = c_title();
@@ -478,7 +617,7 @@ pub fun begin_window(ctx: *context.Context, win: *Window) usize {
     context.glyph(ctx, gch, win.x + PAD, gy, c_text());
     context.text_at(ctx, win.title, win.x + th + PAD, gy, c_text());
 
-    if (win.open == 0) { ret 0; }
+    if (win.open == 0) { ret b; }
 
     ctx.ox = win.x;
     ctx.oy = win.y + th;
@@ -486,41 +625,26 @@ pub fun begin_window(ctx: *context.Context, win: *Window) usize {
     ctx.cy = win.y + th;
     ctx.pw = win.w;
 
-    val handle: usize = context.draw_count(ctx);
-    context.quad(ctx, win.x, win.y + th, win.x + win.w, win.y + th, c_window());
-    ret handle;
+    b.verts = place_background(ctx, win.x, win.y + th, win.x + win.w, c_window());
+    ret b;
 }
 
-# grow the window body to enclose its widgets, like end_panel
-#
-# a no-op when the window is collapsed or the body placeholder was never emitted.
+# grow the window body to enclose its widgets, like end_panel, and give the
+# window's claim its rect (the titlebar alone when collapsed)
 # ---
-# ctx:    context
-# win:    pointer to the window state
-# handle: the value returned by begin_window
-pub fun end_window(ctx: *context.Context, win: *Window, handle: usize) {
-    if (win.open == 0)                        { ret; }
-    if (handle + 6 > context.draw_count(ctx)) { ret; }
-
+# ctx: context
+# win: pointer to the window state
+# b:   the value returned by begin_window
+pub fun end_window(ctx: *context.Context, win: *Window, b: Block) {
     val th: f32 = row_h();
     val x0: f32 = win.x;
-    val y0: f32 = win.y + th;
     val x1: f32 = win.x + win.w;
-    val y1: f32 = ctx.cy + PAD;
-
-    val p: *draw.Vert = context.draw_verts(ctx);
-    p[handle + 0].x = x0;
-    p[handle + 0].y = y0;
-    p[handle + 1].x = x1;
-    p[handle + 1].y = y0;
-    p[handle + 2].x = x1;
-    p[handle + 2].y = y1;
-    p[handle + 3].x = x0;
-    p[handle + 3].y = y0;
-    p[handle + 4].x = x1;
-    p[handle + 4].y = y1;
-    p[handle + 5].x = x0;
-    p[handle + 5].y = y1;
+    var y1: f32 = win.y + th;
+    if (win.open != 0) {
+        y1 = ctx.cy + PAD;
+        grow_background(ctx, b.verts, x0, win.y + th, x1, y1);
+    }
+    context.fill_claim(ctx, b.claim, x0, win.y, x1, y1);
 }
 
 test "widget: text advances the cursor by one row" {
@@ -559,6 +683,25 @@ test "widget: public row metrics match layout advancement" {
     ret 0;
 }
 
+# one frame's input with the cursor at (mx, my) and the button in state down
+fun input_at(mx: f32, my: f32, down: u8) input.Input {
+    var in: input.Input;
+    in.mx   = mx;
+    in.my   = my;
+    in.down = down;
+    ret in;
+}
+
+# a frame holding one panel with one button
+fun frame_button(ctx: *context.Context, in: input.Input) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val clicked: bool  = button(ctx, "ok");
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret clicked;
+}
+
 test "widget: button is true only on release inside after press" {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -567,26 +710,11 @@ test "widget: button is true only on release inside after press" {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var in: input.Input;
-    in.mx        = 10.0::f32;
-    in.my        = 5.0::f32;
-    in.prev_down = 0;
-
-    # frame 1: press on the button
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val n0: usize = context.draw_count(?ctx);
-    if (button(?ctx, "ok") != false)    { ret 1; }
-    if (context.draw_count(?ctx) <= n0) { ret 1; }
-    context.end(?ctx);
-
-    # frame 2: release while still over the button -> click
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (button(?ctx, "ok") != true) { ret 1; }
-    context.end(?ctx);
+    # hover first: a widget is interactive from the frame after it first claims
+    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != false) { ret 2; }
+    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1)) != false) { ret 3; }
+    if (ctx.active != 1)                                               { ret 4; }
+    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != true)  { ret 5; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -601,30 +729,23 @@ test "widget: button is false when released outside" {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var in: input.Input;
-    in.prev_down = 0;
-
-    # frame 1: press on the button
-    in.mx   = 10.0::f32;
-    in.my   = 5.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    button(?ctx, "ok");
-    context.end(?ctx);
-
-    # frame 2: move away, then release -> no click
-    in.mx   = 500.0::f32;
-    in.my   = 500.0::f32;
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (button(?ctx, "ok") != false) { ret 1; }
-    context.end(?ctx);
+    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0));
+    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
+    if (frame_button(?ctx, input_at(500.0::f32, 500.0::f32, 0)) != false) { ret 2; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
+}
+
+# a frame holding one panel with one checkbox
+fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val toggled: bool  = checkbox(ctx, "on", st);
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret toggled;
 }
 
 test "widget: checkbox toggles state on click" {
@@ -636,26 +757,11 @@ test "widget: checkbox toggles state on click" {
     if (sel ie.err) { ret 1; }
 
     var st: u8 = 0;
-    var in: input.Input;
-    in.mx        = 5.0::f32;
-    in.my        = 5.0::f32;
-    in.prev_down = 0;
-
-    # press
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (checkbox(?ctx, "on", ?st) != false) { ret 1; }
-    if (st != 0)                            { ret 1; }
-    context.end(?ctx);
-
-    # release -> toggle on
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (checkbox(?ctx, "on", ?st) != true) { ret 1; }
-    if (st != 1)                           { ret 1; }
-    context.end(?ctx);
+    frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st);
+    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 1), ?st) != false) { ret 2; }
+    if (st != 0)                                                             { ret 3; }
+    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st) != true)  { ret 4; }
+    if (st != 1)                                                             { ret 5; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -708,6 +814,16 @@ test "widget: slider maps the cursor linearly across the track" {
     ret 0;
 }
 
+# a frame holding one panel with one three-option dropdown
+fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str) u8 {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val changed: u8    = dropdown(ctx, "pick", picked, opts, 3);
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret changed;
+}
+
 test "widget: dropdown opens on click and selects an option" {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -722,42 +838,46 @@ test "widget: dropdown opens on click and selects an option" {
     opts[2] = "ccc";
     var picked: usize = 0;
 
-    var in: input.Input;
-    in.prev_down = 0;
+    # hover, press and release the header -> opens, no selection change
+    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]);
+    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0]);
+    if (frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]) != 0) { ret 2; }
+    if (ctx.open_dropdown != 1)                                                         { ret 3; }
 
-    # frame 1: press on the header
-    in.mx   = 10.0::f32;
-    in.my   = 8.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
+    # press and release the second option row (y in [40, 56))
+    frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 1), ?picked, ?opts[0]);
+    if (frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 0), ?picked, ?opts[0]) != 1) { ret 4; }
+    if (picked != 1)                                                                     { ret 5; }
+    if (ctx.open_dropdown != 0)                                                          { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test "widget: an open dropdown overlays later widgets instead of pushing them down" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var opts: [3]str;
+    opts[0] = "a";
+    opts[1] = "b";
+    opts[2] = "c";
+    var picked: usize = 0;
+
+    ctx.open_dropdown = 1;
+    context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
-    context.end(?ctx);
-
-    # frame 2: release over the header -> opens, no selection change
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (dropdown(?ctx, "pick", ?picked, ?opts[0], 3) != 0) { ret 1; }
-    if (ctx.open_dropdown != 1)                            { ret 1; }
-    context.end(?ctx);
-
-    # frame 3: press on the second option row (y in [40, 56))
-    in.mx   = 10.0::f32;
-    in.my   = 48.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
-    context.end(?ctx);
-
-    # frame 4: release over it -> selects index 1 and closes
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    if (dropdown(?ctx, "pick", ?picked, ?opts[0], 3) != 1) { ret 1; }
-    if (picked != 1)                                       { ret 1; }
-    if (ctx.open_dropdown != 0)                            { ret 1; }
+    # the layout continues right under the header
+    if (ctx.cy != row_h() + PAD) { ret 2; }
+    if (ctx.cx != 0.0::f32)      { ret 3; }
+    if (ctx.pw != 100.0::f32)    { ret 4; }
+    if (ctx.layer != 0)          { ret 5; }
     context.end(?ctx);
 
     val freed: err[allo.Error] = context.free(?ctx);
@@ -765,7 +885,7 @@ test "widget: dropdown opens on click and selects an option" {
     ret 0;
 }
 
-test "widget: adjacent dropdown ids stay stable when one expands" {
+test "widget: adjacent dropdown ids stay stable when one opens" {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -781,11 +901,12 @@ test "widget: adjacent dropdown ids stay stable when one expands" {
     var second: usize = 0;
     var in:     input.Input;
 
+    # each dropdown takes a header id, a popup id and one id per option
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "first", ?first, ?opts[0], 3);
     dropdown(?ctx, "second", ?second, ?opts[0], 3);
-    if (ctx.seq != 8) { ret 2; }
+    if (ctx.seq != 10) { ret 2; }
     context.end(?ctx);
 
     ctx.open_dropdown = 1;
@@ -793,20 +914,30 @@ test "widget: adjacent dropdown ids stay stable when one expands" {
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "first", ?first, ?opts[0], 3);
     dropdown(?ctx, "second", ?second, ?opts[0], 3);
-    if (ctx.seq != 8 || ctx.open_dropdown != 1) { ret 3; }
+    if (ctx.seq != 10 || ctx.open_dropdown != 1) { ret 3; }
     context.end(?ctx);
 
-    ctx.open_dropdown = 5;
+    ctx.open_dropdown = 6;
     context.begin(?ctx, in, 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "first", ?first, ?opts[0], 3);
     dropdown(?ctx, "second", ?second, ?opts[0], 3);
-    if (ctx.seq != 8 || ctx.open_dropdown != 5) { ret 4; }
+    if (ctx.seq != 10 || ctx.open_dropdown != 6) { ret 4; }
     context.end(?ctx);
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
+}
+
+# a frame holding one region_clicked rect, clipped to (0,0)-(10,10) when clip is set
+fun frame_region(ctx: *context.Context, in: input.Input, clip: u8) u8 {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    if (clip != 0) { context.push_clip(ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32); }
+    val clicked: u8 = region_clicked(ctx, 40.0::f32, 40.0::f32, 60.0::f32, 60.0::f32);
+    if (clip != 0) { context.pop_clip(ctx); }
+    context.end(ctx);
+    ret clicked;
 }
 
 test "widget: region_clicked fires on release inside after press" {
@@ -817,34 +948,21 @@ test "widget: region_clicked fires on release inside after press" {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var in: input.Input;
-    in.prev_down = 0;
-
-    # frame 1: press inside the rect
-    in.mx   = 50.0::f32;
-    in.my   = 50.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    if (region_clicked(?ctx, 40.0::f32, 40.0::f32, 60.0::f32, 60.0::f32) != 0) { ret 1; }
-    context.end(?ctx);
-
-    # frame 2: release inside -> click
-    in.down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    if (region_clicked(?ctx, 40.0::f32, 40.0::f32, 60.0::f32, 60.0::f32) != 1) { ret 1; }
-    context.end(?ctx);
-
-    # a clipped-away rect cannot be clicked
-    in.down = 1;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    context.push_clip(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
-    if (region_clicked(?ctx, 40.0::f32, 40.0::f32, 60.0::f32, 60.0::f32) != 0) { ret 1; }
-    context.pop_clip(?ctx);
-    context.end(?ctx);
+    frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 0);
+    if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 1), 0) != 0) { ret 2; }
+    if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 0) != 1) { ret 3; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
+}
+
+# a frame holding one window with nothing in it
+fun frame_window(ctx: *context.Context, in: input.Input, win: *Window) {
+    context.begin(ctx, in, 400.0::f32, 400.0::f32);
+    val b: Block = begin_window(ctx, win);
+    end_window(ctx, win, b);
+    context.end(ctx);
 }
 
 test "widget: window drags by the titlebar and collapses" {
@@ -862,52 +980,386 @@ test "widget: window drags by the titlebar and collapses" {
     win.open  = 1;
     win.title = "w";
 
-    var in: input.Input;
-    in.prev_down = 0;
+    # hover then press the drag region, right of the collapse box
+    frame_window(?ctx, input_at(100.0::f32, 58.0::f32, 0), ?win);
+    frame_window(?ctx, input_at(100.0::f32, 58.0::f32, 1), ?win);
 
-    # frame 1: press on the drag region of the titlebar (right of the collapse box)
-    in.mx   = 100.0::f32;
-    in.my   = 58.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 400.0::f32, 400.0::f32);
-    val h1: usize = begin_window(?ctx, ?win);
-    end_window(?ctx, ?win, h1);
-    context.end(?ctx);
+    # move while held -> the window follows the cursor
+    frame_window(?ctx, input_at(150.0::f32, 90.0::f32, 1), ?win);
+    if (win.x != 100.0::f32) { ret 2; }
+    if (win.y != 82.0::f32)  { ret 3; }
 
-    # frame 2: move while held -> window follows the cursor
-    in.mx   = 150.0::f32;
-    in.my   = 90.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 400.0::f32, 400.0::f32);
-    val h2: usize = begin_window(?ctx, ?win);
-    end_window(?ctx, ?win, h2);
-    context.end(?ctx);
-    if (win.x != 100.0::f32) { ret 1; }
-    if (win.y != 82.0::f32)  { ret 1; }
+    # release, then press and release the collapse box (now [100,116] x [82,98])
+    frame_window(?ctx, input_at(150.0::f32, 90.0::f32, 0), ?win);
+    frame_window(?ctx, input_at(108.0::f32, 90.0::f32, 0), ?win);
+    frame_window(?ctx, input_at(108.0::f32, 90.0::f32, 1), ?win);
+    frame_window(?ctx, input_at(108.0::f32, 90.0::f32, 0), ?win);
+    if (win.open != 0) { ret 4; }
 
-    # frame 3: release to drop the drag
-    in.down = 0;
-    context.begin(?ctx, in, 400.0::f32, 400.0::f32);
-    val h3: usize = begin_window(?ctx, ?win);
-    end_window(?ctx, ?win, h3);
-    context.end(?ctx);
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
 
-    # frame 4: press the collapse box (now at [100,116] x [82,98])
-    in.mx   = 108.0::f32;
-    in.my   = 90.0::f32;
-    in.down = 1;
-    context.begin(?ctx, in, 400.0::f32, 400.0::f32);
-    val h4: usize = begin_window(?ctx, ?win);
-    end_window(?ctx, ?win, h4);
-    context.end(?ctx);
+# a frame holding a panel with a three-option dropdown, then a window called
+# after it whose titlebar crosses the option rows
+fun frame_dropdown_window(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str, win: *Window) u8 {
+    context.begin(ctx, in, 400.0::f32, 400.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val changed: u8    = dropdown(ctx, "pick", picked, opts, 3);
+    end_panel(ctx, p);
+    val w: Block = begin_window(ctx, win);
+    end_window(ctx, win, w);
+    context.end(ctx);
+    ret changed;
+}
 
-    # frame 5: release over it -> collapses
-    in.down = 0;
-    context.begin(?ctx, in, 400.0::f32, 400.0::f32);
-    val h5: usize = begin_window(?ctx, ?win);
-    end_window(?ctx, ?win, h5);
-    context.end(?ctx);
-    if (win.open != 0) { ret 1; }
+# first composed vertex at exactly (x, y), or the vertex count when none is
+fun vert_at(ctx: *context.Context, x: f32, y: f32) usize {
+    val p: *draw.Vert = context.draw_verts(ctx);
+    val n: usize      = context.draw_count(ctx);
+    var i: usize      = 0;
+    for (i < n) {
+        if (p[i].x == x && p[i].y == y) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# fails on the last-writer-wins routing: the later window stole the click
+test "widget: an open dropdown takes the click over a later window it overlaps" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var opts: [3]str;
+    opts[0] = "a";
+    opts[1] = "b";
+    opts[2] = "c";
+    var picked: usize = 0;
+
+    # the titlebar spans y [30, 46) and crosses option rows [20, 36) and [40, 56)
+    var win: Window;
+    win.x     = 0.0::f32;
+    win.y     = 30.0::f32;
+    win.w     = 150.0::f32;
+    win.open  = 1;
+    win.title = "w";
+
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
+    if (ctx.open_dropdown != 1) { ret 2; }
+
+    # the option rows paint after the window despite being called before it
+    if (vert_at(?ctx, 0.0::f32, 30.0::f32) >= vert_at(?ctx, 0.0::f32, 40.0::f32)) { ret 3; }
+    if (vert_at(?ctx, 0.0::f32, 40.0::f32) >= context.draw_count(?ctx))           { ret 4; }
+
+    # hover, press and release where option 1 and the drag region overlap.
+    # ids: header 1, popup 2, options 3..5, window drag 6 and collapse 7
+    frame_dropdown_window(?ctx, input_at(50.0::f32, 42.0::f32, 0), ?picked, ?opts[0], ?win);
+    if (ctx.hot != 4) { ret 5; }
+    frame_dropdown_window(?ctx, input_at(50.0::f32, 42.0::f32, 1), ?picked, ?opts[0], ?win);
+    if (ctx.active != 4)                                                                              { ret 6; }
+    if (frame_dropdown_window(?ctx, input_at(50.0::f32, 42.0::f32, 0), ?picked, ?opts[0], ?win) != 1) { ret 7; }
+    if (picked != 1)                                                                                  { ret 8; }
+    if (ctx.open_dropdown != 0)                                                                       { ret 9; }
+    if (win.x != 0.0::f32 || win.y != 30.0::f32 || win.open != 1)                                     { ret 10; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the first half fails on today's code, where the dropdown stays open and the
+# press drags the window
+test "widget: a press outside an open dropdown closes it and is swallowed" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var opts: [3]str;
+    opts[0] = "a";
+    opts[1] = "b";
+    opts[2] = "c";
+    var picked: usize = 0;
+
+    var win: Window;
+    win.x     = 0.0::f32;
+    win.y     = 30.0::f32;
+    win.w     = 150.0::f32;
+    win.open  = 1;
+    win.title = "w";
+
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
+    if (ctx.open_dropdown != 1) { ret 2; }
+
+    # press on the titlebar right of the option rows: the dropdown closes and
+    # the window beneath does not start a drag
+    frame_dropdown_window(?ctx, input_at(120.0::f32, 38.0::f32, 0), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(120.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
+    if (ctx.open_dropdown != 0) { ret 3; }
+    if (ctx.active != 2)        { ret 4; }
+    frame_dropdown_window(?ctx, input_at(130.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
+    frame_dropdown_window(?ctx, input_at(130.0::f32, 38.0::f32, 0), ?picked, ?opts[0], ?win);
+    if (win.x != 0.0::f32 || win.y != 30.0::f32) { ret 5; }
+    if (picked != 0)                             { ret 6; }
+
+    # the next press there goes to the window
+    frame_dropdown_window(?ctx, input_at(130.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
+    if (ctx.active != 6) { ret 7; }
+    frame_dropdown_window(?ctx, input_at(140.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
+    if (win.x != 10.0::f32) { ret 8; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding popup A with a button, and popup B opened inside A, whose
+# button covers part of A's
+fun frame_nested(ctx: *context.Context, in: input.Input, a_hit: *u8, b_hit: *u8, a_gone: *u8, b_gone: *u8) {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val pa: Popup = begin_popup(ctx, 1, 0.0::f32, 0.0::f32, 100.0::f32);
+    @a_hit = button(ctx, "a");
+    val pb: Popup = begin_popup(ctx, 1, 0.0::f32, 10.0::f32, 100.0::f32);
+    @b_hit = button(ctx, "b");
+    end_popup(ctx, pb);
+    end_popup(ctx, pa);
+    @a_gone = pa.dismissed;
+    @b_gone = pb.dismissed;
+    context.end(ctx);
+}
+
+# fails on today's code, which has no popups: nested overlays cannot be expressed
+test "widget: nested popups resolve input and paint to the innermost" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var ah: u8 = 0;
+    var bh: u8 = 0;
+    var ag: u8 = 0;
+    var bg: u8 = 0;
+
+    # button a spans y [0, 16), button b spans y [10, 26): click the overlap
+    frame_nested(?ctx, input_at(50.0::f32, 12.0::f32, 0), ?ah, ?bh, ?ag, ?bg);
+    frame_nested(?ctx, input_at(50.0::f32, 12.0::f32, 1), ?ah, ?bh, ?ag, ?bg);
+    frame_nested(?ctx, input_at(50.0::f32, 12.0::f32, 0), ?ah, ?bh, ?ag, ?bg);
+    if (bh != 1 || ah != 0) { ret 2; }
+    if (ag != 0 || bg != 0) { ret 3; }
+
+    # B paints above A, and the frame ends on B's layer
+    if (vert_at(?ctx, 0.0::f32, 0.0::f32) >= vert_at(?ctx, 0.0::f32, 10.0::f32)) { ret 4; }
+    val top: context.Run = context.run_at(?ctx, context.run_count(?ctx) - 1);
+    if (top.layer != 2) { ret 5; }
+
+    # a press on A alone dismisses only the innermost popup and is consumed by
+    # it, so A's button under it does not activate.
+    # ids: A popup 1, button a 2, B popup 3, button b 4
+    frame_nested(?ctx, input_at(50.0::f32, 5.0::f32, 0), ?ah, ?bh, ?ag, ?bg);
+    frame_nested(?ctx, input_at(50.0::f32, 5.0::f32, 1), ?ah, ?bh, ?ag, ?bg);
+    if (bg != 1 || ag != 0) { ret 6; }
+    if (ctx.active != 3)    { ret 7; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel with a button at y [30, 46), then a window over it
+# whose body holds only text
+fun frame_covered(ctx: *context.Context, in: input.Input, win: *Window) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 30.0::f32, 100.0::f32);
+    val clicked: bool  = button(ctx, "under");
+    end_panel(ctx, p);
+    val w: Block = begin_window(ctx, win);
+    text(ctx, "one");
+    text(ctx, "two");
+    end_window(ctx, win, w);
+    context.end(ctx);
+    ret clicked;
+}
+
+# fails on today's code, where the empty window body lets the click through
+test "widget: a window body stops input to what it covers" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the window body spans y [16, 44)
+    var win: Window;
+    win.x     = 0.0::f32;
+    win.y     = 0.0::f32;
+    win.w     = 120.0::f32;
+    win.open  = 1;
+    win.title = "w";
+
+    frame_covered(?ctx, input_at(50.0::f32, 35.0::f32, 0), ?win);
+    if (ctx.hot != 0) { ret 2; }
+    frame_covered(?ctx, input_at(50.0::f32, 35.0::f32, 1), ?win);
+    if (ctx.hot != 0 || ctx.active != 0)                                       { ret 3; }
+    if (frame_covered(?ctx, input_at(50.0::f32, 35.0::f32, 0), ?win) != false) { ret 4; }
+
+    # below the window the button is reachable
+    frame_covered(?ctx, input_at(50.0::f32, 45.0::f32, 0), ?win);
+    if (ctx.hot != 1) { ret 5; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel button at y [0, 16) and, when shown, a popup whose
+# button covers it
+fun frame_vanish(ctx: *context.Context, in: input.Input, show: u8) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val clicked: bool  = button(ctx, "base");
+    end_panel(ctx, p);
+    val pop: Popup = begin_popup(ctx, show, 0.0::f32, 0.0::f32, 100.0::f32);
+    if (pop.open != 0) { button(ctx, "top"); }
+    end_popup(ctx, pop);
+    context.end(ctx);
+    ret clicked;
+}
+
+# fails on today's code, where the base button takes the press the moment the
+# popup is gone
+test "widget: a vanished topmost claimant leaves one dead frame, never a misroute" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # ids: base button 1, popup 2, popup button 3
+    frame_vanish(?ctx, input_at(50.0::f32, 8.0::f32, 0), 1);
+    frame_vanish(?ctx, input_at(50.0::f32, 8.0::f32, 0), 1);
+    if (ctx.hot != 3) { ret 2; }
+
+    # the popup is gone and a press lands where it was: it reaches nobody
+    frame_vanish(?ctx, input_at(50.0::f32, 8.0::f32, 1), 0);
+    if (ctx.hot != 0 || ctx.active != 0) { ret 3; }
+
+    # the next frame routes to the base button, and the earlier press never clicks it
+    if (frame_vanish(?ctx, input_at(50.0::f32, 8.0::f32, 0), 0) != false) { ret 4; }
+    if (ctx.hot != 1)                                                     { ret 5; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# fails on today's code, where a widget is hot in the frame it first appears
+test "widget: a widget is interactive from the frame after it first claims" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # a press in the very first frame does nothing
+    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
+    if (ctx.hot != 0 || ctx.active != 0) { ret 2; }
+    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
+    if (ctx.hot != 1) { ret 3; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding two overlapping regions, returning which was clicked
+fun frame_pair(ctx: *context.Context, in: input.Input, first: *u8, second: *u8) {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    @first  = region_clicked(ctx, 0.0::f32, 0.0::f32, 50.0::f32, 50.0::f32);
+    @second = region_clicked(ctx, 25.0::f32, 25.0::f32, 75.0::f32, 75.0::f32);
+    context.end(ctx);
+}
+
+# a guard: last-called-wins held before and is now a stated rule
+test "widget: overlapping siblings on one layer resolve to the later call" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var f: u8 = 0;
+    var s: u8 = 0;
+    frame_pair(?ctx, input_at(30.0::f32, 30.0::f32, 0), ?f, ?s);
+    frame_pair(?ctx, input_at(30.0::f32, 30.0::f32, 1), ?f, ?s);
+    if (ctx.hot != 2) { ret 2; }
+    frame_pair(?ctx, input_at(30.0::f32, 30.0::f32, 0), ?f, ?s);
+    if (s != 1 || f != 0) { ret 3; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel slider at y [0, 16), then a window whose titlebar
+# spans y [30, 46)
+fun frame_slider_window(ctx: *context.Context, in: input.Input, v: *f32, win: *Window) {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    slider_f(ctx, "v", v, 0.0::f32, 10.0::f32);
+    end_panel(ctx, p);
+    val w: Block = begin_window(ctx, win);
+    end_window(ctx, win, w);
+    context.end(ctx);
+}
+
+# a guard: an active drag is never re-routed, and clipped rects never claim
+test "widget: a drag continues over a higher claimant and clipped rects stay cold" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var win: Window;
+    win.x     = 0.0::f32;
+    win.y     = 30.0::f32;
+    win.w     = 100.0::f32;
+    win.open  = 1;
+    win.title = "w";
+    var v: f32 = 0.0::f32;
+
+    frame_slider_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?v, ?win);
+    frame_slider_window(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?v, ?win);
+    if (ctx.active != 1) { ret 2; }
+    frame_slider_window(?ctx, input_at(50.0::f32, 38.0::f32, 1), ?v, ?win);
+    if (v != 5.0::f32)                           { ret 3; }
+    if (ctx.active != 1)                         { ret 4; }
+    if (win.x != 0.0::f32 || win.y != 30.0::f32) { ret 5; }
+    frame_slider_window(?ctx, input_at(50.0::f32, 38.0::f32, 0), ?v, ?win);
+
+    # a region clipped away cannot be hovered or clicked
+    frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 1);
+    frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 1), 1);
+    if (ctx.hot != 0 || ctx.active != 0)                               { ret 6; }
+    if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 1) != 0) { ret 7; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
