@@ -58,7 +58,7 @@ fun main(argc: i64, argv: **u8) i64 {
     in.prev_down = 0;
 
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
-    val panel: usize = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
+    val panel: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
     blit.widget.text(?ctx, "blit headless smoke");
     blit.widget.button(?ctx, "step");
     blit.widget.checkbox(?ctx, "running", ?checked);
@@ -81,16 +81,22 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     blit.context.end_surface(?ctx, surf);
 
-    # an accordion dropdown in its own panel
-    val p2: usize = blit.widget.begin_panel(?ctx, 8.0::f32, 220.0::f32, 200.0::f32);
+    # a dropdown in its own panel
+    val p2: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 220.0::f32, 200.0::f32);
     blit.widget.dropdown(?ctx, "op", ?picked, ?opts[0], 3);
     blit.widget.end_panel(?ctx, p2);
 
     # a draggable, collapsible window with a couple of widgets
-    val wh: usize = blit.widget.begin_window(?ctx, ?win);
+    val wh: blit.widget.Block = blit.widget.begin_window(?ctx, ?win);
     blit.widget.text(?ctx, "drag me");
     blit.widget.button(?ctx, "go");
     blit.widget.end_window(?ctx, ?win, wh);
+
+    # a popup over everything drawn so far
+    val pop: blit.widget.Popup = blit.widget.begin_popup(?ctx, 1, 420.0::f32, 60.0::f32, 120.0::f32);
+    blit.widget.text(?ctx, "popup");
+    blit.widget.button(?ctx, "close");
+    blit.widget.end_popup(?ctx, pop);
 
     blit.context.end(?ctx);
 

@@ -17,7 +17,7 @@ if (sel built.err) { ... }
 
 # per frame:
 blit.context.begin(?ctx, in, screen_w, screen_h);
-val panel: usize = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
+val panel: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
 blit.widget.text(?ctx, "controls");
 if (blit.widget.button(?ctx, "step")) { ... }
 blit.widget.checkbox(?ctx, "running", ?running);
@@ -28,7 +28,7 @@ blit.context.end(?ctx);
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.font`, `blit.input`, `blit.context`, `blit.widget`. A
+`blit.draw`, `blit.font`, `blit.input`, `blit.hit`, `blit.context`, `blit.widget`. A
 submodule can also be imported directly, e.g. `use w: blit.widget;`.
 
 ## Clipping & sub-surfaces
@@ -45,10 +45,43 @@ local coordinates and read the returned `Surface`'s `local_mx`/`local_my`/
 `inside` to hit-test custom content against `blit.input`. Close it with
 `end_surface`.
 
-Beyond the v0 widgets, `blit.widget.dropdown` is an inline accordion select,
-`blit.widget.begin_window`/`end_window` is a draggable, collapsible titled
-window, and `blit.widget.region_clicked` hit-tests an arbitrary screen rect for
-consumer-drawn affordances.
+Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
+a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
+draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
+opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
+rect for consumer-drawn affordances.
+
+## Layers & input routing
+
+Paint order and input order come from one key, so the widget that receives a
+click is always the one visibly on top.
+
+- **Layers.** `blit.context.push_layer` raises subsequent geometry and claims
+  onto an overlay above everything on lower layers, in screen coordinates with
+  the clip reset to the screen. `pop_layer` returns. `end()` composes the draw
+  list by layer, keeping call order within a layer, so a popup opened early in
+  the frame still paints over a window called after it. `run_at` reports each
+  span's `layer`.
+- **Claims.** Interactive widgets call `blit.context.claim(?ctx, id, x0, y0,
+  x1, y1)`, which records the rect with the key (layer, then claim order) and
+  returns whether the widget is hovered. Containers call `reserve_claim` before
+  their children and `fill_claim` at their end, so their empty areas stop input
+  instead of letting it reach what they cover.
+- **Routing.** Frame N's input goes only to the topmost of frame N-1's claims
+  under frame N's cursor, resolved once in `begin`. If the topmost claimant
+  disappears, nothing is hovered for one frame rather than the click reaching
+  whatever was beneath it.
+- **A press in the first frame a widget exists does nothing.** Which widget is
+  on top can only be known from rects that already exist, so routing uses the
+  previous frame's claims. A widget that appears this frame has no claim there
+  yet, so it becomes hoverable and clickable from the next frame. A popup opened
+  by a click cannot be pressed in the same frame it opens. The next press always
+  comes at least one frame later, since it needs the button to go up and down
+  again. In tests, hover for one frame before the first press. This is chosen:
+  the alternatives (a second pass over the widgets, or letting some widgets jump
+  the queue) would make some widgets special.
+- **Popups.** A press anywhere outside an open popup dismisses it (`Popup.dismissed`)
+  and is consumed: it does not activate the widget underneath.
 
 ## Rendering
 

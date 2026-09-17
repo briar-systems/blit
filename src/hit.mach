@@ -1,0 +1,209 @@
+# per-frame hit claims and the topmost-at-point resolver
+#
+# widgets claim their interactive rects while a frame is built. the next frame
+# routes input to the one claim on top at the cursor. a claim's key orders claims
+# exactly as they paint: the layer in the high 32 bits and the frame's claim
+# ordinal in the low 32. ordinals are unique within a frame, so two keys never
+# tie and the topmost claim under a point is unique.
+
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+# claim capacity allocated by init before any growth
+pub val INIT_CAP: usize = 256;
+
+# largest ordinal a key can carry in its low 32 bits
+pub val ORDINAL_MAX: u64 = 0xFFFFFFFF;
+
+# one interactive rect in screen space
+#
+# an empty rect (x1 <= x0 or y1 <= y0) never contains a point, which is how a
+# reserved claim waits for its rect.
+# ---
+# id:  widget id that receives input when this claim is topmost
+# key: paint order, see key()
+# x0:  left edge in screen pixels (inclusive)
+# y0:  top edge in screen pixels (inclusive)
+# x1:  right edge in screen pixels (exclusive)
+# y1:  bottom edge in screen pixels (exclusive)
+pub rec Claim {
+    id:  u64;
+    key: u64;
+    x0:  f32;
+    y0:  f32;
+    x1:  f32;
+    y1:  f32;
+}
+
+# a growable list of one frame's claims
+# ---
+# items: backing buffer (nil before init)
+# cap:   capacity in claims
+# len:   claims currently recorded
+# a:     allocator backing the buffer
+pub rec ClaimList {
+    items: *Claim;
+    cap:   usize;
+    len:   usize;
+    a:     *allo.Allocator;
+}
+
+# the paint-order key of a claim
+# ---
+# layer:   layer the claim was made on
+# ordinal: the frame's claim ordinal, at most ORDINAL_MAX
+# ret:     the key, higher is on top
+pub fun key(layer: u32, ordinal: u64) u64 {
+    ret (layer::u64 << 32) | ordinal;
+}
+
+# allocate a claim list's initial backing buffer
+# ---
+# l:   list to initialize
+# a:   allocator to back the buffer
+# ret: ok, or the allocator's refusal with the list left empty
+pub fun init(l: *ClaimList, a: *allo.Allocator) err[allo.Error] {
+    l.a     = a;
+    l.len   = 0;
+    l.cap   = 0;
+    l.items = nil;
+
+    val r: res[*Claim, allo.Error] = allo.allocate[Claim](a, INIT_CAP);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    l.items = r.ok;
+    l.cap   = INIT_CAP;
+    ret err[allo.Error].ok{};
+}
+
+# release the backing buffer and reset the list to empty
+# ---
+# l:   list to free
+# ret: ok, or the allocator's refusal with the list still owning its buffer
+pub fun free(l: *ClaimList) err[allo.Error] {
+    if (l.items == nil) { ret err[allo.Error].ok{}; }
+
+    val freed: err[allo.Error] = allo.deallocate[Claim](l.a, l.items, l.cap);
+    if (sel freed.err) { ret freed; }
+    l.items = nil;
+    l.cap   = 0;
+    l.len   = 0;
+    ret err[allo.Error].ok{};
+}
+
+# clear the list for a new frame, keeping allocated capacity
+# ---
+# l: list to reset
+pub fun reset(l: *ClaimList) {
+    l.len = 0;
+}
+
+# append a claim, doubling capacity when full
+# ---
+# l:   list to append to
+# c:   claim to append
+# ret: the claim's index, or the allocator's refusal with nothing appended
+pub fun push(l: *ClaimList, c: Claim) res[usize, allo.Error] {
+    if (l.len >= l.cap) {
+        var new_cap: usize = l.cap * 2;
+        if (new_cap == 0) { new_cap = INIT_CAP; }
+        val r: res[*Claim, allo.Error] = allo.reallocate[Claim](l.a, l.items, l.cap, new_cap);
+        if (sel r.err) { ret res[usize, allo.Error].err{r.err}; }
+        l.items = r.ok;
+        l.cap   = new_cap;
+    }
+    l.items[l.len] = c;
+    l.len          = l.len + 1;
+    ret res[usize, allo.Error].ok{l.len - 1};
+}
+
+# id of the highest-key claim whose rect contains (x, y)
+# ---
+# l:   claims to search
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the topmost claim's id, or 0 when no claim contains the point
+pub fun resolve(l: *ClaimList, x: f32, y: f32) u64 {
+    var found: u8    = 0;
+    var best:  u64   = 0;
+    var id:    u64   = 0;
+    var i:     usize = 0;
+    for (i < l.len) {
+        val c: Claim = l.items[i];
+        if (x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1) {
+            if (found == 0 || c.key > best) {
+                found = 1;
+                best  = c.key;
+                id    = c.id;
+            }
+        }
+        i = i + 1;
+    }
+    ret id;
+}
+
+test "hit: key orders by layer before ordinal" {
+    if (key(1, 0) <= key(0, ORDINAL_MAX)) { ret 1; }
+    if (key(0, 2) <= key(0, 1))           { ret 2; }
+    ret 0;
+}
+
+test "hit: resolve picks the highest key under the point" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var l:  ClaimList;
+    val ie: err[allo.Error] = init(?l, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the layer-1 claim was recorded first and still wins over later layer-0 ones
+    val p1: res[usize, allo.Error] = push(?l, Claim{id: 7, key: key(1, 0), x0: 0.0::f32, y0: 0.0::f32, x1: 10.0::f32, y1: 10.0::f32});
+    if (sel p1.err) { ret 1; }
+    val p2: res[usize, allo.Error] = push(?l, Claim{id: 8, key: key(0, 1), x0: 0.0::f32, y0: 0.0::f32, x1: 10.0::f32, y1: 10.0::f32});
+    if (sel p2.err) { ret 1; }
+    val p3: res[usize, allo.Error] = push(?l, Claim{id: 9, key: key(0, 2), x0: 5.0::f32, y0: 5.0::f32, x1: 20.0::f32, y1: 20.0::f32});
+    if (sel p3.err)                             { ret 1; }
+    if (resolve(?l, 6.0::f32, 6.0::f32) != 7)   { ret 2; }
+    if (resolve(?l, 15.0::f32, 15.0::f32) != 9) { ret 3; }
+    if (resolve(?l, 30.0::f32, 30.0::f32) != 0) { ret 4; }
+
+    # an empty rect never contains a point, and edges are half-open
+    val p4: res[usize, allo.Error] = push(?l, Claim{id: 10, key: key(2, 3), x0: 12.0::f32, y0: 12.0::f32, x1: 12.0::f32, y1: 12.0::f32});
+    if (sel p4.err)                             { ret 1; }
+    if (resolve(?l, 12.0::f32, 12.0::f32) != 9) { ret 5; }
+    if (resolve(?l, 20.0::f32, 15.0::f32) != 0) { ret 6; }
+
+    val freed: err[allo.Error] = free(?l);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test "hit: push grows past the initial capacity and reset keeps it" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var l:  ClaimList;
+    val ie: err[allo.Error] = init(?l, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var i: usize = 0;
+    for (i < INIT_CAP + 5) {
+        val r: res[usize, allo.Error] = push(?l, Claim{id: i::u64 + 1, key: key(0, i::u64), x0: 0.0::f32, y0: 0.0::f32, x1: 1.0::f32, y1: 1.0::f32});
+        if (sel r.err) { ret 2; }
+        if (r.ok != i) { ret 3; }
+        i = i + 1;
+    }
+    if (l.len != INIT_CAP + 5)                                  { ret 4; }
+    if (resolve(?l, 0.5::f32, 0.5::f32) != (INIT_CAP + 5)::u64) { ret 5; }
+
+    val cap: usize = l.cap;
+    reset(?l);
+    if (l.len != 0 || l.cap != cap) { ret 6; }
+
+    val freed: err[allo.Error] = free(?l);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

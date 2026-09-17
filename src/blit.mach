@@ -10,8 +10,9 @@ use std.types.string.str;
 fwd blit.draw;
 fwd blit.font;
 fwd blit.input;
+fwd blit.hit;
 fwd blit.context;
 fwd blit.widget;
 
 # blit library version
-pub val VERSION: str = "0.3.1";
+pub val VERSION: str = "0.4.0";

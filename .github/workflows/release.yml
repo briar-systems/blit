@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
+    with:
+      stage: verify
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      heavy: all
+
+  publish:
+    needs: [verify, ci]
+    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
+    permissions:
+      contents: write
+    with:
+      stage: publish
