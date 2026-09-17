@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-17
+
 ### Added
 - context: layers. `push_layer`/`pop_layer` open a screen-space overlay, `end()` composes the draw list by layer, and `Run` carries its `layer`.
 - context: claim-based input routing. `claim`, `reserve_claim` and `fill_claim` record interactive rects, and `hover` holds the topmost claimant under the cursor. Frame N's input is routed by frame N-1's claims at frame N's cursor, so a widget is interactive from the frame after it first appears. `blit.hit` holds the claim list and resolver.

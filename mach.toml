@@ -1,6 +1,6 @@
 [project]
 id      = "blit"
-version = "0.3.1"
+version = "0.4.0"
 mach    = "^5.3"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
