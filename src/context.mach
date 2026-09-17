@@ -13,6 +13,14 @@
 # uvs interpolated, so all clipping stays geometric and backend-agnostic. push a
 # sub-surface (begin_surface) to draw custom content in a scrolled local space.
 #
+# coordinates compose one way. every rect a caller passes (geometry, claims,
+# clips, surfaces) is in the current local space, which is screen space shifted
+# by the local origin. a surface adds its offset to its parent's origin, so
+# surfaces nest relative to their parent's content. clips are kept in screen
+# space and always intersect with the parent, so nothing drawn inside a region
+# can escape it. a layer is a new root with the origin at zero. the cursor alone
+# stays in screen space, as it arrives from the platform.
+#
 # paint and input share one order. geometry is emitted on a layer (push_layer
 # raises it), and end() composes the draw list by layer, keeping emission order
 # within a layer. interactive widgets claim their rects with the same order as a
@@ -497,17 +505,31 @@ fun minf(a: f32, b: f32) f32 {
     ret b;
 }
 
-# intersect the active clip rect with (x0,y0,x1,y1) and push the old one
+# intersect the active clip rect with the local rect (x0,y0,x1,y1) and push the
+# old one
 #
-# quads emitted until the matching pop_clip are clipped to the intersection.
-# beyond CLIP_DEPTH nesting the old rect is not saved but depth still balances.
+# the rect is shifted by the local origin like geometry. quads emitted until the
+# matching pop_clip are clipped to the intersection, which never exceeds the
+# parent clip. beyond CLIP_DEPTH nesting the old rect is not saved but depth
+# still balances.
 # ---
 # ctx: context
-# x0:  clip left in screen pixels
-# y0:  clip top in screen pixels
-# x1:  clip right in screen pixels
-# y1:  clip bottom in screen pixels
+# x0:  clip left in local pixels
+# y0:  clip top in local pixels
+# x1:  clip right in local pixels
+# y1:  clip bottom in local pixels
 pub fun push_clip(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) {
+    save_clip(ctx);
+    ctx.clip_x0 = maxf(ctx.clip_x0, x0 + ctx.lx);
+    ctx.clip_y0 = maxf(ctx.clip_y0, y0 + ctx.ly);
+    ctx.clip_x1 = minf(ctx.clip_x1, x1 + ctx.lx);
+    ctx.clip_y1 = minf(ctx.clip_y1, y1 + ctx.ly);
+    if (ctx.clip_x1 < ctx.clip_x0) { ctx.clip_x1 = ctx.clip_x0; }
+    if (ctx.clip_y1 < ctx.clip_y0) { ctx.clip_y1 = ctx.clip_y0; }
+}
+
+# push the active clip rect unchanged, for pop_clip to restore
+fun save_clip(ctx: *Context) {
     if (ctx.clip_sp < CLIP_DEPTH) {
         ctx.clip_x0s[ctx.clip_sp] = ctx.clip_x0;
         ctx.clip_y0s[ctx.clip_sp] = ctx.clip_y0;
@@ -515,13 +537,6 @@ pub fun push_clip(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) {
         ctx.clip_y1s[ctx.clip_sp] = ctx.clip_y1;
     }
     ctx.clip_sp = ctx.clip_sp + 1;
-
-    ctx.clip_x0 = maxf(ctx.clip_x0, x0);
-    ctx.clip_y0 = maxf(ctx.clip_y0, y0);
-    ctx.clip_x1 = minf(ctx.clip_x1, x1);
-    ctx.clip_y1 = minf(ctx.clip_y1, y1);
-    if (ctx.clip_x1 < ctx.clip_x0) { ctx.clip_x1 = ctx.clip_x0; }
-    if (ctx.clip_y1 < ctx.clip_y0) { ctx.clip_y1 = ctx.clip_y0; }
 }
 
 # restore the clip rect saved by the matching push_clip
@@ -538,7 +553,10 @@ pub fun pop_clip(ctx: *Context) {
     }
 }
 
-# set the local origin to (nx, ny), saving the old one
+# set the local origin to the screen position (nx, ny), saving the old one
+#
+# callers compose: a surface passes its parent origin plus its offset, a layer
+# passes zero.
 fun push_origin(ctx: *Context, nx: f32, ny: f32) {
     if (ctx.org_sp < CLIP_DEPTH) {
         ctx.org_xs[ctx.org_sp] = ctx.lx;
@@ -559,9 +577,10 @@ fun pop_origin(ctx: *Context) {
     }
 }
 
-# whether screen point (x, y) lies inside the active clip rect
+# whether the screen point (x, y) lies inside the active clip rect
 #
-# widgets use it (with the cursor) so clipped-out rows never become hot.
+# the point is in screen space, not local space, because it is meant for the
+# cursor (ctx.in.mx, ctx.in.my), which always arrives in screen space.
 # ---
 # ctx: context
 # x:   screen x in pixels
@@ -587,7 +606,7 @@ pub fun push_layer(ctx: *Context) {
     ctx.layer_sp = ctx.layer_sp + 1;
     ctx.layer    = ctx.layer + 1;
 
-    push_clip(ctx, ctx.clip_x0, ctx.clip_y0, ctx.clip_x1, ctx.clip_y1);
+    save_clip(ctx);
     ctx.clip_x0 = 0.0::f32;
     ctx.clip_y0 = 0.0::f32;
     ctx.clip_x1 = ctx.sw;
@@ -798,8 +817,8 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
 
 # a scrolled, clipped local drawing region returned by begin_surface
 # ---
-# x:        region left in screen pixels
-# y:        region top in screen pixels
+# x:        region left, in the parent's local pixels as passed to begin_surface
+# y:        region top, in the parent's local pixels as passed to begin_surface
 # w:        region width in pixels
 # h:        region height in pixels
 # local_mx: cursor x expressed in the region's local content coordinates
@@ -817,15 +836,17 @@ pub rec Surface {
 
 # open a clipped sub-region with its own scrolled local origin
 #
-# content drawn at local (cx, cy) lands at screen (x - scroll_x + cx,
-# y - scroll_y + cy) and is clipped to the region. the returned Surface reports
-# the cursor in local content coordinates and whether it is inside the region;
-# the consumer hit-tests its own content with those plus input pressed/released.
-# pair every begin_surface with an end_surface.
+# the region (x, y, w, h) is in the current local space, so a surface opened
+# inside another is placed relative to the outer surface's content. content drawn
+# at local (cx, cy) lands at the parent origin plus (x - scroll_x + cx,
+# y - scroll_y + cy), and is clipped to the region intersected with the parent
+# clip. the returned Surface reports the cursor in the new local space and
+# whether it is inside the region. widgets placed inside hit-test in that local
+# space too. pair every begin_surface with an end_surface.
 # ---
 # ctx:      context
-# x:        region left in screen pixels
-# y:        region top in screen pixels
+# x:        region left in local pixels
+# y:        region top in local pixels
 # w:        region width in pixels
 # h:        region height in pixels
 # scroll_x: content offset scrolled out to the left in pixels
@@ -833,7 +854,7 @@ pub rec Surface {
 # ret:      the surface descriptor
 pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f32, scroll_y: f32) Surface {
     push_clip(ctx, x, y, x + w, y + h);
-    push_origin(ctx, x - scroll_x, y - scroll_y);
+    push_origin(ctx, ctx.lx + x - scroll_x, ctx.ly + y - scroll_y);
 
     var s: Surface;
     s.x        = x;
@@ -1369,6 +1390,126 @@ test "context: claims past the ordinal limit are refused, never wrapped" {
     if (claim(?ctx, 4, 10.0::f32, 10.0::f32, 20.0::f32, 20.0::f32) != 0) { ret 7; }
     pop_clip(?ctx);
     if (ctx.claims.len != 0 || ctx.ordinal != 0) { ret 8; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# fails before 0.5.0, where the inner surface was placed and clipped in screen space
+test "context: a nested surface is placed and clipped relative to its parent" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 70.0::f32, 75.0::f32);
+
+    # A's origin is (40, 40), so B at local (20, 20) starts at screen (60, 60)
+    val sa: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 100.0::f32, 100.0::f32, 10.0::f32, 10.0::f32);
+    val sb: Surface = begin_surface(?ctx, 20.0::f32, 20.0::f32, 30.0::f32, 30.0::f32, 0.0::f32, 0.0::f32);
+    if (ctx.lx != 60.0::f32 || ctx.ly != 60.0::f32)           { ret 2; }
+    if (ctx.clip_x0 != 60.0::f32 || ctx.clip_y0 != 60.0::f32) { ret 3; }
+    if (ctx.clip_x1 != 90.0::f32 || ctx.clip_y1 != 90.0::f32) { ret 4; }
+    if (sb.local_mx != 10.0::f32 || sb.local_my != 15.0::f32) { ret 5; }
+    if (sb.inside != 1)                                       { ret 6; }
+    if (sb.x != 20.0::f32 || sb.y != 20.0::f32)               { ret 7; }
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
+    if (draw_count(?ctx) != 6) { ret 8; }
+    val p: *draw.Vert = draw_verts(?ctx);
+    if (p[0].x != 60.0::f32 || p[0].y != 60.0::f32 || p[2].x != 65.0::f32 || p[2].y != 65.0::f32) { ret 9; }
+
+    end_surface(?ctx, sb);
+    end_surface(?ctx, sa);
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# fails before 0.5.0, where push_clip took screen coordinates
+test "context: push_clip inside a surface is local" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val sa: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 100.0::f32, 100.0::f32, 10.0::f32, 10.0::f32);
+    push_clip(?ctx, 20.0::f32, 20.0::f32, 30.0::f32, 30.0::f32);
+    if (ctx.clip_x0 != 60.0::f32 || ctx.clip_y0 != 60.0::f32) { ret 2; }
+    if (ctx.clip_x1 != 70.0::f32 || ctx.clip_y1 != 70.0::f32) { ret 3; }
+    # a clip reaching past the surface is still held inside it
+    push_clip(?ctx, 0.0::f32, 0.0::f32, 500.0::f32, 500.0::f32);
+    if (ctx.clip_x0 != 60.0::f32 || ctx.clip_x1 != 70.0::f32) { ret 4; }
+    pop_clip(?ctx);
+    pop_clip(?ctx);
+    # the screen is 100 wide, so A's clip ends there
+    if (ctx.clip_x0 != 50.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 5; }
+    end_surface(?ctx, sa);
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# fails before 0.5.0, where each surface replaced the origin instead of adding to it
+test "context: nested surface origins accumulate and unwind exactly" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val s1: Surface = begin_surface(?ctx, 10.0::f32, 10.0::f32, 100.0::f32, 100.0::f32, 0.0::f32, 0.0::f32);
+    val s2: Surface = begin_surface(?ctx, 5.0::f32, 5.0::f32, 80.0::f32, 80.0::f32, 0.0::f32, 0.0::f32);
+    val s3: Surface = begin_surface(?ctx, 5.0::f32, 5.0::f32, 50.0::f32, 50.0::f32, 2.0::f32, 3.0::f32);
+    if (ctx.lx != 18.0::f32 || ctx.ly != 17.0::f32)           { ret 2; }
+    if (ctx.clip_x0 != 20.0::f32 || ctx.clip_y0 != 20.0::f32) { ret 3; }
+    if (ctx.clip_x1 != 70.0::f32 || ctx.clip_y1 != 70.0::f32) { ret 4; }
+
+    end_surface(?ctx, s3);
+    if (ctx.lx != 15.0::f32 || ctx.ly != 15.0::f32)           { ret 5; }
+    if (ctx.clip_x0 != 15.0::f32 || ctx.clip_x1 != 95.0::f32) { ret 6; }
+    end_surface(?ctx, s2);
+    if (ctx.lx != 10.0::f32 || ctx.ly != 10.0::f32)            { ret 7; }
+    if (ctx.clip_x0 != 10.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 8; }
+    end_surface(?ctx, s1);
+    if (ctx.lx != 0.0::f32 || ctx.ly != 0.0::f32)             { ret 9; }
+    if (ctx.clip_x0 != 0.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 10; }
+    if (ctx.org_sp != 0 || ctx.clip_sp != 0)                  { ret 11; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a guard: a layer was already a screen-space root before 0.5.0
+test "context: a surface inside a layer is placed from the screen origin" {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val sa: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 40.0::f32, 40.0::f32, 10.0::f32, 10.0::f32);
+    push_layer(?ctx);
+    val sb: Surface = begin_surface(?ctx, 5.0::f32, 5.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, 0.0::f32);
+    if (ctx.lx != 5.0::f32 || ctx.ly != 5.0::f32)            { ret 2; }
+    if (ctx.clip_x0 != 5.0::f32 || ctx.clip_x1 != 25.0::f32) { ret 3; }
+    end_surface(?ctx, sb);
+    pop_layer(?ctx);
+    if (ctx.lx != 40.0::f32 || ctx.clip_x0 != 50.0::f32) { ret 4; }
+    end_surface(?ctx, sa);
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
