@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- license: copyright is attributed to Briar Systems LLC.
 - ci: releases are published by the family release workflow (`briar-systems/.github` `mach-release.yml`). Pushing a `v*` tag runs verify, the full CI tier and publish, and `workflow_dispatch` rehearses the same path. `ci.yml` accepts `heavy` as a `workflow_call` input, and pull requests run as before.
 
 ## [0.3.1] - 2026-09-16
