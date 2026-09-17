@@ -1,6 +1,6 @@
 [project]
 id      = "blit"
-version = "0.3.0"
+version = "0.3.1"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
@@ -64,4 +64,4 @@ need    = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v3.2.0"
+ref = "tag/v4.0.0"
