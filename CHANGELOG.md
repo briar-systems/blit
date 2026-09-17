@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-17
+
 ### Changed
 - context: **`begin_surface` and `push_clip` take local coordinates, and surface origins accumulate** (#38). Every rect a caller passes is now in the current local space, so a surface opened inside another is placed and scrolled relative to the outer surface's content. **Root-level calls are unaffected**, because the origin is zero there. Only `begin_surface` or `push_clip` calls made inside a surface change: pass the rect in that surface's local space instead of converting it to screen space. Clips are still kept in screen space and always intersect with the active clip, so a nested region or clip can never draw outside its parent. A layer (and so a popup) remains a root at the screen origin. `Surface.x`/`y` now echo the rect as passed, in the parent's local space. The cursor, `input_visible` and `Window.x`/`y` are unchanged, and their docs now say which space they use.
 - widget: migrating from 0.3.x: `region_clicked` and every widget hit-test inside a surface use local coordinates since 0.4.0. See the note under 0.4.0.
