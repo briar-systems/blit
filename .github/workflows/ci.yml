@@ -2,6 +2,11 @@ name: CI
 
 on:
   pull_request:
+  workflow_call:
+    inputs:
+      heavy:
+        type: string
+        default: none
   workflow_dispatch:
     inputs:
       heavy:
