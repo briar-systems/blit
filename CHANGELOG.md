@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- ci: the tag-triggered workflow is `cd.yml` (was `release.yml`), and it sets a `concurrency` group on the tag with `cancel-in-progress: false`, so a tag push GitHub delivers twice publishes once.
+
 ## [0.5.0] - 2026-09-17
 
 ### Changed
