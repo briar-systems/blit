@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-19
+
+### Changed
+- dep: std moves from tag/v4.0.0 to `^6.0` pinned at v6.0.0, and the compiler range is `mach = "^5.9"` (#48). blit uses only `std.types`, `std.allocator`, `std.print` and `std.runtime`, none of which changed shape between 4.0.0 and 6.0.0, so no blit API or behaviour changes.
+- ci: the tag-triggered workflow is `cd.yml` (was `release.yml`), and it sets a `concurrency` group on the tag with `cancel-in-progress: false`, so a tag push GitHub delivers twice publishes once.
+
 ## [0.5.0] - 2026-09-17
 
 ### Changed
