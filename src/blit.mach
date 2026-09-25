@@ -6,6 +6,8 @@
 # reaches each submodule under its short name, e.g. blit.widget.button.
 
 use std.types.string.str;
+# links the startup entrypoint so `mach test` over this library produces a binary.
+use std.runtime;
 
 fwd blit.draw;
 fwd blit.font;

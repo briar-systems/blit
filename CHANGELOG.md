@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking: builds against std 8.0.0 and requires mach 5.12** (#51). `[dep.std]` moves from `^6.0` to `^8.0`, realized to v8.0.0 by the committed `dep/std` gitlink, and `[project].mach` rises from `^5.9` to `^5.12`, which std 8 requires. Resolution is flat, so a consumer of blit must move to std 8 and mach 5.12 with it, and must rebuild anything that links std rather than only recompiling against the new sources. No API or behaviour changes: nothing here calls `io.runtime.make`, reads `data.toml.Value` or uses `buffers.SecretSource`, the surfaces std 7 and 8 changed, and the page allocator now honouring `align` is built only by tests and the harness, which pass unchanged. The library itself allocates through the caller's allocator.
+- lib: `blit.mach` now uses `std.runtime`, as the other libraries in the family do (#51). mach 5.12 tests only the selected artifact's closure (briar-systems/mach#3813), and until now only the harness reached `std.runtime`, so `mach test .` failed to link with no `_start`. Every module that holds a test is reached from `blit.mach`, so all 53 tests are still collected on every target.
+- ci: the lib job seeds mach v5.12.0 until the family pin moves (briar-systems/.github#103) (#51).
+
 ## [0.6.0] - 2026-09-19
 
 ### Changed
