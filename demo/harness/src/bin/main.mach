@@ -1,8 +1,4 @@
-# drives a full blit frame without a GL backend, hosting the library's tests
-# under a bin artifact (a static lib carries no _start, so the tests must be
-# built and run through a bin)
-#
-# exercises the public surface end to end and prints the resulting vertex count.
+# drives a headless blit frame through a bare `use blit;` and prints its vertex count
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -12,7 +8,7 @@ use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit.blit;
+use blit;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {

@@ -132,9 +132,15 @@ mach build .
 mach test .
 ```
 
-The `[artifact.harness]` bin drives a headless frame end to end. It imports the
-library entry as `use blit.blit;`, because inside this project a bare `use blit;`
-binds the artifact being built.
+`demo/harness/` is its own project with a path dependency on this checkout. It
+drives a headless frame end to end through a bare `use blit;` and prints the
+vertex count. It takes std from this checkout's `dep/std`, so pull the root first:
+
+```
+mach dep pull demo/harness
+mach build demo/harness
+demo/harness/out/linux-x86_64/debug/bin/harness
+```
 
 ## Conventions
 
