@@ -25,6 +25,8 @@ jobs:
       heavy: ${{ inputs.heavy }}
       # std 8 needs mach 5.12, so this seeds v5.12.0 until the family pin moves (briar-systems/.github#103)
       mach-version: v5.12.0
+      # the harness demo builds against this checkout, and .github/ci/verify.sh runs it
+      subprojects: '[{"path": "demo/harness", "build": true, "test": false}]'
 
   gate:
     if: always()

@@ -1,6 +1,6 @@
 [project]
-id      = "blit"
-version = "0.7.0"
+id      = "harness"
+version = "0.1.0"
 mach    = "^5.12"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
@@ -46,15 +46,18 @@ simd          = "scalarize"
 vectorize     = true
 float_reassoc = false
 
-[artifact.blit]
-kind    = "static"
+[artifact.harness]
+kind    = "bin"
 default = true
-entry   = "blit.mach"
-out     = "lib/blit"
+entry   = "bin/main.mach"
+out     = "bin/harness{artifact.suffix}"
 targets = ["*"]
 link    = []
 need    = []
 
+[dep.blit]
+path = "../.."
+
+# blit's own committed pin, so the demo builds against exactly the std blit does
 [dep.std]
-git = "https://github.com/briar-systems/mach-std"
-version = "^8.0"
+path = "../../dep/std"

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- chore: the harness leaves the library for `demo/harness/`, its own project with a path dependency on this checkout (#55). `[artifact.harness]` is gone, so blit ships no binary artifact, and the demo imports the library through a bare `use blit;` as a consumer would. It never hosted tests: the library entry reaches `std.runtime`, so `mach test .` collects the same 53 tests as before. CI builds the demo as a subproject and `.github/ci/verify.sh` runs it in each profile.
+
 ## [0.7.0] - 2026-09-25
 
 ### Changed
