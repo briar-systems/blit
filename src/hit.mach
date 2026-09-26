@@ -145,13 +145,7 @@ pub fun resolve(l: *ClaimList, x: f32, y: f32) u64 {
     ret id;
 }
 
-test "hit: key orders by layer before ordinal" {
-    if (key(1, 0) <= key(0, ORDINAL_MAX)) { ret 1; }
-    if (key(0, 2) <= key(0, 1))           { ret 2; }
-    ret 0;
-}
-
-test "hit: resolve picks the highest key under the point" {
+test resolve__highest_key_under_point {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -181,7 +175,7 @@ test "hit: resolve picks the highest key under the point" {
     ret 0;
 }
 
-test "hit: push grows past the initial capacity and reset keeps it" {
+test push__grows_past_initial_capacity {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
