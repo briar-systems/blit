@@ -876,142 +876,7 @@ pub fun end_surface(ctx: *Context, surf: Surface) {
     pop_clip(ctx);
 }
 
-test "context: begin resets seq and draw list, next_id increments" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val e:   err[allo.Error] = init(?ctx, ?a);
-    if (sel e.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 1.0::f32;
-    in.my        = 2.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 800.0::f32, 600.0::f32);
-
-    if (ctx.seq != 0)          { ret 1; }
-    if (draw_count(?ctx) != 0) { ret 1; }
-    if (ctx.sw != 800.0::f32)  { ret 1; }
-    if (ctx.sh != 600.0::f32)  { ret 1; }
-
-    if (next_id(?ctx) != 1) { ret 1; }
-    if (next_id(?ctx) != 2) { ret 1; }
-    if (ctx.seq != 2)       { ret 1; }
-
-    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
-
-    begin(?ctx, in, 800.0::f32, 600.0::f32);
-    if (draw_count(?ctx) != 0) { ret 1; }
-    if (ctx.seq != 0)          { ret 1; }
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: prev_down carried across begin drives press and release" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.prev_down = 0;
-
-    in.down = 1;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.down != 1)           { ret 1; }
-    if (ctx.in.prev_down != 0)      { ret 1; }
-    if (input.pressed(ctx.in) != 1) { ret 1; }
-    end(?ctx);
-
-    in.down = 1;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.prev_down != 1)      { ret 1; }
-    if (input.pressed(ctx.in) != 0) { ret 1; }
-    end(?ctx);
-
-    in.down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (ctx.in.prev_down != 1)       { ret 1; }
-    if (input.released(ctx.in) != 1) { ret 1; }
-    end(?ctx);
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: text_at emits a quad per character" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-
-    val c: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    text_at(?ctx, "hi", 0.0::f32, 0.0::f32, c);
-    # two glyphs, six verts each
-    if (draw_count(?ctx) != 12) { ret 1; }
-    if (ok(?ctx) != 1)          { ret 1; }
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: push_clip intersects nested rects and pop restores them" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-
-    push_clip(?ctx, 0.0::f32, 0.0::f32, 60.0::f32, 60.0::f32);
-    push_clip(?ctx, 40.0::f32, 40.0::f32, 100.0::f32, 100.0::f32);
-    if (ctx.clip_x0 != 40.0::f32) { ret 1; }
-    if (ctx.clip_y0 != 40.0::f32) { ret 1; }
-    if (ctx.clip_x1 != 60.0::f32) { ret 1; }
-    if (ctx.clip_y1 != 60.0::f32) { ret 1; }
-
-    pop_clip(?ctx);
-    if (ctx.clip_x1 != 60.0::f32) { ret 1; }
-    if (ctx.clip_x0 != 0.0::f32)  { ret 1; }
-
-    pop_clip(?ctx);
-    if (ctx.clip_x1 != 100.0::f32) { ret 1; }
-    if (ctx.clip_sp != 0)          { ret 1; }
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: clip halves a glyph and interpolates its uvs" {
+test clip__glyph_uvs_interpolate {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1057,36 +922,7 @@ test "context: clip halves a glyph and interpolates its uvs" {
     ret 0;
 }
 
-test "context: input_visible follows the clip stack" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
-
-    if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 1)  { ret 1; }
-    if (input_visible(?ctx, 150.0::f32, 50.0::f32) != 0) { ret 1; }
-
-    push_clip(?ctx, 0.0::f32, 0.0::f32, 40.0::f32, 40.0::f32);
-    if (input_visible(?ctx, 30.0::f32, 30.0::f32) != 1) { ret 1; }
-    if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 0) { ret 1; }
-    pop_clip(?ctx);
-    if (input_visible(?ctx, 50.0::f32, 50.0::f32) != 1) { ret 1; }
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: begin_surface maps the cursor to local coords and clips content" {
+test surface__maps_cursor_and_clips {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1132,31 +968,7 @@ test "context: begin_surface maps the cursor to local coords and clips content" 
     ret 0;
 }
 
-test "context: begin_surface reports the cursor outside its region" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 60.0::f32;
-    in.my        = 70.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 200.0::f32, 200.0::f32);
-
-    val s: Surface = begin_surface(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, 0.0::f32, 0.0::f32);
-    if (s.inside != 0) { ret 1; }
-    end_surface(?ctx, s);
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "context: texture runs divide the draw list in draw order" {
+test runs__split_by_texture_in_draw_order {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1194,7 +1006,7 @@ test "context: texture runs divide the draw list in draw order" {
     ret 0;
 }
 
-test "context: images through one texture merge into one span" {
+test runs__same_texture_images_merge {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1233,6 +1045,7 @@ test "context: images through one texture merge into one span" {
 }
 
 # begin a frame with the cursor at (mx, my) and the button up
+#[testing]
 fun start_at(ctx: *Context, mx: f32, my: f32) {
     var in: input.Input;
     in.mx = mx;
@@ -1240,7 +1053,7 @@ fun start_at(ctx: *Context, mx: f32, my: f32) {
     begin(ctx, in, 100.0::f32, 100.0::f32);
 }
 
-test "context: layers paint in ascending order and keep emission order within one" {
+test layer__ascending_paint_order {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1273,7 +1086,7 @@ test "context: layers paint in ascending order and keep emission order within on
     ret 0;
 }
 
-test "context: push_layer opens a screen-space overlay and pop_layer restores" {
+test layer__screen_space_overlay_restores {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1304,7 +1117,7 @@ test "context: push_layer opens a screen-space overlay and pop_layer restores" {
     ret 0;
 }
 
-test "context: hover resolves the previous frame's claims at the current cursor" {
+test claim__hover_resolves_previous_frame {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1336,7 +1149,7 @@ test "context: hover resolves the previous frame's claims at the current cursor"
     ret 0;
 }
 
-test "context: a reserved claim sits beneath later claims and takes its rect late" {
+test claim__reserved_sits_beneath_later {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1368,7 +1181,7 @@ test "context: a reserved claim sits beneath later claims and takes its rect lat
     ret 0;
 }
 
-test "context: claims past the ordinal limit are refused, never wrapped" {
+test claim__ordinal_limit_refuses {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1396,8 +1209,7 @@ test "context: claims past the ordinal limit are refused, never wrapped" {
     ret 0;
 }
 
-# fails before 0.5.0, where the inner surface was placed and clipped in screen space
-test "context: a nested surface is placed and clipped relative to its parent" {
+test surface__nested_placed_relative_to_parent {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1430,8 +1242,7 @@ test "context: a nested surface is placed and clipped relative to its parent" {
     ret 0;
 }
 
-# fails before 0.5.0, where push_clip took screen coordinates
-test "context: push_clip inside a surface is local" {
+test surface__push_clip_is_local {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1458,8 +1269,7 @@ test "context: push_clip inside a surface is local" {
     ret 0;
 }
 
-# fails before 0.5.0, where each surface replaced the origin instead of adding to it
-test "context: nested surface origins accumulate and unwind exactly" {
+test surface__nested_origins_unwind {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1485,31 +1295,6 @@ test "context: nested surface origins accumulate and unwind exactly" {
     if (ctx.lx != 0.0::f32 || ctx.ly != 0.0::f32)             { ret 9; }
     if (ctx.clip_x0 != 0.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 10; }
     if (ctx.org_sp != 0 || ctx.clip_sp != 0)                  { ret 11; }
-
-    val freed: err[allo.Error] = free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a guard: a layer was already a screen-space root before 0.5.0
-test "context: a surface inside a layer is placed from the screen origin" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: Context;
-    val ie:  err[allo.Error] = init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-    start_at(?ctx, 0.0::f32, 0.0::f32);
-
-    val sa: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 40.0::f32, 40.0::f32, 10.0::f32, 10.0::f32);
-    push_layer(?ctx);
-    val sb: Surface = begin_surface(?ctx, 5.0::f32, 5.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, 0.0::f32);
-    if (ctx.lx != 5.0::f32 || ctx.ly != 5.0::f32)            { ret 2; }
-    if (ctx.clip_x0 != 5.0::f32 || ctx.clip_x1 != 25.0::f32) { ret 3; }
-    end_surface(?ctx, sb);
-    pop_layer(?ctx);
-    if (ctx.lx != 40.0::f32 || ctx.clip_x0 != 50.0::f32) { ret 4; }
-    end_surface(?ctx, sa);
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }

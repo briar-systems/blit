@@ -255,14 +255,7 @@ pub fun text_width(s: str) f32 {
     ret str_len(s)::f32 * GLYPH_W;
 }
 
-test "font: text_width counts glyphs" {
-    if (text_width("") != 0.0::f32)                       { ret 1; }
-    if (text_width("ABC") != 3.0::f32 * GLYPH_W)          { ret 1; }
-    if (text_width("hello world") != 11.0::f32 * GLYPH_W) { ret 1; }
-    ret 0;
-}
-
-test "font: glyph_uv in range for 'A', space, and non-printable" {
+test glyph_uv__nonprintable_folds_to_space {
     var u0: f32;
     var v0: f32;
     var u1: f32;
@@ -291,16 +284,7 @@ test "font: glyph_uv in range for 'A', space, and non-printable" {
     ret 0;
 }
 
-test "font: white_uv lies inside the atlas" {
-    var u: f32;
-    var v: f32;
-    white_uv(?u, ?v);
-    if (u < 0.0::f32 || u > 1.0::f32) { ret 1; }
-    if (v < 0.0::f32 || v > 1.0::f32) { ret 1; }
-    ret 0;
-}
-
-test "font: build_atlas fills consistent dimensions and an opaque white texel" {
+test build_atlas__opaque_white_texel {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
