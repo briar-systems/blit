@@ -647,43 +647,8 @@ pub fun end_window(ctx: *context.Context, win: *Window, b: Block) {
     context.fill_claim(ctx, b.claim, x0, win.y, x1, y1);
 }
 
-test "widget: text advances the cursor by one row" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-
-    val cy0: f32   = ctx.cy;
-    val n0:  usize = context.draw_count(?ctx);
-    text(?ctx, "hello");
-
-    if (ctx.cy != cy0 + font.GLYPH_H + PAD) { ret 1; }
-    if (ctx.cx != ctx.ox)                   { ret 1; }
-    if (context.draw_count(?ctx) <= n0)     { ret 1; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "widget: public row metrics match layout advancement" {
-    if (text_row_height() != font.GLYPH_H + PAD) { ret 1; }
-    if (control_row_height() != row_h() + PAD)   { ret 2; }
-    if (layout_gap() != PAD)                     { ret 3; }
-    ret 0;
-}
-
 # one frame's input with the cursor at (mx, my) and the button in state down
+#[testing]
 fun input_at(mx: f32, my: f32, down: u8) input.Input {
     var in: input.Input;
     in.mx   = mx;
@@ -693,6 +658,7 @@ fun input_at(mx: f32, my: f32, down: u8) input.Input {
 }
 
 # a frame holding one panel with one button
+#[testing]
 fun frame_button(ctx: *context.Context, in: input.Input) bool {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -702,7 +668,7 @@ fun frame_button(ctx: *context.Context, in: input.Input) bool {
     ret clicked;
 }
 
-test "widget: button is true only on release inside after press" {
+test button__clicks_on_release_inside_after_press {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -716,22 +682,9 @@ test "widget: button is true only on release inside after press" {
     if (ctx.active != 1)                                               { ret 4; }
     if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != true)  { ret 5; }
 
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test "widget: button is false when released outside" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0));
+    # a release outside after a press inside is no click
     frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
-    if (frame_button(?ctx, input_at(500.0::f32, 500.0::f32, 0)) != false) { ret 2; }
+    if (frame_button(?ctx, input_at(500.0::f32, 500.0::f32, 0)) != false) { ret 6; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -739,6 +692,7 @@ test "widget: button is false when released outside" {
 }
 
 # a frame holding one panel with one checkbox
+#[testing]
 fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -748,7 +702,7 @@ fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {
     ret toggled;
 }
 
-test "widget: checkbox toggles state on click" {
+test checkbox__toggles_on_click {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -768,7 +722,7 @@ test "widget: checkbox toggles state on click" {
     ret 0;
 }
 
-test "widget: slider maps the cursor linearly across the track" {
+test slider__maps_cursor_linearly {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -815,6 +769,7 @@ test "widget: slider maps the cursor linearly across the track" {
 }
 
 # a frame holding one panel with one three-option dropdown
+#[testing]
 fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str) u8 {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -824,7 +779,7 @@ fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts:
     ret changed;
 }
 
-test "widget: dropdown opens on click and selects an option" {
+test dropdown__opens_and_selects {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -855,7 +810,7 @@ test "widget: dropdown opens on click and selects an option" {
     ret 0;
 }
 
-test "widget: an open dropdown overlays later widgets instead of pushing them down" {
+test dropdown__open_overlays_later_widgets {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -885,7 +840,7 @@ test "widget: an open dropdown overlays later widgets instead of pushing them do
     ret 0;
 }
 
-test "widget: adjacent dropdown ids stay stable when one opens" {
+test dropdown__ids_stable_when_open {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -931,6 +886,7 @@ test "widget: adjacent dropdown ids stay stable when one opens" {
 }
 
 # a frame holding one region_clicked rect, clipped to (0,0)-(10,10) when clip is set
+#[testing]
 fun frame_region(ctx: *context.Context, in: input.Input, clip: u8) u8 {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     if (clip != 0) { context.push_clip(ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32); }
@@ -940,24 +896,8 @@ fun frame_region(ctx: *context.Context, in: input.Input, clip: u8) u8 {
     ret clicked;
 }
 
-test "widget: region_clicked fires on release inside after press" {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 0);
-    if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 1), 0) != 0) { ret 2; }
-    if (frame_region(?ctx, input_at(50.0::f32, 50.0::f32, 0), 0) != 1) { ret 3; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
 # a frame holding one window with nothing in it
+#[testing]
 fun frame_window(ctx: *context.Context, in: input.Input, win: *Window) {
     context.begin(ctx, in, 400.0::f32, 400.0::f32);
     val b: Block = begin_window(ctx, win);
@@ -965,7 +905,7 @@ fun frame_window(ctx: *context.Context, in: input.Input, win: *Window) {
     context.end(ctx);
 }
 
-test "widget: window drags by the titlebar and collapses" {
+test window__drags_by_titlebar_and_collapses {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1003,6 +943,7 @@ test "widget: window drags by the titlebar and collapses" {
 
 # a frame holding a panel with a three-option dropdown, then a window called
 # after it whose titlebar crosses the option rows
+#[testing]
 fun frame_dropdown_window(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str, win: *Window) u8 {
     context.begin(ctx, in, 400.0::f32, 400.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -1015,6 +956,7 @@ fun frame_dropdown_window(ctx: *context.Context, in: input.Input, picked: *usize
 }
 
 # first composed vertex at exactly (x, y), or the vertex count when none is
+#[testing]
 fun vert_at(ctx: *context.Context, x: f32, y: f32) usize {
     val p: *draw.Vert = context.draw_verts(ctx);
     val n: usize      = context.draw_count(ctx);
@@ -1026,8 +968,7 @@ fun vert_at(ctx: *context.Context, x: f32, y: f32) usize {
     ret n;
 }
 
-# fails on the last-writer-wins routing: the later window stole the click
-test "widget: an open dropdown takes the click over a later window it overlaps" {
+test routing__open_dropdown_beats_later_window {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1074,9 +1015,7 @@ test "widget: an open dropdown takes the click over a later window it overlaps" 
     ret 0;
 }
 
-# the first half fails on today's code, where the dropdown stays open and the
-# press drags the window
-test "widget: a press outside an open dropdown closes it and is swallowed" {
+test dropdown__outside_press_closes_and_is_swallowed {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1126,6 +1065,7 @@ test "widget: a press outside an open dropdown closes it and is swallowed" {
 
 # a frame holding popup A with a button, and popup B opened inside A, whose
 # button covers part of A's
+#[testing]
 fun frame_nested(ctx: *context.Context, in: input.Input, a_hit: *u8, b_hit: *u8, a_gone: *u8, b_gone: *u8) {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val pa: Popup = begin_popup(ctx, 1, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -1139,8 +1079,7 @@ fun frame_nested(ctx: *context.Context, in: input.Input, a_hit: *u8, b_hit: *u8,
     context.end(ctx);
 }
 
-# fails on today's code, which has no popups: nested overlays cannot be expressed
-test "widget: nested popups resolve input and paint to the innermost" {
+test popup__nested_resolve_to_innermost {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1180,6 +1119,7 @@ test "widget: nested popups resolve input and paint to the innermost" {
 
 # a frame holding a panel with a button at y [30, 46), then a window over it
 # whose body holds only text
+#[testing]
 fun frame_covered(ctx: *context.Context, in: input.Input, win: *Window) bool {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 30.0::f32, 100.0::f32);
@@ -1193,8 +1133,7 @@ fun frame_covered(ctx: *context.Context, in: input.Input, win: *Window) bool {
     ret clicked;
 }
 
-# fails on today's code, where the empty window body lets the click through
-test "widget: a window body stops input to what it covers" {
+test window__body_blocks_input_beneath {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1227,6 +1166,7 @@ test "widget: a window body stops input to what it covers" {
 
 # a frame holding a panel button at y [0, 16) and, when shown, a popup whose
 # button covers it
+#[testing]
 fun frame_vanish(ctx: *context.Context, in: input.Input, show: u8) bool {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -1239,9 +1179,7 @@ fun frame_vanish(ctx: *context.Context, in: input.Input, show: u8) bool {
     ret clicked;
 }
 
-# fails on today's code, where the base button takes the press the moment the
-# popup is gone
-test "widget: a vanished topmost claimant leaves one dead frame, never a misroute" {
+test routing__vanished_claimant_leaves_one_dead_frame {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1267,8 +1205,7 @@ test "widget: a vanished topmost claimant leaves one dead frame, never a misrout
     ret 0;
 }
 
-# fails on today's code, where a widget is hot in the frame it first appears
-test "widget: a widget is interactive from the frame after it first claims" {
+test routing__interactive_from_frame_after_first_claim {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1288,6 +1225,7 @@ test "widget: a widget is interactive from the frame after it first claims" {
 }
 
 # a frame holding two overlapping regions, returning which was clicked
+#[testing]
 fun frame_pair(ctx: *context.Context, in: input.Input, first: *u8, second: *u8) {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     @first  = region_clicked(ctx, 0.0::f32, 0.0::f32, 50.0::f32, 50.0::f32);
@@ -1295,8 +1233,7 @@ fun frame_pair(ctx: *context.Context, in: input.Input, first: *u8, second: *u8) 
     context.end(ctx);
 }
 
-# a guard: last-called-wins held before and is now a stated rule
-test "widget: overlapping siblings on one layer resolve to the later call" {
+test routing__later_sibling_wins_on_one_layer {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1319,6 +1256,7 @@ test "widget: overlapping siblings on one layer resolve to the later call" {
 
 # a frame holding a panel slider at y [0, 16), then a window whose titlebar
 # spans y [30, 46)
+#[testing]
 fun frame_slider_window(ctx: *context.Context, in: input.Input, v: *f32, win: *Window) {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
@@ -1329,8 +1267,7 @@ fun frame_slider_window(ctx: *context.Context, in: input.Input, v: *f32, win: *W
     context.end(ctx);
 }
 
-# a guard: an active drag is never re-routed, and clipped rects never claim
-test "widget: a drag continues over a higher claimant and clipped rects stay cold" {
+test routing__drag_holds_and_clipped_rects_stay_cold {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1368,6 +1305,7 @@ test "widget: a drag continues over a higher claimant and clipped rects stay col
 
 # a frame holding a region at local (0, 0)-(10, 10) inside surface B nested in
 # surface A, which paints at screen (60, 60)-(70, 70)
+#[testing]
 fun frame_nested_region(ctx: *context.Context, in: input.Input) u8 {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val sa:      context.Surface = context.begin_surface(ctx, 50.0::f32, 50.0::f32, 100.0::f32, 100.0::f32, 10.0::f32, 10.0::f32);
@@ -1379,8 +1317,7 @@ fun frame_nested_region(ctx: *context.Context, in: input.Input) u8 {
     ret clicked;
 }
 
-# fails before 0.5.0, where the inner surface's clip and origin were in screen space
-test "widget: a widget in a nested surface is clicked where it paints" {
+test surface__nested_widget_clicked_where_painted {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }

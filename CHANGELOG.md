@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-26
+
+### Breaking
+- chore: blit and `demo/harness` require Mach 6 (`mach = "^6"`) and std 9.0 (`^9.0`, pinned to v9.0.0), and CI seeds Mach v6.0.0 (#59). A consumer on Mach 5 or std 8 stays on 0.7.x. The public surface is unchanged.
+
+### Changed
+- test: every test is named `test subject__case` as Mach 6 requires and pruned to the test policy, so `mach test .` runs 35 tests in place of 53 (#59). Tests of one-line functions and tests another test covers are gone, and test-only helpers are `#[testing]`.
+
 ## [0.7.1] - 2026-09-25
 
 ### Changed
