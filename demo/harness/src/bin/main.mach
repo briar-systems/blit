@@ -1,5 +1,5 @@
 # drives a headless blit frame through a bare `use blit;` and prints its vertex
-# count and atlas pages
+# count, spans and atlas pages
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -62,6 +62,21 @@ fun main(argc: i64, argv: **u8) i64 {
     in.down      = 0;
     in.prev_down = 0;
 
+    var steps: [3]blit.draw.Color;
+    steps[0] = blit.draw.rgba(0.1::f32, 0.1::f32, 0.4::f32, 1.0::f32);
+    steps[1] = blit.draw.rgba(0.9::f32, 0.5::f32, 0.1::f32, 1.0::f32);
+    steps[2] = blit.draw.rgba(1.0::f32, 1.0::f32, 0.8::f32, 1.0::f32);
+    var field: [8]f32;
+    var fi:    usize = 0;
+    for (fi < 8) {
+        field[fi] = fi::f32 / 7.0::f32;
+        fi        = fi + 1;
+    }
+    val heat: blit.widget.Grid = blit.widget.Grid{
+        cols:    4, rows: 2, colors: nil, values: ?field[0],
+        palette: blit.widget.Palette{colors: ?steps[0], count: 3, lo: 0.0::f32, hi: 1.0::f32}
+    };
+
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
 
     # a side panel docked to the right edge, in collapsible sections
@@ -98,9 +113,12 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     blit.context.end_surface(?ctx, surf);
 
-    # a dropdown in its own panel
+    # a dropdown in its own panel, over a consumer texture and a heat field
     val p2: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 220.0::f32, 200.0::f32);
     blit.widget.dropdown(?ctx, "op", ?picked, ?opts[0], 3);
+    # handle 1 is whatever texture the renderer knows by it: blit only passes it on
+    blit.widget.image(?ctx, blit.draw.region(1, 64.0::f32, 64.0::f32, 0.0::f32, 0.0::f32, 32.0::f32, 32.0::f32, blit.draw.FILTER_NEAREST), 96.0::f32, 96.0::f32);
+    blit.widget.grid(?ctx, heat, 96.0::f32, 48.0::f32);
     blit.widget.end_panel(?ctx, p2);
 
     # a draggable, collapsible window with a couple of widgets
@@ -129,9 +147,10 @@ fun main(argc: i64, argv: **u8) i64 {
 
     blit.context.end(?ctx);
 
-    print.printf("blit {}: {} vertices, {} atlas pages, ok={}\n",
+    print.printf("blit {}: {} vertices in {} spans, {} atlas pages, ok={}\n",
         blit.VERSION,
         blit.context.draw_count(?ctx),
+        blit.context.run_count(?ctx),
         blit.atlas.page_count(blit.context.atlas_of(?ctx)),
         blit.context.ok(?ctx)::u64);
 

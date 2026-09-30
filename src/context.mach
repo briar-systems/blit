@@ -81,18 +81,26 @@ pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
 
 # one contiguous span of the draw list sampling a single texture on one layer
+#
+# every vertex lies in exactly one span, so a span's tex is the texture handle
+# of each quad in it. a renderer binds atlas page `page` when tex is
+# draw.ATLAS, else the consumer texture tex with the sampling filter names,
+# and draws count vertices from start. the record is plain integers, so a
+# foreign renderer reads it field for field.
 # ---
-# tex:   consumer texture handle, nil for the font atlas
-# page:  the atlas page sampled when tex is nil (see blit.atlas), else 0
-# layer: layer the span was drawn on
-# start: first vertex of the span
-# count: vertices in the span
+# tex:    consumer texture handle, draw.ATLAS (0) for the font atlas
+# page:   the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
+# layer:  layer the span was drawn on
+# start:  first vertex of the span
+# count:  vertices in the span
+# filter: draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
 pub rec Run {
-    tex:   ptr;
-    page:  u32;
-    layer: u32;
-    start: usize;
-    count: usize;
+    tex:    u64;
+    page:   u32;
+    layer:  u32;
+    start:  usize;
+    count:  usize;
+    filter: u32;
 }
 
 # a screen edge a docked container attaches to
@@ -147,8 +155,9 @@ pub rec Area {
 # org_sp:        local-origin stack depth
 # org_xs:        saved parent local-origin xs
 # org_ys:        saved parent local-origin ys
-# tex:           texture subsequent geometry samples (nil = font atlas)
+# tex:           texture handle subsequent geometry samples (draw.ATLAS = font atlas)
 # page:          atlas page subsequent atlas geometry samples
+# filter:        sampling filter subsequent consumer-texture geometry asks for
 # run_start:     first vertex of the span being accumulated
 # runs:          closed single-texture spans, in draw order
 # run_len:       how many spans are closed
@@ -197,8 +206,9 @@ pub rec Context {
     org_sp:        usize;
     org_xs:        [16]f32;
     org_ys:        [16]f32;
-    tex:           ptr;
+    tex:           u64;
     page:          u32;
+    filter:        u32;
     run_start:     usize;
     runs:          [64]Run;
     run_len:       usize;
@@ -285,8 +295,9 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_y1       = 0.0::f32;
     ctx.clip_sp       = 0;
     ctx.org_sp        = 0;
-    ctx.tex           = nil;
+    ctx.tex           = draw.ATLAS;
     ctx.page          = 0;
+    ctx.filter        = draw.FILTER_NEAREST;
     ctx.run_start     = 0;
     ctx.run_len       = 0;
     ctx.oom           = 0;
@@ -353,8 +364,9 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.clip_sp = 0;
     ctx.org_sp  = 0;
 
-    ctx.tex       = nil;
+    ctx.tex       = draw.ATLAS;
     ctx.page      = 0;
+    ctx.filter    = draw.FILTER_NEAREST;
     ctx.run_start = 0;
     ctx.run_len   = 0;
 
@@ -425,7 +437,7 @@ fun record(ctx: *Context, e: err[allo.Error]) {
     if (sel e.err) { ctx.oom = 1; }
 }
 
-# sample subsequent geometry from one consumer texture, nil for the atlas
+# sample subsequent geometry from one consumer texture, draw.ATLAS for the atlas
 #
 # a switch with nothing emitted since the last one retargets in place, so
 # alternating between an image and the atlas records spans only where
@@ -433,21 +445,37 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 # drawing into the last one, which mistextures (and mislayers) those vertices
 # rather than dropping them; raise RUN_DEPTH before drawing that many spans.
 # ---
-# ctx: context
-# tex: consumer texture handle, nil for the font atlas
-pub fun set_texture(ctx: *Context, tex: ptr) {
-    retarget(ctx, tex, ctx.page);
+# ctx:    context
+# tex:    consumer texture handle, draw.ATLAS for the font atlas
+# filter: draw.FILTER_NEAREST or FILTER_LINEAR, ignored for the atlas
+pub fun set_texture(ctx: *Context, tex: u64, filter: u32) {
+    retarget(ctx, tex, ctx.page, filter);
 }
 
-# whether two (texture, atlas page) targets sample the same texels
-fun same_target(tex: ptr, page: u32, other_tex: ptr, other_page: u32) bool {
-    if (tex != other_tex) { ret false; }
-    ret tex != nil || page == other_page;
+# a texture target, the atlas's page and filter normalised so equal targets
+# compare equal field for field
+fun target(tex: u64, page: u32, filter: u32) Run {
+    if (tex == draw.ATLAS) {
+        ret Run{tex: tex, page: page, layer: 0, start: 0, count: 0, filter: draw.FILTER_NEAREST};
+    }
+    ret Run{tex: tex, page: 0, layer: 0, start: 0, count: 0, filter: filter};
 }
 
-# sample subsequent geometry from a texture, or from an atlas page when tex is nil
-fun retarget(ctx: *Context, tex: ptr, page: u32) {
-    if (same_target(ctx.tex, ctx.page, tex, page)) {
+# whether two spans sample the same texels the same way
+fun same_target(a: Run, b: Run) bool {
+    ret a.tex == b.tex && a.page == b.page && a.filter == b.filter;
+}
+
+# the target subsequent geometry samples
+fun current(ctx: *Context) Run {
+    ret target(ctx.tex, ctx.page, ctx.filter);
+}
+
+# sample subsequent geometry from a consumer texture, or from an atlas page
+# when tex is draw.ATLAS
+fun retarget(ctx: *Context, tex: u64, page: u32, filter: u32) {
+    val want: Run = target(tex, page, filter);
+    if (same_target(current(ctx), want)) {
         ctx.page = page;
         ret;
     }
@@ -456,7 +484,7 @@ fun retarget(ctx: *Context, tex: ptr, page: u32) {
     # sheet costs one span however often the atlas was targeted between them
     val len: usize = draw.count(?ctx.dl);
     if (len == ctx.run_start && ctx.run_len > 0
-        && same_target(ctx.runs[ctx.run_len - 1].tex, ctx.runs[ctx.run_len - 1].page, tex, page)
+        && same_target(ctx.runs[ctx.run_len - 1], want)
         && ctx.runs[ctx.run_len - 1].layer == ctx.layer
         && ctx.runs[ctx.run_len - 1].start
         + ctx.runs[ctx.run_len - 1].count == len) {
@@ -464,11 +492,13 @@ fun retarget(ctx: *Context, tex: ptr, page: u32) {
         ctx.run_start = ctx.runs[ctx.run_len].start;
         ctx.tex       = tex;
         ctx.page      = page;
+        ctx.filter    = filter;
         ret;
     }
     flush_run(ctx);
-    ctx.tex  = tex;
-    ctx.page = page;
+    ctx.tex    = tex;
+    ctx.page   = page;
+    ctx.filter = filter;
 }
 
 # number of single-texture spans the frame's draw list divides into
@@ -487,7 +517,7 @@ pub fun run_count(ctx: *Context) usize {
 # index: span index below run_count()
 # ret:   the span, or an empty one for an index out of range
 pub fun run_at(ctx: *Context, index: usize) Run {
-    if (index >= ctx.run_len) { ret Run{tex: nil, page: 0, layer: 0, start: 0, count: 0}; }
+    if (index >= ctx.run_len) { ret target(draw.ATLAS, 0, draw.FILTER_NEAREST); }
     ret ctx.runs[index];
 }
 
@@ -504,13 +534,13 @@ fun flush_run(ctx: *Context) {
         ctx.run_start        = len;
         ret;
     }
-    var page: u32 = 0;
-    if (ctx.tex == nil) { page = ctx.page; }
-    ctx.runs[ctx.run_len] = Run{
-        tex: ctx.tex, page: page, layer: ctx.layer, start: ctx.run_start, count: len - ctx.run_start
-    };
-    ctx.run_len   = ctx.run_len + 1;
-    ctx.run_start = len;
+    var run: Run = current(ctx);
+    run.layer             = ctx.layer;
+    run.start             = ctx.run_start;
+    run.count             = len - ctx.run_start;
+    ctx.runs[ctx.run_len] = run;
+    ctx.run_len           = ctx.run_len + 1;
+    ctx.run_start         = len;
 }
 
 # reorder the draw list so layers paint in ascending order
@@ -561,13 +591,13 @@ fun compose(ctx: *Context) {
             record(ctx, draw.push_vert(?ctx.out, src[run.start + v]));
             v = v + 1;
         }
-        if (n > 0 && same_target(ctx.runs[n - 1].tex, ctx.runs[n - 1].page, run.tex, run.page)
-            && ctx.runs[n - 1].layer == run.layer) {
+        if (n > 0 && same_target(ctx.runs[n - 1], run) && ctx.runs[n - 1].layer == run.layer) {
             ctx.runs[n - 1].count = ctx.runs[n - 1].count + run.count;
         }
         or {
-            ctx.runs[n] = Run{tex: run.tex, page: run.page, layer: run.layer, start: at, count: run.count};
-            n           = n + 1;
+            ctx.runs[n]       = run;
+            ctx.runs[n].start = at;
+            n                 = n + 1;
         }
         at = at + run.count;
         k  = k + 1;
@@ -579,28 +609,25 @@ fun compose(ctx: *Context) {
     ctx.out = emitted;
 }
 
-# emit one rectangle sampling a consumer texture
+# draw a region of a consumer texture scaled into a rect
 #
-# passes through the same local origin and clip as every quad, with uvs
-# interpolated when clipped. geometry returns to the atlas afterwards, so
-# whatever draws next needs no bookkeeping.
+# the region stretches to fill the rect and passes through the same local
+# origin and clip as every quad, with its uvs interpolated when clipped. the
+# quad's span carries the image's handle and filter for the renderer to bind.
+# geometry returns to the atlas afterwards, so whatever draws next needs no
+# bookkeeping.
 # ---
 # ctx: context
-# tex: consumer texture handle
+# img: the texture region and its sampling filter
 # x0:  left x in pixels
 # y0:  top y in pixels
 # x1:  right x in pixels
 # y1:  bottom y in pixels
-# u0:  left u in the texture
-# v0:  top v in the texture
-# u1:  right u in the texture
-# v1:  bottom v in the texture
-# c:   multiplicative tint
-pub fun image_at(ctx: *Context, tex: ptr, x0: f32, y0: f32, x1: f32, y1: f32,
-    u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
-    set_texture(ctx, tex);
-    emit(ctx, x0, y0, x1, y1, u0, v0, u1, v1, paint(ctx, c));
-    set_texture(ctx, nil);
+# c:   multiplicative tint, white to draw the texels as they are
+pub fun image_at(ctx: *Context, img: draw.Image, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    set_texture(ctx, img.tex, img.filter);
+    emit(ctx, x0, y0, x1, y1, img.u0, img.v0, img.u1, img.v1, paint(ctx, c));
+    set_texture(ctx, draw.ATLAS, draw.FILTER_NEAREST);
 }
 
 # the larger of two f32 values
@@ -1173,7 +1200,7 @@ pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f
 fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
     val p: font.Placed = font.place(?ctx.font, cp, ctx.scale);
     if (p.drawn == 0) { ret p.g.advance; }
-    retarget(ctx, nil, p.page);
+    retarget(ctx, draw.ATLAS, p.page, draw.FILTER_NEAREST);
     emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
     ret p.g.advance;
 }
@@ -1436,22 +1463,21 @@ test runs__split_by_texture_in_draw_order {
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64        = 7;
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
 
     # atlas span, one image span, then atlas again
     quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
-    image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    image_at(?ctx, sheet, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32, white);
     quad(?ctx, 20.0::f32, 0.0::f32, 30.0::f32, 10.0::f32, white);
     end(?ctx);
 
     if (run_count(?ctx) != 3) { ret 1; }
     val head: Run = run_at(?ctx, 0);
-    if (head.tex != nil || head.start != 0 || head.count != 6) { ret 1; }
+    if (head.tex != draw.ATLAS || head.start != 0 || head.count != 6) { ret 1; }
     val mid: Run = run_at(?ctx, 1);
-    if (mid.tex != (?sheet)::ptr || mid.start != 6 || mid.count != 6) { ret 1; }
+    if (mid.tex != 7 || mid.filter != draw.FILTER_LINEAR || mid.start != 6 || mid.count != 6) { ret 1; }
     val tail: Run = run_at(?ctx, 2);
-    if (tail.tex != nil || tail.start != 12 || tail.count != 6) { ret 1; }
+    if (tail.tex != draw.ATLAS || tail.start != 12 || tail.count != 6) { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -1474,20 +1500,18 @@ test runs__same_texture_images_merge {
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64        = 7;
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
 
     # two images through the same texture, nothing on the atlas between
-    image_at(?ctx, (?sheet)::ptr, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
-    image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    image_at(?ctx, sheet, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    image_at(?ctx, sheet, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32, white);
     end(?ctx);
 
     # one span: the second image reopened the first's rather than closing
     # an empty atlas bracket between them
     if (run_count(?ctx) != 1) { ret 1; }
     val whole: Run = run_at(?ctx, 0);
-    if (whole.tex != (?sheet)::ptr || whole.start != 0 || whole.count != 12) {
+    if (whole.tex != 7 || whole.start != 0 || whole.count != 12) {
         ret 1;
     }
 
