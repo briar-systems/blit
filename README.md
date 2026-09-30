@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.theme`, `blit.context`, `blit.widget`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.widget`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -74,8 +74,9 @@ Every color and length a widget draws with comes from a theme, a plain record
 (`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
 `window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
 `accent`, `warn`, control states (`control`, `control_hot`, `control_on`,
-`track`, `handle`, `handle_on`), and the metrics `row`, `gap`, `pad`,
-`handle_w`, `bar_w`, `thumb_min`, `corner` and `edge_w`. No widget holds a
+`track`, `handle`, `handle_on`), the text selection highlight `select`, and
+the metrics `row`, `gap`, `pad`, `handle_w`, `bar_w`, `thumb_min`, `corner`,
+`edge_w` and `caret_w`. No widget holds a
 color or a size of its own.
 
 ```mach
@@ -120,6 +121,48 @@ draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
+
+## Keyboard, focus & text fields
+
+The keyboard is plain data in `Input` like the mouse, so blit still never
+touches a window. Each frame the consumer empties it (`blit.input.clear_keys`)
+and fills it in arrival order: `type_text(?in, cp)` for each typed codepoint and
+`press_key(?in, code, mods)` for each key press or repeat (releases are not
+events). A key that types a printable ASCII character is that character, letters
+in uppercase (`'A'`, `'7'`, `' '`); every other key is a `KEY_*` constant
+(`KEY_ENTER`, `KEY_ESCAPE`, `KEY_BACKSPACE`, `KEY_DELETE`, the arrows,
+`KEY_HOME`, `KEY_END`, ...). Modifiers are `MOD_SHIFT`, `MOD_CTRL`, `MOD_ALT`
+and `MOD_SUPER` bits, and `blit.input.shortcut(mods)` is ctrl, or super as
+darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
+
+- **Focus.** One widget at a time holds the keyboard, by id across frames
+  (`blit.context.focus`, `focused`, `unfocus`). A press that lands anywhere
+  else takes it back, and so does a frame that does not draw the holder.
+  `blit.context.typing(?ctx)` is true exactly while a widget holds it: read it
+  before `begin` to keep the consumer's own key bindings quiet for the keys that
+  frame will type into a field.
+- **Clipboard hand-off.** blit never reads the system clipboard. After `end`,
+  `blit.context.copied(?ctx)` is text a copy or cut left for the consumer to put
+  on the clipboard (nil when none), and `wants_paste(?ctx)` asks for the
+  clipboard's text, which the consumer hands to the next frame as `in.paste`.
+- **Text field.** `blit.widget.text_field(?ctx, ?f, hint)` edits a
+  `blit.field.Field`: UTF-8 in a buffer the consumer owns, with a caret, a
+  selection, a maximum length in characters and a per-field filter.
+  ```mach
+  var buf:  [64]u8;
+  var name: blit.field.Field;
+  blit.field.init(?name, ?buf[0], 64, 24, nil); # 24 characters, any printable
+  # per frame, inside a panel:
+  val did: u8 = blit.widget.text_field(?ctx, ?name, "name");
+  if ((did & blit.field.ENTERED) != 0) { ... }
+  ```
+  A press on the field focuses it and puts the caret under the cursor. It takes
+  typed text, backspace and delete, left, right, home and end (shift extends
+  the selection), shortcut A to select all, shortcut C, X and V through the
+  clipboard hand-off, and enter or escape, which end the edit and give the
+  keyboard back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
+  The edit model in `blit.field` needs no context, so it can be driven
+  directly.
 
 ## Clipping & sub-surfaces
 
@@ -221,8 +264,9 @@ cell.
                      1.0 - aPos.y / uScreen.y * 2.0, 0.0, 1.0);
   FragColor   = aColor * texture(atlas, aUV);
   ```
-- **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`), `begin`,
-  widgets, `end`, then upload `draw_verts` / `draw_count` and draw each span as
+- **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
+  events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
+  clipboard and answer `wants_paste`, then upload `draw_verts` / `draw_count` and draw each span as
   `GL_TRIANGLES` with its texture bound and `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA`
   blending.
 
