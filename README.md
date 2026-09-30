@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.context`, `blit.widget`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.theme`, `blit.context`, `blit.widget`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -67,6 +67,43 @@ pub rec GlyphSource {
 `blit.context.text_width` and `line_height` measure at the context's scale, and
 `blit.font.advance` steps one codepoint at a time for layout built outside
 blit.
+
+## Theme & scale
+
+Every color and length a widget draws with comes from a theme, a plain record
+(`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
+`window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
+`accent`, `warn`, control states (`control`, `control_hot`, `control_on`,
+`track`, `handle`, `handle_on`), and the metrics `row`, `gap`, `pad`,
+`handle_w`, `bar_w`, `thumb_min`, `corner` and `edge_w`. No widget holds a
+color or a size of its own.
+
+```mach
+var look: blit.theme.Theme = blit.theme.default();
+look.accent = blit.draw.rgba(0.37::f32, 0.83::f32, 0.63::f32, 1.0::f32);
+look.corner = 3.0::f32;
+blit.context.set_theme(?ctx, look);
+blit.context.set_scale(?ctx, 2.0::f32);
+```
+
+- **Zero configuration.** A context draws with `blit.theme.default()` until
+  `set_theme` swaps in another, and `theme_of` hands back the live one to
+  adjust in place. `warn` is there for consumers drawing their own content in
+  the same palette. No widget uses it.
+- **One scale.** `set_scale` multiplies every theme length and the size text is
+  laid out and rasterised at (see glyph sources), so 2.0 doubles the whole
+  interface, layout and hit rects included, for a HiDPI display or a user's
+  choice. Lengths you pass (panel and window widths, dock sizes, your own
+  geometry) stay in pixels. `blit.context.px(?ctx, v)` scales them to match.
+  `blit.widget.row_gap(?ctx)`, `text_row_height` and `control_row_height`
+  report the spacing at the current theme and scale.
+- **Rows fit their text.** A control row is `row` tall, or a line of text plus
+  `pad` above and below if that is taller, so a larger glyph source never
+  overflows its rows.
+- **Corners from quads.** `corner` rounds controls and containers with one
+  quad per pixel row of each rounded end (`blit.context.fill`), so rounding
+  needs nothing of the renderer and clips like any quad. The default is square,
+  one quad per rect.
 
 ## Docked containers
 
