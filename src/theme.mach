@@ -25,14 +25,15 @@ use blit.draw;
 # edge:        the edge line a dock draws on its inner side
 # text:        text
 # text_dim:    secondary text and glyphs, such as a collapse marker
-# accent:      a mark that is on, such as a checked box
+# accent:      a mark that is on, such as a checked box, and a focused text field's outline
 # warn:        warnings, for consumers drawing their own content; no widget uses it
 # control:     a control's face at rest
 # control_hot: a control under the cursor
 # control_on:  a control pressed, or a dropdown open
-# track:       a slider or scrollbar track, and a dropdown option at rest
+# track:       a slider or scrollbar track, a dropdown option at rest and a text field's face
 # handle:      a slider handle or scrollbar thumb at rest
 # handle_on:   a slider handle or scrollbar thumb being dragged
+# select:      the highlight behind selected text
 # row:         least height of a control row, which grows to fit a line of text and its padding
 # gap:         space between layout rows
 # pad:         space inside chrome, around text and at a container's bottom
@@ -40,7 +41,8 @@ use blit.draw;
 # bar_w:       scrollbar width
 # thumb_min:   shortest scrollbar thumb
 # corner:      corner radius of controls and containers, 0 for square
-# edge_w:      width of a dock's edge line
+# edge_w:      width of an edge line: a dock's inner side and a focused text field's outline
+# caret_w:     width of a text field's caret
 pub rec Theme {
     panel:       draw.Color;
     window:      draw.Color;
@@ -58,6 +60,7 @@ pub rec Theme {
     track:       draw.Color;
     handle:      draw.Color;
     handle_on:   draw.Color;
+    select:      draw.Color;
     row:         f32;
     gap:         f32;
     pad:         f32;
@@ -66,6 +69,7 @@ pub rec Theme {
     thumb_min:   f32;
     corner:      f32;
     edge_w:      f32;
+    caret_w:     f32;
 }
 
 # blit's own look: dark surfaces, square corners and 4 pixel spacing
@@ -89,6 +93,7 @@ pub fun default() Theme {
     t.track       = draw.rgba(0.15::f32, 0.15::f32, 0.18::f32, 1.0::f32);
     t.handle      = draw.rgba(0.55::f32, 0.55::f32, 0.65::f32, 1.0::f32);
     t.handle_on   = draw.rgba(0.78::f32, 0.78::f32, 0.92::f32, 1.0::f32);
+    t.select      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 0.35::f32);
     t.row         = 16.0::f32;
     t.gap         = 4.0::f32;
     t.pad         = 4.0::f32;
@@ -97,5 +102,6 @@ pub fun default() Theme {
     t.thumb_min   = 12.0::f32;
     t.corner      = 0.0::f32;
     t.edge_w      = 1.0::f32;
+    t.caret_w     = 1.0::f32;
     ret t;
 }
