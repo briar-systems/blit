@@ -23,7 +23,6 @@ use std.types.string.str;
 
 use blit.context;
 use blit.draw;
-use blit.font;
 use blit.input;
 use allo: std.allocator;
 use std.allocator.page;
@@ -37,19 +36,19 @@ val HANDLE_W: f32 = 6.0;
 # the vertex handle of a container whose background could not be emitted
 pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
 
-# height of an interactive row (a glyph plus padding above and below)
-fun row_h() f32 {
-    ret font.GLYPH_H + PAD * 2.0::f32;
+# height of an interactive row (a line of text plus padding above and below)
+fun row_h(ctx: *context.Context) f32 {
+    ret context.line_height(ctx) + PAD * 2.0::f32;
 }
 
 # vertical space consumed by one text row, including the following gap
-pub fun text_row_height() f32 {
-    ret font.GLYPH_H + PAD;
+pub fun text_row_height(ctx: *context.Context) f32 {
+    ret context.line_height(ctx) + PAD;
 }
 
 # vertical space consumed by one control row, including the following gap
-pub fun control_row_height() f32 {
-    ret row_h() + PAD;
+pub fun control_row_height(ctx: *context.Context) f32 {
+    ret row_h(ctx) + PAD;
 }
 
 # spacing between adjacent layout rows and around panel content
@@ -219,7 +218,7 @@ pub fun end_panel(ctx: *context.Context, b: Block) {
 # s:   string to draw
 pub fun text(ctx: *context.Context, s: str) {
     context.text_at(ctx, s, ctx.cx, ctx.cy, c_text());
-    advance(ctx, font.GLYPH_H);
+    advance(ctx, context.line_height(ctx));
 }
 
 # a full-width clickable button with a centered label
@@ -234,7 +233,7 @@ pub fun button(ctx: *context.Context, label: str) bool {
     val id: u64 = context.next_id(ctx);
     val x0: f32 = ctx.cx;
     val y0: f32 = ctx.cy;
-    val h:  f32 = row_h();
+    val h:  f32 = row_h(ctx);
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
@@ -250,9 +249,9 @@ pub fun button(ctx: *context.Context, label: str) bool {
     if (ctx.active == id) { bg = c_btn_active(); }
     context.quad(ctx, x0, y0, x1, y1, bg);
 
-    val tw: f32 = font.text_width(label);
+    val tw: f32 = context.text_width(ctx, label);
     val tx: f32 = x0 + (ctx.pw - tw) / 2.0::f32;
-    val ty: f32 = y0 + (h - font.GLYPH_H) / 2.0::f32;
+    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
     context.text_at(ctx, label, tx, ty, c_text());
 
     advance(ctx, h);
@@ -269,11 +268,11 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val id:  u64 = context.next_id(ctx);
     val x0:  f32 = ctx.cx;
     val y0:  f32 = ctx.cy;
-    val box: f32 = row_h();
+    val box: f32 = row_h(ctx);
     val bx1: f32 = x0 + box;
     val y1:  f32 = y0 + box;
 
-    val tw:  f32 = font.text_width(label);
+    val tw:  f32 = context.text_width(ctx, label);
     val rx1: f32 = bx1 + PAD + tw;
     val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
 
@@ -292,7 +291,7 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
         context.quad(ctx, x0 + PAD, y0 + PAD, bx1 - PAD, y1 - PAD, c_check_fill());
     }
 
-    val ty: f32 = y0 + (box - font.GLYPH_H) / 2.0::f32;
+    val ty: f32 = y0 + (box - context.line_height(ctx)) / 2.0::f32;
     context.text_at(ctx, label, bx1 + PAD, ty, c_text());
 
     advance(ctx, box);
@@ -314,7 +313,7 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
     val id: u64 = context.next_id(ctx);
     val x0: f32 = ctx.cx;
     val y0: f32 = ctx.cy;
-    val h:  f32 = row_h();
+    val h:  f32 = row_h(ctx);
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
@@ -344,7 +343,7 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
     if (ctx.active == id) { hc = c_handle_active(); }
     context.quad(ctx, hx, y0, hx + HANDLE_W, y1, hc);
 
-    val ty: f32 = y0 + (h - font.GLYPH_H) / 2.0::f32;
+    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
     context.text_at(ctx, label, x0 + PAD, ty, c_text());
 
     advance(ctx, h);
@@ -463,7 +462,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val id: u64 = context.next_id(ctx);
     val x0: f32 = ctx.cx;
     val y0: f32 = ctx.cy;
-    val h:  f32 = row_h();
+    val h:  f32 = row_h(ctx);
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
@@ -478,11 +477,11 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     if (ctx.open_dropdown == id) { bg = c_btn_active(); }
     context.quad(ctx, x0, y0, x1, y1, bg);
 
-    val ty: f32 = y0 + (h - font.GLYPH_H) / 2.0::f32;
+    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
     context.text_at(ctx, label, x0 + PAD, ty, c_text());
     if (@selected < count) {
         val cur: str = options[@selected];
-        val cw:  f32 = font.text_width(cur);
+        val cw:  f32 = context.text_width(ctx, cur);
         context.text_at(ctx, cur, x1 - PAD - cw, ty, c_text());
     }
 
@@ -512,7 +511,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             var obg: draw.Color = c_track();
             if (ctx.hot == oid) { obg = c_btn_hot(); }
             context.quad(ctx, ox0, oy0, ox1, oy1, obg);
-            context.text_at(ctx, options[i], ox0 + PAD, oy0 + (h - font.GLYPH_H) / 2.0::f32, c_text());
+            context.text_at(ctx, options[i], ox0 + PAD, oy0 + (h - context.line_height(ctx)) / 2.0::f32, c_text());
 
             advance(ctx, h);
         }
@@ -576,7 +575,7 @@ pub rec Window {
 # win: pointer to the window state, mutated by dragging and collapsing
 # ret: a handle for end_window
 pub fun begin_window(ctx: *context.Context, win: *Window) Block {
-    val th:      f32 = row_h();
+    val th:      f32 = row_h(ctx);
     val drag_id: u64 = context.next_id(ctx);
     val col_id:  u64 = context.next_id(ctx);
 
@@ -611,8 +610,8 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     if (ctx.hot == drag_id || ctx.hot == col_id) { tbg = c_title_hot(); }
     context.quad(ctx, win.x, win.y, win.x + win.w, win.y + th, tbg);
 
-    val gy:  f32 = win.y + (th - font.GLYPH_H) / 2.0::f32;
-    var gch: u8  = '+';
+    val gy:  f32 = win.y + (th - context.line_height(ctx)) / 2.0::f32;
+    var gch: u32 = '+';
     if (win.open != 0) { gch = '-'; }
     context.glyph(ctx, gch, win.x + PAD, gy, c_text());
     context.text_at(ctx, win.title, win.x + th + PAD, gy, c_text());
@@ -636,7 +635,7 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
 # win: pointer to the window state
 # b:   the value returned by begin_window
 pub fun end_window(ctx: *context.Context, win: *Window, b: Block) {
-    val th: f32 = row_h();
+    val th: f32 = row_h(ctx);
     val x0: f32 = win.x;
     val x1: f32 = win.x + win.w;
     var y1: f32 = win.y + th;
@@ -829,10 +828,10 @@ test dropdown__open_overlays_later_widgets {
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
     # the layout continues right under the header
-    if (ctx.cy != row_h() + PAD) { ret 2; }
-    if (ctx.cx != 0.0::f32)      { ret 3; }
-    if (ctx.pw != 100.0::f32)    { ret 4; }
-    if (ctx.layer != 0)          { ret 5; }
+    if (ctx.cy != row_h(?ctx) + PAD) { ret 2; }
+    if (ctx.cx != 0.0::f32)          { ret 3; }
+    if (ctx.pw != 100.0::f32)        { ret 4; }
+    if (ctx.layer != 0)              { ret 5; }
     context.end(?ctx);
 
     val freed: err[allo.Error] = context.free(?ctx);

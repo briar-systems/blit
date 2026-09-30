@@ -4,8 +4,12 @@
 # the context owns the per-frame draw list and the current input, tracks a simple
 # top-to-bottom layout cursor, and assigns stable widget ids by call order. it is
 # also the painter: quad/glyph/text_at emit into the draw list through the font
-# atlas so widgets never touch the draw list or font directly. a draw-list growth
-# failure is recorded in `oom` rather than silently dropping geometry; check ok().
+# and its atlas so widgets never touch the draw list or font directly. a
+# draw-list growth failure is recorded in `oom` rather than silently dropping
+# geometry; check ok().
+#
+# text comes from a glyph source (see blit.glyph), the built-in bitmap font
+# unless set_glyph_source swaps in another, laid out at the context's scale.
 #
 # the painter also carries a CPU clip stack and a local-origin offset. every quad
 # is shifted by the local origin into screen space, then clipped to the active
@@ -34,9 +38,15 @@ use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
+use std.types.bool.bool;
+use std.types.bool.false;
+
+use blit.atlas;
 use blit.draw;
 use blit.font;
+use gly: blit.glyph;
 use blit.hit;
 use blit.input;
 use allo: std.allocator;
@@ -54,11 +64,13 @@ pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 # one contiguous span of the draw list sampling a single texture on one layer
 # ---
 # tex:   consumer texture handle, nil for the font atlas
+# page:  the atlas page sampled when tex is nil (see blit.atlas), else 0
 # layer: layer the span was drawn on
 # start: first vertex of the span
 # count: vertices in the span
 pub rec Run {
     tex:   ptr;
+    page:  u32;
     layer: u32;
     start: usize;
     count: usize;
@@ -96,6 +108,7 @@ pub rec Run {
 # org_xs:        saved parent local-origin xs
 # org_ys:        saved parent local-origin ys
 # tex:           texture subsequent geometry samples (nil = font atlas)
+# page:          atlas page subsequent atlas geometry samples
 # run_start:     first vertex of the span being accumulated
 # runs:          closed single-texture spans, in draw order
 # run_len:       how many spans are closed
@@ -108,6 +121,8 @@ pub rec Run {
 # ordinal:       claims made so far this frame
 # layer_sp:      layer stack depth
 # layers:        saved parent layers
+# font:          the glyph source, its glyph cache and its atlas
+# scale:         interface scale text is laid out and rasterised at, 1.0 by default
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -139,6 +154,7 @@ pub rec Context {
     org_xs:        [16]f32;
     org_ys:        [16]f32;
     tex:           ptr;
+    page:          u32;
     run_start:     usize;
     runs:          [64]Run;
     run_len:       usize;
@@ -151,25 +167,37 @@ pub rec Context {
     ordinal:       u64;
     layer_sp:      usize;
     layers:        [16]u32;
+    font:          font.Font;
+    scale:         f32;
 }
 
-# initialize a context, its draw lists and its claim lists
+# initialize a context, its draw lists, its claim lists and its font
+#
+# text draws from the built-in bitmap font until set_glyph_source says
+# otherwise, so a context needs no configuration.
 # ---
 # ctx: context to initialize
-# a:   allocator backing the lists
+# a:   allocator backing the lists and the font
 # ret: ok, or the allocator's refusal with nothing left allocated
 pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
+    val ef: err[allo.Error] = font.init(?ctx.font, a);
+    if (sel ef.err) { ret ef; }
     val e: err[allo.Error] = draw.init(?ctx.dl, a);
-    if (sel e.err) { ret e; }
+    if (sel e.err) {
+        val f6: err[allo.Error] = font.free(?ctx.font);
+        ret e;
+    }
     val eo: err[allo.Error] = draw.init(?ctx.out, a);
     if (sel eo.err) {
         val f0: err[allo.Error] = draw.free(?ctx.dl);
+        val f7: err[allo.Error] = font.free(?ctx.font);
         ret eo;
     }
     val ec: err[allo.Error] = hit.init(?ctx.claims, a);
     if (sel ec.err) {
         val f1: err[allo.Error] = draw.free(?ctx.out);
         val f2: err[allo.Error] = draw.free(?ctx.dl);
+        val f8: err[allo.Error] = font.free(?ctx.font);
         ret ec;
     }
     val ep: err[allo.Error] = hit.init(?ctx.prior, a);
@@ -177,6 +205,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         val f3: err[allo.Error] = hit.free(?ctx.claims);
         val f4: err[allo.Error] = draw.free(?ctx.out);
         val f5: err[allo.Error] = draw.free(?ctx.dl);
+        val f9: err[allo.Error] = font.free(?ctx.font);
         ret ep;
     }
 
@@ -207,6 +236,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_sp       = 0;
     ctx.org_sp        = 0;
     ctx.tex           = nil;
+    ctx.page          = 0;
     ctx.run_start     = 0;
     ctx.run_len       = 0;
     ctx.oom           = 0;
@@ -214,10 +244,11 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer         = 0;
     ctx.ordinal       = 0;
     ctx.layer_sp      = 0;
+    ctx.scale         = 1.0::f32;
     ret err[allo.Error].ok{};
 }
 
-# release the context's draw lists and claim lists
+# release the context's draw lists, claim lists and font
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
@@ -228,7 +259,9 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel e1.err) { ret e1; }
     val e2: err[allo.Error] = hit.free(?ctx.claims);
     if (sel e2.err) { ret e2; }
-    ret hit.free(?ctx.prior);
+    val e3: err[allo.Error] = hit.free(?ctx.prior);
+    if (sel e3.err) { ret e3; }
+    ret font.free(?ctx.font);
 }
 
 # start a frame: store input (carrying the previous button state into
@@ -267,6 +300,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.org_sp  = 0;
 
     ctx.tex       = nil;
+    ctx.page      = 0;
     ctx.run_start = 0;
     ctx.run_len   = 0;
 
@@ -345,23 +379,39 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 # ctx: context
 # tex: consumer texture handle, nil for the font atlas
 pub fun set_texture(ctx: *Context, tex: ptr) {
-    if (ctx.tex == tex) { ret; }
+    retarget(ctx, tex, ctx.page);
+}
+
+# whether two (texture, atlas page) targets sample the same texels
+fun same_target(tex: ptr, page: u32, other_tex: ptr, other_page: u32) bool {
+    if (tex != other_tex) { ret false; }
+    ret tex != nil || page == other_page;
+}
+
+# sample subsequent geometry from a texture, or from an atlas page when tex is nil
+fun retarget(ctx: *Context, tex: ptr, page: u32) {
+    if (same_target(ctx.tex, ctx.page, tex, page)) {
+        ctx.page = page;
+        ret;
+    }
     # a retarget with nothing drawn since the last span closed reopens that
     # span when it sampled the same texture, so a row of images through one
     # sheet costs one span however often the atlas was targeted between them
     val len: usize = draw.count(?ctx.dl);
     if (len == ctx.run_start && ctx.run_len > 0
-        && ctx.runs[ctx.run_len - 1].tex == tex
+        && same_target(ctx.runs[ctx.run_len - 1].tex, ctx.runs[ctx.run_len - 1].page, tex, page)
         && ctx.runs[ctx.run_len - 1].layer == ctx.layer
         && ctx.runs[ctx.run_len - 1].start
         + ctx.runs[ctx.run_len - 1].count == len) {
         ctx.run_len   = ctx.run_len - 1;
         ctx.run_start = ctx.runs[ctx.run_len].start;
         ctx.tex       = tex;
+        ctx.page      = page;
         ret;
     }
     flush_run(ctx);
-    ctx.tex = tex;
+    ctx.tex  = tex;
+    ctx.page = page;
 }
 
 # number of single-texture spans the frame's draw list divides into
@@ -380,7 +430,7 @@ pub fun run_count(ctx: *Context) usize {
 # index: span index below run_count()
 # ret:   the span, or an empty one for an index out of range
 pub fun run_at(ctx: *Context, index: usize) Run {
-    if (index >= ctx.run_len) { ret Run{tex: nil, layer: 0, start: 0, count: 0}; }
+    if (index >= ctx.run_len) { ret Run{tex: nil, page: 0, layer: 0, start: 0, count: 0}; }
     ret ctx.runs[index];
 }
 
@@ -397,8 +447,10 @@ fun flush_run(ctx: *Context) {
         ctx.run_start        = len;
         ret;
     }
+    var page: u32 = 0;
+    if (ctx.tex == nil) { page = ctx.page; }
     ctx.runs[ctx.run_len] = Run{
-        tex: ctx.tex, layer: ctx.layer, start: ctx.run_start, count: len - ctx.run_start
+        tex: ctx.tex, page: page, layer: ctx.layer, start: ctx.run_start, count: len - ctx.run_start
     };
     ctx.run_len   = ctx.run_len + 1;
     ctx.run_start = len;
@@ -452,11 +504,12 @@ fun compose(ctx: *Context) {
             record(ctx, draw.push_vert(?ctx.out, src[run.start + v]));
             v = v + 1;
         }
-        if (n > 0 && ctx.runs[n - 1].tex == run.tex && ctx.runs[n - 1].layer == run.layer) {
+        if (n > 0 && same_target(ctx.runs[n - 1].tex, ctx.runs[n - 1].page, run.tex, run.page)
+            && ctx.runs[n - 1].layer == run.layer) {
             ctx.runs[n - 1].count = ctx.runs[n - 1].count + run.count;
         }
         or {
-            ctx.runs[n] = Run{tex: run.tex, layer: run.layer, start: at, count: run.count};
+            ctx.runs[n] = Run{tex: run.tex, page: run.page, layer: run.layer, start: at, count: run.count};
             n           = n + 1;
         }
         at = at + run.count;
@@ -767,7 +820,51 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
     record(ctx, draw.push_quad(?ctx.dl, nx0, ny0, nx1, ny1, nu0, nv0, nu1, nv1, c));
 }
 
-# emit a solid-color rectangle sampling the atlas white cell
+# draw text from another glyph source from now on
+#
+# every atlas page is cleared and must be uploaded again. call it between
+# frames. see blit.glyph for the contract a source implements.
+# ---
+# ctx: context
+# src: the glyph source
+pub fun set_glyph_source(ctx: *Context, src: gly.GlyphSource) {
+    font.set_source(?ctx.font, src);
+}
+
+# the atlas the consumer uploads, one texture per page (see blit.atlas)
+# ---
+# ctx: context
+# ret: the atlas
+pub fun atlas_of(ctx: *Context) *atlas.Atlas {
+    ret ?ctx.font.atlas;
+}
+
+# the context's font, for measuring text outside a frame
+# ---
+# ctx: context
+# ret: the font
+pub fun font_of(ctx: *Context) *font.Font {
+    ret ?ctx.font;
+}
+
+# the height of one line of text at the context's scale
+# ---
+# ctx: context
+# ret: line height in pixels
+pub fun line_height(ctx: *Context) f32 {
+    ret font.line_height(?ctx.font, ctx.scale);
+}
+
+# width of the widest line of a string at the context's scale
+# ---
+# ctx: context
+# s:   utf-8 text
+# ret: width in pixels
+pub fun text_width(ctx: *Context, s: str) f32 {
+    ret font.measure(?ctx.font, s, ctx.scale);
+}
+
+# emit a solid-color rectangle sampling the atlas white block
 # ---
 # ctx: context
 # x0:  left x in pixels
@@ -778,40 +875,69 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     var wu: f32;
     var wv: f32;
-    font.white_uv(?wu, ?wv);
+    atlas.white_uv(?wu, ?wv);
     emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, c);
 }
 
-# emit one character cell at (x, y), tinted by c
+# emit one glyph with its pen at x on the baseline, sampling its atlas page
 # ---
-# ctx: context
-# ch:  character to draw
-# x:   left x in pixels
-# y:   top y in pixels
-# c:   tint color
-pub fun glyph(ctx: *Context, ch: u8, x: f32, y: f32, c: draw.Color) {
-    var u0: f32;
-    var v0: f32;
-    var u1: f32;
-    var v1: f32;
-    font.glyph_uv(ch, ?u0, ?v0, ?u1, ?v1);
-    emit(ctx, x, y, x + font.GLYPH_W, y + font.GLYPH_H, u0, v0, u1, v1, c);
+# ret: the glyph's advance
+fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
+    val p: font.Placed = font.place(?ctx.font, cp, ctx.scale);
+    if (p.drawn == 0) { ret p.g.advance; }
+    retarget(ctx, nil, p.page);
+    emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
+    ret p.g.advance;
 }
 
-# draw a string starting at (x, y), advancing one glyph per character
+# emit one codepoint in a line box whose top-left is (x, y), tinted by c
+#
+# a codepoint the glyph source lacks draws as its replacement glyph.
 # ---
 # ctx: context
-# s:   string to draw
+# cp:  codepoint to draw
+# x:   pen x in pixels
+# y:   line top y in pixels
+# c:   tint color
+pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
+    if (font.is_control(cp)) { ret; }
+    val m:   gly.LineMetrics = font.line(?ctx.font, ctx.scale);
+    val adv: f32             = pen_glyph(ctx, cp, x, y + m.ascent, c);
+}
+
+# draw utf-8 text with its first line box's top-left at (x, y)
+#
+# kerning comes from the glyph source, control codepoints take no space and a
+# newline starts the next line box at x.
+# ---
+# ctx: context
+# s:   utf-8 text
 # x:   left x in pixels
 # y:   top y in pixels
 # c:   tint color
 pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
-    var i:  usize = 0;
-    var px: f32   = x;
-    for (s[i] != 0) {
-        glyph(ctx, s[i], px, y, c);
-        px = px + font.GLYPH_W;
-        i  = i + 1;
+    if (s == nil) { ret; }
+    val m:    gly.LineMetrics = font.line(?ctx.font, ctx.scale);
+    val lh:   f32             = gly.line_height(m);
+    val ink:  draw.Color      = c;
+    val n:    usize           = str_len(s);
+    var base: f32             = y + m.ascent;
+    var px:   f32             = x;
+    var prev: u32             = 0;
+    var i:    usize           = 0;
+    for (i < n) {
+        var cp: u32 = 0;
+        i = i + font.next(s, i, n, ?cp);
+        if (cp == font.NEWLINE) {
+            base = base + lh;
+            px   = x;
+            prev = 0;
+        }
+        or (!font.is_control(cp)) {
+            px   = px + font.kern(?ctx.font, prev, cp, ctx.scale);
+            px   = px + pen_glyph(ctx, cp, px, base, ink);
+            prev = cp;
+        }
     }
 }
 
@@ -903,14 +1029,10 @@ test clip__glyph_uvs_interpolate {
     # left edge and its u untouched
     if (p[0].x != 0.0::f32) { ret 1; }
 
-    var u0: f32;
-    var v0: f32;
-    var u1: f32;
-    var v1: f32;
-    font.glyph_uv('A', ?u0, ?v0, ?u1, ?v1);
-    if (p[0].u != u0) { ret 1; }
+    val g: font.Placed = font.place(?ctx.font, 'A', 1.0::f32);
+    if (p[0].u != g.u0) { ret 1; }
     # clipped edge u interpolated to the cell midpoint
-    if (p[1].u != (u0 + u1) / 2.0::f32) { ret 1; }
+    if (p[1].u != (g.u0 + g.u1) / 2.0::f32) { ret 1; }
 
     # a quad fully outside the clip is dropped entirely
     quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
