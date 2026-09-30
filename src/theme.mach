@@ -13,7 +13,12 @@
 # colors are straight rgba as authored in sRGB, like every color passed to the
 # painter (see context.set_srgb).
 
+use std.types.size.usize;
+
 use blit.draw;
+
+# how many series colors a theme holds
+pub val SERIES: usize = 8;
 
 # the colors and unscaled metrics widgets draw with
 # ---
@@ -40,7 +45,12 @@ use blit.draw;
 # bar_w:       scrollbar width
 # thumb_min:   shortest scrollbar thumb
 # corner:      corner radius of controls and containers, 0 for square
-# edge_w:      width of a dock's edge line
+# edge_w:      width of a dock's edge line, and of a chart's axes, grid and ticks
+# series:      chart series colors, series k drawing in series[k % SERIES]
+# grid:        chart grid lines
+# line_w:      width of a chart line
+# tick:        length of a chart axis tick
+# area:        alpha factor of the area filled under a chart line, in [0, 1]
 pub rec Theme {
     panel:       draw.Color;
     window:      draw.Color;
@@ -66,6 +76,11 @@ pub rec Theme {
     thumb_min:   f32;
     corner:      f32;
     edge_w:      f32;
+    series:      [8]draw.Color;
+    grid:        draw.Color;
+    line_w:      f32;
+    tick:        f32;
+    area:        f32;
 }
 
 # blit's own look: dark surfaces, square corners and 4 pixel spacing
@@ -97,5 +112,17 @@ pub fun default() Theme {
     t.thumb_min   = 12.0::f32;
     t.corner      = 0.0::f32;
     t.edge_w      = 1.0::f32;
+    t.series[0]   = draw.rgba(0.36::f32, 0.62::f32, 0.95::f32, 1.0::f32);
+    t.series[1]   = draw.rgba(0.96::f32, 0.62::f32, 0.30::f32, 1.0::f32);
+    t.series[2]   = draw.rgba(0.47::f32, 0.80::f32, 0.50::f32, 1.0::f32);
+    t.series[3]   = draw.rgba(0.93::f32, 0.43::f32, 0.52::f32, 1.0::f32);
+    t.series[4]   = draw.rgba(0.68::f32, 0.56::f32, 0.93::f32, 1.0::f32);
+    t.series[5]   = draw.rgba(0.36::f32, 0.80::f32, 0.80::f32, 1.0::f32);
+    t.series[6]   = draw.rgba(0.90::f32, 0.80::f32, 0.36::f32, 1.0::f32);
+    t.series[7]   = draw.rgba(0.70::f32, 0.70::f32, 0.74::f32, 1.0::f32);
+    t.grid        = draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
+    t.line_w      = 2.0::f32;
+    t.tick        = 4.0::f32;
+    t.area        = 0.25::f32;
     ret t;
 }
