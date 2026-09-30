@@ -11,9 +11,8 @@ rendering.
 use blit;
 
 # once, at startup (fallible calls return err[allocator.Error]):
-val built: err[allocator.Error] = blit.font.build_atlas(?a);
-if (sel built.err) { ... }
-# upload blit.font.atlas_pixels() as an RGBA8 texture (see Rendering)
+val made: err[allocator.Error] = blit.context.init(?ctx, ?a);
+if (sel made.err) { ... }
 
 # per frame:
 blit.context.begin(?ctx, in, screen_w, screen_h);
@@ -24,12 +23,66 @@ blit.widget.checkbox(?ctx, "running", ?running);
 blit.widget.slider_f(?ctx, "rate", ?rate, 0.0::f32, 1.0::f32);
 blit.widget.end_panel(?ctx, panel);
 blit.context.end(?ctx);
-# upload blit.context.draw_verts(?ctx) / draw_count(?ctx) and draw as triangles.
+# upload the atlas pages that changed (see Rendering), then
+# blit.context.draw_verts(?ctx) / draw_count(?ctx), and draw as triangles.
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.font`, `blit.input`, `blit.hit`, `blit.context`, `blit.widget`. A
-submodule can also be imported directly, e.g. `use w: blit.widget;`.
+`blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.input`, `blit.hit`, `blit.context`, `blit.widget`. A submodule can also be
+imported directly, e.g. `use w: blit.widget;`.
+
+## Text & glyph sources
+
+Text comes from a glyph source, a record of functions over the source's own
+state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, layout, the glyph
+cache and the atlas, and asks the source only for what a face knows:
+
+```mach
+pub rec GlyphSource {
+    self:   ptr;
+    line:   fun(ptr, f32) LineMetrics;              # (self, scale)
+    glyph:  fun(ptr, u32, f32, *Glyph) bool;        # (self, codepoint, scale, out)
+    kern:   fun(ptr, u32, u32, f32) f32;            # (self, left, right, scale), or nil
+    raster: fun(ptr, u32, f32, *u8, usize) bool;    # (self, codepoint, scale, coverage, stride)
+}
+```
+
+- **Metrics are floats** in pixels at the scale asked for: `LineMetrics` is
+  ascent, descent and gap, and a `Glyph` is its advance, the rect its bitmap
+  covers relative to the pen on the baseline (y down), and the bitmap's size in
+  texels. Scale is the interface scale (`ctx.scale`, 1.0 by default), so text at
+  200% is rasterised at that size, not stretched.
+- **Glyphs come on demand.** A codepoint is measured the first time it is laid
+  out and rasterised the first time it is drawn, then cached per scale.
+  Measuring never rasterises.
+- **Codepoints, not bytes.** Text is UTF-8. A codepoint the source lacks draws
+  as U+FFFD, or `?` when it lacks that too. Control codepoints take no space and
+  a newline starts the next line.
+- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is the
+  default, so a context needs no configuration. `blit.context.set_glyph_source`
+  plugs in another between frames, such as a TrueType face from the host. blit
+  itself never depends on one.
+
+`blit.context.text_width` and `line_height` measure at the context's scale, and
+`blit.font.advance` steps one codepoint at a time for layout built outside
+blit.
+
+## Docked containers
+
+Alongside floating windows, `blit.widget.begin_dock`/`end_dock` attach a panel
+to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
+takes a strip from the frame's free area, so docks opened in turn stack inward,
+and `blit.context.free_area` reports what they leave for the rest of the screen,
+such as a world view. Call docks at the root.
+
+A dock's body is a scroll region. `blit.widget.begin_scroll`/`end_scroll` open
+one at the layout cursor on its own: its column is clipped and scrolls by the
+wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
+draggable scrollbar when its content is taller than it. The wheel goes to the
+innermost region holding the topmost claim under the cursor.
+`blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
+whether the rows beneath it should be placed.
 
 ## Clipping & sub-surfaces
 
@@ -104,13 +157,24 @@ click is always the one visibly on top.
 ## Rendering
 
 blit emits one vertex stream that draws both solid rectangles and text through
-a single shader and texture. Solid quads sample a reserved white texel, so
-`color * texel` is the flat color; glyph quads sample the glyph's cell.
+a single shader per texture. Solid quads sample a white block every atlas page
+carries, so `color * texel` is the flat color; glyph quads sample the glyph's
+cell.
 
-- **Atlas.** `blit.font.build_atlas(?a)` rasterizes the font once and returns
-  the allocator's refusal as `err[allocator.Error]`;
-  `blit.font.atlas_pixels()` returns RGBA8, `ATLAS_W`×`ATLAS_H` (128×48). Use
-  nearest filtering.
+- **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
+  pages, each an RGBA8 square of `blit.atlas.PAGE_SIDE` (512) texels at
+  `page_pixels(at, i)`. Pages open as glyphs arrive and never resize. Each has a
+  `page_version` bumped on every write and a `page_dirty` rect: upload the dirty
+  rect of each changed page before drawing, then `page_clean` it. Every glyph
+  has a transparent gutter, so linear filtering is safe. The built-in font at
+  whole scales looks sharpest with nearest.
+- **Spans.** `run_count`/`run_at` split the draw list into spans that each
+  sample one texture: a consumer image (`tex`), or atlas page `page` when `tex`
+  is nil.
+- **Color.** Colors are straight rgba as authored. When the target encodes sRGB
+  on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
+  in linear light, so the encoding brings it back to what was authored. Alpha is
+  never converted.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
   straight rgba.
@@ -120,9 +184,10 @@ a single shader and texture. Solid quads sample a reserved white texel, so
                      1.0 - aPos.y / uScreen.y * 2.0, 0.0, 1.0);
   FragColor   = aColor * texture(atlas, aUV);
   ```
-- **Per frame.** Fill an `Input` (`mx`, `my`, `down`), `begin`, widgets, `end`,
-  then upload `draw_verts` / `draw_count` and draw `GL_TRIANGLES` with
-  `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA` blending.
+- **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`), `begin`,
+  widgets, `end`, then upload `draw_verts` / `draw_count` and draw each span as
+  `GL_TRIANGLES` with its texture bound and `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA`
+  blending.
 
 ## Build & test
 
@@ -134,7 +199,8 @@ mach test .
 
 `demo/harness/` is its own project with a path dependency on this checkout. It
 drives a headless frame end to end through a bare `use blit;` and prints the
-vertex count. It takes std from this checkout's `dep/std`, so pull the root first:
+vertex count and atlas pages. It takes std from this checkout's `dep/std`, so
+pull the root first:
 
 ```
 mach dep pull demo/harness
