@@ -2,8 +2,14 @@
 #
 # widgets accumulate vertices here; each frame the consumer uploads data()/count()
 # to a dynamic vertex buffer and renders them as GL_TRIANGLES. positions are in
-# pixel space, u/v index the font atlas in [0, 1], and rgba is straight (not
-# premultiplied) with each channel in [0, 1].
+# pixel space, u/v index the sampled texture in [0, 1], and rgba is straight
+# (not premultiplied) with each channel in [0, 1].
+#
+# a vertex samples either the font atlas or a texture the consumer owns. the
+# consumer's texture is named by an opaque integer handle blit only passes
+# through: it never creates, owns or binds a texture, and ATLAS (0) is reserved
+# for the atlas. the context records which handle each span of the list samples
+# (see blit.context.Run).
 
 use std.types.error.err;
 use std.types.result.res;
@@ -15,6 +21,59 @@ use std.math.float;
 
 # vertex capacity allocated by init before any growth
 pub val INIT_CAP: usize = 1024;
+
+# the texture handle naming blit's own font atlas, never a consumer texture
+pub val ATLAS: u64 = 0;
+
+# sample the texel nearest each fragment, for crisp cells and pixel art
+pub val FILTER_NEAREST: u32 = 0;
+
+# blend the four texels around each fragment, for smooth scaling
+pub val FILTER_LINEAR: u32 = 1;
+
+# a region of a consumer texture and how to sample it
+#
+# the source rect is in uv, [0, 1] across the texture, since blit never learns
+# a texture's size. region builds one from a rect in texels.
+# ---
+# tex:    consumer texture handle, never ATLAS
+# u0:     left u of the region
+# v0:     top v of the region
+# u1:     right u of the region
+# v1:     bottom v of the region
+# filter: FILTER_NEAREST or FILTER_LINEAR
+pub rec Image {
+    tex:    u64;
+    u0:     f32;
+    v0:     f32;
+    u1:     f32;
+    v1:     f32;
+    filter: u32;
+}
+
+# a region of a consumer texture given as a rect in texels
+# ---
+# tex:    consumer texture handle, never ATLAS
+# tw:     texture width in texels
+# th:     texture height in texels
+# x:      region left in texels
+# y:      region top in texels
+# w:      region width in texels
+# h:      region height in texels
+# filter: FILTER_NEAREST or FILTER_LINEAR
+# ret:    the region with its rect in uv
+pub fun region(tex: u64, tw: f32, th: f32, x: f32, y: f32, w: f32, h: f32, filter: u32) Image {
+    ret Image{tex: tex, u0: x / tw, v0: y / th, u1: (x + w) / tw, v1: (y + h) / th, filter: filter};
+}
+
+# the whole of a consumer texture
+# ---
+# tex:    consumer texture handle, never ATLAS
+# filter: FILTER_NEAREST or FILTER_LINEAR
+# ret:    the region covering uv [0, 1] on both axes
+pub fun whole(tex: u64, filter: u32) Image {
+    ret Image{tex: tex, u0: 0.0::f32, v0: 0.0::f32, u1: 1.0::f32, v1: 1.0::f32, filter: filter};
+}
 
 # straight (non-premultiplied) rgba, each channel in [0, 1]
 # ---
