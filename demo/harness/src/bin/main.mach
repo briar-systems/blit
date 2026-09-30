@@ -56,11 +56,19 @@ fun main(argc: i64, argv: **u8) i64 {
     var view_open: u8 = 1;
     var info_open: u8 = 1;
 
+    # a text field over a buffer the harness owns, holding at most 24 characters
+    var name_buf: [64]u8;
+    var name:     blit.field.Field;
+    blit.field.init(?name, ?name_buf[0], 64, 24, nil);
+    blit.field.set(?name, "caf\xC3\xA9");
+
     var in: blit.input.Input;
     in.mx        = 20.0::f32;
     in.my        = 30.0::f32;
     in.down      = 0;
     in.prev_down = 0;
+    # keyboard events are plain data too, though no field holds the keyboard yet
+    blit.input.type_text(?in, '!');
 
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
 
@@ -80,6 +88,7 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.widget.button(?ctx, "step");
     blit.widget.checkbox(?ctx, "running", ?checked);
     blit.widget.slider_f(?ctx, "rate", ?amount, 0.0::f32, 1.0::f32);
+    val edits: u8 = blit.widget.text_field(?ctx, ?name, "name");
     blit.widget.end_panel(?ctx, panel);
 
     # sub-surface: a 4x4 grid drawn in local coords, clipped to a short region
@@ -117,11 +126,13 @@ fun main(argc: i64, argv: **u8) i64 {
 
     blit.context.end(?ctx);
 
-    print.printf("blit {}: {} vertices, {} atlas pages, ok={}\n",
+    print.printf("blit {}: {} vertices, {} atlas pages, ok={}, field \"{}\", typing={}\n",
         blit.VERSION,
         blit.context.draw_count(?ctx),
         blit.atlas.page_count(blit.context.atlas_of(?ctx)),
-        blit.context.ok(?ctx)::u64);
+        blit.context.ok(?ctx)::u64,
+        blit.field.text(?name),
+        blit.context.typing(?ctx)::u64);
 
     val freed: err[allo.Error] = blit.context.free(?ctx);
     if (sel freed.err) {
