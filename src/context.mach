@@ -1205,10 +1205,26 @@ pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
 # c:   tint color
 pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
     if (s == nil) { ret; }
+    text_span(ctx, s, str_len(s), x, y, c);
+}
+
+# draw the first n bytes of utf-8 text with its first line box's top-left at
+# (x, y), as text_at does the whole string
+#
+# for layout that splits a string without copying it, such as wrapped text.
+# n must fall on a codepoint boundary.
+# ---
+# ctx: context
+# s:   utf-8 text, at least n bytes
+# n:   bytes to draw
+# x:   left x in pixels
+# y:   top y in pixels
+# c:   tint color
+pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color) {
+    if (s == nil) { ret; }
     val m:    gly.LineMetrics = font.line(?ctx.font, ctx.scale);
     val lh:   f32             = gly.line_height(m);
     val ink:  draw.Color      = paint(ctx, c);
-    val n:    usize           = str_len(s);
     var base: f32             = y + m.ascent;
     var px:   f32             = x;
     var prev: u32             = 0;
