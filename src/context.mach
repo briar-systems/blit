@@ -41,15 +41,25 @@
 # topmost claimant under the cursor is hovered. a widget therefore becomes
 # interactive one frame after it first claims. that is a chosen property, since
 # any way around it makes some widgets special.
+#
+# the keyboard goes to one widget at a time, the focus holder, by id across
+# frames. a press that lands anywhere else drops it in begin, and so does a
+# frame the holder is not drawn in, at end. while a widget holds it, typing()
+# says so, so a consumer can keep its own key bindings quiet. the clipboard is
+# a hand-off: a frame leaves text to copy in copied() and a paste request in
+# wants_paste(), and the consumer answers the request with the next frame's
+# input.paste (see blit.input).
 
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 
 use blit.atlas;
 use blit.draw;
@@ -176,6 +186,13 @@ pub rec Area {
 # srgb:          1 if colors are converted to linear light for an sRGB target, else 0
 # wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
 # free:          the screen area docked containers have not taken this frame
+# focus:         id of the widget holding the keyboard, persists across frames (0 = none)
+# focus_drawn:   1 once the focus holder was drawn this frame, else 0
+# a:             allocator backing the clipboard text
+# clip:          text the frame copies to the clipboard, NUL-terminated, nil before the first copy
+# clip_cap:      bytes allocated for clip
+# clip_on:       1 if the frame copied text into clip, else 0
+# paste_wanted:  1 if a widget asked for the clipboard's text this frame, else 0
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -227,6 +244,13 @@ pub rec Context {
     srgb:          u8;
     wheel_taken:   u8;
     free:          Area;
+    focus:         u64;
+    focus_drawn:   u8;
+    a:             *allo.Allocator;
+    clip:          *u8;
+    clip_cap:      usize;
+    clip_on:       u8;
+    paste_wanted:  u8;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -273,6 +297,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.in.down      = 0;
     ctx.in.prev_down = 0;
     ctx.in.wheel     = 0.0::f32;
+    input.clear_keys(?ctx.in);
 
     ctx.sw            = 0.0::f32;
     ctx.sh            = 0.0::f32;
@@ -310,14 +335,27 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.srgb          = 0;
     ctx.wheel_taken   = 0;
     ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
+    ctx.focus         = 0;
+    ctx.focus_drawn   = 0;
+    ctx.a             = a;
+    ctx.clip          = nil;
+    ctx.clip_cap      = 0;
+    ctx.clip_on       = 0;
+    ctx.paste_wanted  = 0;
     ret err[allo.Error].ok{};
 }
 
-# release the context's draw lists, claim lists and font
+# release the context's draw lists, claim lists, font and clipboard text
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
+    if (ctx.clip != nil) {
+        val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
+        if (sel ec.err) { ret ec; }
+        ctx.clip     = nil;
+        ctx.clip_cap = 0;
+    }
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
     val e1: err[allo.Error] = draw.free(?ctx.out);
@@ -334,6 +372,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
 # layout and layers
 #
 # hover is the topmost of the previous frame's claims under this frame's cursor.
+# a press on anything but the focus holder drops the focus, and the last
+# frame's copied text and paste request are cleared.
 # ---
 # ctx: context
 # in:  this frame's input (consumer sets mx/my/down; prev_down is managed here)
@@ -382,11 +422,17 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.ordinal  = 0;
     ctx.layer_sp = 0;
 
+    if (input.pressed(ctx.in) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
+    ctx.focus_drawn  = 0;
+    ctx.clip_on      = 0;
+    ctx.paste_wanted = 0;
+
     draw.reset(?ctx.dl);
 }
 
-# finish a frame: close the last texture span, compose the draw list by layer
-# and drop the active widget once the button is released
+# finish a frame: close the last texture span, compose the draw list by layer,
+# drop the active widget once the button is released and drop the focus when
+# its holder was not drawn
 #
 # vertex indices taken during the frame (begin_panel's handle) are emission
 # indices and are only valid until end().
@@ -395,7 +441,112 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (ctx.in.down == 0) { ctx.active = 0; }
+    if (ctx.in.down == 0)     { ctx.active = 0; }
+    if (ctx.focus_drawn == 0) { ctx.focus = 0; }
+}
+
+# give a widget the keyboard
+#
+# it holds it across frames until a press lands elsewhere, a frame does not
+# draw it (see focused), or unfocus. a widget given it during a frame counts
+# as drawn in that frame.
+# ---
+# ctx: context
+# id:  the widget's id from next_id, 0 to drop the focus
+pub fun focus(ctx: *Context, id: u64) {
+    ctx.focus       = id;
+    ctx.focus_drawn = 0;
+    if (id != 0) { ctx.focus_drawn = 1; }
+}
+
+# take the keyboard from whichever widget holds it
+# ---
+# ctx: context
+pub fun unfocus(ctx: *Context) {
+    focus(ctx, 0);
+}
+
+# whether a widget holds the keyboard, marking it drawn this frame when it does
+#
+# a focusable widget asks this every frame it is drawn, which is what keeps
+# the focus past end().
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: true if the widget holds the keyboard
+pub fun focused(ctx: *Context, id: u64) bool {
+    if (id == 0 || ctx.focus != id) { ret false; }
+    ctx.focus_drawn = 1;
+    ret true;
+}
+
+# whether a widget holds the keyboard, so the consumer's own key bindings
+# should stay quiet
+#
+# read before begin, it says whether the keys the consumer is about to hand
+# the frame will go to a widget.
+# ---
+# ctx: context
+# ret: true while a widget holds the keyboard
+pub fun typing(ctx: *Context) bool {
+    ret ctx.focus != 0;
+}
+
+# put text on the frame's clipboard hand-off, replacing any copied earlier in
+# the frame
+#
+# the bytes are copied, so the caller may change them afterwards. a copy that
+# cannot grow the buffer is dropped and oom set.
+# ---
+# ctx: context
+# s:   utf-8 bytes
+# n:   byte count
+pub fun set_copied(ctx: *Context, s: *u8, n: usize) {
+    if (n + 1 > ctx.clip_cap) {
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](ctx.a, ctx.clip, ctx.clip_cap, n + 1);
+        if (sel r.err) {
+            ctx.oom     = 1;
+            ctx.clip_on = 0;
+            ret;
+        }
+        ctx.clip     = r.ok;
+        ctx.clip_cap = n + 1;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        ctx.clip[i] = s[i];
+        i           = i + 1;
+    }
+    ctx.clip[n] = 0;
+    ctx.clip_on = 1;
+}
+
+# the text the frame copied, for the consumer to put on the system clipboard
+# ---
+# ctx: context
+# ret: utf-8 text valid until the next begin, or nil when the frame copied nothing
+pub fun copied(ctx: *Context) str {
+    if (ctx.clip_on == 0) { ret nil; }
+    ret ctx.clip;
+}
+
+# ask the consumer for the clipboard's text, delivered in the next frame's
+# input.paste
+# ---
+# ctx: context
+pub fun request_paste(ctx: *Context) {
+    ctx.paste_wanted = 1;
+}
+
+# whether a widget asked for the clipboard's text this frame
+#
+# when true, the consumer reads the system clipboard and hands its text to the
+# next frame as input.paste.
+# ---
+# ctx: context
+# ret: true if the next frame should carry the clipboard's text
+pub fun wants_paste(ctx: *Context) bool {
+    ret ctx.paste_wanted != 0;
 }
 
 # allocate the next widget id for this frame (stable while call order is)
@@ -1849,6 +2000,84 @@ test fill__rounds_corners_and_grows_reserved {
     if (p[60].y != 30.0::f32 || p[62].y != 46.0::f32) { ret 8; }
     if (p[66].y != 49.0::f32 || p[68].y != 50.0::f32) { ret 9; }
     if (p[66].x <= 1.0::f32)                          { ret 10; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test focus__held_while_drawn_and_dropped_by_a_press_elsewhere {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # a widget given the focus keeps it while it is drawn
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    val c1: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    focus(?ctx, 1);
+    if (!typing(?ctx)) { ret 2; }
+    end(?ctx);
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    val c2: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    if (!focused(?ctx, 1) || focused(?ctx, 2)) { ret 3; }
+    end(?ctx);
+    if (!typing(?ctx)) { ret 4; }
+
+    # a press on the holder keeps it, a press elsewhere drops it
+    var in: input.Input;
+    in.mx   = 5.0::f32;
+    in.my   = 5.0::f32;
+    in.down = 1;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    val c3: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    if (!focused(?ctx, 1)) { ret 5; }
+    end(?ctx);
+    in.down = 0;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    val c4: u8   = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    val f4: bool = focused(?ctx, 1);
+    end(?ctx);
+    in.mx   = 50.0::f32;
+    in.down = 1;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (typing(?ctx)) { ret 6; }
+    end(?ctx);
+
+    # a frame that does not draw the holder drops it
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    focus(?ctx, 1);
+    end(?ctx);
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    end(?ctx);
+    if (typing(?ctx)) { ret 7; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test clipboard__copied_and_paste_request_last_one_frame {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    if (copied(?ctx) != nil || wants_paste(?ctx)) { ret 2; }
+    set_copied(?ctx, "caf\xC3\xA9 au lait", 5);
+    request_paste(?ctx);
+    end(?ctx);
+    if (copied(?ctx) == nil || !str_equals(copied(?ctx), "caf\xC3\xA9")) { ret 3; }
+    if (!wants_paste(?ctx))                                              { ret 4; }
+
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    end(?ctx);
+    if (copied(?ctx) != nil || wants_paste(?ctx)) { ret 5; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }

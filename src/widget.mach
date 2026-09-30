@@ -1,6 +1,6 @@
 # the widgets: panel, window, popup, dock, scroll region, section, text, note,
 # button, button rows and grids, segmented choice, checkbox, toggle, slider,
-# dropdown, list, image, grid
+# dropdown, list, image, grid, text field
 #
 # the layout helpers place rows by hand: space and advance move the cursor
 # down, cell_x0 and cell_x1 split the column into equal cells for widgets that
@@ -20,6 +20,9 @@
 # drawn so far. a press anywhere outside an open popup dismisses it, and that
 # press is consumed rather than delivered to what lies beneath.
 #
+# a text field takes the keyboard (see context.focus) when pressed and edits a
+# blit.field.Field with the frame's keyboard events while it holds it.
+#
 # alongside floating windows, a dock attaches a panel to a screen edge and
 # takes it from the free area (see context.carve) the rest of the screen is
 # laid out in. a dock's body is a scroll region, which clips its column and
@@ -37,10 +40,12 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use blit.context;
 use blit.draw;
+use blit.field;
 use blit.font;
 use blit.input;
 use blit.theme;
@@ -835,6 +840,152 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
     if (pop.dismissed != 0 && ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
     ret changed;
+}
+
+# width of the field's bytes [lo, hi) laid out on one line at the context's scale
+fun span(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
+    val fnt:  *font.Font = context.font_of(ctx);
+    var w:    f32        = 0.0::f32;
+    var prev: u32        = 0;
+    var i:    usize      = lo;
+    for (i < hi) {
+        var cp: u32 = 0;
+        i    = i + font.next(f.buf, i, hi, ?cp);
+        w    = w + font.advance(fnt, prev, cp, ctx.scale);
+        prev = cp;
+    }
+    ret w;
+}
+
+# scroll the field's shown text so the caret is in view in w pixels, showing
+# as much of the text as fits
+fun keep_in_view(ctx: *context.Context, f: *field.Field, w: f32) {
+    if (f.first > f.caret) { f.first = f.caret; }
+    for (f.first < f.caret && span(ctx, f, f.first, f.caret) > w) { f.first = field.after(f, f.first); }
+    for (f.first > 0 && span(ctx, f, field.before(f, f.first), f.len) <= w) { f.first = field.before(f, f.first); }
+}
+
+# the character boundary nearest x pixels right of the field's shown text start
+fun caret_at(ctx: *context.Context, f: *field.Field, x: f32) usize {
+    var at: f32   = 0.0::f32;
+    var i:  usize = f.first;
+    for (i < f.len) {
+        val n: usize = field.after(f, i);
+        val w: f32   = span(ctx, f, i, n);
+        if (x < at + w / 2.0::f32) { brk; }
+        at = at + w;
+        i  = n;
+    }
+    ret i;
+}
+
+# hand the frame's paste and keyboard events, in order, to a focused field
+#
+# copy and cut go to the context's clipboard hand-off and paste asks it for
+# the clipboard. enter or escape drop the focus, and events after them are
+# left alone.
+fun feed(ctx: *context.Context, f: *field.Field) u8 {
+    var out: u8 = 0;
+    if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
+    var i: usize = 0;
+    for (i < ctx.in.events_len) {
+        val e: input.Event = ctx.in.events[i];
+        i = i + 1;
+        if (sel e.text) {
+            if (field.insert(f, e.text)) { out = out | field.EDITED; }
+            cnt;
+        }
+        val k:   input.Key = e.key;
+        val cmd: bool      = input.shortcut(k.mods);
+        if (cmd && (k.code == 'C' || k.code == 'X')) {
+            if (field.selected(f)) {
+                val lo: usize = field.sel_lo(f);
+                context.set_copied(ctx, ?f.buf[lo], field.sel_hi(f) - lo);
+                if (k.code == 'X' && field.erase(f)) { out = out | field.EDITED; }
+            }
+            cnt;
+        }
+        if (cmd && k.code == 'V') {
+            context.request_paste(ctx);
+            cnt;
+        }
+        val r: u8 = field.key(f, k);
+        out = out | r;
+        if ((r & (field.ENTERED | field.ESCAPED)) != 0) {
+            context.unfocus(ctx);
+            brk;
+        }
+    }
+    ret out;
+}
+
+# a full-width, one-line text field editing @f
+#
+# a press on it gives it the keyboard (see context.focus) and puts the caret
+# under the cursor; a press elsewhere, or a frame it is not drawn in, takes the
+# keyboard back. while it holds the keyboard it takes the frame's typed text
+# and editing keys (see field.key) in order: shortcut C and X copy and cut the
+# selection to the clipboard hand-off (see context.copied), shortcut V asks for
+# the clipboard (see context.wants_paste) and takes the next frame's
+# input.paste, and enter or escape end the edit and give the keyboard back.
+# the text scrolls to keep the caret in view.
+# ---
+# ctx:  context
+# f:    the field's state, edited in place
+# hint: dim text shown while it is empty and unfocused, nil for none
+# ret:  this frame's outcome bits: field.EDITED, field.ENTERED, field.ESCAPED
+pub fun text_field(ctx: *context.Context, f: *field.Field, hint: str) u8 {
+    val id: u64 = context.next_id(ctx);
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+    val h:  f32 = row_h(ctx);
+    val x1: f32 = ctx.cx + ctx.pw;
+    val y1: f32 = y0 + h;
+    val tx: f32 = x0 + pad(ctx);
+    val tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
+
+    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+    if (hov != 0 && input.pressed(ctx.in) != 0) {
+        context.focus(ctx, id);
+        keep_in_view(ctx, f, tw);
+        val at: usize = caret_at(ctx, f, ctx.in.mx - ctx.lx - tx);
+        f.caret  = at;
+        f.anchor = at;
+    }
+    var out: u8 = 0;
+    if (context.focused(ctx, id)) { out = feed(ctx, f); }
+    val on: bool = ctx.focus == id;
+
+    var bg: draw.Color = ctx.theme.track;
+    if (ctx.hot == id && !on) { bg = ctx.theme.control_hot; }
+    if (on) {
+        val ew: f32 = context.px(ctx, ctx.theme.edge_w);
+        face(ctx, x0, y0, x1, y1, ctx.theme.accent);
+        face(ctx, x0 + ew, y0 + ew, x1 - ew, y1 - ew, bg);
+    }
+    or { face(ctx, x0, y0, x1, y1, bg); }
+
+    keep_in_view(ctx, f, tw);
+    val lh: f32 = context.line_height(ctx);
+    val ty: f32 = y0 + (h - lh) / 2.0::f32;
+    context.push_clip(ctx, tx, y0, tx + tw, y1);
+    if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, ctx.theme.text_dim); }
+    if (on && field.selected(f)) {
+        var lo: usize = field.sel_lo(f);
+        if (lo < f.first) { lo = f.first; }
+        val sx0: f32 = tx + span(ctx, f, f.first, lo);
+        val sx1: f32 = tx + span(ctx, f, f.first, field.sel_hi(f));
+        context.quad(ctx, sx0, ty, sx1, ty + lh, ctx.theme.select);
+    }
+    context.text_at(ctx, ?f.buf[f.first], tx, ty, ctx.theme.text);
+    context.pop_clip(ctx);
+    if (on) {
+        val cx: f32 = tx + span(ctx, f, f.first, f.caret);
+        context.quad(ctx, cx, ty, cx + context.px(ctx, ctx.theme.caret_w), ty + lh, ctx.theme.text);
+    }
+
+    advance(ctx, h);
+    ret out;
 }
 
 # hit-test an arbitrary rect with button click semantics
@@ -2753,6 +2904,138 @@ test image__quads_carry_handle_rect_and_uvs {
     if (p[12].b != 1.0::f32 || p[18].r != 1.0::f32)   { ret 15; }
     if (p[24].y != 110.0::f32 || p[24].r != 1.0::f32) { ret 16; }
     if (p[30].b != 1.0::f32)                          { ret 17; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding one panel that draws one text field when draw_it is set
+#[testing]
+fun frame_field(ctx: *context.Context, in: input.Input, f: *field.Field, draw_it: u8) u8 {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:   Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    var out: u8    = 0;
+    if (draw_it != 0) { out = text_field(ctx, f, "name"); }
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret out;
+}
+
+# hover, press and release on the field at x, which gives it the keyboard
+#[testing]
+fun click_field(ctx: *context.Context, f: *field.Field, x: f32) {
+    frame_field(ctx, input_at(x, 8.0::f32, 0), f, 1);
+    frame_field(ctx, input_at(x, 8.0::f32, 1), f, 1);
+    frame_field(ctx, input_at(x, 8.0::f32, 0), f, 1);
+}
+
+test text_field__types_edits_and_reports_enter {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [64]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 64, 0, nil);
+
+    # typing reaches no field until one is clicked
+    var in: input.Input = input_at(10.0::f32, 8.0::f32, 0);
+    input.type_text(?in, 'q');
+    frame_field(?ctx, in, ?f, 1);
+    if (f.len != 0 || context.typing(?ctx)) { ret 2; }
+    click_field(?ctx, ?f, 10.0::f32);
+    if (!context.typing(?ctx)) { ret 3; }
+
+    # typed text, non-ascii included, lands at the caret in arrival order
+    in = input_at(10.0::f32, 8.0::f32, 0);
+    input.type_text(?in, 'c');
+    input.type_text(?in, 'f');
+    input.press_key(?in, input.KEY_LEFT, 0);
+    input.type_text(?in, 'a');
+    input.press_key(?in, input.KEY_END, 0);
+    input.type_text(?in, 0xE9);
+    if (frame_field(?ctx, in, ?f, 1) != field.EDITED)               { ret 4; }
+    if (!str_equals(field.text(?f), "caf\xC3\xA9") || f.caret != 5) { ret 5; }
+
+    # shift+arrows select, and typing replaces the selection
+    in = input_at(10.0::f32, 8.0::f32, 0);
+    input.press_key(?in, input.KEY_LEFT, input.MOD_SHIFT);
+    input.press_key(?in, input.KEY_LEFT, input.MOD_SHIFT);
+    input.type_text(?in, 'X');
+    frame_field(?ctx, in, ?f, 1);
+    if (!str_equals(field.text(?f), "caX")) { ret 6; }
+
+    # a click puts the caret under the cursor: the bitmap font's cells are 8
+    # wide after 4 of padding, so x = 13 is nearest the boundary after 'c'
+    click_field(?ctx, ?f, 13.0::f32);
+    if (f.caret != 1 || field.selected(?f)) { ret 7; }
+
+    # select all and cut hands the text to the clipboard, paste asks for it
+    # and takes it from the next frame
+    in = input_at(13.0::f32, 8.0::f32, 0);
+    input.press_key(?in, 'A', input.MOD_CTRL);
+    input.press_key(?in, 'X', input.MOD_CTRL);
+    input.press_key(?in, 'V', input.MOD_CTRL);
+    if (frame_field(?ctx, in, ?f, 1) != field.EDITED || f.len != 0) { ret 8; }
+    if (!str_equals(context.copied(?ctx), "caX"))                   { ret 9; }
+    if (!context.wants_paste(?ctx))                                 { ret 10; }
+    in       = input_at(13.0::f32, 8.0::f32, 0);
+    in.paste = "caX";
+    frame_field(?ctx, in, ?f, 1);
+    if (!str_equals(field.text(?f), "caX") || context.copied(?ctx) != nil) { ret 11; }
+
+    # enter reports and gives the keyboard back, and what follows it is not taken
+    in = input_at(13.0::f32, 8.0::f32, 0);
+    input.press_key(?in, input.KEY_ENTER, 0);
+    input.type_text(?in, 'z');
+    if (frame_field(?ctx, in, ?f, 1) != field.ENTERED) { ret 12; }
+    if (context.typing(?ctx) || f.len != 3)            { ret 13; }
+
+    # escape reports the same way
+    click_field(?ctx, ?f, 13.0::f32);
+    in = input_at(13.0::f32, 8.0::f32, 0);
+    input.type_text(?in, 'y');
+    input.press_key(?in, input.KEY_ESCAPE, 0);
+    if (frame_field(?ctx, in, ?f, 1) != (field.EDITED | field.ESCAPED)) { ret 14; }
+    if (context.typing(?ctx))                                           { ret 15; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test text_field__focus_lost_when_undrawn_or_clicked_elsewhere {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [16]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 16, 0, nil);
+
+    # a frame that does not draw the field takes the keyboard back
+    click_field(?ctx, ?f, 10.0::f32);
+    if (!context.typing(?ctx)) { ret 2; }
+    frame_field(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?f, 0);
+    if (context.typing(?ctx)) { ret 3; }
+    var in: input.Input = input_at(10.0::f32, 8.0::f32, 0);
+    input.type_text(?in, 'k');
+    frame_field(?ctx, in, ?f, 1);
+    if (f.len != 0) { ret 4; }
+
+    # so does a press anywhere else, inside the panel or out of it
+    click_field(?ctx, ?f, 10.0::f32);
+    frame_field(?ctx, input_at(10.0::f32, 40.0::f32, 1), ?f, 1);
+    if (context.typing(?ctx)) { ret 5; }
+    frame_field(?ctx, input_at(10.0::f32, 40.0::f32, 0), ?f, 1);
+    click_field(?ctx, ?f, 10.0::f32);
+    frame_field(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?f, 1);
+    if (context.typing(?ctx)) { ret 6; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }

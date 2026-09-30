@@ -1,0 +1,393 @@
+# the edit model of a one-line text field, as plain data
+#
+# a Field is utf-8 text in a buffer the consumer owns, with a caret, a
+# selection and a view offset, edited by typed codepoints, pasted text and
+# editing keys. it knows nothing of the context, the font or the clipboard:
+# blit.widget.text_field draws one, routes the keyboard to it while it holds
+# the focus, and does the clipboard hand-off. every offset is a byte offset on
+# a character boundary.
+#
+# a field takes a codepoint only when it is printable, its filter accepts it,
+# and it fits both the buffer and the field's maximum length in characters.
+
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use blit.font;
+use blit.input;
+
+# outcome bits of an edit, combined with |
+# ---
+# EDITED:  the text changed
+# ENTERED: enter ended the edit
+# ESCAPED: escape ended the edit
+pub val EDITED:  u8 = 1;
+pub val ENTERED: u8 = 2;
+pub val ESCAPED: u8 = 4;
+
+# an editable line of utf-8 text in a consumer-owned buffer
+# ---
+# buf:    the text, NUL-terminated
+# cap:    bytes buf holds, the terminator included
+# len:    bytes of text
+# chars:  characters of text
+# max:    most characters the text may hold, 0 for as many as buf fits
+# caret:  byte offset of the caret
+# anchor: the selection's other end, equal to caret when nothing is selected
+# first:  byte offset of the first character shown, kept by the widget so the caret stays in view
+# accept: whether a typed codepoint belongs in the field, nil for any printable one
+pub rec Field {
+    buf:    *u8;
+    cap:    usize;
+    len:    usize;
+    chars:  usize;
+    max:    usize;
+    caret:  usize;
+    anchor: usize;
+    first:  usize;
+    accept: fun(u32) bool;
+}
+
+# make an empty field over a buffer
+# ---
+# f:      the field
+# buf:    storage for the text, at least one byte
+# cap:    bytes buf holds, the terminator included
+# max:    most characters the field holds, 0 for as many as buf fits
+# accept: which typed codepoints the field takes, nil for any printable one
+pub fun init(f: *Field, buf: *u8, cap: usize, max: usize, accept: fun(u32) bool) {
+    f.buf    = buf;
+    f.cap    = cap;
+    f.len    = 0;
+    f.chars  = 0;
+    f.max    = max;
+    f.caret  = 0;
+    f.anchor = 0;
+    f.first  = 0;
+    f.accept = accept;
+    if (cap > 0) { buf[0] = 0; }
+}
+
+# the field's text
+# ---
+# f:   the field
+# ret: its NUL-terminated utf-8 text, valid until the next edit
+pub fun text(f: *Field) str {
+    ret f.buf;
+}
+
+# replace the text with the codepoints of s the field takes, caret at the end
+# ---
+# f: the field
+# s: utf-8 text
+pub fun set(f: *Field, s: str) {
+    f.len    = 0;
+    f.chars  = 0;
+    f.caret  = 0;
+    f.anchor = 0;
+    f.first  = 0;
+    if (f.cap > 0) { f.buf[0] = 0; }
+    paste(f, s);
+}
+
+# whether some text is selected
+# ---
+# f:   the field
+# ret: true when the caret and the anchor differ
+pub fun selected(f: *Field) bool {
+    ret f.caret != f.anchor;
+}
+
+# the selection's start, the smaller of caret and anchor
+# ---
+# f:   the field
+# ret: byte offset
+pub fun sel_lo(f: *Field) usize {
+    if (f.caret < f.anchor) { ret f.caret; }
+    ret f.anchor;
+}
+
+# the selection's end, the larger of caret and anchor
+# ---
+# f:   the field
+# ret: byte offset
+pub fun sel_hi(f: *Field) usize {
+    if (f.caret > f.anchor) { ret f.caret; }
+    ret f.anchor;
+}
+
+# the character boundary before i
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the previous boundary, 0 at the start
+pub fun before(f: *Field, i: usize) usize {
+    if (i == 0) { ret 0; }
+    var j: usize = i - 1;
+    for (j > 0 && utf8.is_continuation(f.buf[j])) { j = j - 1; }
+    ret j;
+}
+
+# the character boundary after i
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the next boundary, len at the end
+pub fun after(f: *Field, i: usize) usize {
+    if (i >= f.len) { ret f.len; }
+    var j: usize = i + 1;
+    for (j < f.len && utf8.is_continuation(f.buf[j])) { j = j + 1; }
+    ret j;
+}
+
+# characters in the bytes [lo, hi)
+fun count(f: *Field, lo: usize, hi: usize) usize {
+    var n: usize = 0;
+    var i: usize = lo;
+    for (i < hi) {
+        if (!utf8.is_continuation(f.buf[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# remove the bytes [lo, hi), leaving caret and anchor at lo
+fun remove(f: *Field, lo: usize, hi: usize) {
+    f.chars = f.chars - count(f, lo, hi);
+    var i: usize = hi;
+    for (i <= f.len) {
+        f.buf[lo + i - hi] = f.buf[i];
+        i                  = i + 1;
+    }
+    f.len    = f.len - (hi - lo);
+    f.caret  = lo;
+    f.anchor = lo;
+    if (f.first > lo) { f.first = lo; }
+}
+
+# remove the selected text
+# ---
+# f:   the field
+# ret: true if anything was selected and removed
+pub fun erase(f: *Field) bool {
+    if (!selected(f)) { ret false; }
+    remove(f, sel_lo(f), sel_hi(f));
+    ret true;
+}
+
+# whether a codepoint is text rather than a control
+fun printable(cp: u32) bool {
+    ret cp >= 0x20 && (cp < 0x7F || cp >= 0xA0);
+}
+
+# whether the field takes a codepoint once freed_chars characters of
+# freed_bytes bytes are removed, and how many bytes it encodes to
+fun fits(f: *Field, cp: u32, freed_chars: usize, freed_bytes: usize, n: *usize) bool {
+    if (!printable(cp))                                            { ret false; }
+    if (f.accept != nil && !f.accept(cp))                          { ret false; }
+    if (cp > utf8.MAX_CODEPOINT || (cp >= 0xD800 && cp <= 0xDFFF)) { ret false; }
+    if (f.max != 0 && f.chars - freed_chars >= f.max)              { ret false; }
+    @n = utf8.codepoint_len(cp);
+    ret f.len - freed_bytes + @n + 1 <= f.cap;
+}
+
+# put a codepoint at the caret, which must have no selection, if the field takes it
+fun put(f: *Field, cp: u32) bool {
+    var n: usize = 0;
+    if (!fits(f, cp, 0, 0, ?n)) { ret false; }
+    var b:     [4]u8;
+    val wrote: usize = utf8.encode(cp, ?b[0], 4);
+
+    val at: usize = f.caret;
+    var i:  usize = f.len + 1;
+    for (i > at) {
+        i            = i - 1;
+        f.buf[i + n] = f.buf[i];
+    }
+    var k: usize = 0;
+    for (k < n) {
+        f.buf[at + k] = b[k];
+        k             = k + 1;
+    }
+    f.len    = f.len + n;
+    f.chars  = f.chars + 1;
+    f.caret  = at + n;
+    f.anchor = f.caret;
+    ret true;
+}
+
+# type a codepoint at the caret, replacing any selection
+#
+# a codepoint the field refuses leaves the selection in place.
+# ---
+# f:   the field
+# cp:  a unicode scalar value
+# ret: true if the text changed
+pub fun insert(f: *Field, cp: u32) bool {
+    val lo: usize = sel_lo(f);
+    val hi: usize = sel_hi(f);
+    var n:  usize = 0;
+    if (!fits(f, cp, count(f, lo, hi), hi - lo, ?n)) { ret false; }
+    val erased: bool = erase(f);
+    ret put(f, cp);
+}
+
+# type the codepoints of utf-8 text at the caret, replacing any selection
+#
+# codepoints the field refuses are skipped, and typing stops once it is full.
+# ---
+# f:   the field
+# s:   utf-8 text, nil for none
+# ret: true if the text changed
+pub fun paste(f: *Field, s: str) bool {
+    if (s == nil) { ret false; }
+    var changed: bool  = erase(f);
+    val n:       usize = str_len(s);
+    var i:       usize = 0;
+    for (i < n) {
+        var cp: u32 = 0;
+        i = i + font.next(s, i, n, ?cp);
+        if (put(f, cp)) { changed = true; }
+    }
+    ret changed;
+}
+
+# move the caret to i, extending the selection when shift is held
+fun move_to(f: *Field, i: usize, shift: bool) {
+    f.caret = i;
+    if (!shift) { f.anchor = i; }
+}
+
+# apply an editing key
+#
+# backspace and delete remove the selection or one character. left and right
+# move by a character and home and end to either end, extending the selection
+# with shift; without shift, left and right collapse a selection to its side.
+# a shortcut A (see input.shortcut) selects all, and enter and escape report
+# that the edit ended. other keys do nothing.
+# ---
+# f:   the field
+# k:   the key press
+# ret: the outcome bits it came to
+pub fun key(f: *Field, k: input.Key) u8 {
+    val shift: bool = (k.mods & input.MOD_SHIFT) != 0;
+    val c:     u32  = k.code;
+    if (c == input.KEY_ENTER)  { ret ENTERED; }
+    if (c == input.KEY_ESCAPE) { ret ESCAPED; }
+    if (c == 'A' && input.shortcut(k.mods)) {
+        f.anchor = 0;
+        f.caret  = f.len;
+        ret 0;
+    }
+    if (c == input.KEY_BACKSPACE || c == input.KEY_DELETE) {
+        if (erase(f)) { ret EDITED; }
+        if (c == input.KEY_BACKSPACE && f.caret > 0) {
+            remove(f, before(f, f.caret), f.caret);
+            ret EDITED;
+        }
+        if (c == input.KEY_DELETE && f.caret < f.len) {
+            remove(f, f.caret, after(f, f.caret));
+            ret EDITED;
+        }
+        ret 0;
+    }
+    if (c == input.KEY_LEFT) {
+        if (selected(f) && !shift) { move_to(f, sel_lo(f), false); }
+        or                         { move_to(f, before(f, f.caret), shift); }
+    }
+    or (c == input.KEY_RIGHT) {
+        if (selected(f) && !shift) { move_to(f, sel_hi(f), false); }
+        or                         { move_to(f, after(f, f.caret), shift); }
+    }
+    or (c == input.KEY_HOME) { move_to(f, 0, shift); }
+    or (c == input.KEY_END)  { move_to(f, f.len, shift); }
+    ret 0;
+}
+
+# a key press with modifiers, for tests
+#[testing]
+fun press(code: u32, mods: u8) input.Key {
+    ret input.Key{code: code, mods: mods};
+}
+
+# a field that takes digits only
+#[testing]
+fun digits(cp: u32) bool {
+    ret cp >= '0' && cp <= '9';
+}
+
+test field__edits_at_the_caret_with_selection {
+    var buf: [32]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 32, 0, nil);
+    insert(?f, 'a');
+    insert(?f, 'c');
+    key(?f, press(input.KEY_LEFT, 0));
+    insert(?f, 'b');
+    if (!str_equals(text(?f), "abc") || f.caret != 2) { ret 1; }
+
+    # a two-byte codepoint moves and deletes as one character
+    insert(?f, 0xE9);
+    if (f.len != 5 || f.chars != 4 || f.caret != 4) { ret 2; }
+    key(?f, press(input.KEY_LEFT, 0));
+    if (f.caret != 2)                                                                  { ret 3; }
+    if (key(?f, press(input.KEY_DELETE, 0)) != EDITED || !str_equals(text(?f), "abc")) { ret 4; }
+
+    # shift extends, typing replaces the selection, backspace takes it whole
+    key(?f, press(input.KEY_END, 0));
+    key(?f, press(input.KEY_LEFT, input.MOD_SHIFT));
+    key(?f, press(input.KEY_LEFT, input.MOD_SHIFT));
+    if (sel_lo(?f) != 1 || sel_hi(?f) != 3) { ret 5; }
+    insert(?f, 0x4E16);
+    if (!str_equals(text(?f), "a\xE4\xB8\x96") || selected(?f)) { ret 6; }
+    key(?f, press(input.KEY_HOME, input.MOD_SHIFT));
+    if (key(?f, press(input.KEY_BACKSPACE, 0)) != EDITED || f.len != 0 || f.chars != 0) { ret 7; }
+
+    # select all, then left collapses to the start without moving further
+    set(?f, "xyz");
+    key(?f, press('A', input.MOD_CTRL));
+    if (sel_lo(?f) != 0 || sel_hi(?f) != 3) { ret 8; }
+    key(?f, press(input.KEY_LEFT, 0));
+    if (f.caret != 0 || selected(?f))                { ret 9; }
+    if (key(?f, press(input.KEY_BACKSPACE, 0)) != 0) { ret 10; }
+
+    if (key(?f, press(input.KEY_ENTER, 0)) != ENTERED)  { ret 11; }
+    if (key(?f, press(input.KEY_ESCAPE, 0)) != ESCAPED) { ret 12; }
+    if (!str_equals(text(?f), "xyz"))                   { ret 13; }
+    ret 0;
+}
+
+test field__limits_filters_and_pastes {
+    # four characters, whatever their bytes
+    var buf: [32]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 32, 4, nil);
+    paste(?f, "\xC3\xA9t\xC3\xA9s!");
+    if (!str_equals(text(?f), "\xC3\xA9t\xC3\xA9s") || f.chars != 4) { ret 1; }
+    if (insert(?f, 'x'))                                             { ret 2; }
+    # a full field still takes a character that replaces a selection
+    key(?f, press(input.KEY_LEFT, input.MOD_SHIFT));
+    if (!insert(?f, 'x') || !str_equals(text(?f), "\xC3\xA9t\xC3\xA9x")) { ret 3; }
+
+    # the buffer bounds the text too: three bytes of text and a terminator
+    var small: [4]u8;
+    var g:     Field;
+    init(?g, ?small[0], 4, 0, nil);
+    set(?g, "ab\xC3\xA9");
+    if (!str_equals(text(?g), "ab") || insert(?g, 0xE9) || !insert(?g, 'c')) { ret 4; }
+
+    # the filter and control characters are refused, and pasting skips them
+    var dbuf: [16]u8;
+    var d:    Field;
+    init(?d, ?dbuf[0], 16, 0, digits);
+    if (insert(?d, 'a') || insert(?d, 0x08) || !insert(?d, '7')) { ret 5; }
+    paste(?d, "1a2\n3");
+    if (!str_equals(text(?d), "7123")) { ret 6; }
+    ret 0;
+}
