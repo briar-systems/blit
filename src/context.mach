@@ -10,6 +10,8 @@
 #
 # text comes from a glyph source (see blit.glyph), the built-in bitmap font
 # unless set_glyph_source swaps in another, laid out at the context's scale.
+# colors are emitted as authored unless set_srgb says the target encodes sRGB,
+# in which case they are converted to linear light first.
 #
 # the painter also carries a CPU clip stack and a local-origin offset. every quad
 # is shifted by the local origin into screen space, then clipped to the active
@@ -123,6 +125,7 @@ pub rec Run {
 # layers:        saved parent layers
 # font:          the glyph source, its glyph cache and its atlas
 # scale:         interface scale text is laid out and rasterised at, 1.0 by default
+# srgb:          1 if colors are converted to linear light for an sRGB target, else 0
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -169,6 +172,7 @@ pub rec Context {
     layers:        [16]u32;
     font:          font.Font;
     scale:         f32;
+    srgb:          u8;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -245,6 +249,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.ordinal       = 0;
     ctx.layer_sp      = 0;
     ctx.scale         = 1.0::f32;
+    ctx.srgb          = 0;
     ret err[allo.Error].ok{};
 }
 
@@ -542,7 +547,7 @@ fun compose(ctx: *Context) {
 pub fun image_at(ctx: *Context, tex: ptr, x0: f32, y0: f32, x1: f32, y1: f32,
     u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
     set_texture(ctx, tex);
-    emit(ctx, x0, y0, x1, y1, u0, v0, u1, v1, c);
+    emit(ctx, x0, y0, x1, y1, u0, v0, u1, v1, paint(ctx, c));
     set_texture(ctx, nil);
 }
 
@@ -820,6 +825,24 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
     record(ctx, draw.push_quad(?ctx.dl, nx0, ny0, nx1, ny1, nu0, nv0, nu1, nv1, c));
 }
 
+# a color as it is emitted: converted to linear light for an sRGB target
+fun paint(ctx: *Context, c: draw.Color) draw.Color {
+    if (ctx.srgb != 0) { ret draw.linear(c); }
+    ret c;
+}
+
+# say whether the target encodes sRGB on write
+#
+# with it on, every color passed to the painter (quads, text, image tints) is
+# taken as authored in sRGB and emitted in linear light, so the target's
+# encoding brings it back to what was authored. alpha is never converted.
+# ---
+# ctx: context
+# on:  1 for an sRGB-encoding target, 0 to emit colors as authored
+pub fun set_srgb(ctx: *Context, on: u8) {
+    ctx.srgb = on;
+}
+
 # draw text from another glyph source from now on
 #
 # every atlas page is cleared and must be uploaded again. call it between
@@ -876,7 +899,7 @@ pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     var wu: f32;
     var wv: f32;
     atlas.white_uv(?wu, ?wv);
-    emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, c);
+    emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, paint(ctx, c));
 }
 
 # emit one glyph with its pen at x on the baseline, sampling its atlas page
@@ -902,7 +925,7 @@ fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
 pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
     if (font.is_control(cp)) { ret; }
     val m:   gly.LineMetrics = font.line(?ctx.font, ctx.scale);
-    val adv: f32             = pen_glyph(ctx, cp, x, y + m.ascent, c);
+    val adv: f32             = pen_glyph(ctx, cp, x, y + m.ascent, paint(ctx, c));
 }
 
 # draw utf-8 text with its first line box's top-left at (x, y)
@@ -919,7 +942,7 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
     if (s == nil) { ret; }
     val m:    gly.LineMetrics = font.line(?ctx.font, ctx.scale);
     val lh:   f32             = gly.line_height(m);
-    val ink:  draw.Color      = c;
+    val ink:  draw.Color      = paint(ctx, c);
     val n:    usize           = str_len(s);
     var base: f32             = y + m.ascent;
     var px:   f32             = x;
@@ -1417,6 +1440,32 @@ test surface__nested_origins_unwind {
     if (ctx.lx != 0.0::f32 || ctx.ly != 0.0::f32)             { ret 9; }
     if (ctx.clip_x0 != 0.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 10; }
     if (ctx.org_sp != 0 || ctx.clip_sp != 0)                  { ret 11; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test srgb__painter_emits_linear_colors {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val grey: draw.Color = draw.rgba(0.5::f32, 0.5::f32, 0.5::f32, 0.5::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
+    set_srgb(?ctx, 1);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
+    text_at(?ctx, "A", 0.0::f32, 0.0::f32, grey);
+
+    val p:    *draw.Vert = draw_verts(?ctx);
+    val want: f32        = draw.srgb_to_linear(0.5::f32);
+    if (p[0].r != 0.5::f32)                   { ret 2; }
+    if (p[6].r != want || p[6].a != 0.5::f32) { ret 3; }
+    if (p[12].g != want)                      { ret 4; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
