@@ -1,9 +1,8 @@
 # per-frame input the consumer fills before calling widgets
 #
-# v0 covers the mouse only: position and primary button. the consumer writes
-# mx/my/down each frame; the context carries the previous frame's button state
-# into prev_down so press and release edges can be detected. extend with keys
-# and scroll later.
+# the mouse: position, primary button and wheel. the consumer writes
+# mx/my/down/wheel each frame; the context carries the previous frame's button
+# state into prev_down so press and release edges can be detected.
 
 # mouse input for a single frame
 # ---
@@ -11,11 +10,13 @@
 # my:        cursor y in pixels
 # down:      1 if the primary button is down this frame, else 0
 # prev_down: 1 if the primary button was down last frame, else 0
+# wheel:     vertical wheel travel this frame in pixels, positive when turned away from the user
 pub rec Input {
     mx:        f32;
     my:        f32;
     down:      u8;
     prev_down: u8;
+    wheel:     f32;
 }
 
 # 1 on the frame the primary button transitions from up to down

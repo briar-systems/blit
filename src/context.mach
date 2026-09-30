@@ -78,6 +78,27 @@ pub rec Run {
     count: usize;
 }
 
+# a screen edge a docked container attaches to
+pub tag Side: u8 {
+    left;
+    right;
+    top;
+    bottom;
+}
+
+# an axis-aligned rect in screen pixels, [x0, x1) x [y0, y1)
+# ---
+# x0: left edge
+# y0: top edge
+# x1: right edge
+# y1: bottom edge
+pub rec Area {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+}
+
 # immediate-mode UI state for one consumer
 # ---
 # dl:            draw list accumulated each frame
@@ -126,6 +147,8 @@ pub rec Run {
 # font:          the glyph source, its glyph cache and its atlas
 # scale:         interface scale text is laid out and rasterised at, 1.0 by default
 # srgb:          1 if colors are converted to linear light for an sRGB target, else 0
+# wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
+# free:          the screen area docked containers have not taken this frame
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -173,6 +196,8 @@ pub rec Context {
     font:          font.Font;
     scale:         f32;
     srgb:          u8;
+    wheel_taken:   u8;
+    free:          Area;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -217,6 +242,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.in.my        = 0.0::f32;
     ctx.in.down      = 0;
     ctx.in.prev_down = 0;
+    ctx.in.wheel     = 0.0::f32;
 
     ctx.sw            = 0.0::f32;
     ctx.sh            = 0.0::f32;
@@ -250,6 +276,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer_sp      = 0;
     ctx.scale         = 1.0::f32;
     ctx.srgb          = 0;
+    ctx.wheel_taken   = 0;
+    ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
     ret err[allo.Error].ok{};
 }
 
@@ -308,6 +336,9 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.page      = 0;
     ctx.run_start = 0;
     ctx.run_len   = 0;
+
+    ctx.wheel_taken = 0;
+    ctx.free        = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
 
     val done: hit.ClaimList = ctx.claims;
     ctx.claims = ctx.prior;
@@ -962,6 +993,48 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
             prev = cp;
         }
     }
+}
+
+# take a strip off an edge of the screen area docked containers have left
+#
+# the strip is clamped to what is left, and the area shrinks by it, so docks
+# carved in turn stack inward from the edges. at the root, local coordinates
+# are screen coordinates, so the strip can be drawn in directly.
+# ---
+# ctx:  context
+# side: the edge to take the strip from
+# size: strip width (left, right) or height (top, bottom) in pixels
+# ret:  the strip, in screen pixels
+pub fun carve(ctx: *Context, side: Side, size: f32) Area {
+    var r: Area = ctx.free;
+    if (sel side.left) {
+        r.x1        = minf(r.x0 + size, r.x1);
+        ctx.free.x0 = r.x1;
+    }
+    or (sel side.right) {
+        r.x0        = maxf(r.x1 - size, r.x0);
+        ctx.free.x1 = r.x0;
+    }
+    or (sel side.top) {
+        r.y1        = minf(r.y0 + size, r.y1);
+        ctx.free.y0 = r.y1;
+    }
+    or {
+        r.y0        = maxf(r.y1 - size, r.y0);
+        ctx.free.y1 = r.y0;
+    }
+    ret r;
+}
+
+# the part of the screen docked containers have not taken so far this frame
+#
+# read it after the docks to place what the docks surround, such as a world
+# view. floating windows and popups are not counted.
+# ---
+# ctx: context
+# ret: the free area, in screen pixels
+pub fun free_area(ctx: *Context) Area {
+    ret ctx.free;
 }
 
 # a scrolled, clipped local drawing region returned by begin_surface
