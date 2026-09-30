@@ -16,6 +16,7 @@ fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;
 fwd blit.hit;
+fwd blit.theme;
 fwd blit.context;
 fwd blit.widget;
 
