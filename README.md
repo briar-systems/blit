@@ -228,6 +228,26 @@ click is always the one visibly on top.
 - **Popups.** A press anywhere outside an open popup dismisses it (`Popup.dismissed`)
   and is consumed: it does not activate the widget underneath.
 
+## Images & grids
+
+blit draws textures it does not own. A consumer texture is named by an opaque
+`u64` handle, whatever the renderer understands (a GL texture name, an index
+into its own table). blit never creates, owns or binds one, it only passes the
+handle through to the draw list's spans. `0` is reserved for the atlas.
+
+- **Image.** `blit.draw.Image` is a handle, a source rect in uv and a filter.
+  `blit.draw.region(tex, tw, th, x, y, w, h, filter)` builds one from a rect in
+  texels, `whole(tex, filter)` covers the texture.
+- **Drawing.** `blit.context.image_at(?ctx, img, x0, y0, x1, y1, tint)` stretches
+  the region into a rect, clipped like any geometry with its uvs cut to match.
+  `blit.widget.image(?ctx, img, w, h)` places it at the layout cursor.
+- **Grids.** `blit.widget.Grid` is a row-major field of cells, each colored by
+  the consumer (`colors`) or by mapping `values` through a `Palette` of equal
+  steps from `lo` to `hi`. `grid_at` fills a rect with it and `grid` places it
+  at the cursor. Cells are solid quads on the atlas, so a small field needs no
+  texture. A large one is better uploaded as a texture and drawn with
+  `FILTER_NEAREST`.
+
 ## Rendering
 
 blit emits one vertex stream that draws both solid rectangles and text through
@@ -243,8 +263,15 @@ cell.
   has a transparent gutter, so linear filtering is safe. The built-in font at
   whole scales looks sharpest with nearest.
 - **Spans.** `run_count`/`run_at` split the draw list into spans that each
-  sample one texture: a consumer image (`tex`), or atlas page `page` when `tex`
-  is nil.
+  sample one texture, so every quad's texture is its span's. A `Run` is plain
+  integers: `tex` (u64), `page` (u32), `layer` (u32), `start` and `count`
+  (vertices, usize), `filter` (u32). When `tex` is `blit.draw.ATLAS` (0), bind atlas
+  page `page`. Otherwise `tex` is the consumer's own texture handle, passed
+  through untouched, and `filter` asks for `FILTER_NEAREST` (0) or
+  `FILTER_LINEAR` (1) sampling. On the atlas `filter` is always
+  `FILTER_NEAREST` and how to sample it stays the renderer's choice. Draw
+  spans in order, rebinding only when `tex`, `page` or `filter` differ from
+  the previous span.
 - **Color.** Colors are straight rgba as authored. When the target encodes sRGB
   on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
   in linear light, so the encoding brings it back to what was authored. Alpha is
