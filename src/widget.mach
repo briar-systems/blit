@@ -20,6 +20,11 @@
 # laid out in. a dock's body is a scroll region, which clips its column and
 # scrolls it by wheel and scrollbar when it is taller than the region, and a
 # section is a collapsible heading that groups the rows beneath it.
+#
+# every color and length a widget draws with comes from the context's theme
+# (see blit.theme), each length multiplied by the context's interface scale,
+# so a theme or a scale changes the whole interface and no widget holds a
+# color or a size of its own.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -31,98 +36,58 @@ use std.types.string.str;
 use blit.context;
 use blit.draw;
 use blit.input;
+use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
 
-# spacing between widgets and inside widget chrome, in pixels
-val PAD: f32 = 4.0;
-
-# slider handle width in pixels
-val HANDLE_W: f32 = 6.0;
-
-# scrollbar width in pixels
-val BAR_W: f32 = 6.0;
-
-# shortest scrollbar thumb in pixels
-val THUMB_MIN: f32 = 12.0;
-
 # the vertex handle of a container whose background could not be emitted
-pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
+pub val NO_VERTS: usize = context.NO_VERTS;
 
-# height of an interactive row (a line of text plus padding above and below)
+# the theme's space inside chrome, at the context's scale
+fun pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.pad);
+}
+
+# the theme's space between layout rows, at the context's scale
+fun gap(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.gap);
+}
+
+# the theme's corner radius, at the context's scale
+fun corner(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.corner);
+}
+
+# height of an interactive row: the theme's row height, grown to fit a line of
+# text with padding above and below
 fun row_h(ctx: *context.Context) f32 {
-    ret context.line_height(ctx) + PAD * 2.0::f32;
+    ret maxf(context.px(ctx, ctx.theme.row), context.line_height(ctx) + pad(ctx) * 2.0::f32);
 }
 
 # vertical space consumed by one text row, including the following gap
 pub fun text_row_height(ctx: *context.Context) f32 {
-    ret context.line_height(ctx) + PAD;
+    ret context.line_height(ctx) + gap(ctx);
 }
 
 # vertical space consumed by one control row, including the following gap
 pub fun control_row_height(ctx: *context.Context) f32 {
-    ret row_h(ctx) + PAD;
+    ret row_h(ctx) + gap(ctx);
 }
 
-# spacing between adjacent layout rows and around panel content
+# spacing between adjacent layout rows, at the context's theme and scale
+pub fun row_gap(ctx: *context.Context) f32 {
+    ret gap(ctx);
+}
+
+# spacing between adjacent layout rows in the default theme at scale 1.0
+#[deprecated("use row_gap(ctx), which follows the theme and scale")]
 pub fun layout_gap() f32 {
-    ret PAD;
+    ret theme.default().gap;
 }
 
-fun c_panel() draw.Color {
-    ret draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.85::f32);
-}
-
-fun c_text() draw.Color {
-    ret draw.rgba(0.92::f32, 0.92::f32, 0.95::f32, 1.0::f32);
-}
-
-fun c_btn() draw.Color {
-    ret draw.rgba(0.25::f32, 0.25::f32, 0.30::f32, 1.0::f32);
-}
-
-fun c_btn_hot() draw.Color {
-    ret draw.rgba(0.35::f32, 0.35::f32, 0.42::f32, 1.0::f32);
-}
-
-fun c_btn_active() draw.Color {
-    ret draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
-}
-
-fun c_track() draw.Color {
-    ret draw.rgba(0.15::f32, 0.15::f32, 0.18::f32, 1.0::f32);
-}
-
-fun c_handle() draw.Color {
-    ret draw.rgba(0.55::f32, 0.55::f32, 0.65::f32, 1.0::f32);
-}
-
-fun c_handle_active() draw.Color {
-    ret draw.rgba(0.78::f32, 0.78::f32, 0.92::f32, 1.0::f32);
-}
-
-fun c_check_fill() draw.Color {
-    ret draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 1.0::f32);
-}
-
-fun c_title() draw.Color {
-    ret draw.rgba(0.20::f32, 0.20::f32, 0.26::f32, 1.0::f32);
-}
-
-fun c_title_hot() draw.Color {
-    ret draw.rgba(0.28::f32, 0.28::f32, 0.36::f32, 1.0::f32);
-}
-
-fun c_window() draw.Color {
-    ret draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.95::f32);
-}
-
-fun c_dock() draw.Color {
-    ret draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
-}
-
-fun c_edge() draw.Color {
-    ret draw.rgba(0.20::f32, 0.20::f32, 0.25::f32, 1.0::f32);
+# a control-shaped fill: rounded to the theme's corner on every side
+fun face(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, c);
 }
 
 # clamp v to [lo, hi]
@@ -141,7 +106,7 @@ fun maxf(a: f32, b: f32) f32 {
 # drop the cursor to the next row, back at the panel's left edge
 fun advance(ctx: *context.Context, h: f32) {
     ctx.cx = ctx.ox;
-    ctx.cy = ctx.cy + h + PAD;
+    ctx.cy = ctx.cy + h + gap(ctx);
 }
 
 # claim a widget's rect and apply the hot/active rules to it
@@ -160,36 +125,6 @@ fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32)
     if (hov != 0)                               { ctx.hot = id; }
     if (hov != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
     ret hov;
-}
-
-# emit a zero-height background quad to grow later with grow_background
-# ---
-# ret: its vertex handle, or NO_VERTS if the quad was not emitted whole
-fun place_background(ctx: *context.Context, x0: f32, y0: f32, x1: f32, c: draw.Color) usize {
-    val before: usize = context.draw_count(ctx);
-    context.quad(ctx, x0, y0, x1, y0, c);
-    if (context.draw_count(ctx) != before + 6) { ret NO_VERTS; }
-    ret before;
-}
-
-# stretch a background placed by place_background over (x0,y0)-(x1,y1)
-fun grow_background(ctx: *context.Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32) {
-    if (handle == NO_VERTS)                   { ret; }
-    if (handle + 6 > context.draw_count(ctx)) { ret; }
-
-    val p: *draw.Vert = context.draw_verts(ctx);
-    p[handle + 0].x = x0;
-    p[handle + 0].y = y0;
-    p[handle + 1].x = x1;
-    p[handle + 1].y = y0;
-    p[handle + 2].x = x1;
-    p[handle + 2].y = y1;
-    p[handle + 3].x = x0;
-    p[handle + 3].y = y0;
-    p[handle + 4].x = x1;
-    p[handle + 4].y = y1;
-    p[handle + 5].x = x0;
-    p[handle + 5].y = y1;
 }
 
 # the handle begin_panel and begin_window return for their matching end
@@ -221,7 +156,7 @@ pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) Block {
 
     var b: Block;
     b.claim = context.reserve_claim(ctx, 0);
-    b.verts = place_background(ctx, x, y, x + w, c_panel());
+    b.verts = context.reserve_fill(ctx, x, y, x + w, corner(ctx), context.CORNERS_ALL, ctx.theme.panel);
     ret b;
 }
 
@@ -234,8 +169,8 @@ pub fun end_panel(ctx: *context.Context, b: Block) {
     val x0: f32 = ctx.ox;
     val y0: f32 = ctx.oy;
     val x1: f32 = ctx.ox + ctx.pw;
-    val y1: f32 = ctx.cy + PAD;
-    grow_background(ctx, b.verts, x0, y0, x1, y1);
+    val y1: f32 = ctx.cy + pad(ctx);
+    context.grow_fill(ctx, b.verts, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL);
     context.fill_claim(ctx, b.claim, x0, y0, x1, y1);
 }
 
@@ -244,7 +179,7 @@ pub fun end_panel(ctx: *context.Context, b: Block) {
 # ctx: context
 # s:   string to draw
 pub fun text(ctx: *context.Context, s: str) {
-    context.text_at(ctx, s, ctx.cx, ctx.cy, c_text());
+    context.text_at(ctx, s, ctx.cx, ctx.cy, ctx.theme.text);
     advance(ctx, context.line_height(ctx));
 }
 
@@ -271,15 +206,15 @@ pub fun button(ctx: *context.Context, label: str) bool {
         clicked = true;
     }
 
-    var bg: draw.Color = c_btn();
-    if (ctx.hot == id)    { bg = c_btn_hot(); }
-    if (ctx.active == id) { bg = c_btn_active(); }
-    context.quad(ctx, x0, y0, x1, y1, bg);
+    var bg: draw.Color = ctx.theme.control;
+    if (ctx.hot == id)    { bg = ctx.theme.control_hot; }
+    if (ctx.active == id) { bg = ctx.theme.control_on; }
+    face(ctx, x0, y0, x1, y1, bg);
 
     val tw: f32 = context.text_width(ctx, label);
     val tx: f32 = x0 + (ctx.pw - tw) / 2.0::f32;
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    context.text_at(ctx, label, tx, ty, c_text());
+    context.text_at(ctx, label, tx, ty, ctx.theme.text);
 
     advance(ctx, h);
     ret clicked;
@@ -300,7 +235,7 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val y1:  f32 = y0 + box;
 
     val tw:  f32 = context.text_width(ctx, label);
-    val rx1: f32 = bx1 + PAD + tw;
+    val rx1: f32 = bx1 + pad(ctx) + tw;
     val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
 
     var toggled: bool = false;
@@ -311,15 +246,16 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
         toggled = true;
     }
 
-    var bg: draw.Color = c_btn();
-    if (ctx.hot == id) { bg = c_btn_hot(); }
-    context.quad(ctx, x0, y0, bx1, y1, bg);
+    var bg: draw.Color = ctx.theme.control;
+    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
+    face(ctx, x0, y0, bx1, y1, bg);
     if (@state != 0) {
-        context.quad(ctx, x0 + PAD, y0 + PAD, bx1 - PAD, y1 - PAD, c_check_fill());
+        val in: f32 = pad(ctx);
+        face(ctx, x0 + in, y0 + in, bx1 - in, y1 - in, ctx.theme.accent);
     }
 
     val ty: f32 = y0 + (box - context.line_height(ctx)) / 2.0::f32;
-    context.text_at(ctx, label, bx1 + PAD, ty, c_text());
+    context.text_at(ctx, label, bx1 + pad(ctx), ty, ctx.theme.text);
 
     advance(ctx, box);
     ret toggled;
@@ -358,20 +294,21 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
         }
     }
 
-    context.quad(ctx, x0, y0, x1, y1, c_track());
+    face(ctx, x0, y0, x1, y1, ctx.theme.track);
 
     var t_out: f32 = 0.0::f32;
     if (hi != lo) { t_out = clampf((@v - lo) / (hi - lo), 0.0::f32, 1.0::f32); }
-    var span: f32 = (x1 - x0) - HANDLE_W;
+    val hw:   f32 = context.px(ctx, ctx.theme.handle_w);
+    var span: f32 = (x1 - x0) - hw;
     if (span < 0.0::f32) { span = 0.0::f32; }
     val hx: f32 = x0 + t_out * span;
 
-    var hc: draw.Color = c_handle();
-    if (ctx.active == id) { hc = c_handle_active(); }
-    context.quad(ctx, hx, y0, hx + HANDLE_W, y1, hc);
+    var hc: draw.Color = ctx.theme.handle;
+    if (ctx.active == id) { hc = ctx.theme.handle_on; }
+    face(ctx, hx, y0, hx + hw, y1, hc);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    context.text_at(ctx, label, x0 + PAD, ty, c_text());
+    context.text_at(ctx, label, x0 + pad(ctx), ty, ctx.theme.text);
 
     advance(ctx, h);
     ret changed;
@@ -444,7 +381,7 @@ pub fun begin_popup(ctx: *context.Context, open: u8, x: f32, y: f32, w: f32) Pop
     ctx.cx  = sx;
     ctx.cy  = sy;
     ctx.pw  = w;
-    p.verts = place_background(ctx, sx, sy, sx + w, c_window());
+    p.verts = context.reserve_fill(ctx, sx, sy, sx + w, corner(ctx), context.CORNERS_ALL, ctx.theme.window);
     ret p;
 }
 
@@ -459,8 +396,8 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
     val x0: f32 = ctx.ox;
     val y0: f32 = ctx.oy;
     val x1: f32 = ctx.ox + ctx.pw;
-    val y1: f32 = ctx.cy + PAD;
-    grow_background(ctx, p.verts, x0, y0, x1, y1);
+    val y1: f32 = ctx.cy + pad(ctx);
+    context.grow_fill(ctx, p.verts, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL);
     context.fill_claim(ctx, p.claim, x0, y0, x1, y1);
     context.pop_layer(ctx);
 
@@ -499,17 +436,17 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
         or                           { ctx.open_dropdown = id; }
     }
 
-    var bg: draw.Color = c_btn();
-    if (ctx.hot == id)           { bg = c_btn_hot(); }
-    if (ctx.open_dropdown == id) { bg = c_btn_active(); }
-    context.quad(ctx, x0, y0, x1, y1, bg);
+    var bg: draw.Color = ctx.theme.control;
+    if (ctx.hot == id)           { bg = ctx.theme.control_hot; }
+    if (ctx.open_dropdown == id) { bg = ctx.theme.control_on; }
+    face(ctx, x0, y0, x1, y1, bg);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    context.text_at(ctx, label, x0 + PAD, ty, c_text());
+    context.text_at(ctx, label, x0 + pad(ctx), ty, ctx.theme.text);
     if (@selected < count) {
         val cur: str = options[@selected];
         val cw:  f32 = context.text_width(ctx, cur);
-        context.text_at(ctx, cur, x1 - PAD - cw, ty, c_text());
+        context.text_at(ctx, cur, x1 - pad(ctx) - cw, ty, ctx.theme.text);
     }
 
     advance(ctx, h);
@@ -535,10 +472,10 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
                 changed           = 1;
             }
 
-            var obg: draw.Color = c_track();
-            if (ctx.hot == oid) { obg = c_btn_hot(); }
-            context.quad(ctx, ox0, oy0, ox1, oy1, obg);
-            context.text_at(ctx, options[i], ox0 + PAD, oy0 + (h - context.line_height(ctx)) / 2.0::f32, c_text());
+            var obg: draw.Color = ctx.theme.track;
+            if (ctx.hot == oid) { obg = ctx.theme.control_hot; }
+            face(ctx, ox0, oy0, ox1, oy1, obg);
+            context.text_at(ctx, options[i], ox0 + pad(ctx), oy0 + (h - context.line_height(ctx)) / 2.0::f32, ctx.theme.text);
 
             advance(ctx, h);
         }
@@ -633,15 +570,17 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
         ctx.drag_off_y = ctx.in.my - win.y;
     }
 
-    var tbg: draw.Color = c_title();
-    if (ctx.hot == drag_id || ctx.hot == col_id) { tbg = c_title_hot(); }
-    context.quad(ctx, win.x, win.y, win.x + win.w, win.y + th, tbg);
+    var tbg: draw.Color = ctx.theme.header;
+    if (ctx.hot == drag_id || ctx.hot == col_id) { tbg = ctx.theme.header_hot; }
+    var ends: u8 = context.CORNERS_ALL;
+    if (win.open != 0) { ends = context.CORNERS_TOP; }
+    context.fill(ctx, win.x, win.y, win.x + win.w, win.y + th, corner(ctx), ends, tbg);
 
     val gy:  f32 = win.y + (th - context.line_height(ctx)) / 2.0::f32;
     var gch: u32 = '+';
     if (win.open != 0) { gch = '-'; }
-    context.glyph(ctx, gch, win.x + PAD, gy, c_text());
-    context.text_at(ctx, win.title, win.x + th + PAD, gy, c_text());
+    context.glyph(ctx, gch, win.x + pad(ctx), gy, ctx.theme.text_dim);
+    context.text_at(ctx, win.title, win.x + th + pad(ctx), gy, ctx.theme.text);
 
     if (win.open == 0) { ret b; }
 
@@ -651,7 +590,7 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     ctx.cy = win.y + th;
     ctx.pw = win.w;
 
-    b.verts = place_background(ctx, win.x, win.y + th, win.x + win.w, c_window());
+    b.verts = context.reserve_fill(ctx, win.x, win.y + th, win.x + win.w, corner(ctx), context.CORNERS_BOTTOM, ctx.theme.window);
     ret b;
 }
 
@@ -667,8 +606,8 @@ pub fun end_window(ctx: *context.Context, win: *Window, b: Block) {
     val x1: f32 = win.x + win.w;
     var y1: f32 = win.y + th;
     if (win.open != 0) {
-        y1 = ctx.cy + PAD;
-        grow_background(ctx, b.verts, x0, win.y + th, x1, y1);
+        y1 = ctx.cy + pad(ctx);
+        context.grow_fill(ctx, b.verts, x0, win.y + th, x1, y1, corner(ctx), context.CORNERS_BOTTOM);
     }
     context.fill_claim(ctx, b.claim, x0, win.y, x1, y1);
 }
@@ -755,7 +694,7 @@ pub fun begin_scroll(ctx: *context.Context, s: *Scroll, h: f32) ScrollArea {
     ctx.cx = 0.0::f32;
     ctx.cy = 0.0::f32;
     ctx.pw = r.w;
-    if (s.content > r.h) { ctx.pw = maxf(r.w - BAR_W - PAD, 0.0::f32); }
+    if (s.content > r.h) { ctx.pw = maxf(r.w - context.px(ctx, ctx.theme.bar_w) - pad(ctx), 0.0::f32); }
     ret r;
 }
 
@@ -788,9 +727,9 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     s.offset = clampf(s.offset, 0.0::f32, most);
 
     if (most > 0.0::f32) {
-        val tx0:     f32 = r.x + r.w - BAR_W;
+        val tx0:     f32 = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
         val tx1:     f32 = r.x + r.w;
-        val thumb_h: f32 = clampf(r.h * r.h / s.content, THUMB_MIN, r.h);
+        val thumb_h: f32 = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
         val travel:  f32 = r.h - thumb_h;
         val my:      f32 = ctx.in.my - ctx.ly;
 
@@ -802,10 +741,10 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
         val hov: u8  = interact(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h);
         if (hov != 0 && input.pressed(ctx.in) != 0) { ctx.drag_off_y = my - ty; }
 
-        var tc: draw.Color = c_handle();
-        if (ctx.active == r.thumb) { tc = c_handle_active(); }
-        context.quad(ctx, tx0, r.y, tx1, r.y + r.h, c_track());
-        context.quad(ctx, tx0, ty, tx1, ty + thumb_h, tc);
+        var tc: draw.Color = ctx.theme.handle;
+        if (ctx.active == r.thumb) { tc = ctx.theme.handle_on; }
+        face(ctx, tx0, r.y, tx1, r.y + r.h, ctx.theme.track);
+        face(ctx, tx0, ty, tx1, ty + thumb_h, tc);
     }
 
     advance(ctx, r.h);
@@ -834,15 +773,15 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
         or              { @open = 0; }
     }
 
-    var bg: draw.Color = c_title();
-    if (ctx.hot == id) { bg = c_title_hot(); }
-    context.quad(ctx, x0, y0, x1, y1, bg);
+    var bg: draw.Color = ctx.theme.header;
+    if (ctx.hot == id) { bg = ctx.theme.header_hot; }
+    face(ctx, x0, y0, x1, y1, bg);
 
     val gy:  f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
     var gch: u32 = '+';
     if (@open != 0) { gch = '-'; }
-    context.glyph(ctx, gch, x0 + PAD, gy, c_text());
-    context.text_at(ctx, title, x0 + h + PAD, gy, c_text());
+    context.glyph(ctx, gch, x0 + pad(ctx), gy, ctx.theme.text_dim);
+    context.text_at(ctx, title, x0 + h + pad(ctx), gy, ctx.theme.text);
 
     advance(ctx, h);
     ret @open != 0;
@@ -904,18 +843,21 @@ pub fun begin_dock(ctx: *context.Context, d: *Dock) DockArea {
     r.claim = context.reserve_claim(ctx, 0);
     context.fill_claim(ctx, r.claim, a.x0, a.y0, a.x1, a.y1);
 
-    context.quad(ctx, a.x0, a.y0, a.x1, a.y1, c_dock());
-    if (sel d.side.left)  { context.quad(ctx, a.x1 - 1.0::f32, a.y0, a.x1, a.y1, c_edge()); }
-    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + 1.0::f32, a.y1, c_edge()); }
-    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - 1.0::f32, a.x1, a.y1, c_edge()); }
-    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + 1.0::f32, c_edge()); }
+    val ew: f32        = context.px(ctx, ctx.theme.edge_w);
+    val ec: draw.Color = ctx.theme.edge;
+    context.quad(ctx, a.x0, a.y0, a.x1, a.y1, ctx.theme.dock);
+    if (sel d.side.left)  { context.quad(ctx, a.x1 - ew, a.y0, a.x1, a.y1, ec); }
+    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + ew, a.y1, ec); }
+    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - ew, a.x1, a.y1, ec); }
+    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + ew, ec); }
 
-    ctx.ox = a.x0 + PAD;
-    ctx.oy = a.y0 + PAD;
+    val in: f32 = pad(ctx);
+    ctx.ox = a.x0 + in;
+    ctx.oy = a.y0 + in;
     ctx.cx = ctx.ox;
     ctx.cy = ctx.oy;
-    ctx.pw = maxf(a.x1 - a.x0 - PAD * 2.0::f32, 0.0::f32);
-    r.body = begin_scroll(ctx, ?d.scroll, a.y1 - a.y0 - PAD * 2.0::f32);
+    ctx.pw = maxf(a.x1 - a.x0 - in * 2.0::f32, 0.0::f32);
+    r.body = begin_scroll(ctx, ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
     ret r;
 }
 
@@ -1115,10 +1057,10 @@ test dropdown__open_overlays_later_widgets {
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
     # the layout continues right under the header
-    if (ctx.cy != row_h(?ctx) + PAD) { ret 2; }
-    if (ctx.cx != 0.0::f32)          { ret 3; }
-    if (ctx.pw != 100.0::f32)        { ret 4; }
-    if (ctx.layer != 0)              { ret 5; }
+    if (ctx.cy != control_row_height(?ctx)) { ret 2; }
+    if (ctx.cx != 0.0::f32)                 { ret 3; }
+    if (ctx.pw != 100.0::f32)               { ret 4; }
+    if (ctx.layer != 0)                     { ret 5; }
     context.end(?ctx);
 
     val freed: err[allo.Error] = context.free(?ctx);
@@ -1741,6 +1683,77 @@ test scroll__thumb_drags_and_wheel_passes_buttons {
     frame_scroll(?ctx, input_at(97.0::f32, 1.0::f32, 1), ?s);
     frame_scroll(?ctx, input_at(97.0::f32, 90.0::f32, 1), ?s);
     if (s.offset != 300.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test scale__doubles_metrics_text_and_hit_rects {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    context.set_scale(?ctx, 2.0::f32);
+    if (context.line_height(?ctx) != 16.0::f32)      { ret 2; }
+    if (context.text_width(?ctx, "ab") != 32.0::f32) { ret 3; }
+    if (control_row_height(?ctx) != 40.0::f32)       { ret 4; }
+    if (text_row_height(?ctx) != 24.0::f32)          { ret 5; }
+    if (row_gap(?ctx) != 8.0::f32)                   { ret 6; }
+
+    var opts: [3]str;
+    opts[0] = "a";
+    opts[1] = "bb";
+    opts[2] = "ccc";
+    var picked: usize = 0;
+
+    # the header spans y [0, 32) and its face ends there
+    frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 0), ?picked, ?opts[0]);
+    if (vert_at(?ctx, 0.0::f32, 32.0::f32) >= context.draw_count(?ctx)) { ret 7; }
+    frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 1), ?picked, ?opts[0]);
+    frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 0), ?picked, ?opts[0]);
+    if (ctx.open_dropdown != 1) { ret 8; }
+
+    # the second option row spans y [80, 112), twice its place at scale 1.0
+    frame_dropdown(?ctx, input_at(10.0::f32, 96.0::f32, 1), ?picked, ?opts[0]);
+    if (frame_dropdown(?ctx, input_at(10.0::f32, 96.0::f32, 0), ?picked, ?opts[0]) != 1) { ret 9; }
+    if (picked != 1)                                                                     { ret 10; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test theme__drives_colors_and_corners {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var t: theme.Theme = theme.default();
+    t.control = draw.rgba(0.9::f32, 0.1::f32, 0.1::f32, 1.0::f32);
+    t.corner  = 4.0::f32;
+    context.set_theme(?ctx, t);
+    if (context.theme_of(?ctx).corner != 4.0::f32) { ret 2; }
+
+    # the button's rounded face: its body starts 4 down, in the theme's control color
+    frame_button(?ctx, input_at(150.0::f32, 150.0::f32, 0));
+    val p:     *draw.Vert = context.draw_verts(?ctx);
+    val n:     usize      = context.draw_count(?ctx);
+    var faced: u8         = 0;
+    var i:     usize      = 0;
+    for (i < n) {
+        if (p[i].x == 0.0::f32 && p[i].y == 4.0::f32 && p[i].r == 0.9::f32) { faced = 1; }
+        i = i + 1;
+    }
+    if (faced == 0) { ret 3; }
+    # the panel's grown background body ends 4 above its bottom at 24
+    if (vert_at(?ctx, 0.0::f32, 20.0::f32) >= n) { ret 4; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
