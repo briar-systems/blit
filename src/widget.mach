@@ -1,5 +1,10 @@
-# the widgets: panel, window, popup, dock, scroll region, section, text, button,
-# checkbox, slider, dropdown, image, grid, text field
+# the widgets: panel, window, popup, dock, scroll region, section, text, note,
+# button, button rows and grids, segmented choice, checkbox, toggle, slider,
+# dropdown, list, image, grid, text field
+#
+# the layout helpers place rows by hand: space and advance move the cursor
+# down, cell_x0 and cell_x1 split the column into equal cells for widgets that
+# take a rect (button_at), and begin_columns lays whole widgets side by side.
 #
 # each widget places itself at the layout cursor, advances the cursor for the
 # next one, emits its geometry through the context painter, and claims its
@@ -36,6 +41,7 @@ use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use blit.context;
 use blit.draw;
@@ -109,10 +115,136 @@ fun maxf(a: f32, b: f32) f32 {
     ret b;
 }
 
-# drop the cursor to the next row, back at the panel's left edge
-fun advance(ctx: *context.Context, h: f32) {
+# the smaller of two f32 values
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# drop the cursor past a row h tall and the gap below it, back at the column's
+# left edge
+#
+# every widget ends with this. call it after placing a row by hand, such as
+# cells of button_at.
+# ---
+# ctx: context
+# h:   the row's height in pixels
+pub fun advance(ctx: *context.Context, h: f32) {
     ctx.cx = ctx.ox;
     ctx.cy = ctx.cy + h + gap(ctx);
+}
+
+# leave h pixels of vertical space in the column
+# ---
+# ctx: context
+# h:   space in pixels, context.px scales an authored length to match
+pub fun space(ctx: *context.Context, h: f32) {
+    ctx.cx = ctx.ox;
+    ctx.cy = ctx.cy + h;
+}
+
+# the width of one of n equal cells across w pixels, g pixels between them
+fun cell_width(w: f32, g: f32, n: usize) f32 {
+    if (n == 0) { ret 0.0::f32; }
+    ret maxf((w - g * (n - 1)::f32) / n::f32, 0.0::f32);
+}
+
+# the left edge of cell i of n equal cells across w pixels from x
+fun cell_left(x: f32, w: f32, g: f32, i: usize, n: usize) f32 {
+    ret x + i::f32 * (cell_width(w, g, n) + g);
+}
+
+# the left edge of cell i of n equal cells across the column, with the theme's
+# gap between cells
+# ---
+# ctx: context
+# i:   the cell, from 0 at the left
+# n:   how many cells share the column
+# ret: the cell's left x in local pixels
+pub fun cell_x0(ctx: *context.Context, i: usize, n: usize) f32 {
+    ret cell_left(ctx.ox, ctx.pw, gap(ctx), i, n);
+}
+
+# the right edge of cell i of n equal cells across the column
+# ---
+# ctx: context
+# i:   the cell, from 0 at the left
+# n:   how many cells share the column
+# ret: the cell's right x in local pixels
+pub fun cell_x1(ctx: *context.Context, i: usize, n: usize) f32 {
+    ret cell_x0(ctx, i, n) + cell_width(ctx.pw, gap(ctx), n);
+}
+
+# the handle begin_columns returns for next_column and end_columns
+# ---
+# n:      how many columns share the row
+# i:      the column being laid out
+# top:    the cursor y the columns start at
+# bottom: the lowest cursor y a finished column reached
+# ox:     the parent layout's origin x, restored by end_columns
+# pw:     the parent layout's width
+pub rec Columns {
+    n:      usize;
+    i:      usize;
+    top:    f32;
+    bottom: f32;
+    ox:     f32;
+    pw:     f32;
+}
+
+# narrow the layout to the first of n equal columns starting at the cursor
+#
+# widgets placed until next_column lay out in that column. next_column moves
+# to the next one, back at the top, and end_columns restores the parent
+# column with the cursor below the tallest. pair it with end_columns.
+# ---
+# ctx: context
+# n:   how many columns share the row, at least 1
+# ret: a handle for next_column and end_columns
+pub fun begin_columns(ctx: *context.Context, n: usize) Columns {
+    var c: Columns;
+    c.n      = n;
+    c.i      = 0;
+    c.top    = ctx.cy;
+    c.bottom = ctx.cy;
+    c.ox     = ctx.ox;
+    c.pw     = ctx.pw;
+    if (c.n == 0) { c.n = 1; }
+    enter_column(ctx, ?c);
+    ret c;
+}
+
+# lay out column c.i of the parent's row
+fun enter_column(ctx: *context.Context, c: *Columns) {
+    val x0: f32 = cell_left(c.ox, c.pw, gap(ctx), c.i, c.n);
+    ctx.ox = x0;
+    ctx.cx = x0;
+    ctx.cy = c.top;
+    ctx.pw = cell_width(c.pw, gap(ctx), c.n);
+}
+
+# move to the next column, back at the columns' top
+#
+# past the last column it stays in the last one.
+# ---
+# ctx: context
+# c:   the handle begin_columns returned
+pub fun next_column(ctx: *context.Context, c: *Columns) {
+    c.bottom = maxf(c.bottom, ctx.cy);
+    if (c.i + 1 < c.n) { c.i = c.i + 1; }
+    enter_column(ctx, c);
+}
+
+# restore the parent column, with the cursor below the tallest column
+# ---
+# ctx: context
+# c:   the handle begin_columns returned
+pub fun end_columns(ctx: *context.Context, c: *Columns) {
+    c.bottom = maxf(c.bottom, ctx.cy);
+    ctx.ox   = c.ox;
+    ctx.cx   = c.ox;
+    ctx.pw   = c.pw;
+    ctx.cy   = c.bottom;
 }
 
 # claim a widget's rect and apply the hot/active rules to it
@@ -189,6 +321,115 @@ pub fun text(ctx: *context.Context, s: str) {
     advance(ctx, context.line_height(ctx));
 }
 
+# where the line of s starting at byte i ends when wrapped to w pixels
+#
+# a line breaks at a newline, else after the last space that keeps it within
+# w, else before the codepoint that would overflow, so a word wider than the
+# column is split rather than drawn past it. a line always takes at least one
+# codepoint.
+# ---
+# ret: the byte the line ends at, with @resume set to where the next line starts
+fun wrap_line(ctx: *context.Context, s: str, n: usize, i: usize, w: f32, resume: *usize) usize {
+    val f:     *font.Font = context.font_of(ctx);
+    var width: f32        = 0.0::f32;
+    var prev:  u32        = 0;
+    var space: usize      = n;
+    var j:     usize      = i;
+    for (j < n) {
+        var cp:   u32   = 0;
+        val used: usize = font.next(s, j, n, ?cp);
+        if (cp == font.NEWLINE) {
+            @resume = j + used;
+            ret j;
+        }
+        val adv: f32 = font.advance(f, prev, cp, ctx.scale);
+        if (width + adv > w && j > i) {
+            if (cp == ' ') {
+                @resume = j + used;
+                ret j;
+            }
+            if (space < n) {
+                @resume = space + 1;
+                ret space;
+            }
+            @resume = j;
+            ret j;
+        }
+        if (cp == ' ') { space = j; }
+        width = width + adv;
+        prev  = cp;
+        j     = j + used;
+    }
+    @resume = n;
+    ret n;
+}
+
+# dim text wrapped at spaces to the column's width, and advance past it
+#
+# a newline starts a new line, and a word wider than the column breaks where
+# it overflows.
+# ---
+# ctx: context
+# s:   utf-8 text
+pub fun note(ctx: *context.Context, s: str) {
+    val lh: f32   = context.line_height(ctx);
+    var n:  usize = 0;
+    if (s != nil) { n = str_len(s); }
+    var y:     f32   = ctx.cy;
+    var i:     usize = 0;
+    var lines: usize = 0;
+    for (i < n || lines == 0) {
+        var next: usize = n;
+        val end:  usize = wrap_line(ctx, s, n, i, ctx.pw, ?next);
+        if (end > i) { context.text_span(ctx, ?s[i], end - i, ctx.cx, y, ctx.theme.text_dim); }
+        y     = y + lh;
+        lines = lines + 1;
+        i     = next;
+    }
+    advance(ctx, y - ctx.cy);
+}
+
+# a clickable button filling a rect, with a centered label
+#
+# the rect is in local coordinates, so rows and grids of buttons place it
+# with cell_x0 and cell_x1. it does not move the layout cursor. returns true
+# on the frame the button is released while hovered, after having been
+# pressed on it.
+# ---
+# ctx:   context
+# label: button text
+# x0:    left x in pixels
+# y0:    top y in pixels
+# x1:    right x in pixels
+# y1:    bottom y in pixels
+# on:    true to draw the button chosen, in the theme's accent
+# ret:   true if the button was clicked this frame
+pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, y1: f32, on: bool) bool {
+    val id:  u64 = context.next_id(ctx);
+    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
+
+    var clicked: bool = false;
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+        clicked = true;
+    }
+
+    var bg:  draw.Color = ctx.theme.control;
+    var ink: draw.Color = ctx.theme.text;
+    if (ctx.hot == id)    { bg = ctx.theme.control_hot; }
+    if (ctx.active == id) { bg = ctx.theme.control_on; }
+    if (on) {
+        bg  = ctx.theme.accent;
+        ink = ctx.theme.accent_text;
+    }
+    face(ctx, x0, y0, x1, y1, bg);
+
+    val tw: f32 = context.text_width(ctx, label);
+    val tx: f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
+    val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
+    context.text_at(ctx, label, tx, ty, ink);
+    ret clicked;
+}
+
 # a full-width clickable button with a centered label
 #
 # returns true on the frame the button is released while hovered, after having
@@ -198,32 +439,59 @@ pub fun text(ctx: *context.Context, s: str) {
 # label: button text
 # ret:   true if the button was clicked this frame
 pub fun button(ctx: *context.Context, label: str) bool {
-    val id: u64 = context.next_id(ctx);
-    val x0: f32 = ctx.cx;
-    val y0: f32 = ctx.cy;
-    val h:  f32 = row_h(ctx);
-    val x1: f32 = ctx.cx + ctx.pw;
-    val y1: f32 = y0 + h;
-
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-
-    var clicked: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
-        clicked = true;
-    }
-
-    var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id)    { bg = ctx.theme.control_hot; }
-    if (ctx.active == id) { bg = ctx.theme.control_on; }
-    face(ctx, x0, y0, x1, y1, bg);
-
-    val tw: f32 = context.text_width(ctx, label);
-    val tx: f32 = x0 + (ctx.pw - tw) / 2.0::f32;
-    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    context.text_at(ctx, label, tx, ty, ctx.theme.text);
-
+    val h:       f32  = row_h(ctx);
+    val clicked: bool = button_at(ctx, label, ctx.cx, ctx.cy, ctx.cx + ctx.pw, ctx.cy + h, false);
     advance(ctx, h);
     ret clicked;
+}
+
+# a grid of n buttons, cols to a row, filling the column
+#
+# every button takes an id whatever is clicked, so later ids stay stable.
+# ---
+# ctx:    context
+# labels: pointer to an array of n labels (pass ?labels[0])
+# n:      how many buttons
+# cols:   buttons to a row, at least 1
+# on:     the button drawn chosen, n for none
+# ret:    the index clicked this frame, n for none
+pub fun button_grid(ctx: *context.Context, labels: *str, n: usize, cols: usize, on: usize) usize {
+    var per: usize = cols;
+    if (per == 0) { per = 1; }
+    val h:   f32   = row_h(ctx);
+    var got: usize = n;
+    var i:   usize = 0;
+    for (i < n) {
+        val c: usize = i % per;
+        if (button_at(ctx, labels[i], cell_x0(ctx, c, per), ctx.cy, cell_x1(ctx, c, per), ctx.cy + h, i == on)) { got = i; }
+        if (c + 1 == per || i + 1 == n)                                                                         { advance(ctx, h); }
+        i = i + 1;
+    }
+    ret got;
+}
+
+# a row of n buttons sharing the column equally
+# ---
+# ctx:    context
+# labels: pointer to an array of n labels (pass ?labels[0])
+# n:      how many buttons
+# ret:    the index clicked this frame, n for none
+pub fun buttons(ctx: *context.Context, labels: *str, n: usize) usize {
+    ret button_grid(ctx, labels, n, n, n);
+}
+
+# a row choosing one of n options, the chosen one drawn in the accent
+# ---
+# ctx:    context
+# labels: pointer to an array of n labels (pass ?labels[0])
+# n:      how many options
+# choice: pointer to the chosen index, updated in place
+# ret:    true if the choice changed this frame
+pub fun segmented(ctx: *context.Context, labels: *str, n: usize, choice: *usize) bool {
+    val got: usize = button_grid(ctx, labels, n, n, @choice);
+    if (got >= n || got == @choice) { ret false; }
+    @choice = got;
+    ret true;
 }
 
 # a labeled toggle that flips @state when clicked
@@ -267,6 +535,64 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     ret toggled;
 }
 
+# a labeled on/off switch across the column that flips @state when clicked
+#
+# the label sits on the left and the switch on the right, its knob at the
+# right end on an accent track when on. the whole row takes the click.
+# ---
+# ctx:   context
+# label: text drawn on the left
+# state: pointer to the 0/1 switch state, updated in place
+# ret:   true if the state changed this frame
+pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
+    val id: u64 = context.next_id(ctx);
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+    val h:  f32 = row_h(ctx);
+    val x1: f32 = ctx.cx + ctx.pw;
+    val y1: f32 = y0 + h;
+
+    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+
+    var flipped: bool = false;
+    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+        var nv: u8 = 1;
+        if (@state != 0) { nv = 0; }
+        @state  = nv;
+        flipped = true;
+    }
+
+    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
+    context.text_at(ctx, label, x0, ty, ctx.theme.text);
+
+    # the switch is a track twice as wide as it is tall, inset from the row by pad
+    val in: f32        = pad(ctx);
+    val sh: f32        = maxf(h - in, 0.0::f32);
+    val sw: f32        = sh * 2.0::f32;
+    val sx: f32        = x1 - sw;
+    val sy: f32        = y0 + (h - sh) / 2.0::f32;
+    var tc: draw.Color = ctx.theme.track;
+    var kc: draw.Color = ctx.theme.handle;
+    if (ctx.hot == id) {
+        tc = ctx.theme.control_hot;
+        kc = ctx.theme.handle_on;
+    }
+    if (@state != 0) {
+        tc = ctx.theme.accent;
+        kc = ctx.theme.accent_text;
+    }
+    face(ctx, sx, sy, sx + sw, sy + sh, tc);
+
+    val ki: f32 = in / 2.0::f32;
+    val k:  f32 = maxf(sh - ki * 2.0::f32, 0.0::f32);
+    var kx: f32 = sx + ki;
+    if (@state != 0) { kx = sx + sw - ki - k; }
+    face(ctx, kx, sy + ki, kx + k, sy + ki + k, kc);
+
+    advance(ctx, h);
+    ret flipped;
+}
+
 # a horizontal slider mapping @v linearly onto [lo, hi]
 #
 # while the handle is held, @v tracks the cursor's x within the track, wherever
@@ -279,6 +605,25 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
 # hi:    maximum value (right end)
 # ret:   true if the value changed this frame
 pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) bool {
+    ret slider(ctx, label, nil, v, lo, hi);
+}
+
+# a horizontal slider mapping @v linearly onto [lo, hi], with a reading of its
+# value beside the label
+#
+# like slider_f, and the reading, which the caller formats from @v however it
+# likes (a unit, a percentage, "off"), is drawn dim at the right end of the
+# track. format it before the call from the value as it stands, and the next
+# frame shows a drag's result.
+# ---
+# ctx:     context
+# label:   slider text, drawn on the left
+# reading: the value as text, drawn on the right, nil for none
+# v:       pointer to the value, updated in place while dragging
+# lo:      minimum value (left end)
+# hi:      maximum value (right end)
+# ret:     true if the value changed this frame
+pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32, hi: f32) bool {
     val id: u64 = context.next_id(ctx);
     val x0: f32 = ctx.cx;
     val y0: f32 = ctx.cy;
@@ -315,6 +660,10 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
     context.text_at(ctx, label, x0 + pad(ctx), ty, ctx.theme.text);
+    if (reading != nil) {
+        val rw: f32 = context.text_width(ctx, reading);
+        context.text_at(ctx, reading, x1 - pad(ctx) - rw, ty, ctx.theme.text_dim);
+    }
 
     advance(ctx, h);
     ret changed;
@@ -1039,18 +1388,62 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
         or              { @open = 0; }
     }
 
-    var bg: draw.Color = ctx.theme.header;
-    if (ctx.hot == id) { bg = ctx.theme.header_hot; }
+    var bg:  draw.Color = ctx.theme.header;
+    var ink: draw.Color = ctx.theme.text_dim;
+    if (ctx.hot == id) {
+        bg  = ctx.theme.header_hot;
+        ink = ctx.theme.text;
+    }
     face(ctx, x0, y0, x1, y1, bg);
 
-    val gy:  f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    var gch: u32 = '+';
-    if (@open != 0) { gch = '-'; }
-    context.glyph(ctx, gch, x0 + pad(ctx), gy, ctx.theme.text_dim);
-    context.text_at(ctx, title, x0 + h + pad(ctx), gy, ctx.theme.text);
+    val lh: f32 = context.line_height(ctx);
+    val gy: f32 = y0 + (h - lh) / 2.0::f32;
+    caret(ctx, x0 + pad(ctx), gy, lh, @open != 0, ink);
+    context.text_at(ctx, title, x0 + pad(ctx) * 2.0::f32 + lh, gy, ctx.theme.text);
 
     advance(ctx, h);
     ret @open != 0;
+}
+
+# a caret filling the k-pixel square at (x, y), pointing right when closed
+# and down when open
+#
+# the triangle is one quad per pixel row, like a rounded corner, so it needs
+# nothing of the renderer and clips like any quad.
+# ---
+# ctx:  context
+# x:    square left in local pixels
+# y:    square top in local pixels
+# k:    square side in pixels
+# open: true to point down
+# c:    fill color
+fun caret(ctx: *context.Context, x: f32, y: f32, k: f32, open: bool, c: draw.Color) {
+    if (k <= 0.0::f32) { ret; }
+    # closed: a vertical edge k tall at the quarter, its tip half as far right.
+    # open:   a horizontal edge k wide at the quarter, its tip half as far down.
+    val depth: f32 = k / 2.0::f32;
+    val edge:  f32 = k / 4.0::f32;
+    var span:  f32 = k;
+    if (open) { span = depth; }
+    var rows: usize = span::usize;
+    if (rows::f32 < span) { rows = rows + 1; }
+    var r: usize = 0;
+    for (r < rows) {
+        val a: f32 = r::f32;
+        val b: f32 = minf(a + 1.0::f32, span);
+        val t: f32 = (a + b) / 2.0::f32 / span;
+        if (open) {
+            val half: f32 = k * (1.0::f32 - t) / 2.0::f32;
+            context.quad(ctx, x + k / 2.0::f32 - half, y + edge + a, x + k / 2.0::f32 + half, y + edge + b, c);
+        }
+        or {
+            var off: f32 = t - 0.5::f32;
+            if (off < 0.0::f32) { off = 0.0::f32 - off; }
+            val len: f32 = depth * (1.0::f32 - off * 2.0::f32);
+            context.quad(ctx, x + edge, y + a, x + edge + len, y + b, c);
+        }
+        r = r + 1;
+    }
 }
 
 # consumer-owned state of a panel docked to a screen edge
@@ -1139,6 +1532,89 @@ pub fun end_dock(ctx: *context.Context, d: *Dock, r: DockArea) {
     ctx.cx = r.cx;
     ctx.cy = r.cy;
     ctx.pw = r.pw;
+}
+
+# consumer-owned state of a list, kept across frames
+# ---
+# selected: index of the selected item, at least the item count for none
+# scroll:   the list's scroll state
+pub rec List {
+    selected: usize;
+    scroll:   Scroll;
+}
+
+# an ascii letter folded to lower case, any other byte unchanged
+fun fold(b: u8) u8 {
+    if (b >= 'A' && b <= 'Z') { ret b + 32; }
+    ret b;
+}
+
+# whether s holds query, ignoring ascii case; an empty or nil query matches all
+fun matches(s: str, query: str) bool {
+    if (query == nil || query[0] == 0) { ret true; }
+    if (s == nil)                      { ret false; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        var j: usize = 0;
+        for (query[j] != 0 && s[i + j] != 0 && fold(s[i + j]) == fold(query[j])) { j = j + 1; }
+        if (query[j] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a scrolling list of items, h pixels tall, one of which can be selected
+#
+# only the items holding query (ignoring ascii case) are shown, so a search
+# box the caller keeps narrows the list. clicking a shown item selects it and
+# the selected one is drawn in the accent. the list scrolls by the wheel and a
+# scrollbar like any scroll region. every item takes an id whether or not it
+# is shown, so an item keeps its hit identity as the query changes and later
+# ids stay stable. items scrolled out of view are skipped rather than emitted.
+# ---
+# ctx:   context
+# l:     the list's state
+# items: pointer to an array of count item strings (pass ?items[0])
+# count: number of items
+# query: text an item must hold to be shown, nil or empty for all
+# h:     list height in pixels
+# ret:   true if the selection changed this frame
+pub fun list(ctx: *context.Context, l: *List, items: *str, count: usize, query: str, h: f32) bool {
+    val r:       ScrollArea = begin_scroll(ctx, ?l.scroll, h);
+    val rh:      f32        = row_h(ctx);
+    val top:     f32        = l.scroll.offset;
+    var changed: bool       = false;
+    var i:       usize      = 0;
+    for (i < count) {
+        val id: u64 = context.next_id(ctx);
+        if (matches(items[i], query)) {
+            val x0: f32 = ctx.cx;
+            val y0: f32 = ctx.cy;
+            val x1: f32 = ctx.cx + ctx.pw;
+            val y1: f32 = y0 + rh;
+            if (y1 > top && y0 < top + r.h) {
+                val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+                if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0 && l.selected != i) {
+                    l.selected = i;
+                    changed    = true;
+                }
+
+                var ink: draw.Color = ctx.theme.text;
+                if (l.selected == i) {
+                    face(ctx, x0, y0, x1, y1, ctx.theme.accent);
+                    ink = ctx.theme.accent_text;
+                }
+                or (ctx.active == id) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
+                or (ctx.hot == id)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
+                val ty: f32 = y0 + (rh - context.line_height(ctx)) / 2.0::f32;
+                context.text_at(ctx, items[i], x0 + pad(ctx), ty, ink);
+            }
+            advance(ctx, rh);
+        }
+        i = i + 1;
+    }
+    end_scroll(ctx, ?l.scroll, r);
+    ret changed;
 }
 
 # one frame's input with the cursor at (mx, my) and the button in state down
@@ -2026,6 +2502,414 @@ test theme__drives_colors_and_corners {
     ret 0;
 }
 
+# a frame holding a panel laid out by hand: space, advance, then two columns,
+# the first with one button and the second with two
+#[testing]
+fun frame_columns(ctx: *context.Context, in: input.Input, hit: *u8) f32 {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    space(ctx, 10.0::f32);
+    advance(ctx, 6.0::f32);
+    var c: Columns = begin_columns(ctx, 2);
+    button(ctx, "left");
+    next_column(ctx, ?c);
+    button(ctx, "a");
+    @hit = 0;
+    if (button(ctx, "b")) { @hit = 1; }
+    end_columns(ctx, ?c);
+    val y: f32 = ctx.cy;
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret y;
+}
+
+test layout__cells_space_advance_and_columns {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # two cells across 100 pixels with a 4 pixel gap
+    context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
+    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    if (cell_x0(?ctx, 0, 2) != 0.0::f32 || cell_x1(?ctx, 0, 2) != 48.0::f32)   { ret 2; }
+    if (cell_x0(?ctx, 1, 2) != 52.0::f32 || cell_x1(?ctx, 1, 2) != 100.0::f32) { ret 3; }
+    context.end(?ctx);
+
+    # space 10 and a 6 pixel row put the columns at 20. the left column ends at
+    # 40, the right at 60, and the parent resumes below the taller
+    var hit: u8 = 0;
+    if (frame_columns(?ctx, input_at(70.0::f32, 45.0::f32, 0), ?hit) != 60.0::f32) { ret 4; }
+    # button b spans x [52, 100) and y [40, 56)
+    frame_columns(?ctx, input_at(70.0::f32, 45.0::f32, 1), ?hit);
+    frame_columns(?ctx, input_at(70.0::f32, 45.0::f32, 0), ?hit);
+    if (hit != 1) { ret 5; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel with a three-way segmented choice
+#[testing]
+fun frame_segmented(ctx: *context.Context, in: input.Input, choice: *usize) bool {
+    var labels: [3]str;
+    labels[0] = "a";
+    labels[1] = "b";
+    labels[2] = "c";
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val changed: bool  = segmented(ctx, ?labels[0], 3, choice);
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret changed;
+}
+
+test segmented__chooses_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the third segment spans x [69.3, 100)
+    var choice: usize = 0;
+    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice);
+    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice) != false) { ret 2; }
+    if (ctx.active != 3)                                                           { ret 3; }
+    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != true)  { ret 4; }
+    if (choice != 2)                                                               { ret 5; }
+
+    # choosing the chosen segment again is no change
+    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice);
+    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != false) { ret 6; }
+
+    # a press on the first released over the second chooses nothing
+    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?choice);
+    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?choice);
+    frame_segmented(?ctx, input_at(50.0::f32, 8.0::f32, 0), ?choice);
+    if (choice != 2) { ret 7; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel with one toggle
+#[testing]
+fun frame_toggle(ctx: *context.Context, in: input.Input, st: *u8) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val flipped: bool  = toggle(ctx, "on", st);
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret flipped;
+}
+
+test toggle__flips_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the whole row takes the click, label included
+    var st: u8 = 0;
+    frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st);
+    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?st) != false) { ret 2; }
+    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st) != true)  { ret 3; }
+    if (st != 1)                                                            { ret 4; }
+
+    # a press dragged off the row and released there does not flip it back
+    frame_toggle(?ctx, input_at(90.0::f32, 8.0::f32, 1), ?st);
+    frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?st);
+    if (frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?st) != false) { ret 5; }
+    if (st != 1)                                                               { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel with one slider showing reading
+#[testing]
+fun frame_reading(ctx: *context.Context, in: input.Input, v: *f32, reading: str) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    val changed: bool  = slider(ctx, "x", reading, v, 0.0::f32, 10.0::f32);
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret changed;
+}
+
+test slider__drags_with_a_reading {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # press in the middle, then drag past the right end while held
+    var v: f32 = 0.0::f32;
+    frame_reading(?ctx, input_at(50.0::f32, 8.0::f32, 0), ?v, "0");
+    if (frame_reading(?ctx, input_at(50.0::f32, 8.0::f32, 1), ?v, "0") != true)   { ret 2; }
+    if (v != 5.0::f32)                                                            { ret 3; }
+    if (frame_reading(?ctx, input_at(300.0::f32, 90.0::f32, 1), ?v, "5") != true) { ret 4; }
+    if (v != 10.0::f32)                                                           { ret 5; }
+    frame_reading(?ctx, input_at(300.0::f32, 90.0::f32, 0), ?v, "10");
+
+    # the reading is two glyphs more than none
+    val shown: usize = context.draw_count(?ctx);
+    frame_reading(?ctx, input_at(300.0::f32, 90.0::f32, 0), ?v, nil);
+    if (shown != context.draw_count(?ctx) + 12) { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a w-wide panel with one note, returning the cursor after it
+#[testing]
+fun frame_note(ctx: *context.Context, s: str, w: f32) f32 {
+    context.begin(ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
+    val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, w);
+    note(ctx, s);
+    val y: f32 = ctx.cy;
+    end_panel(ctx, p);
+    context.end(ctx);
+    ret y;
+}
+
+# the rightmost composed vertex x
+#[testing]
+fun right_edge(ctx: *context.Context) f32 {
+    val p: *draw.Vert = context.draw_verts(ctx);
+    val n: usize      = context.draw_count(ctx);
+    var x: f32        = 0.0::f32;
+    var i: usize      = 0;
+    for (i < n) {
+        x = maxf(x, p[i].x);
+        i = i + 1;
+    }
+    ret x;
+}
+
+test note__wraps_at_spaces_to_the_column {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # lines of 8 pixels and a 4 pixel gap below the note
+    if (frame_note(?ctx, "aa bb", 40.0::f32) != 12.0::f32)       { ret 2; }
+    if (frame_note(?ctx, "aa bb cc dd", 40.0::f32) != 20.0::f32) { ret 3; }
+    if (right_edge(?ctx) > 40.0::f32)                            { ret 4; }
+    # a word wider than the column breaks where it overflows
+    if (frame_note(?ctx, "abcdefghij", 40.0::f32) != 20.0::f32) { ret 5; }
+    if (right_edge(?ctx) > 40.0::f32)                           { ret 6; }
+    # a newline starts a line, and an empty note still takes one
+    if (frame_note(?ctx, "a\nb", 40.0::f32) != 20.0::f32) { ret 7; }
+    if (frame_note(?ctx, "", 40.0::f32) != 12.0::f32)     { ret 8; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a panel with a row of two buttons, then a grid of five two
+# to a row with the second drawn chosen
+#[testing]
+fun frame_grid(ctx: *context.Context, in: input.Input, row: *usize, grid: *usize) {
+    var labels: [5]str;
+    labels[0] = "a";
+    labels[1] = "b";
+    labels[2] = "c";
+    labels[3] = "d";
+    labels[4] = "e";
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    @row  = buttons(ctx, ?labels[0], 2);
+    @grid = button_grid(ctx, ?labels[0], 5, 2, 1);
+    end_panel(ctx, p);
+    context.end(ctx);
+}
+
+test buttons__rows_and_grids_report_the_index {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the row's second button spans x [52, 100) and y [0, 16)
+    var row:  usize = 0;
+    var grid: usize = 0;
+    frame_grid(?ctx, input_at(75.0::f32, 8.0::f32, 0), ?row, ?grid);
+    if (row != 2 || grid != 5) { ret 2; }
+    frame_grid(?ctx, input_at(75.0::f32, 8.0::f32, 1), ?row, ?grid);
+    frame_grid(?ctx, input_at(75.0::f32, 8.0::f32, 0), ?row, ?grid);
+    if (row != 1 || grid != 5) { ret 3; }
+
+    # the grid's last row holds item 4 alone, at x [0, 48) and y [60, 76),
+    # and the layout continues below it
+    frame_grid(?ctx, input_at(20.0::f32, 65.0::f32, 0), ?row, ?grid);
+    frame_grid(?ctx, input_at(20.0::f32, 65.0::f32, 1), ?row, ?grid);
+    frame_grid(?ctx, input_at(20.0::f32, 65.0::f32, 0), ?row, ?grid);
+    if (row != 2 || grid != 4) { ret 4; }
+    if (ctx.seq != 7)          { ret 5; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a right dock with a 100 pixel list of 20 items
+#[testing]
+fun frame_list(ctx: *context.Context, in: input.Input, d: *Dock, l: *List, items: *str, query: str) bool {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val da:      DockArea = begin_dock(ctx, d);
+    val changed: bool     = list(ctx, l, items, 20, query, 100.0::f32);
+    end_dock(ctx, d, da);
+    context.end(ctx);
+    ret changed;
+}
+
+test list__selects_scrolls_and_searches_in_a_dock {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var items: [20]str;
+    var k:     usize = 0;
+    for (k < 20) {
+        items[k] = "item";
+        k        = k + 1;
+    }
+    items[0] = "apple";
+    items[1] = "banana";
+    items[2] = "cherry";
+    items[3] = "Date";
+
+    # the dock spans x [100, 200) and its body starts at (104, 4), where the
+    # list's rows are 16 tall at a 20 pixel pitch
+    var d: Dock;
+    d.side = context.Side.right{};
+    d.size = 100.0::f32;
+    var l: List;
+    l.selected = 20;
+
+    # hover, press and release the second row
+    frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 0), ?d, ?l, ?items[0], nil);
+    if (l.scroll.content != 400.0::f32)                                                        { ret 2; }
+    if (frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 1), ?d, ?l, ?items[0], nil) != false) { ret 3; }
+    if (frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 0), ?d, ?l, ?items[0], nil) != true)  { ret 4; }
+    if (l.selected != 1)                                                                       { ret 5; }
+    val ids: u64 = ctx.seq;
+
+    # the wheel scrolls the list, not the dock around it, and the rows follow
+    var in: input.Input = input_at(120.0::f32, 32.0::f32, 0);
+    in.wheel = -40.0::f32;
+    frame_list(?ctx, in, ?d, ?l, ?items[0], nil);
+    if (l.scroll.offset != 40.0::f32 || d.scroll.offset != 0.0::f32) { ret 6; }
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], nil);
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 1), ?d, ?l, ?items[0], nil);
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], nil);
+    if (l.selected != 2) { ret 7; }
+
+    # a query shows only the items holding it, ignoring case, and every item
+    # keeps its id. the list scrolls back as its content shrinks, so the match
+    # claims its row from the next frame
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT");
+    if (l.scroll.content != 20.0::f32 || l.scroll.offset != 0.0::f32) { ret 8; }
+    if (ctx.seq != ids)                                               { ret 9; }
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT");
+    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 1), ?d, ?l, ?items[0], "dAT");
+    if (frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT") != true) { ret 10; }
+    if (l.selected != 3)                                                                        { ret 11; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test image__quads_carry_handle_rect_and_uvs {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val cold:  draw.Color = draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32);
+    val hot:   draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    var steps: [2]draw.Color;
+    steps[0] = cold;
+    steps[1] = hot;
+    var field: [4]f32;
+    field[0] = 0.0::f32;
+    field[1] = 1.0::f32;
+    field[2] = 0.75::f32;
+    field[3] = 0.25::f32;
+    val heat: Grid = Grid{
+        cols:    2, rows: 2, colors: nil, values: ?field[0],
+        palette: Palette{colors: ?steps[0], count: 2, lo: 0.0::f32, hi: 1.0::f32}
+    };
+
+    context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
+    # texels [16, 48) of a 64 texel texture, scaled 60 wide into a clip 30 wide
+    context.push_clip(?ctx, 0.0::f32, 0.0::f32, 50.0::f32, 100.0::f32);
+    val crop: draw.Image = draw.region(9, 64.0::f32, 64.0::f32, 16.0::f32, 16.0::f32, 32.0::f32, 32.0::f32, draw.FILTER_NEAREST);
+    context.image_at(?ctx, crop, 20.0::f32, 10.0::f32, 80.0::f32, 40.0::f32, white);
+    context.pop_clip(?ctx);
+    # the same texture sampled linearly binds apart
+    ctx.cx = 0.0::f32;
+    ctx.cy = 50.0::f32;
+    image(?ctx, draw.whole(9, draw.FILTER_LINEAR), 16.0::f32, 8.0::f32);
+    grid_at(?ctx, heat, 0.0::f32, 100.0::f32, 20.0::f32, 120.0::f32);
+    context.end(?ctx);
+
+    if (context.run_count(?ctx) != 3) { ret 2; }
+    val near: context.Run = context.run_at(?ctx, 0);
+    if (near.tex != 9 || near.filter != draw.FILTER_NEAREST || near.page != 0) { ret 3; }
+    if (near.start != 0 || near.count != 6)                                    { ret 4; }
+    val lin: context.Run = context.run_at(?ctx, 1);
+    if (lin.tex != 9 || lin.filter != draw.FILTER_LINEAR || lin.count != 6) { ret 5; }
+    val cells: context.Run = context.run_at(?ctx, 2);
+    if (cells.tex != draw.ATLAS || cells.start != 12 || cells.count != 24) { ret 6; }
+
+    # clipped at x 50, half the width survives and half the u range with it
+    val p: *draw.Vert = context.draw_verts(?ctx);
+    if (p[0].x != 20.0::f32 || p[0].y != 10.0::f32) { ret 7; }
+    if (p[0].u != 0.25::f32 || p[0].v != 0.25::f32) { ret 8; }
+    if (p[2].x != 50.0::f32 || p[2].y != 40.0::f32) { ret 9; }
+    if (p[2].u != 0.5::f32 || p[2].v != 0.75::f32)  { ret 10; }
+    # the flow image fills its rect at the cursor with the whole texture
+    if (p[6].x != 0.0::f32 || p[6].y != 50.0::f32)  { ret 11; }
+    if (p[8].x != 16.0::f32 || p[8].y != 58.0::f32) { ret 12; }
+    if (p[8].u != 1.0::f32 || p[8].v != 1.0::f32)   { ret 13; }
+    # cells tile row-major from the top left in their palette steps
+    if (p[12].x != 0.0::f32 || p[14].x != 10.0::f32)  { ret 14; }
+    if (p[12].b != 1.0::f32 || p[18].r != 1.0::f32)   { ret 15; }
+    if (p[24].y != 110.0::f32 || p[24].r != 1.0::f32) { ret 16; }
+    if (p[30].b != 1.0::f32)                          { ret 17; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # a frame holding one panel that draws one text field when draw_it is set
 #[testing]
 fun frame_field(ctx: *context.Context, in: input.Input, f: *field.Field, draw_it: u8) u8 {
@@ -2152,73 +3036,6 @@ test text_field__focus_lost_when_undrawn_or_clicked_elsewhere {
     click_field(?ctx, ?f, 10.0::f32);
     frame_field(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?f, 1);
     if (context.typing(?ctx)) { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test image__quads_carry_handle_rect_and_uvs {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    val cold:  draw.Color = draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32);
-    val hot:   draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
-    var steps: [2]draw.Color;
-    steps[0] = cold;
-    steps[1] = hot;
-    var field: [4]f32;
-    field[0] = 0.0::f32;
-    field[1] = 1.0::f32;
-    field[2] = 0.75::f32;
-    field[3] = 0.25::f32;
-    val heat: Grid = Grid{
-        cols:    2, rows: 2, colors: nil, values: ?field[0],
-        palette: Palette{colors: ?steps[0], count: 2, lo: 0.0::f32, hi: 1.0::f32}
-    };
-
-    context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
-    # texels [16, 48) of a 64 texel texture, scaled 60 wide into a clip 30 wide
-    context.push_clip(?ctx, 0.0::f32, 0.0::f32, 50.0::f32, 100.0::f32);
-    val crop: draw.Image = draw.region(9, 64.0::f32, 64.0::f32, 16.0::f32, 16.0::f32, 32.0::f32, 32.0::f32, draw.FILTER_NEAREST);
-    context.image_at(?ctx, crop, 20.0::f32, 10.0::f32, 80.0::f32, 40.0::f32, white);
-    context.pop_clip(?ctx);
-    # the same texture sampled linearly binds apart
-    ctx.cx = 0.0::f32;
-    ctx.cy = 50.0::f32;
-    image(?ctx, draw.whole(9, draw.FILTER_LINEAR), 16.0::f32, 8.0::f32);
-    grid_at(?ctx, heat, 0.0::f32, 100.0::f32, 20.0::f32, 120.0::f32);
-    context.end(?ctx);
-
-    if (context.run_count(?ctx) != 3) { ret 2; }
-    val near: context.Run = context.run_at(?ctx, 0);
-    if (near.tex != 9 || near.filter != draw.FILTER_NEAREST || near.page != 0) { ret 3; }
-    if (near.start != 0 || near.count != 6)                                    { ret 4; }
-    val lin: context.Run = context.run_at(?ctx, 1);
-    if (lin.tex != 9 || lin.filter != draw.FILTER_LINEAR || lin.count != 6) { ret 5; }
-    val cells: context.Run = context.run_at(?ctx, 2);
-    if (cells.tex != draw.ATLAS || cells.start != 12 || cells.count != 24) { ret 6; }
-
-    # clipped at x 50, half the width survives and half the u range with it
-    val p: *draw.Vert = context.draw_verts(?ctx);
-    if (p[0].x != 20.0::f32 || p[0].y != 10.0::f32) { ret 7; }
-    if (p[0].u != 0.25::f32 || p[0].v != 0.25::f32) { ret 8; }
-    if (p[2].x != 50.0::f32 || p[2].y != 40.0::f32) { ret 9; }
-    if (p[2].u != 0.5::f32 || p[2].v != 0.75::f32)  { ret 10; }
-    # the flow image fills its rect at the cursor with the whole texture
-    if (p[6].x != 0.0::f32 || p[6].y != 50.0::f32)  { ret 11; }
-    if (p[8].x != 16.0::f32 || p[8].y != 58.0::f32) { ret 12; }
-    if (p[8].u != 1.0::f32 || p[8].v != 1.0::f32)   { ret 13; }
-    # cells tile row-major from the top left in their palette steps
-    if (p[12].x != 0.0::f32 || p[14].x != 10.0::f32)  { ret 14; }
-    if (p[12].b != 1.0::f32 || p[18].r != 1.0::f32)   { ret 15; }
-    if (p[24].y != 110.0::f32 || p[24].r != 1.0::f32) { ret 16; }
-    if (p[30].b != 1.0::f32)                          { ret 17; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }

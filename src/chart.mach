@@ -1,0 +1,1105 @@
+# charts: a line chart, a bar chart and a sparkline over plain arrays of values
+#
+# each chart takes its values as a pointer and a count, and the rect it fills
+# in the current local space, and returns a Hover naming the value under the
+# cursor. everything is drawn through the context painter: lines, areas, bars,
+# grid and ticks are quads and labels are text from the glyph source, so the
+# draw list stays plain quads any renderer can draw, clipped to the chart's
+# rect and to whatever clip and sub-surface it is drawn inside.
+#
+# a line is one quad per screen pixel column, spanning the polyline over that
+# column swept by a square brush of the line's width. the column edges and every
+# rule and label sit on whole screen pixels, so a chart at any scale stays
+# crisp, and a column covers every sample that falls in it, so a spike is never
+# lost when samples outnumber pixels.
+#
+# every color and length comes from the context's theme (see blit.theme) at the
+# context's scale: series k draws in theme.series[k % theme.SERIES]. a chart
+# takes one id in call order and claims its plot, so its read-out follows the
+# same topmost-claimant routing as every widget and is stable while the call
+# order is. nothing is allocated: a chart only pushes vertices.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit.context;
+use blit.draw;
+use blit.input;
+use blit.theme;
+use allo: std.allocator;
+use std.allocator.page;
+use std.types.error.err;
+
+# bytes a formatted label may take, its terminator included
+val LABEL_CAP: usize = 32;
+
+# most ticks an axis draws, whatever range it is given
+val TICK_MAX: usize = 64;
+
+# a value range: fixed when lo < hi, else fitted to the values
+# ---
+# lo: lowest value shown
+# hi: highest value shown
+pub rec Range {
+    lo: f32;
+    hi: f32;
+}
+
+# how a line or bar chart lays out its axes
+# ---
+# y:    value range, fitted to the values and widened to whole ticks when not fixed
+# x:    the values the first and last sample stand for, labelling x; the sample index when not fixed
+# axes: 1 draws axes, grid, ticks and labels, 0 gives the whole rect to the plot
+pub rec Options {
+    y:    Range;
+    x:    Range;
+    axes: u8;
+}
+
+# one line of a line chart
+# ---
+# values: count values, one per sample, sharing the chart's x
+# fill:   1 fills the area between the line and zero, 0 draws the line alone
+pub rec Series {
+    values: *f32;
+    fill:   u8;
+}
+
+# what the cursor is over
+# ---
+# hot:    1 if the cursor is over the chart's plot, else 0 and the rest is zero
+# index:  the sample under the cursor
+# series: the series whose value is nearest the cursor, 0 for bars and sparklines
+# value:  that series' value at index
+pub rec Hover {
+    hot:    u8;
+    index:  usize;
+    series: usize;
+    value:  f32;
+}
+
+# a chart's resolved layout, in local pixels
+# ---
+# x0:    plot left
+# y0:    plot top
+# x1:    plot right
+# y1:    plot bottom
+# lo:    value at the plot's bottom
+# hi:    value at the plot's top
+# step:  value between y ticks
+# n:     samples
+# a:     x of sample 0
+# b:     x between samples
+# xlo:   x value of sample 0
+# xhi:   x value of sample n - 1
+# xstep: x value between x ticks
+rec Plot {
+    x0:    f32;
+    y0:    f32;
+    x1:    f32;
+    y1:    f32;
+    lo:    f32;
+    hi:    f32;
+    step:  f32;
+    n:     usize;
+    a:     f32;
+    b:     f32;
+    xlo:   f32;
+    xhi:   f32;
+    xstep: f32;
+}
+
+# a range fitted to the values
+# ---
+# ret: an empty range, which a chart fits to its values
+pub fun auto() Range {
+    ret Range{lo: 0.0::f32, hi: 0.0::f32};
+}
+
+# a fixed range
+# ---
+# lo:  lowest value shown
+# hi:  highest value shown, above lo
+# ret: the range
+pub fun fixed(lo: f32, hi: f32) Range {
+    ret Range{lo: lo, hi: hi};
+}
+
+# the default layout: y fitted to the values, x labelled by sample index, axes on
+# ---
+# ret: the options
+pub fun options() Options {
+    ret Options{y: auto(), x: auto(), axes: 1};
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun absf(v: f32) f32 {
+    if (v < 0.0::f32) { ret -v; }
+    ret v;
+}
+
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+fun floorf(v: f32) f32 {
+    val t: f32 = v::i64::f32;
+    if (t > v) { ret t - 1.0::f32; }
+    ret t;
+}
+
+fun ceilf(v: f32) f32 {
+    ret -floorf(-v);
+}
+
+fun roundf(v: f32) f32 {
+    ret floorf(v + 0.5::f32);
+}
+
+# a local x moved onto the nearest whole screen pixel
+fun snap_x(ctx: *context.Context, x: f32) f32 {
+    ret roundf(x + ctx.lx) - ctx.lx;
+}
+
+# a local y moved onto the nearest whole screen pixel
+fun snap_y(ctx: *context.Context, y: f32) f32 {
+    ret roundf(y + ctx.ly) - ctx.ly;
+}
+
+# a series color from the theme
+fun series_color(ctx: *context.Context, k: usize) draw.Color {
+    ret ctx.theme.series[k % theme.SERIES];
+}
+
+# the smallest of 1, 2 or 5 times a power of ten that splits span into at most
+# want steps
+fun nice_step(span: f32, want: f32) f32 {
+    val raw: f32 = span / maxf(want, 1.0::f32);
+    if (!(raw > 0.0::f32)) { ret 1.0::f32; }
+    var mag: f32   = 1.0::f32;
+    var k:   usize = 0;
+    for (mag * 10.0::f32 <= raw && k < 40) {
+        mag = mag * 10.0::f32;
+        k   = k + 1;
+    }
+    k = 0;
+    for (mag > raw && k < 40) {
+        mag = mag / 10.0::f32;
+        k   = k + 1;
+    }
+    val norm: f32 = raw / mag;
+    if (norm <= 1.0::f32) { ret mag; }
+    if (norm <= 2.0::f32) { ret mag * 2.0::f32; }
+    if (norm <= 5.0::f32) { ret mag * 5.0::f32; }
+    ret mag * 10.0::f32;
+}
+
+# widen lo and hi by the values, returning whether there were any
+fun take_span(values: *f32, count: usize, lo: *f32, hi: *f32, any: u8) u8 {
+    var seen: u8    = any;
+    var i:    usize = 0;
+    for (i < count) {
+        val v: f32 = values[i];
+        if (seen == 0 || v < @lo) { @lo = v; }
+        if (seen == 0 || v > @hi) { @hi = v; }
+        seen = 1;
+        i    = i + 1;
+    }
+    ret seen;
+}
+
+# a span with room in it: an empty one is opened around its value
+fun open_span(lo: *f32, hi: *f32) {
+    if (@hi > @lo) { ret; }
+    var d: f32 = absf(@lo) * 0.1::f32;
+    if (d == 0.0::f32) { d = 1.0::f32; }
+    @lo = @lo - d;
+    @hi = @hi + d;
+}
+
+# resolve the value axis from the range asked for and the values' span
+fun fit_y(p: *Plot, r: Range, dlo: f32, dhi: f32, want: f32) {
+    if (r.lo < r.hi) {
+        p.lo   = r.lo;
+        p.hi   = r.hi;
+        p.step = nice_step(p.hi - p.lo, want);
+        ret;
+    }
+    var lo: f32 = dlo;
+    var hi: f32 = dhi;
+    open_span(?lo, ?hi);
+    p.step = nice_step(hi - lo, want);
+    p.lo   = floorf(lo / p.step) * p.step;
+    p.hi   = ceilf(hi / p.step) * p.step;
+}
+
+# the y of value v
+fun value_y(p: *Plot, v: f32) f32 {
+    ret p.y1 - (v - p.lo) / (p.hi - p.lo) * (p.y1 - p.y0);
+}
+
+# the x of sample i, which may be fractional
+fun sample_x(p: *Plot, i: f32) f32 {
+    ret p.a + i * p.b;
+}
+
+# the x value sample i stands for
+fun x_value(p: *Plot, i: f32) f32 {
+    if (p.n <= 1) { ret p.xlo; }
+    ret p.xlo + (p.xhi - p.xlo) * i / (p.n - 1)::f32;
+}
+
+# the sample an x value falls on, which may be fractional
+fun x_sample(p: *Plot, v: f32) f32 {
+    if (p.n <= 1 || p.xhi == p.xlo) { ret 0.0::f32; }
+    ret (v - p.xlo) / (p.xhi - p.xlo) * (p.n - 1)::f32;
+}
+
+# the first multiple of step at or above lo
+fun first_tick(lo: f32, step: f32) f32 {
+    ret ceilf(lo / step - 0.0001::f32) * step;
+}
+
+# write text into out, returning the bytes written
+fun put(out: *u8, at: usize, s: str) usize {
+    var n: usize = 0;
+    for (s[n] != 0) {
+        out[at + n] = s[n];
+        n           = n + 1;
+    }
+    ret n;
+}
+
+# write v as a label at out[at], terminated, returning the bytes written
+#
+# decimals follow step, the spacing of the values shown beside it, plus extra.
+# a step of a thousand or more shows v in thousands (k), millions (M), billions
+# (G) or trillions (T). out holds at least LABEL_CAP bytes from at.
+fun format(out: *u8, at: usize, v: f32, step: f32, extra: usize) usize {
+    var n: usize = 0;
+    if (v != v) {
+        n           = put(out, at, "nan");
+        out[at + n] = 0;
+        ret n;
+    }
+    var div: f32   = 1.0::f32;
+    var k:   usize = 0;
+    for (k < 4 && absf(step) / div >= 1000.0::f32) {
+        div = div * 1000.0::f32;
+        k   = k + 1;
+    }
+    val x: f32   = v / div;
+    var d: usize = 0;
+    var t: f32   = absf(step) / div;
+    if (t > 0.0::f32) {
+        for (d < 6 && t < 0.9999::f32) {
+            t = t * 10.0::f32;
+            d = d + 1;
+        }
+    }
+    d = d + extra;
+    if (d > 6) { d = 6; }
+    var p10: u64   = 1;
+    var i:   usize = 0;
+    for (i < d) {
+        p10 = p10 * 10;
+        i   = i + 1;
+    }
+    val mag: f32 = absf(x) * p10::f32 + 0.5::f32;
+    if (!(mag < 9000000000000000000.0::f32)) {
+        n = put(out, at, "inf");
+        if (x < 0.0::f32) { n = put(out, at, "-inf"); }
+        out[at + n] = 0;
+        ret n;
+    }
+    val q: u64 = mag::u64;
+    if (q != 0 && x < 0.0::f32) {
+        out[at + n] = '-';
+        n           = n + 1;
+    }
+    var digits: [20]u8;
+    var nd:     usize = 0;
+    var ip:     u64   = q / p10;
+    for {
+        digits[nd] = '0' + (ip % 10)::u8;
+        nd         = nd + 1;
+        ip         = ip / 10;
+        if (ip == 0) { brk; }
+    }
+    for (nd > 0) {
+        nd          = nd - 1;
+        out[at + n] = digits[nd];
+        n           = n + 1;
+    }
+    if (d > 0) {
+        out[at + n] = '.';
+        n           = n + 1;
+        var frac: u64   = q % p10;
+        var j:    usize = d;
+        for (j > 0) {
+            j               = j - 1;
+            out[at + n + j] = '0' + (frac % 10)::u8;
+            frac            = frac / 10;
+        }
+        n = n + d;
+    }
+    if (k > 0) {
+        out[at + n] = "kMGT"[k - 1];
+        n           = n + 1;
+    }
+    out[at + n] = 0;
+    ret n;
+}
+
+# fit the plot into the rect: margins for the labels, the value axis and the x
+# mapping
+#
+# bars sit at the centers of n equal slots, line samples span the plot from
+# edge to edge.
+fun lay_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32, opt: Options, dlo: f32, dhi: f32, n: usize, slots: u8) {
+    val lh:   f32 = context.line_height(ctx);
+    val pad:  f32 = context.px(ctx, ctx.theme.pad);
+    val tick: f32 = context.px(ctx, ctx.theme.tick);
+    val half: f32 = context.px(ctx, ctx.theme.line_w) / 2.0::f32;
+
+    var top:    f32 = half;
+    var bottom: f32 = half;
+    if (opt.axes != 0) {
+        top    = maxf(half, ceilf(lh / 2.0::f32));
+        bottom = lh + tick + pad;
+    }
+    p.y0 = y + top;
+    p.y1 = y + h - bottom;
+    fit_y(p, opt.y, dlo, dhi, (p.y1 - p.y0) / (lh * 2.0::f32));
+
+    var left: f32 = 0.0::f32;
+    if (opt.axes != 0) {
+        var buf:  [32]u8;
+        var wide: f32   = 0.0::f32;
+        val t0:   f32   = first_tick(p.lo, p.step);
+        var k:    usize = 0;
+        for (k < TICK_MAX) {
+            val t: f32 = t0 + k::f32 * p.step;
+            if (t > p.hi + p.step * 0.0001::f32) { brk; }
+            format(?buf[0], 0, t, p.step, 0);
+            wide = maxf(wide, context.text_width(ctx, ?buf[0]));
+            k    = k + 1;
+        }
+        left = wide + tick + pad;
+    }
+    p.x0 = x + left;
+    p.x1 = x + w;
+
+    p.n = n;
+    val pw: f32 = p.x1 - p.x0;
+    if (slots != 0 && n > 0) {
+        p.b = pw / n::f32;
+        p.a = p.x0 + p.b / 2.0::f32;
+    }
+    or (n > 1) {
+        p.a = p.x0;
+        p.b = pw / (n - 1)::f32;
+    }
+    or {
+        p.a = (p.x0 + p.x1) / 2.0::f32;
+        p.b = 0.0::f32;
+    }
+
+    val index: u8 = opt.x.lo >= opt.x.hi;
+    if (index != 0) {
+        p.xlo = 0.0::f32;
+        p.xhi = 0.0::f32;
+        if (n > 1) { p.xhi = (n - 1)::f32; }
+    }
+    or {
+        p.xlo = opt.x.lo;
+        p.xhi = opt.x.hi;
+    }
+    val span: f32 = p.xhi - p.xlo;
+    if (span > 0.0::f32) {
+        # a first guess at the step sizes the widest end label, which spaces the ticks
+        var buf:   [32]u8;
+        val guess: f32 = nice_step(span, pw / (lh * 6.0::f32));
+        format(?buf[0], 0, p.xlo, guess, 0);
+        var wide: f32 = context.text_width(ctx, ?buf[0]);
+        format(?buf[0], 0, p.xhi, guess, 0);
+        wide    = maxf(wide, context.text_width(ctx, ?buf[0]));
+        p.xstep = nice_step(span, pw / (wide + pad * 4.0::f32));
+    }
+    or {
+        p.xstep = 1.0::f32;
+    }
+    if (index != 0 && p.xstep < 1.0::f32) { p.xstep = 1.0::f32; }
+}
+
+# a horizontal rule of the theme's edge width centered on y
+fun rule_h(ctx: *context.Context, x0: f32, x1: f32, y: f32, c: draw.Color) {
+    val ew: f32 = maxf(context.px(ctx, ctx.theme.edge_w), 1.0::f32);
+    val t:  f32 = snap_y(ctx, y - ew / 2.0::f32);
+    context.quad(ctx, snap_x(ctx, x0), t, snap_x(ctx, x1), t + ew, c);
+}
+
+# a vertical rule of the theme's edge width centered on x
+fun rule_v(ctx: *context.Context, x: f32, y0: f32, y1: f32, c: draw.Color) {
+    val ew: f32 = maxf(context.px(ctx, ctx.theme.edge_w), 1.0::f32);
+    val l:  f32 = snap_x(ctx, x - ew / 2.0::f32);
+    context.quad(ctx, l, snap_y(ctx, y0), l + ew, snap_y(ctx, y1), c);
+}
+
+# grid, axes, ticks and labels around the plot, within the chart's rect
+fun draw_axes(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32) {
+    val lh:   f32        = context.line_height(ctx);
+    val pad:  f32        = context.px(ctx, ctx.theme.pad);
+    val tick: f32        = context.px(ctx, ctx.theme.tick);
+    val dim:  draw.Color = ctx.theme.text_dim;
+    var buf:  [32]u8;
+
+    val t0: f32   = first_tick(p.lo, p.step);
+    var k:  usize = 0;
+    for (k < TICK_MAX) {
+        val t: f32 = t0 + k::f32 * p.step;
+        if (t > p.hi + p.step * 0.0001::f32) { brk; }
+        val ty: f32 = value_y(p, t);
+        rule_h(ctx, p.x0, p.x1, ty, ctx.theme.grid);
+        rule_h(ctx, p.x0 - tick, p.x0, ty, dim);
+        format(?buf[0], 0, t, p.step, 0);
+        val tw: f32 = context.text_width(ctx, ?buf[0]);
+        val lx: f32 = snap_x(ctx, p.x0 - tick - pad - tw);
+        val ly: f32 = snap_y(ctx, clampf(ty - lh / 2.0::f32, y, y + h - lh));
+        context.text_at(ctx, ?buf[0], lx, ly, dim);
+        k = k + 1;
+    }
+
+    val x0: f32 = first_tick(minf(p.xlo, p.xhi), p.xstep);
+    k = 0;
+    for (k < TICK_MAX) {
+        val t: f32 = x0 + k::f32 * p.xstep;
+        if (t > maxf(p.xlo, p.xhi) + p.xstep * 0.0001::f32) { brk; }
+        val tx: f32 = sample_x(p, x_sample(p, t));
+        rule_v(ctx, tx, p.y1, p.y1 + tick, dim);
+        format(?buf[0], 0, t, p.xstep, 0);
+        val tw: f32 = context.text_width(ctx, ?buf[0]);
+        val lx: f32 = snap_x(ctx, clampf(tx - tw / 2.0::f32, x, x + w - tw));
+        val ly: f32 = snap_y(ctx, p.y1 + tick + pad / 2.0::f32);
+        context.text_at(ctx, ?buf[0], lx, ly, dim);
+        k = k + 1;
+    }
+
+    rule_v(ctx, p.x0, p.y0, p.y1, dim);
+    rule_h(ctx, p.x0, p.x1, p.y1, dim);
+    if (p.lo < 0.0::f32 && p.hi > 0.0::f32) { rule_h(ctx, p.x0, p.x1, value_y(p, 0.0::f32), dim); }
+}
+
+# the y of the polyline through the values at local x, clamped to its ends
+fun line_y(p: *Plot, values: *f32, x: f32) f32 {
+    if (p.n < 2 || p.b <= 0.0::f32) { ret value_y(p, values[0]); }
+    val u: f32   = clampf((x - p.a) / p.b, 0.0::f32, (p.n - 1)::f32);
+    var i: usize = floorf(u)::usize;
+    if (i > p.n - 2) { i = p.n - 2; }
+    val f: f32 = u - i::f32;
+    ret value_y(p, values[i] + (values[i + 1] - values[i]) * f);
+}
+
+# the local left edge of the screen pixel column holding local x
+fun column(ctx: *context.Context, x: f32) f32 {
+    ret floorf(x + ctx.lx) - ctx.lx;
+}
+
+# one line through the values, a quad per screen pixel column
+#
+# each column spans the polyline over the column widened by half the width on
+# either side, grown by half the width above and below: the polyline swept by a
+# square brush of the given width.
+fun trace(ctx: *context.Context, p: *Plot, values: *f32, width: f32, c: draw.Color) {
+    if (p.n == 0) { ret; }
+    val half: f32 = width / 2.0::f32;
+    if (p.n == 1 || p.b <= 0.0::f32) {
+        val cy: f32 = value_y(p, values[0]);
+        val l:  f32 = snap_x(ctx, p.a - half);
+        val t:  f32 = snap_y(ctx, cy - half);
+        context.quad(ctx, l, t, l + maxf(roundf(width), 1.0::f32), t + maxf(roundf(width), 1.0::f32), c);
+        ret;
+    }
+    val xs:  f32 = p.a;
+    val xe:  f32 = sample_x(p, (p.n - 1)::f32);
+    val end: f32 = minf(xe + half, p.x1 + half);
+    var col: f32 = column(ctx, maxf(xs, p.x0) - half);
+    for (col < end) {
+        val wl: f32 = maxf(col - half, xs);
+        val wr: f32 = minf(col + 1.0::f32 + half, xe);
+        if (wr >= wl) {
+            var ymin: f32 = line_y(p, values, wl);
+            var ymax: f32 = ymin;
+            val yr:   f32 = line_y(p, values, wr);
+            ymin = minf(ymin, yr);
+            ymax = maxf(ymax, yr);
+            var i: usize = ceilf((wl - p.a) / p.b)::usize;
+            for (i < p.n && sample_x(p, i::f32) <= wr) {
+                val vy: f32 = value_y(p, values[i]);
+                ymin = minf(ymin, vy);
+                ymax = maxf(ymax, vy);
+                i    = i + 1;
+            }
+            val t: f32 = snap_y(ctx, ymin - half);
+            var b: f32 = snap_y(ctx, ymax + half);
+            if (b <= t) { b = t + 1.0::f32; }
+            context.quad(ctx, col, t, col + 1.0::f32, b, c);
+        }
+        col = col + 1.0::f32;
+    }
+}
+
+# the area between a line and zero, a quad per screen pixel column
+fun area(ctx: *context.Context, p: *Plot, values: *f32, c: draw.Color) {
+    if (p.n < 2 || p.b <= 0.0::f32) { ret; }
+    val xs:   f32 = p.a;
+    val xe:   f32 = sample_x(p, (p.n - 1)::f32);
+    val base: f32 = snap_y(ctx, clampf(value_y(p, 0.0::f32), p.y0, p.y1));
+    var col:  f32 = column(ctx, maxf(xs, p.x0));
+    for (col < minf(xe, p.x1)) {
+        val ly: f32 = snap_y(ctx, line_y(p, values, clampf(col + 0.5::f32, xs, xe)));
+        if (ly < base) { context.quad(ctx, col, ly, col + 1.0::f32, base, c); }
+        or (ly > base) { context.quad(ctx, col, base, col + 1.0::f32, ly, c); }
+        col = col + 1.0::f32;
+    }
+}
+
+# the local cursor
+fun cursor(ctx: *context.Context, mx: *f32, my: *f32) {
+    @mx = ctx.in.mx - ctx.lx;
+    @my = ctx.in.my - ctx.ly;
+}
+
+# claim the plot for the next frame and report whether the cursor is over it
+fun hovered(ctx: *context.Context, p: *Plot) u8 {
+    val id:  u64 = context.next_id(ctx);
+    val hov: u8  = context.claim(ctx, id, p.x0, p.y0, p.x1, p.y1);
+    if (hov != 0) { ctx.hot = id; }
+    ret hov;
+}
+
+# the sample nearest local x
+fun nearest(p: *Plot, x: f32) usize {
+    if (p.n < 2 || p.b <= 0.0::f32) { ret 0; }
+    ret roundf(clampf((x - p.a) / p.b, 0.0::f32, (p.n - 1)::f32))::usize;
+}
+
+# a square marker of the line's width around a point
+fun marker(ctx: *context.Context, x: f32, y: f32, c: draw.Color) {
+    val s: f32 = maxf(roundf(context.px(ctx, ctx.theme.line_w) * 2.0::f32), 2.0::f32);
+    val l: f32 = snap_x(ctx, x - s / 2.0::f32);
+    val t: f32 = snap_y(ctx, y - s / 2.0::f32);
+    context.quad(ctx, l, t, l + s, t + s, c);
+}
+
+# the read-out beside the point (x, y): a boxed "x: value" kept inside the plot
+fun read_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, index: usize, value: f32) {
+    var buf: [64]u8;
+    val n:   usize = format(?buf[0], 0, x_value(p, index::f32), p.xstep, 0);
+    val m:   usize = put(?buf[0], n, ": ");
+    val o:   usize = format(?buf[0], n + m, value, p.step, 1);
+
+    val lh:  f32 = context.line_height(ctx);
+    val pad: f32 = context.px(ctx, ctx.theme.pad);
+    val bw:  f32 = context.text_width(ctx, ?buf[0]) + pad * 2.0::f32;
+    val bh:  f32 = lh + pad * 2.0::f32;
+    var bx:  f32 = x + pad * 2.0::f32;
+    if (bx + bw > p.x1) { bx = x - pad * 2.0::f32 - bw; }
+    bx = maxf(bx, p.x0);
+    var by: f32 = y - pad * 2.0::f32 - bh;
+    if (by < p.y0) { by = y + pad * 2.0::f32; }
+    by = maxf(minf(by, p.y1 - bh), p.y0);
+    bx = snap_x(ctx, bx);
+    by = snap_y(ctx, by);
+    context.fill(ctx, bx, by, bx + bw, by + bh, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, ctx.theme.window);
+    context.text_at(ctx, ?buf[0], bx + pad, by + pad, ctx.theme.text);
+}
+
+# a line chart: one or more series over a shared x, filled beneath where asked
+#
+# sample i of every series sits at the same x, the first at the plot's left
+# edge and the last at its right. hovering reports the sample nearest the
+# cursor and the series whose value there is nearest it, and draws a guide, a
+# marker and a read-out of that value.
+# ---
+# ctx:    context
+# x:      chart left in local pixels
+# y:      chart top in local pixels
+# w:      chart width in pixels
+# h:      chart height in pixels
+# series: the series, drawn in order, series k in theme.series[k % theme.SERIES]
+# ns:     how many series
+# count:  how many values each series holds
+# opt:    ranges and axes
+# ret:    what the cursor is over
+pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Series, ns: usize, count: usize, opt: Options) Hover {
+    var none: Hover;
+    var dlo:  f32   = 0.0::f32;
+    var dhi:  f32   = 0.0::f32;
+    var any:  u8    = 0;
+    var s:    usize = 0;
+    for (s < ns) {
+        any = take_span(series[s].values, count, ?dlo, ?dhi, any);
+        s   = s + 1;
+    }
+    var p: Plot;
+    lay_out(ctx, ?p, x, y, w, h, opt, dlo, dhi, count, 0);
+    if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
+
+    context.push_clip(ctx, x, y, x + w, y + h);
+    if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
+    val hov: u8 = hovered(ctx, ?p);
+
+    val width: f32 = context.px(ctx, ctx.theme.line_w);
+    val half:  f32 = width / 2.0::f32;
+    if (count > 0) {
+        context.push_clip(ctx, p.x0, p.y0, p.x1, p.y1);
+        s = 0;
+        for (s < ns) {
+            if (series[s].fill != 0) {
+                var c: draw.Color = series_color(ctx, s);
+                c.a = c.a * ctx.theme.area;
+                area(ctx, ?p, series[s].values, c);
+            }
+            s = s + 1;
+        }
+        context.pop_clip(ctx);
+        context.push_clip(ctx, p.x0 - half, p.y0 - half, p.x1 + half, p.y1 + half);
+        s = 0;
+        for (s < ns) {
+            trace(ctx, ?p, series[s].values, width, series_color(ctx, s));
+            s = s + 1;
+        }
+        context.pop_clip(ctx);
+    }
+
+    var out: Hover;
+    if (hov != 0 && count > 0 && ns > 0) {
+        var mx: f32;
+        var my: f32;
+        cursor(ctx, ?mx, ?my);
+        out.hot   = 1;
+        out.index = nearest(?p, mx);
+        var best: f32 = 0.0::f32;
+        s = 0;
+        for (s < ns) {
+            val d: f32 = absf(value_y(?p, series[s].values[out.index]) - my);
+            if (s == 0 || d < best) {
+                best       = d;
+                out.series = s;
+            }
+            s = s + 1;
+        }
+        out.value = series[out.series].values[out.index];
+        val px: f32 = sample_x(?p, out.index::f32);
+        val py: f32 = value_y(?p, out.value);
+        rule_v(ctx, px, p.y0, p.y1, ctx.theme.text_dim);
+        marker(ctx, px, py, series_color(ctx, out.series));
+        read_out(ctx, ?p, px, py, out.index, out.value);
+    }
+    context.pop_clip(ctx);
+    ret out;
+}
+
+# a bar chart: one bar per value, up from zero when positive, down when negative
+#
+# the values share the plot in equal slots, a bar in the middle of each with the
+# theme's gap between bars. a fitted range always holds zero. hovering reports
+# the bar whose slot the cursor is in and draws a read-out of its value.
+# ---
+# ctx:    context
+# x:      chart left in local pixels
+# y:      chart top in local pixels
+# w:      chart width in pixels
+# h:      chart height in pixels
+# values: the values, drawn in theme.series[0]
+# count:  how many values
+# opt:    ranges and axes
+# ret:    what the cursor is over
+pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize, opt: Options) Hover {
+    var none: Hover;
+    var dlo:  f32 = 0.0::f32;
+    var dhi:  f32 = 0.0::f32;
+    val any:  u8  = take_span(values, count, ?dlo, ?dhi, 1);
+    var p:    Plot;
+    lay_out(ctx, ?p, x, y, w, h, opt, dlo, dhi, count, 1);
+    if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
+
+    context.push_clip(ctx, x, y, x + w, y + h);
+    if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
+    val hov: u8 = hovered(ctx, ?p);
+
+    context.push_clip(ctx, p.x0, p.y0, p.x1, p.y1);
+    val c:    draw.Color = series_color(ctx, 0);
+    val gap:  f32        = minf(context.px(ctx, ctx.theme.gap), p.b / 4.0::f32);
+    val base: f32        = snap_y(ctx, clampf(value_y(?p, 0.0::f32), p.y0, p.y1));
+    var i:    usize      = 0;
+    for (i < count) {
+        val l: f32 = snap_x(ctx, p.x0 + i::f32 * p.b + gap / 2.0::f32);
+        var r: f32 = snap_x(ctx, p.x0 + (i + 1)::f32 * p.b - gap / 2.0::f32);
+        if (r <= l) { r = l + 1.0::f32; }
+        val vy: f32 = snap_y(ctx, value_y(?p, values[i]));
+        if (vy < base) { context.quad(ctx, l, vy, r, base, c); }
+        or (vy > base) { context.quad(ctx, l, base, r, vy, c); }
+        i = i + 1;
+    }
+    context.pop_clip(ctx);
+
+    var out: Hover;
+    if (hov != 0 && count > 0) {
+        var mx: f32;
+        var my: f32;
+        cursor(ctx, ?mx, ?my);
+        var k: f32 = floorf((mx - p.x0) / p.b);
+        k         = clampf(k, 0.0::f32, (count - 1)::f32);
+        out.hot   = 1;
+        out.index = k::usize;
+        out.value = values[out.index];
+        read_out(ctx, ?p, sample_x(?p, out.index::f32), value_y(?p, out.value), out.index, out.value);
+    }
+    context.pop_clip(ctx);
+    ret out;
+}
+
+# a sparkline: a compact line with no axes, fitted to its values, for a row or a
+# cell
+#
+# the line fills the rect, inset by half its width so it is never cut. hovering
+# reports the sample nearest the cursor and marks it.
+# ---
+# ctx:    context
+# x:      left in local pixels
+# y:      top in local pixels
+# w:      width in pixels
+# h:      height in pixels
+# values: the values, drawn in theme.series[0]
+# count:  how many values
+# ret:    what the cursor is over
+pub fun sparkline(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize) Hover {
+    var none:  Hover;
+    val width: f32 = context.px(ctx, ctx.theme.line_w);
+    val half:  f32 = width / 2.0::f32;
+    var p:     Plot;
+    p.x0 = x + half;
+    p.y0 = y + half;
+    p.x1 = x + w - half;
+    p.y1 = y + h - half;
+    if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
+    var lo:  f32 = 0.0::f32;
+    var hi:  f32 = 0.0::f32;
+    val any: u8  = take_span(values, count, ?lo, ?hi, 0);
+    open_span(?lo, ?hi);
+    p.lo   = lo;
+    p.hi   = hi;
+    p.step = nice_step(hi - lo, 2.0::f32);
+    p.n    = count;
+    p.a    = p.x0;
+    p.b    = 0.0::f32;
+    if (count > 1) { p.b = (p.x1 - p.x0) / (count - 1)::f32; }
+
+    context.push_clip(ctx, x, y, x + w, y + h);
+    val hov: u8         = hovered(ctx, ?p);
+    val c:   draw.Color = series_color(ctx, 0);
+    trace(ctx, ?p, values, width, c);
+    var out: Hover;
+    if (hov != 0 && count > 0) {
+        var mx: f32;
+        var my: f32;
+        cursor(ctx, ?mx, ?my);
+        out.hot   = 1;
+        out.index = nearest(?p, mx);
+        out.value = values[out.index];
+        marker(ctx, sample_x(?p, out.index::f32), value_y(?p, out.value), c);
+    }
+    context.pop_clip(ctx);
+    ret out;
+}
+
+#[testing]
+fun at(mx: f32, my: f32) input.Input {
+    var in: input.Input;
+    in.mx = mx;
+    in.my = my;
+    ret in;
+}
+
+#[testing]
+fun bare() Options {
+    var o: Options = options();
+    o.axes = 0;
+    ret o;
+}
+
+# a frame holding one line chart of two series in a 200 x 100 rect at the origin
+#[testing]
+fun frame_line(ctx: *context.Context, in: input.Input, series: *Series, opt: Options) Hover {
+    context.begin(ctx, in, 400.0::f32, 300.0::f32);
+    val h: Hover = line(ctx, 0.0::f32, 0.0::f32, context.px(ctx, 200.0::f32), context.px(ctx, 100.0::f32), series, 2, 5, opt);
+    context.end(ctx);
+    ret h;
+}
+
+# every vertex lies in [x0, x1] x [y0, y1]
+#[testing]
+fun inside(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
+    val p: *draw.Vert = context.draw_verts(ctx);
+    var i: usize      = 0;
+    for (i < context.draw_count(ctx)) {
+        if (p[i].x < x0 || p[i].x > x1 || p[i].y < y0 || p[i].y > y1) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+test line__hover_reads_nearest_sample_and_series {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var lo: [5]f32 = [5]f32{0.0::f32, 1.0::f32, 2.0::f32, 1.0::f32, 0.0::f32};
+    var hi: [5]f32 = [5]f32{10.0::f32, 9.0::f32, 8.0::f32, 9.0::f32, 10.0::f32};
+    var ss: [2]Series;
+    ss[0] = Series{values: ?lo[0], fill: 1};
+    ss[1] = Series{values: ?hi[0], fill: 0};
+
+    # without axes the samples sit 50 apart from x 0, and 0..10 spans y 99..1
+    val cold: Hover = frame_line(?ctx, at(101.0::f32, 20.0::f32), ?ss[0], bare());
+    if (cold.hot != 0) { ret 2; }
+    val near: Hover = frame_line(?ctx, at(101.0::f32, 20.0::f32), ?ss[0], bare());
+    if (near.hot != 1 || near.index != 2 || near.series != 1 || near.value != 8.0::f32) { ret 3; }
+    val low: Hover = frame_line(?ctx, at(170.0::f32, 90.0::f32), ?ss[0], bare());
+    if (low.index != 3 || low.series != 0 || low.value != 1.0::f32) { ret 4; }
+
+    # with axes the plot keeps its right edge, so the cursor there reads the last sample
+    frame_line(?ctx, at(199.0::f32, 50.0::f32), ?ss[0], options());
+    val last: Hover = frame_line(?ctx, at(199.0::f32, 50.0::f32), ?ss[0], options());
+    if (last.hot != 1 || last.index != 4) { ret 5; }
+    val gone: Hover = frame_line(?ctx, at(300.0::f32, 50.0::f32), ?ss[0], options());
+    if (gone.hot != 0) { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding one bar chart of four values in a 200 x 100 rect at the origin
+#[testing]
+fun frame_bars(ctx: *context.Context, in: input.Input, values: *f32) Hover {
+    context.begin(ctx, in, 400.0::f32, 300.0::f32);
+    val h: Hover = bars(ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, values, 4, bare());
+    context.end(ctx);
+    ret h;
+}
+
+test bars__hover_reads_positive_and_negative {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var v: [4]f32 = [4]f32{3.0::f32, -2.0::f32, 5.0::f32, -4.0::f32};
+    # four slots 50 wide
+    frame_bars(?ctx, at(60.0::f32, 50.0::f32), ?v[0]);
+    val neg: Hover = frame_bars(?ctx, at(60.0::f32, 50.0::f32), ?v[0]);
+    if (neg.hot != 1 || neg.index != 1 || neg.value != -2.0::f32) { ret 2; }
+    val pos: Hover = frame_bars(?ctx, at(149.0::f32, 5.0::f32), ?v[0]);
+    if (pos.index != 2 || pos.value != 5.0::f32) { ret 3; }
+
+    # the range holds zero, and the negative bars reach below it in the series color
+    val c:     draw.Color = ctx.theme.series[0];
+    val p:     *draw.Vert = context.draw_verts(?ctx);
+    var below: u8         = 0;
+    var above: u8         = 0;
+    var i:     usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (p[i].r == c.r && p[i].g == c.g && p[i].y > 60.0::f32) { below = 1; }
+        if (p[i].r == c.r && p[i].g == c.g && p[i].y < 30.0::f32) { above = 1; }
+        i = i + 1;
+    }
+    if (below == 0 || above == 0) { ret 4; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding one sparkline of four values in a 40 x 10 cell at (10, 10)
+#[testing]
+fun frame_spark(ctx: *context.Context, in: input.Input, values: *f32) Hover {
+    context.begin(ctx, in, 400.0::f32, 300.0::f32);
+    val h: Hover = sparkline(ctx, 10.0::f32, 10.0::f32, 40.0::f32, 10.0::f32, values, 4);
+    context.end(ctx);
+    ret h;
+}
+
+test sparkline__hover_reads_nearest_sample {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var v: [4]f32 = [4]f32{1.0::f32, 2.0::f32, 3.0::f32, 4.0::f32};
+    frame_spark(?ctx, at(36.0::f32, 15.0::f32), ?v[0]);
+    val h: Hover = frame_spark(?ctx, at(36.0::f32, 15.0::f32), ?v[0]);
+    if (h.hot != 1 || h.index != 2 || h.value != 3.0::f32)             { ret 2; }
+    if (inside(?ctx, 10.0::f32, 10.0::f32, 50.0::f32, 20.0::f32) == 0) { ret 3; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding a line chart inside a sub-surface at (50, 50) cut to 80 x 40
+#[testing]
+fun frame_surface(ctx: *context.Context, in: input.Input, series: *Series) Hover {
+    context.begin(ctx, in, 400.0::f32, 300.0::f32);
+    val surf: context.Surface = context.begin_surface(ctx, 50.0::f32, 50.0::f32, 80.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    val h:    Hover           = line(ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, series, 2, 5, bare());
+    context.end_surface(ctx, surf);
+    context.end(ctx);
+    ret h;
+}
+
+test clip__charts_stay_inside_clip_and_surface {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var lo: [5]f32 = [5]f32{0.0::f32, 4.0::f32, 2.0::f32, 7.0::f32, 3.0::f32};
+    var hi: [5]f32 = [5]f32{10.0::f32, 9.0::f32, 8.0::f32, 9.0::f32, 10.0::f32};
+    var ss: [2]Series;
+    ss[0] = Series{values: ?lo[0], fill: 1};
+    ss[1] = Series{values: ?hi[0], fill: 1};
+
+    var v: [4]f32 = [4]f32{3.0::f32, -2.0::f32, 5.0::f32, -4.0::f32};
+    context.begin(?ctx, at(0.0::f32, 0.0::f32), 400.0::f32, 300.0::f32);
+    context.push_clip(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 50.0::f32);
+    val l: Hover = line(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?ss[0], 2, 5, options());
+    val b: Hover = bars(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4, options());
+    val s: Hover = sparkline(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4);
+    context.pop_clip(?ctx);
+    context.end(?ctx);
+    if (context.draw_count(?ctx) == 0)                                { ret 2; }
+    if (inside(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 50.0::f32) == 0) { ret 3; }
+
+    # in a surface the chart is placed and hit-tested in the surface's space
+    frame_surface(?ctx, at(111.0::f32, 60.0::f32), ?ss[0]);
+    if (inside(?ctx, 50.0::f32, 50.0::f32, 130.0::f32, 90.0::f32) == 0) { ret 4; }
+    val h: Hover = frame_surface(?ctx, at(111.0::f32, 60.0::f32), ?ss[0]);
+    if (h.hot != 1 || h.index != 1) { ret 5; }
+    # outside the surface's cut the chart is not hovered
+    frame_surface(?ctx, at(151.0::f32, 60.0::f32), ?ss[0]);
+    val out: Hover = frame_surface(?ctx, at(151.0::f32, 60.0::f32), ?ss[0]);
+    if (out.hot != 0) { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test theme__drives_series_colors_and_area {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    val look: *theme.Theme = context.theme_of(?ctx);
+    look.series[1] = draw.rgba(0.11::f32, 0.22::f32, 0.33::f32, 1.0::f32);
+    look.area      = 0.5::f32;
+    var lo: [5]f32 = [5]f32{0.0::f32, 1.0::f32, 2.0::f32, 1.0::f32, 0.0::f32};
+    var hi: [5]f32 = [5]f32{10.0::f32, 9.0::f32, 8.0::f32, 9.0::f32, 10.0::f32};
+    var ss: [2]Series;
+    ss[0] = Series{values: ?lo[0], fill: 0};
+    ss[1] = Series{values: ?hi[0], fill: 1};
+    frame_line(?ctx, at(300.0::f32, 200.0::f32), ?ss[0], options());
+
+    val p:    *draw.Vert = context.draw_verts(?ctx);
+    var line: u8         = 0;
+    var fill: u8         = 0;
+    var i:    usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (p[i].r == 0.11::f32 && p[i].b == 0.33::f32 && p[i].a == 1.0::f32) { line = 1; }
+        if (p[i].r == 0.11::f32 && p[i].b == 0.33::f32 && p[i].a == 0.5::f32) { fill = 1; }
+        i = i + 1;
+    }
+    if (line == 0 || fill == 0) { ret 2; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the leftmost x of the vertices in series 0's color
+#[testing]
+fun series_left(ctx: *context.Context) f32 {
+    val c:    draw.Color = ctx.theme.series[0];
+    val p:    *draw.Vert = context.draw_verts(ctx);
+    var left: f32        = 100000.0::f32;
+    var i:    usize      = 0;
+    for (i < context.draw_count(ctx)) {
+        if (p[i].r == c.r && p[i].g == c.g && p[i].a == c.a) { left = minf(left, p[i].x); }
+        i = i + 1;
+    }
+    ret left;
+}
+
+test scale__doubles_layout_on_whole_pixels {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var lo: [5]f32 = [5]f32{0.0::f32, 1.5::f32, 2.25::f32, 1.0::f32, 0.5::f32};
+    var hi: [5]f32 = [5]f32{10.0::f32, 9.0::f32, 8.0::f32, 9.0::f32, 10.0::f32};
+    var ss: [2]Series;
+    ss[0] = Series{values: ?lo[0], fill: 0};
+    ss[1] = Series{values: ?hi[0], fill: 1};
+
+    frame_line(?ctx, at(300.0::f32, 250.0::f32), ?ss[0], options());
+    val one: f32 = series_left(?ctx);
+
+    context.set_scale(?ctx, 2.0::f32);
+    # hovered so the read-out, guide and marker are drawn too
+    frame_line(?ctx, at(260.0::f32, 100.0::f32), ?ss[0], options());
+    val h:   Hover = frame_line(?ctx, at(260.0::f32, 100.0::f32), ?ss[0], options());
+    val two: f32   = series_left(?ctx);
+    if (h.hot != 1) { ret 2; }
+    # the label margin and the line's width both double
+    if (two != one * 2.0::f32) { ret 3; }
+
+    val p: *draw.Vert = context.draw_verts(?ctx);
+    var i: usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (roundf(p[i].x) != p[i].x || roundf(p[i].y) != p[i].y) { ret 4; }
+        i = i + 1;
+    }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

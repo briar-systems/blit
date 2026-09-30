@@ -1,0 +1,277 @@
+# drives a docked application panel built only from blit's widgets, laid out
+# like cellar's side panel: a header, then run, view and files sections. it
+# runs headless frames that click a button and drag a slider through
+# blit.input, then prints what the panel did and the vertex count
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.print;
+use std.runtime;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# the panel's state, kept across frames
+# ---
+# side:       the dock the panel lives in
+# open_run:   the run section is open
+# open_view:  the view section is open
+# open_files: the files section is open
+# running:    the run button is on
+# steps:      times step was clicked
+# speed:      generations a second
+# uncapped:   run as fast as it goes
+# area:       the chosen randomize area
+# mode:       the chosen colour mode
+# grid:       grid lines are on
+# trails:     trails fade out
+# size:       the chosen interface size
+# help:       the help button is on
+# files:      the saved files list
+# query:      the text the files list is searched by
+# step_y:     screen y of the run row, where the script clicks
+# speed_y:    screen y of the speed slider, where the script drags
+# x0:         screen x of the panel's column
+# w:          width of the panel's column
+rec Panel {
+    side:       blit.widget.Dock;
+    open_run:   u8;
+    open_view:  u8;
+    open_files: u8;
+    running:    u8;
+    steps:      usize;
+    speed:      f32;
+    uncapped:   u8;
+    area:       usize;
+    mode:       usize;
+    grid:       u8;
+    trails:     u8;
+    size:       usize;
+    help:       u8;
+    files:      blit.widget.List;
+    query:      str;
+    step_y:     f32;
+    speed_y:    f32;
+    x0:         f32;
+    w:          f32;
+}
+
+# write n in decimal into buf at o; ret the offset after it
+fun put_u64(buf: *u8, o: usize, n: u64) usize {
+    var tmp: [20]u8;
+    var k:   usize = 0;
+    var v:   u64   = n;
+    for {
+        tmp[k] = ('0'::u64 + v % 10)::u8;
+        k      = k + 1;
+        v      = v / 10;
+        if (v == 0) { brk; }
+    }
+    var i: usize = o;
+    for (k > 0) {
+        k      = k - 1;
+        buf[i] = tmp[k];
+        i      = i + 1;
+    }
+    ret i;
+}
+
+# write a string into buf at o; ret the offset after it
+fun put_str(buf: *u8, o: usize, s: str) usize {
+    var i: usize = o;
+    var j: usize = 0;
+    for (s[j] != 0) {
+        buf[i] = s[j];
+        i      = i + 1;
+        j      = j + 1;
+    }
+    ret i;
+}
+
+# the header: the name and the help and hide buttons
+fun header(ctx: *blit.context.Context, p: *Panel) {
+    blit.widget.text(ctx, "blit panel");
+    var labels: [2]str;
+    labels[0] = "?";
+    labels[1] = "hide";
+    val hit: usize = blit.widget.buttons(ctx, ?labels[0], 2);
+    if (hit == 0) { p.help = 1 - p.help; }
+}
+
+# stepping, speed and randomizing
+fun run(ctx: *blit.context.Context, p: *Panel) {
+    if (!blit.widget.section(ctx, "RUN", ?p.open_run)) { ret; }
+    p.step_y = ctx.cy + ctx.ly;
+    p.x0     = ctx.cx + ctx.lx;
+    p.w      = ctx.pw;
+    var go: str = "Play";
+    if (p.running != 0) { go = "Pause"; }
+    var acts: [3]str;
+    acts[0] = go;
+    acts[1] = "Step";
+    acts[2] = "Reset";
+    var on: usize = 3;
+    if (p.running != 0) { on = 0; }
+    val hit: usize = blit.widget.button_grid(ctx, ?acts[0], 3, 3, on);
+    if (hit == 0) { p.running = 1 - p.running; }
+    if (hit == 1) { p.steps = p.steps + 1; }
+
+    var rd: [32]u8;
+    var o:  usize = 0;
+    if (p.uncapped != 0) { o = put_str(?rd[0], 0, "as fast as it goes"); }
+    or {
+        o = put_u64(?rd[0], 0, (p.speed + 0.5::f32)::u64);
+        o = put_str(?rd[0], o, " gen/s");
+    }
+    rd[o]     = 0;
+    p.speed_y = ctx.cy + ctx.ly;
+    blit.widget.slider(ctx, "Speed", ?rd[0], ?p.speed, 1.0::f32, 120.0::f32);
+    blit.widget.toggle(ctx, "Uncapped", ?p.uncapped);
+
+    var more: [2]str;
+    more[0] = "Randomize";
+    more[1] = "Clear";
+    blit.widget.buttons(ctx, ?more[0], 2);
+    blit.widget.note(ctx, "Randomize fills a square this wide, from the areas below");
+    var areas: [8]str;
+    areas[0] = "32";
+    areas[1] = "64";
+    areas[2] = "128";
+    areas[3] = "256";
+    areas[4] = "512";
+    areas[5] = "1k";
+    areas[6] = "2k";
+    areas[7] = "4k";
+    val a: usize = blit.widget.button_grid(ctx, ?areas[0], 8, 4, p.area);
+    if (a < 8) { p.area = a; }
+}
+
+# colour, grid and interface size
+fun view(ctx: *blit.context.Context, p: *Panel) {
+    if (!blit.widget.section(ctx, "VIEW", ?p.open_view)) { ret; }
+    var modes: [3]str;
+    modes[0] = "Solid";
+    modes[1] = "Trails";
+    modes[2] = "Age";
+    blit.widget.segmented(ctx, ?modes[0], 3, ?p.mode);
+
+    var c: blit.widget.Columns = blit.widget.begin_columns(ctx, 2);
+    blit.widget.toggle(ctx, "Grid", ?p.grid);
+    blit.widget.next_column(ctx, ?c);
+    blit.widget.toggle(ctx, "Fade", ?p.trails);
+    blit.widget.end_columns(ctx, ?c);
+
+    blit.widget.note(ctx, "Interface size");
+    var sizes: [4]str;
+    sizes[0] = "100%";
+    sizes[1] = "125%";
+    sizes[2] = "150%";
+    sizes[3] = "200%";
+    blit.widget.segmented(ctx, ?sizes[0], 4, ?p.size);
+    blit.widget.button(ctx, "Frame the randomize area");
+}
+
+# saving, and the saved files searched by a query
+fun files(ctx: *blit.context.Context, p: *Panel) {
+    if (!blit.widget.section(ctx, "FILES", ?p.open_files)) { ret; }
+    var save: [2]str;
+    save[0] = "Save world";
+    save[1] = "Save pattern";
+    blit.widget.buttons(ctx, ?save[0], 2);
+    blit.widget.note(ctx, "Click a world to load it, a pattern to edit it");
+
+    var names: [6]str;
+    names[0] = "glider gun";
+    names[1] = "pulsar";
+    names[2] = "acorn";
+    names[3] = "r-pentomino";
+    names[4] = "garden of eden";
+    names[5] = "spaceship";
+    blit.widget.list(ctx, ?p.files, ?names[0], 6, p.query, blit.context.px(ctx, 80.0::f32));
+    blit.widget.space(ctx, blit.context.px(ctx, 4.0::f32));
+    blit.widget.button(ctx, "Screenshot");
+}
+
+# one frame of the panel, docked to the right of an 800 by 600 screen
+fun frame(ctx: *blit.context.Context, p: *Panel, in: blit.input.Input) {
+    blit.context.begin(ctx, in, 800.0::f32, 600.0::f32);
+    val dock: blit.widget.DockArea = blit.widget.begin_dock(ctx, ?p.side);
+    header(ctx, p);
+    run(ctx, p);
+    view(ctx, p);
+    files(ctx, p);
+    blit.widget.end_dock(ctx, ?p.side, dock);
+    blit.context.end(ctx);
+}
+
+# a frame's input with the cursor at (x, y) and the button in state down
+fun at(x: f32, y: f32, down: u8) blit.input.Input {
+    var in: blit.input.Input;
+    in.mx   = x;
+    in.my   = y;
+    in.down = down;
+    ret in;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) {
+        print.println("allocator init failed");
+        ret 1;
+    }
+
+    # the built-in bitmap font and the default theme need no setup
+    var ctx: blit.context.Context;
+    val ce:  err[allo.Error] = blit.context.init(?ctx, ?a);
+    if (sel ce.err) {
+        print.println("context init failed");
+        ret 1;
+    }
+
+    var p: Panel;
+    p.side.side      = blit.context.Side.right{};
+    p.side.size      = 300.0::f32;
+    p.open_run       = 1;
+    p.open_view      = 1;
+    p.open_files     = 1;
+    p.speed          = 30.0::f32;
+    p.area           = 2;
+    p.files.selected = 6;
+    p.query          = "an";
+
+    # lay out once, then hover, press and release the step button
+    frame(?ctx, ?p, at(0.0::f32, 0.0::f32, 0));
+    val half: f32 = blit.widget.control_row_height(?ctx) / 2.0::f32;
+    val sx:   f32 = p.x0 + p.w / 2.0::f32;
+    val sy:   f32 = p.step_y + half;
+    frame(?ctx, ?p, at(sx, sy, 0));
+    frame(?ctx, ?p, at(sx, sy, 1));
+    frame(?ctx, ?p, at(sx, sy, 0));
+
+    # press the speed slider at its left end and drag it three quarters across
+    val vy: f32 = p.speed_y + half;
+    frame(?ctx, ?p, at(p.x0 + 1.0::f32, vy, 0));
+    frame(?ctx, ?p, at(p.x0 + 1.0::f32, vy, 1));
+    frame(?ctx, ?p, at(p.x0 + p.w * 0.75::f32, vy, 1));
+    frame(?ctx, ?p, at(p.x0 + p.w * 0.75::f32, vy, 0));
+
+    print.printf("blit {} panel: steps={} speed={} area={} {} vertices, ok={}\n",
+        blit.VERSION,
+        p.steps,
+        (p.speed + 0.5::f32)::u64,
+        p.area,
+        blit.context.draw_count(?ctx),
+        blit.context.ok(?ctx)::u64);
+
+    val freed: err[allo.Error] = blit.context.free(?ctx);
+    if (sel freed.err) {
+        print.println("context free failed");
+        ret 1;
+    }
+    if (p.steps != 1) { ret 2; }
+    ret 0;
+}
