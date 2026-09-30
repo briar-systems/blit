@@ -25,7 +25,8 @@ use blit.draw;
 # edge:        the edge line a dock draws on its inner side
 # text:        text
 # text_dim:    secondary text and glyphs, such as a collapse marker
-# accent:      a mark that is on, such as a checked box
+# accent:      a mark that is on, such as a checked box, a chosen segment or a selected row
+# accent_text: text and marks drawn on an accent fill
 # warn:        warnings, for consumers drawing their own content; no widget uses it
 # control:     a control's face at rest
 # control_hot: a control under the cursor
@@ -51,6 +52,7 @@ pub rec Theme {
     text:        draw.Color;
     text_dim:    draw.Color;
     accent:      draw.Color;
+    accent_text: draw.Color;
     warn:        draw.Color;
     control:     draw.Color;
     control_hot: draw.Color;
@@ -82,6 +84,7 @@ pub fun default() Theme {
     t.text        = draw.rgba(0.92::f32, 0.92::f32, 0.95::f32, 1.0::f32);
     t.text_dim    = draw.rgba(0.60::f32, 0.60::f32, 0.66::f32, 1.0::f32);
     t.accent      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 1.0::f32);
+    t.accent_text = draw.rgba(0.06::f32, 0.10::f32, 0.06::f32, 1.0::f32);
     t.warn        = draw.rgba(0.91::f32, 0.50::f32, 0.42::f32, 1.0::f32);
     t.control     = draw.rgba(0.25::f32, 0.25::f32, 0.30::f32, 1.0::f32);
     t.control_hot = draw.rgba(0.35::f32, 0.35::f32, 0.42::f32, 1.0::f32);

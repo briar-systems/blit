@@ -73,7 +73,7 @@ blit.
 Every color and length a widget draws with comes from a theme, a plain record
 (`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
 `window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
-`accent`, `warn`, control states (`control`, `control_hot`, `control_on`,
+`accent` and `accent_text` (text on an accent fill), `warn`, control states (`control`, `control_hot`, `control_on`,
 `track`, `handle`, `handle_on`), and the metrics `row`, `gap`, `pad`,
 `handle_w`, `bar_w`, `thumb_min`, `corner` and `edge_w`. No widget holds a
 color or a size of its own.
@@ -152,6 +152,43 @@ Coordinates compose one way:
 - **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
   screen pixels. Use a `Surface`'s `local_mx`/`local_my` for the cursor in its
   local space.
+
+## Widgets & layout
+
+Every widget places itself at the layout cursor, spans the column, advances
+the cursor and emits only quads, so each one clips and scrolls like any
+geometry and works inside surfaces, docks and windows alike. A widget takes
+the same ids every frame whatever it shows, so later widgets keep their hit
+identity.
+
+- **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
+  `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
+  column into n equal cells, gaps between, for widgets that take a rect, such
+  as `button_at(?ctx, label, x0, y0, x1, y1, on)`. `begin_columns(?ctx, n)`,
+  `next_column` and `end_columns` lay whole widgets side by side and resume
+  below the tallest column.
+- **Sections.** `section(?ctx, title, ?open)` is a heading with a caret,
+  pointing right when closed and down when open, that returns whether to place
+  the rows beneath it.
+- **Buttons.** `button` spans the column, `buttons(?ctx, ?labels[0], n)` is a
+  row of n, and `button_grid(?ctx, ?labels[0], n, cols, on)` wraps them cols
+  to a row with button `on` drawn chosen. Both return the index clicked, or n.
+- **Choices.** `segmented(?ctx, ?labels[0], n, ?choice)` picks one of n,
+  `toggle(?ctx, label, ?state)` is an on/off switch across the row, and
+  `checkbox` a box beside its label.
+- **Sliders.** `slider(?ctx, label, reading, ?v, lo, hi)` shows the caller's
+  formatted `reading` of the value beside its label, and `slider_f` is the
+  same without one.
+- **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
+  spaces to the column's width.
+- **Lists.** `list(?ctx, ?l, ?items[0], count, query, h)` is a scrolling list
+  `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
+  none), and only the items holding `query`, ignoring ASCII case, are shown,
+  so a search box the caller keeps narrows it.
+
+`demo/panel/` builds a docked application panel from these widgets alone, in
+the shape of an application's side panel (a header, then run, view and files
+sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
@@ -271,6 +308,8 @@ mach dep pull demo/harness
 mach build demo/harness
 demo/harness/out/linux-x86_64/debug/bin/harness
 ```
+
+`demo/panel/` builds and runs the same way.
 
 ## Conventions
 
