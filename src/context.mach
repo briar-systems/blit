@@ -13,6 +13,12 @@
 # colors are emitted as authored unless set_srgb says the target encodes sRGB,
 # in which case they are converted to linear light first.
 #
+# the look is data: the context holds a theme (see blit.theme), the default
+# one until set_theme swaps in another, and one interface scale (set_scale)
+# that multiplies every theme metric widgets read through px and the size
+# text is laid out and rasterised at, so a scale of 2.0 doubles the interface
+# without any widget knowing.
+#
 # the painter also carries a CPU clip stack and a local-origin offset. every quad
 # is shifted by the local origin into screen space, then clipped to the active
 # rect; quads fully outside are dropped and partial ones are shrunk with their
@@ -51,8 +57,10 @@ use blit.font;
 use gly: blit.glyph;
 use blit.hit;
 use blit.input;
+use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
+use std.math.float.sqrt_f32;
 
 # maximum nesting of pushed clip rects, local origins and layers
 pub val CLIP_DEPTH: usize = 16;
@@ -62,6 +70,15 @@ pub val RUN_DEPTH: usize = 64;
 
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
+
+# the fill handle reserve_fill returns when the fill could not be emitted whole
+pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
+
+# which corners of a fill are rounded, combined with |
+pub val CORNERS_NONE:   u8 = 0;
+pub val CORNERS_TOP:    u8 = 1;
+pub val CORNERS_BOTTOM: u8 = 2;
+pub val CORNERS_ALL:    u8 = 3;
 
 # one contiguous span of the draw list sampling a single texture on one layer
 # ---
@@ -145,7 +162,8 @@ pub rec Area {
 # layer_sp:      layer stack depth
 # layers:        saved parent layers
 # font:          the glyph source, its glyph cache and its atlas
-# scale:         interface scale text is laid out and rasterised at, 1.0 by default
+# scale:         interface scale theme metrics and text are sized at, 1.0 by default
+# theme:         the colors and unscaled metrics widgets draw with
 # srgb:          1 if colors are converted to linear light for an sRGB target, else 0
 # wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
 # free:          the screen area docked containers have not taken this frame
@@ -195,6 +213,7 @@ pub rec Context {
     layers:        [16]u32;
     font:          font.Font;
     scale:         f32;
+    theme:         th.Theme;
     srgb:          u8;
     wheel_taken:   u8;
     free:          Area;
@@ -203,7 +222,8 @@ pub rec Context {
 # initialize a context, its draw lists, its claim lists and its font
 #
 # text draws from the built-in bitmap font until set_glyph_source says
-# otherwise, so a context needs no configuration.
+# otherwise, and widgets draw with the default theme at scale 1.0 until
+# set_theme and set_scale say otherwise, so a context needs no configuration.
 # ---
 # ctx: context to initialize
 # a:   allocator backing the lists and the font
@@ -275,6 +295,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.ordinal       = 0;
     ctx.layer_sp      = 0;
     ctx.scale         = 1.0::f32;
+    ctx.theme         = th.default();
     ctx.srgb          = 0;
     ctx.wheel_taken   = 0;
     ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
@@ -918,6 +939,53 @@ pub fun text_width(ctx: *Context, s: str) f32 {
     ret font.measure(?ctx.font, s, ctx.scale);
 }
 
+# draw widgets with another theme from now on
+# ---
+# ctx: context
+# t:   the theme, copied into the context
+pub fun set_theme(ctx: *Context, t: th.Theme) {
+    ctx.theme = t;
+}
+
+# the theme widgets draw with, to read or adjust in place
+# ---
+# ctx: context
+# ret: the context's theme
+pub fun theme_of(ctx: *Context) *th.Theme {
+    ret ?ctx.theme;
+}
+
+# size the interface by one factor from now on
+#
+# every theme metric and all text scale by it: 2.0 doubles the interface, as a
+# HiDPI display or a user's choice wants. text is rasterised at the new size,
+# so the atlas gains pages to upload. lengths the consumer passes (panel and
+# window widths, dock sizes, geometry) stay in pixels, and px scales them to
+# match. call it between frames.
+# ---
+# ctx: context
+# s:   interface scale, above zero
+pub fun set_scale(ctx: *Context, s: f32) {
+    if (s > 0.0::f32) { ctx.scale = s; }
+}
+
+# the interface scale
+# ---
+# ctx: context
+# ret: the factor set_scale set, 1.0 by default
+pub fun scale_of(ctx: *Context) f32 {
+    ret ctx.scale;
+}
+
+# a length authored at scale 1.0, in pixels at the context's scale
+# ---
+# ctx: context
+# v:   unscaled length
+# ret: the scaled length
+pub fun px(ctx: *Context, v: f32) f32 {
+    ret v * ctx.scale;
+}
+
 # emit a solid-color rectangle sampling the atlas white block
 # ---
 # ctx: context
@@ -931,6 +999,172 @@ pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     var wv: f32;
     atlas.white_uv(?wu, ?wv);
     emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, paint(ctx, c));
+}
+
+# how many quads a fill of radius r with these corners is made of
+#
+# one for the body and one per pixel row of each rounded end, so a square fill
+# is a single quad. the count depends on the radius and corners alone, never
+# on the rect, which lets reserve_fill emit a fill before its height is known.
+fun fill_quads(r: f32, corners: u8) usize {
+    if (r <= 0.0::f32) { ret 1; }
+    var rows: usize = r::usize;
+    if (rows::f32 < r) { rows = rows + 1; }
+    var n: usize = 1;
+    if ((corners & CORNERS_TOP) != 0)    { n = n + rows; }
+    if ((corners & CORNERS_BOTTOM) != 0) { n = n + rows; }
+    ret n;
+}
+
+# the rect of quad k of a fill, empty when the radius left it no row
+#
+# quad 0 is the body between the rounded ends. then come the top end's pixel
+# rows from the edge inward, then the bottom end's, each inset from the sides
+# to follow a circle of the radius, clamped to what the rect can hold.
+fun fill_part(x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, k: usize) Area {
+    val top:    bool = (corners & CORNERS_TOP) != 0 && r > 0.0::f32;
+    val bottom: bool = (corners & CORNERS_BOTTOM) != 0 && r > 0.0::f32;
+    var rr:     f32  = minf(r, (x1 - x0) / 2.0::f32);
+    if (top && bottom) { rr = minf(rr, (y1 - y0) / 2.0::f32); }
+    or (top || bottom) { rr = minf(rr, y1 - y0); }
+    rr = maxf(rr, 0.0::f32);
+
+    if (k == 0) {
+        var b: Area = Area{x0: x0, y0: y0, x1: x1, y1: y1};
+        if (top)    { b.y0 = y0 + rr; }
+        if (bottom) { b.y1 = y1 - rr; }
+        ret b;
+    }
+    val empty:  Area  = Area{x0: x0, y0: y0, x1: x0, y1: y0};
+    val rows:   usize = fill_quads(r, CORNERS_TOP) - 1;
+    var i:      usize = k - 1;
+    var at_top: bool  = top;
+    if (!top || i >= rows) {
+        at_top = false;
+        if (top) { i = i - rows; }
+    }
+    val a: f32 = i::f32;
+    if (a >= rr) { ret empty; }
+    val b:     f32 = minf(a + 1.0::f32, rr);
+    val d:     f32 = rr - (a + b) / 2.0::f32;
+    val inset: f32 = rr - sqrt_f32(maxf(rr * rr - d * d, 0.0::f32));
+    if (at_top) { ret Area{x0: x0 + inset, y0: y0 + a, x1: x1 - inset, y1: y0 + b}; }
+    ret Area{x0: x0 + inset, y0: y1 - b, x1: x1 - inset, y1: y1 - a};
+}
+
+# fill a rectangle with its chosen corners rounded to radius r
+#
+# the rounding is built from quads, one per pixel row of each rounded end, so
+# it needs nothing of the renderer and clips like any quad. a radius of zero
+# or less, or no corners, is one quad, the same as quad.
+# ---
+# ctx:     context
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# r:       corner radius in pixels, clamped to what the rect can hold
+# corners: which corners are rounded, CORNERS_* combined with |
+# c:       fill color
+pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, c: draw.Color) {
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    val n: usize = fill_quads(rad, corners);
+    var k: usize = 0;
+    for (k < n) {
+        val q: Area = fill_part(x0, y0, x1, y1, rad, corners, k);
+        if (q.x1 > q.x0 && q.y1 > q.y0) { quad(ctx, q.x0, q.y0, q.x1, q.y1, c); }
+        k = k + 1;
+    }
+}
+
+# emit a zero-height fill at (x0, y0)-(x1, y0) to give its rect later with
+# grow_fill
+#
+# containers use this: a panel paints its background beneath its widgets
+# before it knows how tall they make it. the placeholder is not clipped until
+# grow_fill gives it its rect. r and corners must match the grow_fill call.
+# ---
+# ctx:     context
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# r:       corner radius in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+# c:       fill color
+# ret:     a handle for grow_fill, or NO_VERTS if the fill was not emitted whole
+pub fun reserve_fill(ctx: *Context, x0: f32, y0: f32, x1: f32, r: f32, corners: u8, c: draw.Color) usize {
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    # the placeholders skip the clip, which would drop a zero-height quad on
+    # its edge, and grow_fill clips them once the rect is known
+    val ink:    draw.Color = paint(ctx, c);
+    val sx0:    f32        = x0 + ctx.lx;
+    val sx1:    f32        = x1 + ctx.lx;
+    val sy:     f32        = y0 + ctx.ly;
+    val n:      usize      = fill_quads(rad, corners);
+    val before: usize      = draw.count(?ctx.dl);
+    var k:      usize      = 0;
+    for (k < n) {
+        record(ctx, draw.push_quad(?ctx.dl, sx0, sy, sx1, sy, wu, wv, wu, wv, ink));
+        k = k + 1;
+    }
+    if (draw.count(?ctx.dl) != before + n * 6) { ret NO_VERTS; }
+    ret before;
+}
+
+# move quad k of a reserved fill onto the local rect q, clipped like emit
+fun place_quad(ctx: *Context, p: *draw.Vert, k: usize, q: Area) {
+    var sx0: f32 = maxf(q.x0 + ctx.lx, ctx.clip_x0);
+    var sy0: f32 = maxf(q.y0 + ctx.ly, ctx.clip_y0);
+    var sx1: f32 = minf(q.x1 + ctx.lx, ctx.clip_x1);
+    var sy1: f32 = minf(q.y1 + ctx.ly, ctx.clip_y1);
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        sx1 = sx0;
+        sy1 = sy0;
+    }
+    p[k + 0].x = sx0;
+    p[k + 0].y = sy0;
+    p[k + 1].x = sx1;
+    p[k + 1].y = sy0;
+    p[k + 2].x = sx1;
+    p[k + 2].y = sy1;
+    p[k + 3].x = sx0;
+    p[k + 3].y = sy0;
+    p[k + 4].x = sx1;
+    p[k + 4].y = sy1;
+    p[k + 5].x = sx0;
+    p[k + 5].y = sy1;
+}
+
+# give a fill reserved by reserve_fill its rect, in local coordinates clipped
+# like geometry
+#
+# a no-op for NO_VERTS. vertex handles are emission indices, valid until end().
+# ---
+# ctx:     context
+# handle:  the value returned by reserve_fill this frame
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# r:       corner radius in pixels, as passed to reserve_fill
+# corners: which corners are rounded, as passed to reserve_fill
+pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8) {
+    if (handle == NO_VERTS) { ret; }
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    val n: usize = fill_quads(rad, corners);
+    if (handle + n * 6 > draw.count(?ctx.dl)) { ret; }
+    val p: *draw.Vert = draw.data(?ctx.dl);
+    var k: usize      = 0;
+    for (k < n) {
+        place_quad(ctx, p, handle + k * 6, fill_part(x0, y0, x1, y1, rad, corners, k));
+        k = k + 1;
+    }
 }
 
 # emit one glyph with its pen at x on the baseline, sampling its atlas page
@@ -1539,6 +1773,42 @@ test srgb__painter_emits_linear_colors {
     if (p[0].r != 0.5::f32)                   { ret 2; }
     if (p[6].r != want || p[6].a != 0.5::f32) { ret 3; }
     if (p[12].g != want)                      { ret 4; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test fill__rounds_corners_and_grows_reserved {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    # a square fill is one quad
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
+    if (draw_count(?ctx) != 6) { ret 2; }
+
+    # radius 4 on every corner: the body plus four rows at each end
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
+    if (draw_count(?ctx) != 60) { ret 3; }
+    val p: *draw.Vert = draw_verts(?ctx);
+    if (p[6].y != 4.0::f32 || p[8].y != 16.0::f32 || p[6].x != 0.0::f32) { ret 4; }
+    # the outermost top row is inset from both sides, the innermost barely
+    if (p[12].y != 0.0::f32 || p[12].x <= 1.0::f32 || p[13].x >= 19.0::f32) { ret 5; }
+    if (p[30].y != 3.0::f32 || p[30].x >= 0.5::f32)                         { ret 6; }
+
+    # a reserved fill rounded at the bottom takes its rect when grown
+    val h: usize = reserve_fill(?ctx, 0.0::f32, 30.0::f32, 20.0::f32, 4.0::f32, CORNERS_BOTTOM, white);
+    if (h != 60 || draw_count(?ctx) != 90) { ret 7; }
+    grow_fill(?ctx, h, 0.0::f32, 30.0::f32, 20.0::f32, 50.0::f32, 4.0::f32, CORNERS_BOTTOM);
+    if (p[60].y != 30.0::f32 || p[62].y != 46.0::f32) { ret 8; }
+    if (p[66].y != 49.0::f32 || p[68].y != 50.0::f32) { ret 9; }
+    if (p[66].x <= 1.0::f32)                          { ret 10; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
