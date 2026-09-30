@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.theme`, `blit.context`, `blit.widget`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.theme`, `blit.context`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -75,8 +75,9 @@ Every color and length a widget draws with comes from a theme, a plain record
 `window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
 `accent`, `warn`, control states (`control`, `control_hot`, `control_on`,
 `track`, `handle`, `handle_on`), and the metrics `row`, `gap`, `pad`,
-`handle_w`, `bar_w`, `thumb_min`, `corner` and `edge_w`. No widget holds a
-color or a size of its own.
+`handle_w`, `bar_w`, `thumb_min`, `corner` and `edge_w`, and for charts a
+`series` palette of `blit.theme.SERIES` colors, `grid`, `line_w`, `tick` and
+`area`. No widget holds a color or a size of its own.
 
 ```mach
 var look: blit.theme.Theme = blit.theme.default();
@@ -158,6 +159,50 @@ a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
 draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
 opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
 rect for consumer-drawn affordances.
+
+## Charts
+
+`blit.chart` plots plain arrays into a rect you give it, in the current local
+space, and returns a `Hover` for the value under the cursor:
+
+```mach
+var energy: [64]f32;   # filled by you, oldest first
+var income: [64]f32;
+var series: [2]blit.chart.Series;
+series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
+series[1] = blit.chart.Series{values: ?income[0], fill: 0};
+val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, 64, blit.chart.options());
+if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
+
+blit.chart.bars(?ctx, x, y, w, h, ?net[0], count, blit.chart.options());
+blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
+```
+
+- **Line.** One or more series share x: sample `i` of every series sits at the
+  same x, the first at the plot's left edge and the last at its right. A series
+  with `fill` set fills the area between its line and zero.
+- **Bars.** One bar per value in equal slots, up from zero when positive and
+  down when negative.
+- **Sparkline.** A compact line fitted to its values, with no axes, for a row or
+  a cell.
+- **Axes.** `Options.y` is the value range, fixed when `lo < hi` and otherwise
+  fitted to the values and widened to whole ticks (bars always hold zero).
+  `Options.x` is what the first and last sample stand for, labelling x, and the
+  sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
+  labels come from the glyph source, with k, M, G or T for large steps.
+  `Options.axes = 0` gives the whole rect to the plot.
+- **Hover.** A chart takes one id in call order and claims its plot, so it
+  reads out only when it is the topmost claimant under the cursor, like any
+  widget. A line reports the sample nearest the cursor and the series nearest it
+  there, bars report the slot under the cursor, and both draw a read-out of the
+  value inside the plot. A sparkline reports and marks its sample.
+- **Crisp at any scale.** A line is one quad per screen pixel column, the
+  polyline swept by a square brush of `line_w`, so no sample is ever skipped
+  when samples outnumber pixels. Columns, rules, bars and labels land on whole
+  screen pixels, and every length is a theme metric at the context's scale.
+- **Plain quads.** Charts emit through the painter like every widget, clipped to
+  their rect and to any clip or sub-surface they sit in, and allocate nothing
+  beyond their vertices.
 
 ## Layers & input routing
 
