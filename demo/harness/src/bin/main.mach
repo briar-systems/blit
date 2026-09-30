@@ -1,4 +1,5 @@
-# drives a headless blit frame through a bare `use blit;` and prints its vertex count
+# drives a headless blit frame through a bare `use blit;` and prints its vertex
+# count and atlas pages
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -19,18 +20,15 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 1;
     }
 
-    val ae: err[allo.Error] = blit.font.build_atlas(?a);
-    if (sel ae.err) {
-        print.println("atlas build failed");
-        ret 1;
-    }
-
+    # the built-in bitmap font is the default glyph source, so no setup is needed
     var ctx: blit.context.Context;
     val ce:  err[allo.Error] = blit.context.init(?ctx, ?a);
     if (sel ce.err) {
         print.println("context init failed");
         ret 1;
     }
+    # a target that encodes sRGB gets linear colors
+    blit.context.set_srgb(?ctx, 1);
 
     var checked: u8    = 1;
     var amount:  f32   = 0.5::f32;
@@ -47,6 +45,12 @@ fun main(argc: i64, argv: **u8) i64 {
     win.open  = 1;
     win.title = "tools";
 
+    var side: blit.widget.Dock;
+    side.side = blit.context.Side.right{};
+    side.size = 160.0::f32;
+    var view_open: u8 = 1;
+    var info_open: u8 = 1;
+
     var in: blit.input.Input;
     in.mx        = 20.0::f32;
     in.my        = 30.0::f32;
@@ -54,6 +58,18 @@ fun main(argc: i64, argv: **u8) i64 {
     in.prev_down = 0;
 
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
+
+    # a side panel docked to the right edge, in collapsible sections
+    val dock: blit.widget.DockArea = blit.widget.begin_dock(?ctx, ?side);
+    if (blit.widget.section(?ctx, "view", ?view_open)) {
+        blit.widget.checkbox(?ctx, "grid", ?checked);
+        blit.widget.slider_f(?ctx, "zoom", ?amount, 0.0::f32, 1.0::f32);
+    }
+    if (blit.widget.section(?ctx, "info", ?info_open)) {
+        # utf-8, with a codepoint the bitmap font lacks drawn as its replacement
+        blit.widget.text(?ctx, "caf\xC3\xA9");
+    }
+    blit.widget.end_dock(?ctx, ?side, dock);
     val panel: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
     blit.widget.text(?ctx, "blit headless smoke");
     blit.widget.button(?ctx, "step");
@@ -96,9 +112,10 @@ fun main(argc: i64, argv: **u8) i64 {
 
     blit.context.end(?ctx);
 
-    print.printf("blit {}: {} vertices, ok={}\n",
+    print.printf("blit {}: {} vertices, {} atlas pages, ok={}\n",
         blit.VERSION,
         blit.context.draw_count(?ctx),
+        blit.atlas.page_count(blit.context.atlas_of(?ctx)),
         blit.context.ok(?ctx)::u64);
 
     val freed: err[allo.Error] = blit.context.free(?ctx);
