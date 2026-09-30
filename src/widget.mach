@@ -323,7 +323,7 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
     if (ctx.active == id && ctx.in.down != 0) {
         val track: f32 = x1 - x0;
         var t:     f32 = 0.0::f32;
-        if (track > 0.0::f32) { t = clampf((ctx.in.mx - x0) / track, 0.0::f32, 1.0::f32); }
+        if (track > 0.0::f32) { t = clampf((ctx.in.mx - ctx.lx - x0) / track, 0.0::f32, 1.0::f32); }
         val nv: f32 = lo + t * (hi - lo);
         if (nv != @v) {
             @v      = nv;
