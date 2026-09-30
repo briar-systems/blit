@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-30
+
+### Added
+- A pluggable glyph source (#63): the caller supplies text metrics and rasterisation (e.g. TrueType), with the built-in 8x8 bitmap font as the zero-configuration default. blit never depends on TrueType.
+- Docked containers (#63): side panels, collapsible sections and scrolling, alongside the floating windows.
+- A data-driven theme and one interface scale (#64): a `Theme` record on the context with a default, and `context.px`/`set_scale` so every metric and text size scales together with no widget changes.
+- A full widget set for a docked application panel (#65): row layout helpers, segmented choice, toggle, slider with a live reading, wrapping note text, button rows and grids, and a scrolling list with selection and search.
+- Keyboard focus, text input and a text field (#66): typed codepoints, key events with modifiers and a clipboard hand-off through `blit.input`, a text field with caret, selection, filter and Enter/Escape, and a `typing` query.
+- Charts (#68): line, bar and sparkline widgets with axes, ticks, labels and a hover read-out, `blit.chart`.
+- An image widget and external textures in the draw list (#69): a per-run opaque texture handle (0 = the atlas) and a filter, an image widget over a consumer texture, and a colour-mapped grid, so any renderer can bind its own textures.
+
+### Breaking
+- sRGB output, atlas on the context, and integer texture handles (#63, #69): the global atlas functions and `GLYPH_*`/`ATLAS_*` constants are gone, the atlas lives on the context, `Run.tex` and the texture API move from `ptr` to `u64` handles. Pre-1.0, so a minor bump.
+
 ## [0.8.0] - 2026-09-26
 
 ### Breaking

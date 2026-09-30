@@ -1,0 +1,137 @@
+# blit's look as data: the colors and metrics every widget draws from
+#
+# a theme is a plain record of colors and lengths, so a consumer can build one
+# in code, load it from a file or fill it from another language, and any
+# renderer draws it the same way. the context holds one (see
+# context.set_theme), and a context that is never given one draws with
+# default(), so zero configuration still works.
+#
+# lengths are authored at scale 1.0. the context multiplies each by its
+# interface scale (see context.set_scale) when a widget reads it, the same
+# factor text is laid out at, so a theme never changes with the display.
+#
+# colors are straight rgba as authored in sRGB, like every color passed to the
+# painter (see context.set_srgb).
+
+use std.types.size.usize;
+
+use blit.draw;
+
+# how many series colors a theme holds
+pub val SERIES: usize = 8;
+
+# the colors and unscaled metrics widgets draw with
+# ---
+# panel:       panel background
+# window:      window and popup body background
+# dock:        docked container background
+# header:      window titlebar and section heading
+# header_hot:  a titlebar or heading under the cursor
+# edge:        the edge line a dock draws on its inner side
+# text:        text
+# text_dim:    secondary text and glyphs, such as a collapse marker
+# accent:      a mark that is on, such as a checked box, a chosen segment or a selected row, and a focused text field's outline
+# accent_text: text and marks drawn on an accent fill
+# warn:        warnings, for consumers drawing their own content; no widget uses it
+# control:     a control's face at rest
+# control_hot: a control under the cursor
+# control_on:  a control pressed, or a dropdown open
+# track:       a slider or scrollbar track, a dropdown option at rest and a text field's face
+# handle:      a slider handle or scrollbar thumb at rest
+# handle_on:   a slider handle or scrollbar thumb being dragged
+# select:      the highlight behind selected text
+# row:         least height of a control row, which grows to fit a line of text and its padding
+# gap:         space between layout rows
+# pad:         space inside chrome, around text and at a container's bottom
+# handle_w:    slider handle width
+# bar_w:       scrollbar width
+# thumb_min:   shortest scrollbar thumb
+# corner:      corner radius of controls and containers, 0 for square
+# edge_w:      width of an edge line: a dock's inner side, a chart's axes, grid and ticks, and a focused text field's outline
+# caret_w:     width of a text field's caret
+# series:      chart series colors, series k drawing in series[k % SERIES]
+# grid:        chart grid lines
+# line_w:      width of a chart line
+# tick:        length of a chart axis tick
+# area:        alpha factor of the area filled under a chart line, in [0, 1]
+pub rec Theme {
+    panel:       draw.Color;
+    window:      draw.Color;
+    dock:        draw.Color;
+    header:      draw.Color;
+    header_hot:  draw.Color;
+    edge:        draw.Color;
+    text:        draw.Color;
+    text_dim:    draw.Color;
+    accent:      draw.Color;
+    accent_text: draw.Color;
+    warn:        draw.Color;
+    control:     draw.Color;
+    control_hot: draw.Color;
+    control_on:  draw.Color;
+    track:       draw.Color;
+    handle:      draw.Color;
+    handle_on:   draw.Color;
+    select:      draw.Color;
+    row:         f32;
+    gap:         f32;
+    pad:         f32;
+    handle_w:    f32;
+    bar_w:       f32;
+    thumb_min:   f32;
+    corner:      f32;
+    edge_w:      f32;
+    caret_w:     f32;
+    series:      [8]draw.Color;
+    grid:        draw.Color;
+    line_w:      f32;
+    tick:        f32;
+    area:        f32;
+}
+
+# blit's own look: dark surfaces, square corners and 4 pixel spacing
+# ---
+# ret: the default theme
+pub fun default() Theme {
+    var t: Theme;
+    t.panel       = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.85::f32);
+    t.window      = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.95::f32);
+    t.dock        = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
+    t.header      = draw.rgba(0.20::f32, 0.20::f32, 0.26::f32, 1.0::f32);
+    t.header_hot  = draw.rgba(0.28::f32, 0.28::f32, 0.36::f32, 1.0::f32);
+    t.edge        = draw.rgba(0.20::f32, 0.20::f32, 0.25::f32, 1.0::f32);
+    t.text        = draw.rgba(0.92::f32, 0.92::f32, 0.95::f32, 1.0::f32);
+    t.text_dim    = draw.rgba(0.60::f32, 0.60::f32, 0.66::f32, 1.0::f32);
+    t.accent      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 1.0::f32);
+    t.accent_text = draw.rgba(0.06::f32, 0.10::f32, 0.06::f32, 1.0::f32);
+    t.warn        = draw.rgba(0.91::f32, 0.50::f32, 0.42::f32, 1.0::f32);
+    t.control     = draw.rgba(0.25::f32, 0.25::f32, 0.30::f32, 1.0::f32);
+    t.control_hot = draw.rgba(0.35::f32, 0.35::f32, 0.42::f32, 1.0::f32);
+    t.control_on  = draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
+    t.track       = draw.rgba(0.15::f32, 0.15::f32, 0.18::f32, 1.0::f32);
+    t.handle      = draw.rgba(0.55::f32, 0.55::f32, 0.65::f32, 1.0::f32);
+    t.handle_on   = draw.rgba(0.78::f32, 0.78::f32, 0.92::f32, 1.0::f32);
+    t.select      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 0.35::f32);
+    t.row         = 16.0::f32;
+    t.gap         = 4.0::f32;
+    t.pad         = 4.0::f32;
+    t.handle_w    = 6.0::f32;
+    t.bar_w       = 6.0::f32;
+    t.thumb_min   = 12.0::f32;
+    t.corner      = 0.0::f32;
+    t.edge_w      = 1.0::f32;
+    t.caret_w     = 1.0::f32;
+    t.series[0]   = draw.rgba(0.36::f32, 0.62::f32, 0.95::f32, 1.0::f32);
+    t.series[1]   = draw.rgba(0.96::f32, 0.62::f32, 0.30::f32, 1.0::f32);
+    t.series[2]   = draw.rgba(0.47::f32, 0.80::f32, 0.50::f32, 1.0::f32);
+    t.series[3]   = draw.rgba(0.93::f32, 0.43::f32, 0.52::f32, 1.0::f32);
+    t.series[4]   = draw.rgba(0.68::f32, 0.56::f32, 0.93::f32, 1.0::f32);
+    t.series[5]   = draw.rgba(0.36::f32, 0.80::f32, 0.80::f32, 1.0::f32);
+    t.series[6]   = draw.rgba(0.90::f32, 0.80::f32, 0.36::f32, 1.0::f32);
+    t.series[7]   = draw.rgba(0.70::f32, 0.70::f32, 0.74::f32, 1.0::f32);
+    t.grid        = draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
+    t.line_w      = 2.0::f32;
+    t.tick        = 4.0::f32;
+    t.area        = 0.25::f32;
+    ret t;
+}

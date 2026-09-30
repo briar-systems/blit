@@ -4,8 +4,20 @@
 # the context owns the per-frame draw list and the current input, tracks a simple
 # top-to-bottom layout cursor, and assigns stable widget ids by call order. it is
 # also the painter: quad/glyph/text_at emit into the draw list through the font
-# atlas so widgets never touch the draw list or font directly. a draw-list growth
-# failure is recorded in `oom` rather than silently dropping geometry; check ok().
+# and its atlas so widgets never touch the draw list or font directly. a
+# draw-list growth failure is recorded in `oom` rather than silently dropping
+# geometry; check ok().
+#
+# text comes from a glyph source (see blit.glyph), the built-in bitmap font
+# unless set_glyph_source swaps in another, laid out at the context's scale.
+# colors are emitted as authored unless set_srgb says the target encodes sRGB,
+# in which case they are converted to linear light first.
+#
+# the look is data: the context holds a theme (see blit.theme), the default
+# one until set_theme swaps in another, and one interface scale (set_scale)
+# that multiplies every theme metric widgets read through px and the size
+# text is laid out and rasterised at, so a scale of 2.0 doubles the interface
+# without any widget knowing.
 #
 # the painter also carries a CPU clip stack and a local-origin offset. every quad
 # is shifted by the local origin into screen space, then clipped to the active
@@ -29,18 +41,36 @@
 # topmost claimant under the cursor is hovered. a widget therefore becomes
 # interactive one frame after it first claims. that is a chosen property, since
 # any way around it makes some widgets special.
+#
+# the keyboard goes to one widget at a time, the focus holder, by id across
+# frames. a press that lands anywhere else drops it in begin, and so does a
+# frame the holder is not drawn in, at end. while a widget holds it, typing()
+# says so, so a consumer can keep its own key bindings quiet. the clipboard is
+# a hand-off: a frame leaves text to copy in copied() and a paste request in
+# wants_paste(), and the consumer answers the request with the next frame's
+# input.paste (see blit.input).
 
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+use blit.atlas;
 use blit.draw;
 use blit.font;
+use gly: blit.glyph;
 use blit.hit;
 use blit.input;
+use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
+use std.math.float.sqrt_f32;
 
 # maximum nesting of pushed clip rects, local origins and layers
 pub val CLIP_DEPTH: usize = 16;
@@ -51,17 +81,57 @@ pub val RUN_DEPTH: usize = 64;
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 
+# the fill handle reserve_fill returns when the fill could not be emitted whole
+pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
+
+# which corners of a fill are rounded, combined with |
+pub val CORNERS_NONE:   u8 = 0;
+pub val CORNERS_TOP:    u8 = 1;
+pub val CORNERS_BOTTOM: u8 = 2;
+pub val CORNERS_ALL:    u8 = 3;
+
 # one contiguous span of the draw list sampling a single texture on one layer
+#
+# every vertex lies in exactly one span, so a span's tex is the texture handle
+# of each quad in it. a renderer binds atlas page `page` when tex is
+# draw.ATLAS, else the consumer texture tex with the sampling filter names,
+# and draws count vertices from start. the record is plain integers, so a
+# foreign renderer reads it field for field.
 # ---
-# tex:   consumer texture handle, nil for the font atlas
-# layer: layer the span was drawn on
-# start: first vertex of the span
-# count: vertices in the span
+# tex:    consumer texture handle, draw.ATLAS (0) for the font atlas
+# page:   the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
+# layer:  layer the span was drawn on
+# start:  first vertex of the span
+# count:  vertices in the span
+# filter: draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
 pub rec Run {
-    tex:   ptr;
-    layer: u32;
-    start: usize;
-    count: usize;
+    tex:    u64;
+    page:   u32;
+    layer:  u32;
+    start:  usize;
+    count:  usize;
+    filter: u32;
+}
+
+# a screen edge a docked container attaches to
+pub tag Side: u8 {
+    left;
+    right;
+    top;
+    bottom;
+}
+
+# an axis-aligned rect in screen pixels, [x0, x1) x [y0, y1)
+# ---
+# x0: left edge
+# y0: top edge
+# x1: right edge
+# y1: bottom edge
+pub rec Area {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
 }
 
 # immediate-mode UI state for one consumer
@@ -95,7 +165,9 @@ pub rec Run {
 # org_sp:        local-origin stack depth
 # org_xs:        saved parent local-origin xs
 # org_ys:        saved parent local-origin ys
-# tex:           texture subsequent geometry samples (nil = font atlas)
+# tex:           texture handle subsequent geometry samples (draw.ATLAS = font atlas)
+# page:          atlas page subsequent atlas geometry samples
+# filter:        sampling filter subsequent consumer-texture geometry asks for
 # run_start:     first vertex of the span being accumulated
 # runs:          closed single-texture spans, in draw order
 # run_len:       how many spans are closed
@@ -108,6 +180,19 @@ pub rec Run {
 # ordinal:       claims made so far this frame
 # layer_sp:      layer stack depth
 # layers:        saved parent layers
+# font:          the glyph source, its glyph cache and its atlas
+# scale:         interface scale theme metrics and text are sized at, 1.0 by default
+# theme:         the colors and unscaled metrics widgets draw with
+# srgb:          1 if colors are converted to linear light for an sRGB target, else 0
+# wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
+# free:          the screen area docked containers have not taken this frame
+# focus:         id of the widget holding the keyboard, persists across frames (0 = none)
+# focus_drawn:   1 once the focus holder was drawn this frame, else 0
+# a:             allocator backing the clipboard text
+# clip:          text the frame copies to the clipboard, NUL-terminated, nil before the first copy
+# clip_cap:      bytes allocated for clip
+# clip_on:       1 if the frame copied text into clip, else 0
+# paste_wanted:  1 if a widget asked for the clipboard's text this frame, else 0
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -138,7 +223,9 @@ pub rec Context {
     org_sp:        usize;
     org_xs:        [16]f32;
     org_ys:        [16]f32;
-    tex:           ptr;
+    tex:           u64;
+    page:          u32;
+    filter:        u32;
     run_start:     usize;
     runs:          [64]Run;
     run_len:       usize;
@@ -151,25 +238,49 @@ pub rec Context {
     ordinal:       u64;
     layer_sp:      usize;
     layers:        [16]u32;
+    font:          font.Font;
+    scale:         f32;
+    theme:         th.Theme;
+    srgb:          u8;
+    wheel_taken:   u8;
+    free:          Area;
+    focus:         u64;
+    focus_drawn:   u8;
+    a:             *allo.Allocator;
+    clip:          *u8;
+    clip_cap:      usize;
+    clip_on:       u8;
+    paste_wanted:  u8;
 }
 
-# initialize a context, its draw lists and its claim lists
+# initialize a context, its draw lists, its claim lists and its font
+#
+# text draws from the built-in bitmap font until set_glyph_source says
+# otherwise, and widgets draw with the default theme at scale 1.0 until
+# set_theme and set_scale say otherwise, so a context needs no configuration.
 # ---
 # ctx: context to initialize
-# a:   allocator backing the lists
+# a:   allocator backing the lists and the font
 # ret: ok, or the allocator's refusal with nothing left allocated
 pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
+    val ef: err[allo.Error] = font.init(?ctx.font, a);
+    if (sel ef.err) { ret ef; }
     val e: err[allo.Error] = draw.init(?ctx.dl, a);
-    if (sel e.err) { ret e; }
+    if (sel e.err) {
+        val f6: err[allo.Error] = font.free(?ctx.font);
+        ret e;
+    }
     val eo: err[allo.Error] = draw.init(?ctx.out, a);
     if (sel eo.err) {
         val f0: err[allo.Error] = draw.free(?ctx.dl);
+        val f7: err[allo.Error] = font.free(?ctx.font);
         ret eo;
     }
     val ec: err[allo.Error] = hit.init(?ctx.claims, a);
     if (sel ec.err) {
         val f1: err[allo.Error] = draw.free(?ctx.out);
         val f2: err[allo.Error] = draw.free(?ctx.dl);
+        val f8: err[allo.Error] = font.free(?ctx.font);
         ret ec;
     }
     val ep: err[allo.Error] = hit.init(?ctx.prior, a);
@@ -177,6 +288,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         val f3: err[allo.Error] = hit.free(?ctx.claims);
         val f4: err[allo.Error] = draw.free(?ctx.out);
         val f5: err[allo.Error] = draw.free(?ctx.dl);
+        val f9: err[allo.Error] = font.free(?ctx.font);
         ret ep;
     }
 
@@ -184,6 +296,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.in.my        = 0.0::f32;
     ctx.in.down      = 0;
     ctx.in.prev_down = 0;
+    ctx.in.wheel     = 0.0::f32;
+    input.clear_keys(?ctx.in);
 
     ctx.sw            = 0.0::f32;
     ctx.sh            = 0.0::f32;
@@ -206,7 +320,9 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_y1       = 0.0::f32;
     ctx.clip_sp       = 0;
     ctx.org_sp        = 0;
-    ctx.tex           = nil;
+    ctx.tex           = draw.ATLAS;
+    ctx.page          = 0;
+    ctx.filter        = draw.FILTER_NEAREST;
     ctx.run_start     = 0;
     ctx.run_len       = 0;
     ctx.oom           = 0;
@@ -214,21 +330,41 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer         = 0;
     ctx.ordinal       = 0;
     ctx.layer_sp      = 0;
+    ctx.scale         = 1.0::f32;
+    ctx.theme         = th.default();
+    ctx.srgb          = 0;
+    ctx.wheel_taken   = 0;
+    ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
+    ctx.focus         = 0;
+    ctx.focus_drawn   = 0;
+    ctx.a             = a;
+    ctx.clip          = nil;
+    ctx.clip_cap      = 0;
+    ctx.clip_on       = 0;
+    ctx.paste_wanted  = 0;
     ret err[allo.Error].ok{};
 }
 
-# release the context's draw lists and claim lists
+# release the context's draw lists, claim lists, font and clipboard text
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
+    if (ctx.clip != nil) {
+        val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
+        if (sel ec.err) { ret ec; }
+        ctx.clip     = nil;
+        ctx.clip_cap = 0;
+    }
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
     val e1: err[allo.Error] = draw.free(?ctx.out);
     if (sel e1.err) { ret e1; }
     val e2: err[allo.Error] = hit.free(?ctx.claims);
     if (sel e2.err) { ret e2; }
-    ret hit.free(?ctx.prior);
+    val e3: err[allo.Error] = hit.free(?ctx.prior);
+    if (sel e3.err) { ret e3; }
+    ret font.free(?ctx.font);
 }
 
 # start a frame: store input (carrying the previous button state into
@@ -236,6 +372,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
 # layout and layers
 #
 # hover is the topmost of the previous frame's claims under this frame's cursor.
+# a press on anything but the focus holder drops the focus, and the last
+# frame's copied text and paste request are cleared.
 # ---
 # ctx: context
 # in:  this frame's input (consumer sets mx/my/down; prev_down is managed here)
@@ -266,9 +404,14 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.clip_sp = 0;
     ctx.org_sp  = 0;
 
-    ctx.tex       = nil;
+    ctx.tex       = draw.ATLAS;
+    ctx.page      = 0;
+    ctx.filter    = draw.FILTER_NEAREST;
     ctx.run_start = 0;
     ctx.run_len   = 0;
+
+    ctx.wheel_taken = 0;
+    ctx.free        = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
 
     val done: hit.ClaimList = ctx.claims;
     ctx.claims = ctx.prior;
@@ -279,11 +422,17 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.ordinal  = 0;
     ctx.layer_sp = 0;
 
+    if (input.pressed(ctx.in) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
+    ctx.focus_drawn  = 0;
+    ctx.clip_on      = 0;
+    ctx.paste_wanted = 0;
+
     draw.reset(?ctx.dl);
 }
 
-# finish a frame: close the last texture span, compose the draw list by layer
-# and drop the active widget once the button is released
+# finish a frame: close the last texture span, compose the draw list by layer,
+# drop the active widget once the button is released and drop the focus when
+# its holder was not drawn
 #
 # vertex indices taken during the frame (begin_panel's handle) are emission
 # indices and are only valid until end().
@@ -292,7 +441,112 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (ctx.in.down == 0) { ctx.active = 0; }
+    if (ctx.in.down == 0)     { ctx.active = 0; }
+    if (ctx.focus_drawn == 0) { ctx.focus = 0; }
+}
+
+# give a widget the keyboard
+#
+# it holds it across frames until a press lands elsewhere, a frame does not
+# draw it (see focused), or unfocus. a widget given it during a frame counts
+# as drawn in that frame.
+# ---
+# ctx: context
+# id:  the widget's id from next_id, 0 to drop the focus
+pub fun focus(ctx: *Context, id: u64) {
+    ctx.focus       = id;
+    ctx.focus_drawn = 0;
+    if (id != 0) { ctx.focus_drawn = 1; }
+}
+
+# take the keyboard from whichever widget holds it
+# ---
+# ctx: context
+pub fun unfocus(ctx: *Context) {
+    focus(ctx, 0);
+}
+
+# whether a widget holds the keyboard, marking it drawn this frame when it does
+#
+# a focusable widget asks this every frame it is drawn, which is what keeps
+# the focus past end().
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: true if the widget holds the keyboard
+pub fun focused(ctx: *Context, id: u64) bool {
+    if (id == 0 || ctx.focus != id) { ret false; }
+    ctx.focus_drawn = 1;
+    ret true;
+}
+
+# whether a widget holds the keyboard, so the consumer's own key bindings
+# should stay quiet
+#
+# read before begin, it says whether the keys the consumer is about to hand
+# the frame will go to a widget.
+# ---
+# ctx: context
+# ret: true while a widget holds the keyboard
+pub fun typing(ctx: *Context) bool {
+    ret ctx.focus != 0;
+}
+
+# put text on the frame's clipboard hand-off, replacing any copied earlier in
+# the frame
+#
+# the bytes are copied, so the caller may change them afterwards. a copy that
+# cannot grow the buffer is dropped and oom set.
+# ---
+# ctx: context
+# s:   utf-8 bytes
+# n:   byte count
+pub fun set_copied(ctx: *Context, s: *u8, n: usize) {
+    if (n + 1 > ctx.clip_cap) {
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](ctx.a, ctx.clip, ctx.clip_cap, n + 1);
+        if (sel r.err) {
+            ctx.oom     = 1;
+            ctx.clip_on = 0;
+            ret;
+        }
+        ctx.clip     = r.ok;
+        ctx.clip_cap = n + 1;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        ctx.clip[i] = s[i];
+        i           = i + 1;
+    }
+    ctx.clip[n] = 0;
+    ctx.clip_on = 1;
+}
+
+# the text the frame copied, for the consumer to put on the system clipboard
+# ---
+# ctx: context
+# ret: utf-8 text valid until the next begin, or nil when the frame copied nothing
+pub fun copied(ctx: *Context) str {
+    if (ctx.clip_on == 0) { ret nil; }
+    ret ctx.clip;
+}
+
+# ask the consumer for the clipboard's text, delivered in the next frame's
+# input.paste
+# ---
+# ctx: context
+pub fun request_paste(ctx: *Context) {
+    ctx.paste_wanted = 1;
+}
+
+# whether a widget asked for the clipboard's text this frame
+#
+# when true, the consumer reads the system clipboard and hands its text to the
+# next frame as input.paste.
+# ---
+# ctx: context
+# ret: true if the next frame should carry the clipboard's text
+pub fun wants_paste(ctx: *Context) bool {
+    ret ctx.paste_wanted != 0;
 }
 
 # allocate the next widget id for this frame (stable while call order is)
@@ -334,7 +588,7 @@ fun record(ctx: *Context, e: err[allo.Error]) {
     if (sel e.err) { ctx.oom = 1; }
 }
 
-# sample subsequent geometry from one consumer texture, nil for the atlas
+# sample subsequent geometry from one consumer texture, draw.ATLAS for the atlas
 #
 # a switch with nothing emitted since the last one retargets in place, so
 # alternating between an image and the atlas records spans only where
@@ -342,26 +596,60 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 # drawing into the last one, which mistextures (and mislayers) those vertices
 # rather than dropping them; raise RUN_DEPTH before drawing that many spans.
 # ---
-# ctx: context
-# tex: consumer texture handle, nil for the font atlas
-pub fun set_texture(ctx: *Context, tex: ptr) {
-    if (ctx.tex == tex) { ret; }
+# ctx:    context
+# tex:    consumer texture handle, draw.ATLAS for the font atlas
+# filter: draw.FILTER_NEAREST or FILTER_LINEAR, ignored for the atlas
+pub fun set_texture(ctx: *Context, tex: u64, filter: u32) {
+    retarget(ctx, tex, ctx.page, filter);
+}
+
+# a texture target, the atlas's page and filter normalised so equal targets
+# compare equal field for field
+fun target(tex: u64, page: u32, filter: u32) Run {
+    if (tex == draw.ATLAS) {
+        ret Run{tex: tex, page: page, layer: 0, start: 0, count: 0, filter: draw.FILTER_NEAREST};
+    }
+    ret Run{tex: tex, page: 0, layer: 0, start: 0, count: 0, filter: filter};
+}
+
+# whether two spans sample the same texels the same way
+fun same_target(a: Run, b: Run) bool {
+    ret a.tex == b.tex && a.page == b.page && a.filter == b.filter;
+}
+
+# the target subsequent geometry samples
+fun current(ctx: *Context) Run {
+    ret target(ctx.tex, ctx.page, ctx.filter);
+}
+
+# sample subsequent geometry from a consumer texture, or from an atlas page
+# when tex is draw.ATLAS
+fun retarget(ctx: *Context, tex: u64, page: u32, filter: u32) {
+    val want: Run = target(tex, page, filter);
+    if (same_target(current(ctx), want)) {
+        ctx.page = page;
+        ret;
+    }
     # a retarget with nothing drawn since the last span closed reopens that
     # span when it sampled the same texture, so a row of images through one
     # sheet costs one span however often the atlas was targeted between them
     val len: usize = draw.count(?ctx.dl);
     if (len == ctx.run_start && ctx.run_len > 0
-        && ctx.runs[ctx.run_len - 1].tex == tex
+        && same_target(ctx.runs[ctx.run_len - 1], want)
         && ctx.runs[ctx.run_len - 1].layer == ctx.layer
         && ctx.runs[ctx.run_len - 1].start
         + ctx.runs[ctx.run_len - 1].count == len) {
         ctx.run_len   = ctx.run_len - 1;
         ctx.run_start = ctx.runs[ctx.run_len].start;
         ctx.tex       = tex;
+        ctx.page      = page;
+        ctx.filter    = filter;
         ret;
     }
     flush_run(ctx);
-    ctx.tex = tex;
+    ctx.tex    = tex;
+    ctx.page   = page;
+    ctx.filter = filter;
 }
 
 # number of single-texture spans the frame's draw list divides into
@@ -380,7 +668,7 @@ pub fun run_count(ctx: *Context) usize {
 # index: span index below run_count()
 # ret:   the span, or an empty one for an index out of range
 pub fun run_at(ctx: *Context, index: usize) Run {
-    if (index >= ctx.run_len) { ret Run{tex: nil, layer: 0, start: 0, count: 0}; }
+    if (index >= ctx.run_len) { ret target(draw.ATLAS, 0, draw.FILTER_NEAREST); }
     ret ctx.runs[index];
 }
 
@@ -397,11 +685,13 @@ fun flush_run(ctx: *Context) {
         ctx.run_start        = len;
         ret;
     }
-    ctx.runs[ctx.run_len] = Run{
-        tex: ctx.tex, layer: ctx.layer, start: ctx.run_start, count: len - ctx.run_start
-    };
-    ctx.run_len   = ctx.run_len + 1;
-    ctx.run_start = len;
+    var run: Run = current(ctx);
+    run.layer             = ctx.layer;
+    run.start             = ctx.run_start;
+    run.count             = len - ctx.run_start;
+    ctx.runs[ctx.run_len] = run;
+    ctx.run_len           = ctx.run_len + 1;
+    ctx.run_start         = len;
 }
 
 # reorder the draw list so layers paint in ascending order
@@ -452,12 +742,13 @@ fun compose(ctx: *Context) {
             record(ctx, draw.push_vert(?ctx.out, src[run.start + v]));
             v = v + 1;
         }
-        if (n > 0 && ctx.runs[n - 1].tex == run.tex && ctx.runs[n - 1].layer == run.layer) {
+        if (n > 0 && same_target(ctx.runs[n - 1], run) && ctx.runs[n - 1].layer == run.layer) {
             ctx.runs[n - 1].count = ctx.runs[n - 1].count + run.count;
         }
         or {
-            ctx.runs[n] = Run{tex: run.tex, layer: run.layer, start: at, count: run.count};
-            n           = n + 1;
+            ctx.runs[n]       = run;
+            ctx.runs[n].start = at;
+            n                 = n + 1;
         }
         at = at + run.count;
         k  = k + 1;
@@ -469,28 +760,25 @@ fun compose(ctx: *Context) {
     ctx.out = emitted;
 }
 
-# emit one rectangle sampling a consumer texture
+# draw a region of a consumer texture scaled into a rect
 #
-# passes through the same local origin and clip as every quad, with uvs
-# interpolated when clipped. geometry returns to the atlas afterwards, so
-# whatever draws next needs no bookkeeping.
+# the region stretches to fill the rect and passes through the same local
+# origin and clip as every quad, with its uvs interpolated when clipped. the
+# quad's span carries the image's handle and filter for the renderer to bind.
+# geometry returns to the atlas afterwards, so whatever draws next needs no
+# bookkeeping.
 # ---
 # ctx: context
-# tex: consumer texture handle
+# img: the texture region and its sampling filter
 # x0:  left x in pixels
 # y0:  top y in pixels
 # x1:  right x in pixels
 # y1:  bottom y in pixels
-# u0:  left u in the texture
-# v0:  top v in the texture
-# u1:  right u in the texture
-# v1:  bottom v in the texture
-# c:   multiplicative tint
-pub fun image_at(ctx: *Context, tex: ptr, x0: f32, y0: f32, x1: f32, y1: f32,
-    u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
-    set_texture(ctx, tex);
-    emit(ctx, x0, y0, x1, y1, u0, v0, u1, v1, c);
-    set_texture(ctx, nil);
+# c:   multiplicative tint, white to draw the texels as they are
+pub fun image_at(ctx: *Context, img: draw.Image, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    set_texture(ctx, img.tex, img.filter);
+    emit(ctx, x0, y0, x1, y1, img.u0, img.v0, img.u1, img.v1, paint(ctx, c));
+    set_texture(ctx, draw.ATLAS, draw.FILTER_NEAREST);
 }
 
 # the larger of two f32 values
@@ -767,7 +1055,116 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
     record(ctx, draw.push_quad(?ctx.dl, nx0, ny0, nx1, ny1, nu0, nv0, nu1, nv1, c));
 }
 
-# emit a solid-color rectangle sampling the atlas white cell
+# a color as it is emitted: converted to linear light for an sRGB target
+fun paint(ctx: *Context, c: draw.Color) draw.Color {
+    if (ctx.srgb != 0) { ret draw.linear(c); }
+    ret c;
+}
+
+# say whether the target encodes sRGB on write
+#
+# with it on, every color passed to the painter (quads, text, image tints) is
+# taken as authored in sRGB and emitted in linear light, so the target's
+# encoding brings it back to what was authored. alpha is never converted.
+# ---
+# ctx: context
+# on:  1 for an sRGB-encoding target, 0 to emit colors as authored
+pub fun set_srgb(ctx: *Context, on: u8) {
+    ctx.srgb = on;
+}
+
+# draw text from another glyph source from now on
+#
+# every atlas page is cleared and must be uploaded again. call it between
+# frames. see blit.glyph for the contract a source implements.
+# ---
+# ctx: context
+# src: the glyph source
+pub fun set_glyph_source(ctx: *Context, src: gly.GlyphSource) {
+    font.set_source(?ctx.font, src);
+}
+
+# the atlas the consumer uploads, one texture per page (see blit.atlas)
+# ---
+# ctx: context
+# ret: the atlas
+pub fun atlas_of(ctx: *Context) *atlas.Atlas {
+    ret ?ctx.font.atlas;
+}
+
+# the context's font, for measuring text outside a frame
+# ---
+# ctx: context
+# ret: the font
+pub fun font_of(ctx: *Context) *font.Font {
+    ret ?ctx.font;
+}
+
+# the height of one line of text at the context's scale
+# ---
+# ctx: context
+# ret: line height in pixels
+pub fun line_height(ctx: *Context) f32 {
+    ret font.line_height(?ctx.font, ctx.scale);
+}
+
+# width of the widest line of a string at the context's scale
+# ---
+# ctx: context
+# s:   utf-8 text
+# ret: width in pixels
+pub fun text_width(ctx: *Context, s: str) f32 {
+    ret font.measure(?ctx.font, s, ctx.scale);
+}
+
+# draw widgets with another theme from now on
+# ---
+# ctx: context
+# t:   the theme, copied into the context
+pub fun set_theme(ctx: *Context, t: th.Theme) {
+    ctx.theme = t;
+}
+
+# the theme widgets draw with, to read or adjust in place
+# ---
+# ctx: context
+# ret: the context's theme
+pub fun theme_of(ctx: *Context) *th.Theme {
+    ret ?ctx.theme;
+}
+
+# size the interface by one factor from now on
+#
+# every theme metric and all text scale by it: 2.0 doubles the interface, as a
+# HiDPI display or a user's choice wants. text is rasterised at the new size,
+# so the atlas gains pages to upload. lengths the consumer passes (panel and
+# window widths, dock sizes, geometry) stay in pixels, and px scales them to
+# match. call it between frames.
+# ---
+# ctx: context
+# s:   interface scale, above zero
+pub fun set_scale(ctx: *Context, s: f32) {
+    if (s > 0.0::f32) { ctx.scale = s; }
+}
+
+# the interface scale
+# ---
+# ctx: context
+# ret: the factor set_scale set, 1.0 by default
+pub fun scale_of(ctx: *Context) f32 {
+    ret ctx.scale;
+}
+
+# a length authored at scale 1.0, in pixels at the context's scale
+# ---
+# ctx: context
+# v:   unscaled length
+# ret: the scaled length
+pub fun px(ctx: *Context, v: f32) f32 {
+    ret v * ctx.scale;
+}
+
+# emit a solid-color rectangle sampling the atlas white block
 # ---
 # ctx: context
 # x0:  left x in pixels
@@ -778,41 +1175,294 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     var wu: f32;
     var wv: f32;
-    font.white_uv(?wu, ?wv);
-    emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, c);
+    atlas.white_uv(?wu, ?wv);
+    emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, paint(ctx, c));
 }
 
-# emit one character cell at (x, y), tinted by c
+# how many quads a fill of radius r with these corners is made of
+#
+# one for the body and one per pixel row of each rounded end, so a square fill
+# is a single quad. the count depends on the radius and corners alone, never
+# on the rect, which lets reserve_fill emit a fill before its height is known.
+fun fill_quads(r: f32, corners: u8) usize {
+    if (r <= 0.0::f32) { ret 1; }
+    var rows: usize = r::usize;
+    if (rows::f32 < r) { rows = rows + 1; }
+    var n: usize = 1;
+    if ((corners & CORNERS_TOP) != 0)    { n = n + rows; }
+    if ((corners & CORNERS_BOTTOM) != 0) { n = n + rows; }
+    ret n;
+}
+
+# the rect of quad k of a fill, empty when the radius left it no row
+#
+# quad 0 is the body between the rounded ends. then come the top end's pixel
+# rows from the edge inward, then the bottom end's, each inset from the sides
+# to follow a circle of the radius, clamped to what the rect can hold.
+fun fill_part(x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, k: usize) Area {
+    val top:    bool = (corners & CORNERS_TOP) != 0 && r > 0.0::f32;
+    val bottom: bool = (corners & CORNERS_BOTTOM) != 0 && r > 0.0::f32;
+    var rr:     f32  = minf(r, (x1 - x0) / 2.0::f32);
+    if (top && bottom) { rr = minf(rr, (y1 - y0) / 2.0::f32); }
+    or (top || bottom) { rr = minf(rr, y1 - y0); }
+    rr = maxf(rr, 0.0::f32);
+
+    if (k == 0) {
+        var b: Area = Area{x0: x0, y0: y0, x1: x1, y1: y1};
+        if (top)    { b.y0 = y0 + rr; }
+        if (bottom) { b.y1 = y1 - rr; }
+        ret b;
+    }
+    val empty:  Area  = Area{x0: x0, y0: y0, x1: x0, y1: y0};
+    val rows:   usize = fill_quads(r, CORNERS_TOP) - 1;
+    var i:      usize = k - 1;
+    var at_top: bool  = top;
+    if (!top || i >= rows) {
+        at_top = false;
+        if (top) { i = i - rows; }
+    }
+    val a: f32 = i::f32;
+    if (a >= rr) { ret empty; }
+    val b:     f32 = minf(a + 1.0::f32, rr);
+    val d:     f32 = rr - (a + b) / 2.0::f32;
+    val inset: f32 = rr - sqrt_f32(maxf(rr * rr - d * d, 0.0::f32));
+    if (at_top) { ret Area{x0: x0 + inset, y0: y0 + a, x1: x1 - inset, y1: y0 + b}; }
+    ret Area{x0: x0 + inset, y0: y1 - b, x1: x1 - inset, y1: y1 - a};
+}
+
+# fill a rectangle with its chosen corners rounded to radius r
+#
+# the rounding is built from quads, one per pixel row of each rounded end, so
+# it needs nothing of the renderer and clips like any quad. a radius of zero
+# or less, or no corners, is one quad, the same as quad.
+# ---
+# ctx:     context
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# r:       corner radius in pixels, clamped to what the rect can hold
+# corners: which corners are rounded, CORNERS_* combined with |
+# c:       fill color
+pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, c: draw.Color) {
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    val n: usize = fill_quads(rad, corners);
+    var k: usize = 0;
+    for (k < n) {
+        val q: Area = fill_part(x0, y0, x1, y1, rad, corners, k);
+        if (q.x1 > q.x0 && q.y1 > q.y0) { quad(ctx, q.x0, q.y0, q.x1, q.y1, c); }
+        k = k + 1;
+    }
+}
+
+# emit a zero-height fill at (x0, y0)-(x1, y0) to give its rect later with
+# grow_fill
+#
+# containers use this: a panel paints its background beneath its widgets
+# before it knows how tall they make it. the placeholder is not clipped until
+# grow_fill gives it its rect. r and corners must match the grow_fill call.
+# ---
+# ctx:     context
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# r:       corner radius in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+# c:       fill color
+# ret:     a handle for grow_fill, or NO_VERTS if the fill was not emitted whole
+pub fun reserve_fill(ctx: *Context, x0: f32, y0: f32, x1: f32, r: f32, corners: u8, c: draw.Color) usize {
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    # the placeholders skip the clip, which would drop a zero-height quad on
+    # its edge, and grow_fill clips them once the rect is known
+    val ink:    draw.Color = paint(ctx, c);
+    val sx0:    f32        = x0 + ctx.lx;
+    val sx1:    f32        = x1 + ctx.lx;
+    val sy:     f32        = y0 + ctx.ly;
+    val n:      usize      = fill_quads(rad, corners);
+    val before: usize      = draw.count(?ctx.dl);
+    var k:      usize      = 0;
+    for (k < n) {
+        record(ctx, draw.push_quad(?ctx.dl, sx0, sy, sx1, sy, wu, wv, wu, wv, ink));
+        k = k + 1;
+    }
+    if (draw.count(?ctx.dl) != before + n * 6) { ret NO_VERTS; }
+    ret before;
+}
+
+# move quad k of a reserved fill onto the local rect q, clipped like emit
+fun place_quad(ctx: *Context, p: *draw.Vert, k: usize, q: Area) {
+    var sx0: f32 = maxf(q.x0 + ctx.lx, ctx.clip_x0);
+    var sy0: f32 = maxf(q.y0 + ctx.ly, ctx.clip_y0);
+    var sx1: f32 = minf(q.x1 + ctx.lx, ctx.clip_x1);
+    var sy1: f32 = minf(q.y1 + ctx.ly, ctx.clip_y1);
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        sx1 = sx0;
+        sy1 = sy0;
+    }
+    p[k + 0].x = sx0;
+    p[k + 0].y = sy0;
+    p[k + 1].x = sx1;
+    p[k + 1].y = sy0;
+    p[k + 2].x = sx1;
+    p[k + 2].y = sy1;
+    p[k + 3].x = sx0;
+    p[k + 3].y = sy0;
+    p[k + 4].x = sx1;
+    p[k + 4].y = sy1;
+    p[k + 5].x = sx0;
+    p[k + 5].y = sy1;
+}
+
+# give a fill reserved by reserve_fill its rect, in local coordinates clipped
+# like geometry
+#
+# a no-op for NO_VERTS. vertex handles are emission indices, valid until end().
+# ---
+# ctx:     context
+# handle:  the value returned by reserve_fill this frame
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# r:       corner radius in pixels, as passed to reserve_fill
+# corners: which corners are rounded, as passed to reserve_fill
+pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8) {
+    if (handle == NO_VERTS) { ret; }
+    var rad: f32 = r;
+    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
+    val n: usize = fill_quads(rad, corners);
+    if (handle + n * 6 > draw.count(?ctx.dl)) { ret; }
+    val p: *draw.Vert = draw.data(?ctx.dl);
+    var k: usize      = 0;
+    for (k < n) {
+        place_quad(ctx, p, handle + k * 6, fill_part(x0, y0, x1, y1, rad, corners, k));
+        k = k + 1;
+    }
+}
+
+# emit one glyph with its pen at x on the baseline, sampling its atlas page
+# ---
+# ret: the glyph's advance
+fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
+    val p: font.Placed = font.place(?ctx.font, cp, ctx.scale);
+    if (p.drawn == 0) { ret p.g.advance; }
+    retarget(ctx, draw.ATLAS, p.page, draw.FILTER_NEAREST);
+    emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
+    ret p.g.advance;
+}
+
+# emit one codepoint in a line box whose top-left is (x, y), tinted by c
+#
+# a codepoint the glyph source lacks draws as its replacement glyph.
 # ---
 # ctx: context
-# ch:  character to draw
-# x:   left x in pixels
-# y:   top y in pixels
+# cp:  codepoint to draw
+# x:   pen x in pixels
+# y:   line top y in pixels
 # c:   tint color
-pub fun glyph(ctx: *Context, ch: u8, x: f32, y: f32, c: draw.Color) {
-    var u0: f32;
-    var v0: f32;
-    var u1: f32;
-    var v1: f32;
-    font.glyph_uv(ch, ?u0, ?v0, ?u1, ?v1);
-    emit(ctx, x, y, x + font.GLYPH_W, y + font.GLYPH_H, u0, v0, u1, v1, c);
+pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
+    if (font.is_control(cp)) { ret; }
+    val m:   gly.LineMetrics = font.line(?ctx.font, ctx.scale);
+    val adv: f32             = pen_glyph(ctx, cp, x, y + m.ascent, paint(ctx, c));
 }
 
-# draw a string starting at (x, y), advancing one glyph per character
+# draw utf-8 text with its first line box's top-left at (x, y)
+#
+# kerning comes from the glyph source, control codepoints take no space and a
+# newline starts the next line box at x.
 # ---
 # ctx: context
-# s:   string to draw
+# s:   utf-8 text
 # x:   left x in pixels
 # y:   top y in pixels
 # c:   tint color
 pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
-    var i:  usize = 0;
-    var px: f32   = x;
-    for (s[i] != 0) {
-        glyph(ctx, s[i], px, y, c);
-        px = px + font.GLYPH_W;
-        i  = i + 1;
+    if (s == nil) { ret; }
+    text_span(ctx, s, str_len(s), x, y, c);
+}
+
+# draw the first n bytes of utf-8 text with its first line box's top-left at
+# (x, y), as text_at does the whole string
+#
+# for layout that splits a string without copying it, such as wrapped text.
+# n must fall on a codepoint boundary.
+# ---
+# ctx: context
+# s:   utf-8 text, at least n bytes
+# n:   bytes to draw
+# x:   left x in pixels
+# y:   top y in pixels
+# c:   tint color
+pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color) {
+    if (s == nil) { ret; }
+    val m:    gly.LineMetrics = font.line(?ctx.font, ctx.scale);
+    val lh:   f32             = gly.line_height(m);
+    val ink:  draw.Color      = paint(ctx, c);
+    var base: f32             = y + m.ascent;
+    var px:   f32             = x;
+    var prev: u32             = 0;
+    var i:    usize           = 0;
+    for (i < n) {
+        var cp: u32 = 0;
+        i = i + font.next(s, i, n, ?cp);
+        if (cp == font.NEWLINE) {
+            base = base + lh;
+            px   = x;
+            prev = 0;
+        }
+        or (!font.is_control(cp)) {
+            px   = px + font.kern(?ctx.font, prev, cp, ctx.scale);
+            px   = px + pen_glyph(ctx, cp, px, base, ink);
+            prev = cp;
+        }
     }
+}
+
+# take a strip off an edge of the screen area docked containers have left
+#
+# the strip is clamped to what is left, and the area shrinks by it, so docks
+# carved in turn stack inward from the edges. at the root, local coordinates
+# are screen coordinates, so the strip can be drawn in directly.
+# ---
+# ctx:  context
+# side: the edge to take the strip from
+# size: strip width (left, right) or height (top, bottom) in pixels
+# ret:  the strip, in screen pixels
+pub fun carve(ctx: *Context, side: Side, size: f32) Area {
+    var r: Area = ctx.free;
+    if (sel side.left) {
+        r.x1        = minf(r.x0 + size, r.x1);
+        ctx.free.x0 = r.x1;
+    }
+    or (sel side.right) {
+        r.x0        = maxf(r.x1 - size, r.x0);
+        ctx.free.x1 = r.x0;
+    }
+    or (sel side.top) {
+        r.y1        = minf(r.y0 + size, r.y1);
+        ctx.free.y0 = r.y1;
+    }
+    or {
+        r.y0        = maxf(r.y1 - size, r.y0);
+        ctx.free.y1 = r.y0;
+    }
+    ret r;
+}
+
+# the part of the screen docked containers have not taken so far this frame
+#
+# read it after the docks to place what the docks surround, such as a world
+# view. floating windows and popups are not counted.
+# ---
+# ctx: context
+# ret: the free area, in screen pixels
+pub fun free_area(ctx: *Context) Area {
+    ret ctx.free;
 }
 
 # a scrolled, clipped local drawing region returned by begin_surface
@@ -903,14 +1553,10 @@ test clip__glyph_uvs_interpolate {
     # left edge and its u untouched
     if (p[0].x != 0.0::f32) { ret 1; }
 
-    var u0: f32;
-    var v0: f32;
-    var u1: f32;
-    var v1: f32;
-    font.glyph_uv('A', ?u0, ?v0, ?u1, ?v1);
-    if (p[0].u != u0) { ret 1; }
+    val g: font.Placed = font.place(?ctx.font, 'A', 1.0::f32);
+    if (p[0].u != g.u0) { ret 1; }
     # clipped edge u interpolated to the cell midpoint
-    if (p[1].u != (u0 + u1) / 2.0::f32) { ret 1; }
+    if (p[1].u != (g.u0 + g.u1) / 2.0::f32) { ret 1; }
 
     # a quad fully outside the clip is dropped entirely
     quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
@@ -984,22 +1630,21 @@ test runs__split_by_texture_in_draw_order {
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64        = 7;
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
 
     # atlas span, one image span, then atlas again
     quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
-    image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    image_at(?ctx, sheet, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32, white);
     quad(?ctx, 20.0::f32, 0.0::f32, 30.0::f32, 10.0::f32, white);
     end(?ctx);
 
     if (run_count(?ctx) != 3) { ret 1; }
     val head: Run = run_at(?ctx, 0);
-    if (head.tex != nil || head.start != 0 || head.count != 6) { ret 1; }
+    if (head.tex != draw.ATLAS || head.start != 0 || head.count != 6) { ret 1; }
     val mid: Run = run_at(?ctx, 1);
-    if (mid.tex != (?sheet)::ptr || mid.start != 6 || mid.count != 6) { ret 1; }
+    if (mid.tex != 7 || mid.filter != draw.FILTER_LINEAR || mid.start != 6 || mid.count != 6) { ret 1; }
     val tail: Run = run_at(?ctx, 2);
-    if (tail.tex != nil || tail.start != 12 || tail.count != 6) { ret 1; }
+    if (tail.tex != draw.ATLAS || tail.start != 12 || tail.count != 6) { ret 1; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -1022,20 +1667,18 @@ test runs__same_texture_images_merge {
     begin(?ctx, in, 100.0::f32, 100.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    var sheet: u64        = 7;
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
 
     # two images through the same texture, nothing on the atlas between
-    image_at(?ctx, (?sheet)::ptr, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
-    image_at(?ctx, (?sheet)::ptr, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32,
-        0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    image_at(?ctx, sheet, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    image_at(?ctx, sheet, 10.0::f32, 0.0::f32, 20.0::f32, 10.0::f32, white);
     end(?ctx);
 
     # one span: the second image reopened the first's rather than closing
     # an empty atlas bracket between them
     if (run_count(?ctx) != 1) { ret 1; }
     val whole: Run = run_at(?ctx, 0);
-    if (whole.tex != (?sheet)::ptr || whole.start != 0 || whole.count != 12) {
+    if (whole.tex != 7 || whole.start != 0 || whole.count != 12) {
         ret 1;
     }
 
@@ -1295,6 +1938,146 @@ test surface__nested_origins_unwind {
     if (ctx.lx != 0.0::f32 || ctx.ly != 0.0::f32)             { ret 9; }
     if (ctx.clip_x0 != 0.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 10; }
     if (ctx.org_sp != 0 || ctx.clip_sp != 0)                  { ret 11; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test srgb__painter_emits_linear_colors {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val grey: draw.Color = draw.rgba(0.5::f32, 0.5::f32, 0.5::f32, 0.5::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
+    set_srgb(?ctx, 1);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
+    text_at(?ctx, "A", 0.0::f32, 0.0::f32, grey);
+
+    val p:    *draw.Vert = draw_verts(?ctx);
+    val want: f32        = draw.srgb_to_linear(0.5::f32);
+    if (p[0].r != 0.5::f32)                   { ret 2; }
+    if (p[6].r != want || p[6].a != 0.5::f32) { ret 3; }
+    if (p[12].g != want)                      { ret 4; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test fill__rounds_corners_and_grows_reserved {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    # a square fill is one quad
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
+    if (draw_count(?ctx) != 6) { ret 2; }
+
+    # radius 4 on every corner: the body plus four rows at each end
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
+    if (draw_count(?ctx) != 60) { ret 3; }
+    val p: *draw.Vert = draw_verts(?ctx);
+    if (p[6].y != 4.0::f32 || p[8].y != 16.0::f32 || p[6].x != 0.0::f32) { ret 4; }
+    # the outermost top row is inset from both sides, the innermost barely
+    if (p[12].y != 0.0::f32 || p[12].x <= 1.0::f32 || p[13].x >= 19.0::f32) { ret 5; }
+    if (p[30].y != 3.0::f32 || p[30].x >= 0.5::f32)                         { ret 6; }
+
+    # a reserved fill rounded at the bottom takes its rect when grown
+    val h: usize = reserve_fill(?ctx, 0.0::f32, 30.0::f32, 20.0::f32, 4.0::f32, CORNERS_BOTTOM, white);
+    if (h != 60 || draw_count(?ctx) != 90) { ret 7; }
+    grow_fill(?ctx, h, 0.0::f32, 30.0::f32, 20.0::f32, 50.0::f32, 4.0::f32, CORNERS_BOTTOM);
+    if (p[60].y != 30.0::f32 || p[62].y != 46.0::f32) { ret 8; }
+    if (p[66].y != 49.0::f32 || p[68].y != 50.0::f32) { ret 9; }
+    if (p[66].x <= 1.0::f32)                          { ret 10; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test focus__held_while_drawn_and_dropped_by_a_press_elsewhere {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # a widget given the focus keeps it while it is drawn
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    val c1: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    focus(?ctx, 1);
+    if (!typing(?ctx)) { ret 2; }
+    end(?ctx);
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    val c2: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    if (!focused(?ctx, 1) || focused(?ctx, 2)) { ret 3; }
+    end(?ctx);
+    if (!typing(?ctx)) { ret 4; }
+
+    # a press on the holder keeps it, a press elsewhere drops it
+    var in: input.Input;
+    in.mx   = 5.0::f32;
+    in.my   = 5.0::f32;
+    in.down = 1;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    val c3: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    if (!focused(?ctx, 1)) { ret 5; }
+    end(?ctx);
+    in.down = 0;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    val c4: u8   = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    val f4: bool = focused(?ctx, 1);
+    end(?ctx);
+    in.mx   = 50.0::f32;
+    in.down = 1;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (typing(?ctx)) { ret 6; }
+    end(?ctx);
+
+    # a frame that does not draw the holder drops it
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    focus(?ctx, 1);
+    end(?ctx);
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    end(?ctx);
+    if (typing(?ctx)) { ret 7; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test clipboard__copied_and_paste_request_last_one_frame {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    if (copied(?ctx) != nil || wants_paste(?ctx)) { ret 2; }
+    set_copied(?ctx, "caf\xC3\xA9 au lait", 5);
+    request_paste(?ctx);
+    end(?ctx);
+    if (copied(?ctx) == nil || !str_equals(copied(?ctx), "caf\xC3\xA9")) { ret 3; }
+    if (!wants_paste(?ctx))                                              { ret 4; }
+
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    end(?ctx);
+    if (copied(?ctx) != nil || wants_paste(?ctx)) { ret 5; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }

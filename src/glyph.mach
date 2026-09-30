@@ -1,0 +1,86 @@
+# the glyph-source contract: where blit's text gets its metrics and coverage
+#
+# a source answers four questions about a face at a scale: how tall a line is,
+# what one codepoint measures, how a pair of codepoints kerns, and what a
+# codepoint's coverage bitmap looks like. blit owns everything else: utf-8
+# decoding, layout, the glyph cache and the atlas the bitmaps are packed into.
+#
+# the contract is shaped for a scalable outline face, the hardest member.
+# every metric is a float in pixels at the scale asked for, so advances can be
+# fractional and text scaled to 200% is rasterised at that size rather than
+# stretched. a source is asked for a codepoint only when blit first needs it,
+# so nothing assumes a fixed glyph set, and a source that lacks a codepoint
+# says so and blit falls back to a replacement glyph.
+#
+# coordinates are y-down, relative to the pen on the baseline: a glyph's top
+# above the baseline is a negative y. scale is the interface scale, 1.0 for
+# the face's own size.
+#
+# blit.bitmap is the built-in implementation and the zero-configuration
+# default. a host plugs in its own, such as a TrueType face, by filling a
+# GlyphSource with its functions and an opaque pointer to its state.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+
+# vertical metrics of a line at one scale, in pixels
+# ---
+# ascent:  distance from the line's top to its baseline
+# descent: distance from the baseline to the line's bottom, positive downward
+# gap:     extra space from one line's bottom to the next line's top
+pub rec LineMetrics {
+    ascent:  f32;
+    descent: f32;
+    gap:     f32;
+}
+
+# what one codepoint measures at one scale
+#
+# x0..y1 is the rect its bitmap covers on screen, relative to the pen on the
+# baseline, and w x h is the bitmap in texels. the two differ when a source
+# rasterises at another resolution than it lays out, as an oversampling face
+# does. a glyph with nothing to draw, such as a space, has w or h zero.
+# ---
+# advance: pen movement after the glyph, in pixels
+# x0:      left of the bitmap's rect from the pen, in pixels
+# y0:      top of the bitmap's rect from the baseline, in pixels (negative above)
+# x1:      right of the bitmap's rect from the pen, in pixels
+# y1:      bottom of the bitmap's rect from the baseline, in pixels
+# w:       bitmap width in texels
+# h:       bitmap height in texels
+pub rec Glyph {
+    advance: f32;
+    x0:      f32;
+    y0:      f32;
+    x1:      f32;
+    y1:      f32;
+    w:       u32;
+    h:       u32;
+}
+
+# a face blit draws text from, as functions over the source's own state
+#
+# every function takes `self` first. glyph and raster must agree: raster
+# writes exactly the w x h bitmap glyph reported for the same codepoint and
+# scale. kern may be nil for a face without kerning.
+# ---
+# self:   opaque pointer to the source's state, passed back to every function
+# line:   (self, scale) -> the line metrics at scale
+# glyph:  (self, codepoint, scale, out) -> whether the face has the codepoint, filling out when it does
+# kern:   (self, left, right, scale) -> the pen adjustment between the pair, in pixels, or nil for none
+# raster: (self, codepoint, scale, coverage, stride) -> whether it wrote h rows of w coverage bytes, stride bytes apart
+pub rec GlyphSource {
+    self:   ptr;
+    line:   fun(ptr, f32) LineMetrics;
+    glyph:  fun(ptr, u32, f32, *Glyph) bool;
+    kern:   fun(ptr, u32, u32, f32) f32;
+    raster: fun(ptr, u32, f32, *u8, usize) bool;
+}
+
+# the height of one line box: ascent, descent and gap
+# ---
+# m:   line metrics
+# ret: distance from one line's top to the next line's top, in pixels
+pub fun line_height(m: LineMetrics) f32 {
+    ret m.ascent + m.descent + m.gap;
+}

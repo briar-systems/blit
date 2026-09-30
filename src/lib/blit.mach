@@ -9,12 +9,18 @@ use std.types.string.str;
 # links the startup entrypoint so `mach test` over this library produces a binary.
 use std.runtime;
 
+fwd blit.atlas;
+fwd blit.bitmap;
 fwd blit.draw;
 fwd blit.font;
+fwd blit.glyph;
 fwd blit.input;
 fwd blit.hit;
+fwd blit.field;
+fwd blit.theme;
 fwd blit.context;
 fwd blit.widget;
+fwd blit.chart;
 
 # blit library version
 pub val VERSION: str = "0.8.0";
