@@ -319,7 +319,7 @@ shows.
 | `metrics.gap` | length | space between layout rows, cells and buttons in a row |
 | `metrics.pad` | length | container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content |
 | `metrics.inset` | length | control inset: between a control's edge and its text, and between a box and its label |
-| `metrics.handle_w` | length | slider handle width |
+| `metrics.handle_w` | length | slider handle width, 0 for none |
 | `metrics.bar_w` | length | scrollbar width |
 | `metrics.thumb_min` | length | shortest scrollbar thumb |
 | `metrics.corner` | length | corner radius of controls and containers, 0 for square |
@@ -369,7 +369,7 @@ shows.
 | `toggle` | a toggle's switch track and label, on while set: pad between the row and the track |
 | `toggle_knob` | a toggle's knob, in the toggle's state: margin between the knob and the track |
 | `slider` | a slider's track: text the label, mark the reading |
-| `slider_handle` | a slider's handle: min_w its width |
+| `slider_handle` | a slider's handle: min_w its width, 0 for none |
 | `dropdown` | a dropdown's header, on while open |
 | `field` | a text field: mark the hint, focused while it holds the keyboard |
 | `field_caret` | a text field's caret and its composition underline: fill, min_w the width |
@@ -408,6 +408,7 @@ shows.
 | `checker` | the checkerboard alpha shows through: fill and mark its two cells |
 | `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
 | `focus_ring` | the ring around the control the keyboard reached: border and border_w its stroke, radius its corners |
+| `slider_fill` | a slider's fill from the track's start to the value, transparent unless a theme gives it a fill |
 
 | state | when |
 |---|---|
@@ -990,7 +991,9 @@ instead of `ox` and `pw`.
   `checkbox` a box beside its label.
 - **Sliders.** `slider(?ctx, label, reading, ?v, lo, hi)` shows the caller's
   formatted `reading` of the value beside its label, and `slider_f` is the
-  same without one.
+  same without one. A theme fills the track up to the value through
+  `slider_fill`, clear in the built-in themes, and a `slider_handle.min_w` of
+  0 leaves the handle out for a fill alone.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
 - **Lists.** `blit.list.show(?ctx, key, ?l, rows, h)` is a scrolling list `h`
