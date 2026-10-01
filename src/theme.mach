@@ -59,7 +59,7 @@ pub val STATES: u8 = 6;
 
 # a line of text and a wrapped note: text, and mark for a note
 pub val LABEL: u32 = 0;
-# layout itself: margin between cells, columns and rows placed by hand, pad of a generic container
+# layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row
 pub val LAYOUT: u32 = 1;
 # a panel's background and padding
 pub val PANEL: u32 = 2;
@@ -333,7 +333,7 @@ pub val FIELDS: [50]Field = [50]Field{
     Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
     Field{group: GROUP_PALETTE, name: "header", unit: UNIT_COLOR, off: $offset_of(Theme, header), count: 1, doc: "window titlebar and section heading"},
     Field{group: GROUP_PALETTE, name: "header_hot", unit: UNIT_COLOR, off: $offset_of(Theme, header_hot), count: 1, doc: "a titlebar or heading under the cursor"},
-    Field{group: GROUP_PALETTE, name: "edge", unit: UNIT_COLOR, off: $offset_of(Theme, edge), count: 1, doc: "the edge line a dock draws on its inner side"},
+    Field{group: GROUP_PALETTE, name: "edge", unit: UNIT_COLOR, off: $offset_of(Theme, edge), count: 1, doc: "a dock's inner edge and a separator's rule"},
     Field{group: GROUP_PALETTE, name: "text", unit: UNIT_COLOR, off: $offset_of(Theme, text), count: 1, doc: "text"},
     Field{group: GROUP_PALETTE, name: "text_dim", unit: UNIT_COLOR, off: $offset_of(Theme, text_dim), count: 1, doc: "secondary text and glyphs: notes, readings, carets, axis labels"},
     Field{group: GROUP_PALETTE, name: "text_faint", unit: UNIT_COLOR, off: $offset_of(Theme, text_faint), count: 1, doc: "the faintest text: hints, placeholders and disabled text"},
@@ -342,16 +342,16 @@ pub val FIELDS: [50]Field = [50]Field{
     Field{group: GROUP_PALETTE, name: "warn", unit: UNIT_COLOR, off: $offset_of(Theme, warn), count: 1, doc: "warnings, for consumers drawing their own content; no widget uses it"},
     Field{group: GROUP_PALETTE, name: "control", unit: UNIT_COLOR, off: $offset_of(Theme, control), count: 1, doc: "a control's face at rest"},
     Field{group: GROUP_PALETTE, name: "control_hot", unit: UNIT_COLOR, off: $offset_of(Theme, control_hot), count: 1, doc: "a control under the cursor"},
-    Field{group: GROUP_PALETTE, name: "control_on", unit: UNIT_COLOR, off: $offset_of(Theme, control_on), count: 1, doc: "a control pressed, or a dropdown open"},
-    Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, doc: "a slider, toggle or scrollbar track, a dropdown option and a text field's face"},
+    Field{group: GROUP_PALETTE, name: "control_on", unit: UNIT_COLOR, off: $offset_of(Theme, control_on), count: 1, doc: "a control pressed, a dropdown open or a menu's header open"},
+    Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, doc: "a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face"},
     Field{group: GROUP_PALETTE, name: "handle", unit: UNIT_COLOR, off: $offset_of(Theme, handle), count: 1, doc: "a slider handle, toggle knob or scrollbar thumb at rest"},
     Field{group: GROUP_PALETTE, name: "handle_on", unit: UNIT_COLOR, off: $offset_of(Theme, handle_on), count: 1, doc: "a handle, knob or thumb being dragged or hovered"},
     Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, doc: "the highlight behind selected text"},
     Field{group: GROUP_PALETTE, name: "grid", unit: UNIT_COLOR, off: $offset_of(Theme, grid), count: 1, doc: "chart grid lines"},
     Field{group: GROUP_METRICS, name: "row", unit: UNIT_LENGTH, off: $offset_of(Theme, row), count: 1, doc: "least height of a control row, which grows to fit a line of text and its inset"},
-    Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows and cells"},
-    Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, doc: "container padding: below a panel's content, around a dock's column"},
-    Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, doc: "control inset: between a control's edge and its text"},
+    Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows, cells and buttons in a row"},
+    Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, doc: "container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content"},
+    Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, doc: "control inset: between a control's edge and its text, and between a box and its label"},
     Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, doc: "slider handle width"},
     Field{group: GROUP_METRICS, name: "bar_w", unit: UNIT_LENGTH, off: $offset_of(Theme, bar_w), count: 1, doc: "scrollbar width"},
     Field{group: GROUP_METRICS, name: "thumb_min", unit: UNIT_LENGTH, off: $offset_of(Theme, thumb_min), count: 1, doc: "shortest scrollbar thumb"},
@@ -392,7 +392,7 @@ pub rec Name {
 # every widget kind, indexed by the kind constants
 pub val KIND_NAMES: [44]Name = [44]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
-    Name{name: "layout", doc: "layout itself: margin between cells, columns and rows placed by hand, and a generic container's pad"},
+    Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
     Name{name: "window", doc: "a window's body and its shadow, pad around its column, margin the resize grips outside its edges"},
     Name{name: "window_title", doc: "a window's titlebar: text the title, mark the collapse glyph, hot under the cursor"},
@@ -1000,7 +1000,6 @@ pub fun derive(t: *Theme) {
     t.styles[MODAL]         = below(t, t.window);
     fill_all(?t.styles[TOOLTIP], t.window);
 
-    t.styles[WINDOW_TITLE].inset = edges(t.pad);
     fills(?t.styles[WINDOW_TITLE], t.header, t.header_hot, t.header_hot, t.header);
 
     t.styles[DOCK].radius = draw.radii(0.0::f32);
@@ -1032,27 +1031,22 @@ pub fun derive(t: *Theme) {
     t.styles[TOGGLE_KNOB].margin = edges(t.pad / 2.0::f32);
     fills(?t.styles[TOGGLE_KNOB], t.handle, t.handle_on, t.handle_on, t.accent_text);
 
-    t.styles[SLIDER].inset = edges(t.pad);
     fill_all(?t.styles[SLIDER], t.track);
     t.styles[SLIDER_HANDLE].min_w = t.handle_w;
     fills(?t.styles[SLIDER_HANDLE], t.handle, t.handle, t.handle_on, t.handle);
 
-    t.styles[DROPDOWN].inset = edges(t.pad);
     fills(?t.styles[DROPDOWN], t.control, t.control_hot, t.control_hot, t.control_on);
-    t.styles[OPTION].inset = edges(t.pad);
     fills(?t.styles[OPTION], t.track, t.control_hot, t.control_hot, t.accent);
     t.styles[OPTION].states[ON].text = t.accent_text;
 
     t.styles[MENU_BAR].radius = draw.radii(0.0::f32);
     fill_all(?t.styles[MENU_BAR], t.header);
     t.styles[MENU_TITLE].radius = draw.radii(0.0::f32);
-    t.styles[MENU_TITLE].inset  = Edges{l: t.pad * 2.0::f32, t: t.inset, r: t.pad * 2.0::f32, b: t.inset};
+    t.styles[MENU_TITLE].inset  = Edges{l: t.inset * 2.0::f32, t: t.inset, r: t.inset * 2.0::f32, b: t.inset};
     fills(?t.styles[MENU_TITLE], clear(), t.header_hot, t.header_hot, t.control_on);
     t.styles[MENU_ITEM].radius = draw.radii(0.0::f32);
-    t.styles[MENU_ITEM].inset  = edges(t.pad);
     fills(?t.styles[MENU_ITEM], clear(), t.control_hot, t.control_hot, t.control_hot);
 
-    t.styles[FIELD].inset = edges(t.pad);
     fills(?t.styles[FIELD], t.track, t.control_hot, t.control_hot, t.track);
     i = 0;
     for (i < STATES::usize) {
@@ -1065,7 +1059,6 @@ pub fun derive(t: *Theme) {
     fill_all(?t.styles[FIELD_CARET], t.text);
     fill_all(?t.styles[FIELD_SELECT], t.select);
 
-    t.styles[SECTION].inset = edges(t.pad);
     fills(?t.styles[SECTION], t.header, t.header_hot, t.header_hot, t.header);
     t.styles[SECTION].states[HOT].mark    = t.text;
     t.styles[SECTION].states[ACTIVE].mark = t.text;
@@ -1076,13 +1069,11 @@ pub fun derive(t: *Theme) {
     t.styles[SCROLLBAR_THUMB].min_h = t.thumb_min;
     fills(?t.styles[SCROLLBAR_THUMB], t.handle, t.handle, t.handle_on, t.handle);
 
-    t.styles[LIST_ITEM].inset = edges(t.pad);
     fills(?t.styles[LIST_ITEM], clear(), t.control_hot, t.control_on, t.accent);
     t.styles[LIST_ITEM].states[ON].text = t.accent_text;
     t.styles[LIST_ITEM].states[ON].mark = t.accent_text;
     t.styles[TREE_ITEM]                 = t.styles[LIST_ITEM];
 
-    t.styles[CHART].inset = edges(t.pad);
     outline(t, CHART, t.grid, t.edge_w);
 
     fill_all(?t.styles[PROGRESS], t.track);
