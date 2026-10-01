@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -235,10 +235,42 @@ the shape of an application's side panel (a header, then run, view and files
 sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
-a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
+a popup over later widgets, its open state kept in the state store under its
+id, `blit.widget.begin_window`/`end_window` is a
 draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
 opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
 rect for consumer-drawn affordances.
+
+## State store
+
+State that must outlive a frame can live on the context, keyed by widget id.
+`blit.state.get[T](?ctx, id)` returns the `T` that id keeps, zeroed the first
+time it is asked for. One id can keep several types of state, each its own
+entry, so a widget never reads another's bytes.
+
+- **Lifetime.** The pointer is valid until `end`. Each `get` marks the entry
+  reached, and `end` drops every entry no frame reached for `max_age` frames
+  (`blit.state.MAX_AGE`, 60, by default; `set_max_age(?ctx, n)` changes it and
+  0 keeps everything), so state for widgets that stopped drawing does not pile
+  up. A `get` between frames counts toward the next frame.
+  `pin[T](?ctx, id, 1)` keeps an entry however long it goes untouched, and
+  `pin[T](?ctx, id, 0)` lets it age out again.
+- **Failure.** Entries are allocator-backed and the store grows. When it cannot,
+  `get` sets the context's oom (see `context.ok`) and hands back zeroed scratch
+  state that every refused entry shares, never a dangling pointer. A state type
+  is at most 1 KiB and 16-byte aligned, a compile error otherwise.
+- **Persistence.** `register[T](?ctx, name, save, load)` makes `T` a persisted
+  kind. `save(?ctx)` writes every entry of a registered kind into one TOML
+  document, a `[<name>.<id>]` table per entry that the kind's save hook fills
+  through `put_int`, `put_float`, `put_bool` and `put_str`. The text stays the
+  context's until the next save. `load(?ctx, text)` reads such a document
+  through `std.data.toml`, zeroes each entry and runs the kind's load hook over
+  its table. Tables of unregistered kinds are skipped. A load hook copies any
+  string it keeps, since the parsed document is freed when `load` returns.
+
+The store is one owner, not the only one. Widgets that take a caller-owned
+record (`Window`, `Scroll`, `List`, `Field`) keep taking it, so an app can own
+its state where it wants to.
 
 ## Charts
 
