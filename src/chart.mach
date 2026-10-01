@@ -149,6 +149,7 @@ pub rec Hover {
 # p0:   pixel of lo
 # p1:   pixel of hi
 # step: coordinate between ticks, a whole number on a u or log axis
+# tame: 1 when every value drawn on the axis is known to land on a pixel f32 holds exactly
 rec Scale {
     u:    u8;
     log:  u8;
@@ -158,6 +159,7 @@ rec Scale {
     p0:   f32;
     p1:   f32;
     step: f64;
+    tame: u8;
 }
 
 # a chart's resolved layout, in local pixels
@@ -502,6 +504,31 @@ fun pixel(s: *Scale, c: f64) f32 {
 # the pixel of value v
 fun place(s: *Scale, v: Num) f32 {
     ret pixel(s, coord(s, v));
+}
+
+# mark a linear scale tame when the span's values all land within the pixels
+# f32 places exactly, so its values are mapped without a clamp
+fun tame(s: *Scale, d: *Span) {
+    s.tame = 0;
+    if (s.log != 0 || d.any == 0) { ret; }
+    var a: f64 = 0.0;
+    var b: f64 = 0.0;
+    if (d.all != 0) {
+        a = coord(s, Num.u{d.ulo});
+        b = coord(s, Num.u{d.uhi});
+    }
+    or {
+        a = coord(s, Num.f{d.flo});
+        b = coord(s, Num.f{d.fhi});
+    }
+    if (!(s.hi > s.lo)) {
+        s.tame = 1;
+        ret;
+    }
+    val k:  f64 = (s.p1 - s.p0)::f64 / (s.hi - s.lo);
+    val pa: f64 = s.p0::f64 + (a - s.lo) * k;
+    val pb: f64 = s.p0::f64 + (b - s.lo) * k;
+    s.tame = pa > -10000000.0 && pa < 10000000.0 && pb > -10000000.0 && pb < 10000000.0;
 }
 
 # the u64 at coordinate c of a linear u axis, rounded down and held to u64
@@ -929,52 +956,166 @@ fun draw_axes(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32) {
     }
 }
 
-# vertices in a series' path: a step series turns at each sample
-fun nverts(s: *Series) usize {
-    if (s.count == 0)    { ret 0; }
-    if (s.shape == STEP) { ret s.count * 2 - 1; }
-    ret s.count;
-}
+# values a walk decodes at once
+val RUN: usize = 256;
 
-# vertex v of a series' path in local pixels: a step series runs level to the
-# next sample's x, then to its value
-fun vert(p: *Plot, s: *Series, v: usize, vx: *f32, vy: *f32) {
-    var i: usize = v;
-    var j: usize = v;
-    if (s.shape == STEP) {
-        i = (v + 1) / 2;
-        j = v / 2;
-    }
-    @vx = place(?p.sx, x_of(s, i));
-    @vy = place(?p.sy, cell(?s.y, j));
-}
+# columns a sweep holds open at once
+val RING: usize = 64;
 
-# the y of a series' path at local x, clamped to its ends
+# a column mapped onto a scale: a value's pixel is base + coordinate * k
 #
-# j is advanced to the first vertex at or right of x, so a walk left to right
-# visits each vertex once.
-fun path_y(p: *Plot, s: *Series, nv: usize, j: *usize, x: f32) f32 {
-    var ax: f32 = 0.0::f32;
-    var ay: f32 = 0.0::f32;
-    for (@j < nv) {
-        vert(p, s, @j, ?ax, ?ay);
-        if (ax >= x) { brk; }
-        @j = @j + 1;
+# every per-value decision (kind, origin, log) is made once per run of values,
+# so the per-value work is a load, at most one log, and a multiply-add.
+# ---
+# data:   the first value, nil for an absent x, whose value i is i
+# kind:   F32, F64 or U64
+# stride: bytes between values
+# u:      1 when u64 values are offset from org exactly before conversion
+# log:    1 when the coordinate is log10 of the value
+# org:    the scale's origin
+# floor:  coordinate of values at or below zero on a log scale
+# base:   pixel of coordinate 0
+# k:      pixels per coordinate unit
+# tame:   1 when no value can map beyond what f32 places exactly
+rec Map {
+    data:   *u8;
+    kind:   u8;
+    stride: usize;
+    u:      u8;
+    log:    u8;
+    org:    u64;
+    floor:  f64;
+    base:   f64;
+    k:      f64;
+    tame:   u8;
+}
+
+# a column mapped onto a scale
+fun map_of(s: *Scale, c: *Column) Map {
+    var m: Map;
+    m.data   = c.data::*u8;
+    m.kind   = c.kind;
+    m.stride = c.stride;
+    if (m.stride == 0) {
+        m.stride = 8;
+        if (c.kind == F32) { m.stride = 4; }
     }
-    if (@j == 0) {
-        vert(p, s, 0, ?ax, ?ay);
-        ret ay;
+    m.u     = s.u;
+    m.log   = s.log;
+    m.org   = s.org;
+    m.floor = s.lo;
+    m.tame  = s.tame;
+    if (s.hi > s.lo) {
+        m.k    = (s.p1 - s.p0)::f64 / (s.hi - s.lo);
+        m.base = s.p0::f64 - s.lo * m.k;
     }
-    if (@j == nv) {
-        vert(p, s, nv - 1, ?ax, ?ay);
-        ret ay;
+    or {
+        m.k    = 0.0;
+        m.base = ((s.p0 + s.p1) / 2.0::f32)::f64;
     }
-    var bx: f32 = 0.0::f32;
-    var by: f32 = 0.0::f32;
-    vert(p, s, @j - 1, ?ax, ?ay);
-    vert(p, s, @j, ?bx, ?by);
-    if (bx <= ax) { ret by; }
-    ret ay + (by - ay) * (x - ax) / (bx - ax);
+    ret m;
+}
+
+# value i of a mapped column as f64
+fun raw(m: *Map, i: usize) f64 {
+    if (m.data == nil) { ret i::f64; }
+    val at: *u8 = ?m.data[i * m.stride];
+    if (m.kind == U64) { ret (@(at::*u64))::f64; }
+    if (m.kind == F64) { ret @(at::*f64); }
+    ret (@(at::*f32))::f64;
+}
+
+# pixels of values i0 .. i0 + n of a mapped column into out
+#
+# the kind and scale are dispatched once, and each kind runs its own loop. an
+# untamed map holds its pixels to what f32 places exactly afterwards.
+fun map_run(m: *Map, i0: usize, n: usize, out: *f32) {
+    map_raw(m, i0, n, out);
+    if (m.tame != 0) { ret; }
+    var j: usize = 0;
+    for (j < n) {
+        if (!(out[j] > -10000000.0::f32)) { out[j] = -10000000.0::f32; }
+        if (out[j] > 10000000.0::f32)     { out[j] = 10000000.0::f32; }
+        j = j + 1;
+    }
+}
+
+# pixels of values i0 .. i0 + n of a mapped column into out, unheld
+fun map_raw(m: *Map, i0: usize, n: usize, out: *f32) {
+    val base: f64   = m.base;
+    val k:    f64   = m.k;
+    val st:   usize = m.stride;
+    var j:    usize = 0;
+    if (m.log != 0) {
+        val fl: f64 = m.floor;
+        for (j < n) {
+            val v: f64 = raw(m, i0 + j);
+            var c: f64 = fl;
+            if (v > 0.0) { c = log10d(v); }
+            out[j] = (base + c * k)::f32;
+            j      = j + 1;
+        }
+        ret;
+    }
+    if (m.data == nil) {
+        var c: f64 = i0::f64;
+        if (m.u != 0) {
+            val i: u64 = i0::u64;
+            if (i >= m.org) { c = (i - m.org)::f64; }
+            or              { c = -((m.org - i)::f64); }
+        }
+        for (j < n) {
+            out[j] = (base + c * k)::f32;
+            c      = c + 1.0;
+            j      = j + 1;
+        }
+        ret;
+    }
+    val at: *u8 = ?m.data[i0 * st];
+    if (m.kind == U64) {
+        if (m.u != 0) {
+            val o: u64 = m.org;
+            for (j < n) {
+                val v: u64 = @((?at[j * st])::*u64);
+                var c: f64 = 0.0;
+                if (v >= o) { c = (v - o)::f64; }
+                or          { c = -((o - v)::f64); }
+                out[j] = (base + c * k)::f32;
+                j      = j + 1;
+            }
+            ret;
+        }
+        for (j < n) {
+            out[j] = (base + (@((?at[j * st])::*u64))::f64 * k)::f32;
+            j      = j + 1;
+        }
+        ret;
+    }
+    if (m.kind == F64) {
+        for (j < n) {
+            out[j] = (base + @((?at[j * st])::*f64) * k)::f32;
+            j      = j + 1;
+        }
+        ret;
+    }
+    for (j < n) {
+        out[j] = (base + (@((?at[j * st])::*f32))::f64 * k)::f32;
+        j      = j + 1;
+    }
+}
+
+# the pixel of value i of a mapped column
+fun map_one(m: *Map, i: usize) f32 {
+    var o: [1]f32;
+    map_run(m, i, 1, ?o[0]);
+    ret o[0];
+}
+
+# the x pixels of a series' first and last samples
+fun ends(p: *Plot, s: *Series, xs: *f32, xe: *f32) {
+    var m: Map = map_of(?p.sx, ?s.x);
+    @xs = map_one(?m, 0);
+    @xe = map_one(?m, s.count - 1);
 }
 
 # the local left edge of the screen pixel column holding local x
@@ -982,49 +1123,248 @@ fun column(ctx: *context.Context, x: f32) f32 {
     ret floorf(x + ctx.lx) - ctx.lx;
 }
 
+# the open columns of a line being swept, each the y extent of the path within
+# its reach, half the line's width either side of it
+#
+# the reaches' edges cut the x axis into intervals that lie wholly inside or
+# wholly outside each reach. the sweep gathers the path's y extent over one
+# interval at a time, a compare and two min/max per vertex, and hands each
+# interval's extent to the few columns whose reach holds it.
+# ---
+# lo:    first column drawn
+# hi:    columns drawn lie left of hi
+# half:  half the line's width
+# o1:    screen offset of left reach edges within a pixel
+# o2:    screen offset of right reach edges within a pixel
+# c:     the line's color
+# first: column of the ring's head
+# head:  ring slot of the first column
+# cnt:   open columns
+# ymin:  least y per open column
+# ymax:  greatest y per open column
+rec Sweep {
+    lo:    f32;
+    hi:    f32;
+    half:  f32;
+    o1:    f32;
+    o2:    f32;
+    c:     draw.Color;
+    first: f32;
+    head:  usize;
+    cnt:   usize;
+    ymin:  [64]f32;
+    ymax:  [64]f32;
+}
+
+# close the first open column, drawing its quad grown by half the width
+fun sweep_emit(ctx: *context.Context, sw: *Sweep) {
+    val t: f32 = snap_y(ctx, sw.ymin[sw.head] - sw.half);
+    var b: f32 = snap_y(ctx, sw.ymax[sw.head] + sw.half);
+    if (b <= t) { b = t + 1.0::f32; }
+    context.quad(ctx, sw.first, t, sw.first + 1.0::f32, b, sw.c);
+    sw.head  = (sw.head + 1) % RING;
+    sw.cnt   = sw.cnt - 1;
+    sw.first = sw.first + 1.0::f32;
+}
+
+# the first reach edge right of local x
+fun edge_next(ctx: *context.Context, sw: *Sweep, x: f32) f32 {
+    val u: f32 = x + ctx.lx;
+    val a: f32 = floorf(u - sw.o1) + 1.0::f32 + sw.o1;
+    val b: f32 = floorf(u - sw.o2) + 1.0::f32 + sw.o2;
+    var e: f32 = minf(a, b) - ctx.lx;
+    if (e <= x) { e = x + 1.0::f32; }
+    ret e;
+}
+
+# hand the path's y extent [y0, y1] over [xa, xb] to every column whose reach
+# [col - half, col + 1 + half] holds it, closing the columns left of them
+fun sweep_take(ctx: *context.Context, sw: *Sweep, xa: f32, xb: f32, y0: f32, y1: f32) {
+    val half: f32 = sw.half;
+    var cmin: f32 = column(ctx, xb - 1.0::f32 - half);
+    if (cmin < xb - 1.0::f32 - half) { cmin = cmin + 1.0::f32; }
+    cmin = maxf(cmin, sw.lo);
+    val cmax: f32 = column(ctx, xa + half);
+    for (sw.cnt > 0 && sw.first < cmin) { sweep_emit(ctx, sw); }
+    if (sw.cnt == 0) { sw.first = cmin; }
+    var col: f32 = cmin;
+    for (col <= cmax && col < sw.hi) {
+        var d: usize = roundf(col - sw.first)::usize;
+        if (d >= sw.cnt) {
+            if (sw.cnt == RING) {
+                sweep_emit(ctx, sw);
+                d = d - 1;
+            }
+            val slot: usize = (sw.head + sw.cnt) % RING;
+            sw.ymin[slot] = y0;
+            sw.ymax[slot] = y1;
+            sw.cnt        = sw.cnt + 1;
+        }
+        val k: usize = (sw.head + d) % RING;
+        sw.ymin[k] = minf(sw.ymin[k], y0);
+        sw.ymax[k] = maxf(sw.ymax[k], y1);
+        col        = col + 1.0::f32;
+    }
+}
+
+# the interval of the path a sweep is gathering
+# ---
+# ea: where the interval starts
+# eb: the reach edge that ends it
+# lo: least y of the path over it so far
+# hi: greatest y of the path over it so far
+rec Pen {
+    ea: f32;
+    eb: f32;
+    lo: f32;
+    hi: f32;
+}
+
+# carry the pen along the segment (ax, ay)-(bx, by) up to ex, handing each
+# interval it closes at a reach edge to the sweep
+fun pen_cross(ctx: *context.Context, sw: *Sweep, pen: *Pen, ax: f32, ay: f32, bx: f32, by: f32, ex: f32) {
+    for (ex >= pen.eb) {
+        var ye: f32 = by;
+        if (bx > ax) { ye = ay + (by - ay) * (pen.eb - ax) / (bx - ax); }
+        sweep_take(ctx, sw, pen.ea, pen.eb, minf(pen.lo, ye), maxf(pen.hi, ye));
+        pen.ea = pen.eb;
+        pen.eb = edge_next(ctx, sw, pen.eb);
+        pen.lo = ye;
+        pen.hi = ye;
+    }
+}
+
 # one series' path, a quad per screen pixel column
 #
 # each column spans the path over the column widened by half the width on
 # either side, grown by half the width above and below: the path swept by a
-# square brush of the given width.
+# square brush of the given width. the path is walked once in decoded runs, a
+# step series running level to the next sample's x and then to its value, and
+# the part of it beyond the columns drawn is passed over. a run of a line
+# wholly inside the columns drawn takes the fast loop: a compare and a min and
+# max per sample.
 fun trace(ctx: *context.Context, p: *Plot, s: *Series, width: f32, c: draw.Color) {
-    val nv: usize = nverts(s);
-    if (nv == 0) { ret; }
+    val n: usize = s.count;
+    if (n == 0) { ret; }
+    var mx:   Map = map_of(?p.sx, ?s.x);
+    var my:   Map = map_of(?p.sy, ?s.y);
     val half: f32 = width / 2.0::f32;
-    var xs:   f32 = 0.0::f32;
-    var xe:   f32 = 0.0::f32;
-    var vy:   f32 = 0.0::f32;
-    vert(p, s, 0, ?xs, ?vy);
-    vert(p, s, nv - 1, ?xe, ?vy);
-    val end: f32   = minf(xe + half, p.x1 + half);
-    var col: f32   = column(ctx, maxf(xs, p.x0) - half);
-    var j:   usize = 0;
-    for (col < end) {
-        val wl: f32 = maxf(col - half, xs);
-        val wr: f32 = minf(col + 1.0::f32 + half, xe);
-        if (wr >= wl) {
-            var ymin: f32   = path_y(p, s, nv, ?j, wl);
-            var ymax: f32   = ymin;
-            var k:    usize = j;
-            var vx:   f32   = 0.0::f32;
-            for (k < nv) {
-                vert(p, s, k, ?vx, ?vy);
-                if (vx > wr) { brk; }
-                ymin = minf(ymin, vy);
-                ymax = maxf(ymax, vy);
-                k    = k + 1;
+    val xs:   f32 = map_one(?mx, 0);
+    val xe:   f32 = map_one(?mx, n - 1);
+    var sw:   Sweep;
+    sw.lo    = column(ctx, maxf(xs, p.x0) - half);
+    sw.hi    = minf(xe + half, p.x1 + half);
+    sw.half  = half;
+    sw.o1    = -half - floorf(-half);
+    sw.o2    = half - floorf(half);
+    sw.c     = c;
+    sw.first = sw.lo;
+    val cl:   f32   = sw.lo - half - 2.0::f32;
+    val cr:   f32   = sw.hi + half + 2.0::f32;
+    var turn: usize = 1;
+    if (s.shape == STEP) { turn = 2; }
+
+    var xb:   [256]f32;
+    var yb:   [256]f32;
+    var pen:  Pen;
+    var ax:   f32   = 0.0::f32;
+    var ay:   f32   = 0.0::f32;
+    var on:   u8    = 0;
+    var done: u8    = 0;
+    var last: f32   = 0.0::f32;
+    var i0:   usize = 0;
+    for (i0 < n && done == 0) {
+        var m: usize = n - i0;
+        if (m > RUN) { m = RUN; }
+        map_run(?mx, i0, m, ?xb[0]);
+        map_run(?my, i0, m, ?yb[0]);
+        var j: usize = 0;
+        if (i0 == 0) {
+            ax = xb[0];
+            ay = yb[0];
+            if (ax >= cl && ax <= cr) {
+                on     = 1;
+                pen.ea = ax;
+                pen.eb = edge_next(ctx, ?sw, ax);
+                pen.lo = ay;
+                pen.hi = ay;
+                last   = ax;
             }
-            var jr: usize = j;
-            val yr: f32   = path_y(p, s, nv, ?jr, wr);
-            ymin = minf(ymin, yr);
-            ymax = maxf(ymax, yr);
-            val t: f32 = snap_y(ctx, ymin - half);
-            var b: f32 = snap_y(ctx, ymax + half);
-            if (b <= t) { b = t + 1.0::f32; }
-            context.quad(ctx, col, t, col + 1.0::f32, b, c);
+            j = 1;
         }
-        col = col + 1.0::f32;
+        if (on != 0 && turn == 1 && xb[m - 1] <= cr) {
+            var lo: f32 = pen.lo;
+            var hi: f32 = pen.hi;
+            for (j < m) {
+                val bx: f32 = xb[j];
+                val by: f32 = yb[j];
+                if (bx >= pen.eb) {
+                    pen.lo = lo;
+                    pen.hi = hi;
+                    pen_cross(ctx, ?sw, ?pen, ax, ay, bx, by, bx);
+                    lo = pen.lo;
+                    hi = pen.hi;
+                }
+                if (by < lo) { lo = by; }
+                if (by > hi) { hi = by; }
+                ax = bx;
+                ay = by;
+                j  = j + 1;
+            }
+            pen.lo = lo;
+            pen.hi = hi;
+            last   = ax;
+        }
+        for (j < m && done == 0) {
+            val sx: f32   = xb[j];
+            val sy: f32   = yb[j];
+            var v:  usize = 0;
+            j = j + 1;
+            for (v < turn) {
+                val bx: f32 = sx;
+                var by: f32 = sy;
+                if (v + 1 < turn) { by = ay; }
+                v = v + 1;
+                if (on == 0) {
+                    if (ax > cr) {
+                        done = 1;
+                        brk;
+                    }
+                    if (bx < cl) {
+                        ax = bx;
+                        ay = by;
+                        cnt;
+                    }
+                    var sy0: f32 = ay;
+                    if (ax < cl) { sy0 = ay + (by - ay) * (cl - ax) / (bx - ax); }
+                    pen.ea = maxf(ax, cl);
+                    pen.eb = edge_next(ctx, ?sw, pen.ea);
+                    pen.lo = sy0;
+                    pen.hi = sy0;
+                    on     = 1;
+                }
+                var ex: f32 = bx;
+                var ey: f32 = by;
+                if (bx > cr) {
+                    ex = cr;
+                    ey = ay + (by - ay) * (cr - ax) / (bx - ax);
+                }
+                pen_cross(ctx, ?sw, ?pen, ax, ay, bx, by, ex);
+                pen.lo = minf(pen.lo, ey);
+                pen.hi = maxf(pen.hi, ey);
+                last   = ex;
+                ax     = bx;
+                ay     = by;
+                if (bx > cr) {
+                    done = 1;
+                    brk;
+                }
+            }
+        }
+        i0 = i0 + m;
     }
+    if (on != 0) { sweep_take(ctx, ?sw, pen.ea, maxf(last, pen.ea), pen.lo, pen.hi); }
+    for (sw.cnt > 0) { sweep_emit(ctx, ?sw); }
 }
 
 # the y a filled area or a bar grows from: zero, or the plot's bottom on a log axis
@@ -1034,23 +1374,130 @@ fun base_y(ctx: *context.Context, p: *Plot) f32 {
 }
 
 # the area between a series' path and zero, a quad per screen pixel column
+#
+# each column reads the path at its center. the sample left of it is found by
+# galloping on from the last column's, so a frame costs a few decodes per
+# column however many samples there are.
 fun area(ctx: *context.Context, p: *Plot, s: *Series, c: draw.Color) {
-    val nv: usize = nverts(s);
-    if (nv < 2) { ret; }
-    var xs: f32 = 0.0::f32;
-    var xe: f32 = 0.0::f32;
-    var vy: f32 = 0.0::f32;
-    vert(p, s, 0, ?xs, ?vy);
-    vert(p, s, nv - 1, ?xe, ?vy);
+    val n: usize = s.count;
+    if (n < 2) { ret; }
+    var mx:   Map   = map_of(?p.sx, ?s.x);
+    var my:   Map   = map_of(?p.sy, ?s.y);
+    val xs:   f32   = map_one(?mx, 0);
+    val xe:   f32   = map_one(?mx, n - 1);
     val base: f32   = base_y(ctx, p);
+    val end:  f32   = minf(xe, p.x1);
     var col:  f32   = column(ctx, maxf(xs, p.x0));
-    var j:    usize = 0;
-    for (col < minf(xe, p.x1)) {
-        val ly: f32 = snap_y(ctx, path_y(p, s, nv, ?j, clampf(col + 0.5::f32, xs, xe)));
+    var i:    usize = 0;
+    var xi:   f32   = xs;
+    var xn:   f32   = map_one(?mx, 1);
+    var yi:   f32   = map_one(?my, 0);
+    var yn:   f32   = map_one(?my, 1);
+    for (col < end) {
+        val cx: f32 = clampf(col + 0.5::f32, xs, xe);
+        if (i + 1 < n && xn <= cx) {
+            var a:  usize = i + 1;
+            var b:  usize = a + 1;
+            var st: usize = 1;
+            for (b < n && map_one(?mx, b) <= cx) {
+                a  = b;
+                st = st * 2;
+                b  = a + st;
+            }
+            if (b > n) { b = n; }
+            for (b - a > 1) {
+                val mid: usize = (a + b) / 2;
+                if (map_one(?mx, mid) <= cx) { a = mid; }
+                or                           { b = mid; }
+            }
+            i  = a;
+            xi = map_one(?mx, i);
+            yi = map_one(?my, i);
+            if (i + 1 < n) {
+                xn = map_one(?mx, i + 1);
+                yn = map_one(?my, i + 1);
+            }
+        }
+        var ly: f32 = yi;
+        if (s.shape != STEP && i + 1 < n && xn > xi) { ly = yi + (yn - yi) * (cx - xi) / (xn - xi); }
+        ly = snap_y(ctx, ly);
         if (ly < base) { context.quad(ctx, col, ly, col + 1.0::f32, base, c); }
         or (ly > base) { context.quad(ctx, col, base, col + 1.0::f32, ly, c); }
         col = col + 1.0::f32;
     }
+}
+
+# widen a span by the first n values of a column, its kind dispatched once,
+# finding the least positive value too where pos asks, for a log axis
+fun span_col(d: *Span, c: *Column, n: usize, pos: u8) {
+    if (n == 0) { ret; }
+    if (c.data == nil) {
+        span_add(d, Num.u{0});
+        span_add(d, Num.u{(n - 1)::u64});
+        ret;
+    }
+    var stride: usize = c.stride;
+    if (stride == 0) {
+        stride = 8;
+        if (c.kind == F32) { stride = 4; }
+    }
+    val at: *u8   = c.data::*u8;
+    var i:  usize = 0;
+    if (c.kind == U64) {
+        var lo: u64 = 18446744073709551615;
+        var hi: u64 = 0;
+        for (i < n) {
+            val v: u64 = @((?at[i * stride])::*u64);
+            if (v < lo) { lo = v; }
+            if (v > hi) { hi = v; }
+            i = i + 1;
+        }
+        span_add(d, Num.u{lo});
+        span_add(d, Num.u{hi});
+    }
+    or {
+        # nan compares false, so once a first value seeds the extent nan is passed over
+        var lo: f64 = 0.0;
+        for (i < n) {
+            lo = as_f(cell(c, i));
+            i  = i + 1;
+            if (lo == lo) { brk; }
+        }
+        if (lo != lo) { ret; }
+        var hi: f64 = lo;
+        if (c.kind == F64) {
+            for (i < n) {
+                val v: f64 = @((?at[i * stride])::*f64);
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+                i = i + 1;
+            }
+        }
+        or {
+            var flo: f32 = lo::f32;
+            var fhi: f32 = flo;
+            for (i < n) {
+                val v: f32 = @((?at[i * stride])::*f32);
+                if (v < flo) { flo = v; }
+                if (v > fhi) { fhi = v; }
+                i = i + 1;
+            }
+            lo = flo::f64;
+            hi = fhi::f64;
+        }
+        span_add(d, Num.f{lo});
+        span_add(d, Num.f{hi});
+    }
+    if (pos == 0) { ret; }
+    # the least value above zero, for a log axis
+    var least: Num;
+    i = 0;
+    for (i < n) {
+        val v: Num = cell(c, i);
+        if (as_f(v) > 0.0 && (sel least.none || as_f(v) < as_f(least))) { least = v; }
+        i = i + 1;
+    }
+    span_add(d, least);
 }
 
 # the local cursor
@@ -1161,12 +1608,8 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
     var ys:   Span  = span_new();
     var s:    usize = 0;
     for (s < ns) {
-        var i: usize = 0;
-        for (i < series[s].count) {
-            span_add(?xs, x_of(?series[s], i));
-            span_add(?ys, cell(?series[s].y, i));
-            i = i + 1;
-        }
+        span_col(?xs, ?series[s].x, series[s].count, opt.x.log);
+        span_col(?ys, ?series[s].y, series[s].count, opt.y.log);
         s = s + 1;
     }
     var p: Plot;
@@ -1174,6 +1617,8 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
     if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
     fit(?p.sx, opt.x, ?xs);
     lay_out_x(ctx, ?p);
+    tame(?p.sx, ?xs);
+    tame(?p.sy, ?ys);
 
     context.push_clip(ctx, x, y, x + w, y + h);
     if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
@@ -1228,9 +1673,7 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
             if (series[bk].shape == STEP) {
                 var lx: f32 = 0.0::f32;
                 var rx: f32 = 0.0::f32;
-                var vy: f32 = 0.0::f32;
-                vert(?p, ?series[bk], 0, ?lx, ?vy);
-                vert(?p, ?series[bk], nverts(?series[bk]) - 1, ?rx, ?vy);
+                ends(?p, ?series[bk], ?lx, ?rx);
                 gx = clampf(mx, lx, rx);
             }
             out     = show(ctx, ?p, series, bk, bi, gx);
@@ -1270,11 +1713,8 @@ pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: Colu
     var col:  Column = values;
     var ys:   Span   = span_new();
     if (opt.y.log == 0) { span_add(?ys, Num.u{0}); }
+    span_col(?ys, ?col, count, opt.y.log);
     var i: usize = 0;
-    for (i < count) {
-        span_add(?ys, cell(?col, i));
-        i = i + 1;
-    }
     var p: Plot;
     lay_out(ctx, ?p, x, y, w, h, ?opt, ?ys);
     if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
@@ -1367,14 +1807,10 @@ pub fun sparkline(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, s: Seri
     p.x1 = x + w - half;
     p.y1 = y + h - half;
     if (p.x1 <= p.x0 || p.y1 <= p.y0) { ret none; }
-    var xs: Span  = span_new();
-    var ys: Span  = span_new();
-    var i:  usize = 0;
-    for (i < sr.count) {
-        span_add(?xs, x_of(?sr, i));
-        span_add(?ys, cell(?sr.y, i));
-        i = i + 1;
-    }
+    var xs: Span = span_new();
+    var ys: Span = span_new();
+    span_col(?xs, ?sr.x, sr.count, 0);
+    span_col(?ys, ?sr.y, sr.count, 0);
     fit(?p.sy, auto(), ?ys);
     p.sy.step = tick_step(?p.sy, 2.0);
     p.sy.p0   = p.y1;
@@ -1383,6 +1819,8 @@ pub fun sparkline(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, s: Seri
     p.sx.step = 1.0;
     p.sx.p0   = p.x0;
     p.sx.p1   = p.x1;
+    tame(?p.sx, ?xs);
+    tame(?p.sy, ?ys);
 
     context.push_clip(ctx, x, y, x + w, y + h);
     val hov: u8         = hovered(ctx, ?p);
@@ -1716,6 +2154,12 @@ test clip__charts_stay_inside_clip_and_surface {
     val l: Hover = line(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?ss[0], 2, options());
     val b: Hover = bars(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, f32s(?v[0]), 4, options());
     val s: Hover = sparkline(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, series(f32s(?v[0]), 4));
+    # a fixed x range narrower than the samples passes over the path beyond it
+    var narrow: Options = options();
+    narrow.x    = fixed(Num.u{1}, Num.u{3});
+    ss[0].shape = STEP;
+    val n: Hover = line(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?ss[0], 2, narrow);
+    ss[0].shape = LINE;
     context.pop_clip(?ctx);
     context.end(?ctx);
     if (context.draw_count(?ctx) == 0)                                { ret 2; }
