@@ -2942,6 +2942,48 @@ test nav__tab_reaches_every_control_and_keys_act_on_it {
     ret 0;
 }
 
+# three buttons, the middle one disabled while the flag says so
+#[testing]
+fun skip_ui(ctx: *context.Context, user: ptr) {
+    val off: *u8   = user::*u8;
+    val b:   Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    button(ctx, "first");
+    context.begin_disabled(ctx, @off != 0);
+    button(ctx, "middle");
+    context.end_disabled(ctx);
+    button(ctx, "last");
+    end_panel(ctx, b);
+}
+
+test nav__tab_passes_over_disabled_widgets {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var off: u8              = 1;
+    var d:   driver.Driver;
+    val e:   err[allo.Error] = driver.init(?d, ?a, 200.0::f32, 200.0::f32, skip_ui, (?off)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+    val tab: u32 = input.KEY_TAB;
+
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, driver.find(?d, "first"))) { ret 2; }
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, driver.find(?d, "last"))) { ret 3; }
+    driver.key(?d, tab, input.MOD_SHIFT);
+    if (!driver.focused(?d, driver.find(?d, "first"))) { ret 4; }
+
+    # enabled again, it is a stop once more
+    off = 0;
+    driver.step(?d);
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, driver.find(?d, "middle"))) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # clicks of the button in each of two overlapping windows
 #[testing]
 rec Pair {

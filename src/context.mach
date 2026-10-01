@@ -1255,7 +1255,8 @@ fun plain(ctx: *Context, id: u64) u8 {
 # claim is a container's (a list, a tree) calls it over its whole rect. the
 # stop takes the next frame's keys (see navigate), and while id holds the
 # keyboard it counts as drawn, shows the focus ring once the keyboard moved
-# to it and says what it takes. inside push_measure nothing is registered.
+# to it and says what it takes. inside push_measure or a disabled scope (see
+# begin_disabled) nothing is registered, so navigation passes over it.
 # ---
 # ctx:   context
 # id:    the widget's id, 0 registers nothing
@@ -1266,7 +1267,7 @@ fun plain(ctx: *Context, id: u64) u8 {
 # flags: the NAV_* bits it takes, NAV_FOCUS among them
 # ret:   true if the widget holds the keyboard
 pub fun add_stop(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, flags: u8) bool {
-    if (id == 0 || ctx.measuring != 0) { ret false; }
+    if (id == 0 || ctx.measuring != 0 || disabled(ctx)) { ret false; }
     ctx.stops = room[Stop](ctx, ctx.stops, ?ctx.stops_cap, ctx.stops_len + 1, CLIP_DEPTH);
     if (ctx.stops_len < ctx.stops_cap) {
         ctx.stops[ctx.stops_len] = Stop{

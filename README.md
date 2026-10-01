@@ -829,7 +829,8 @@ if (h.held) { drag_by(h.dx, h.dy); }
   `end_disabled(?ctx)` wrap widgets that draw and lay out, keeping their ids
   and state, but take no input when `cond` holds. Inside, `hit` still claims
   the rect but reports nothing hot, pressed, clicked or dragged, the focus is
-  neither given nor kept (a holder that becomes disabled loses it), scroll
+  neither given nor kept (a holder that becomes disabled loses it), tab and
+  the arrows pass over it, scroll
   regions and tables take no wheel, menu items and their shortcuts never fire,
   and every kind paints in its `DISABLED` state through `box` and `paint_of`.
   Scopes nest, and one with `cond` false inside a disabling one stays
