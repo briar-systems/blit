@@ -621,14 +621,10 @@ fun members(ctx: *context.Context, p: *Pass) bool {
     state.each[widget.Docked](ctx, gather_one, (?g)::ptr);
     p.n = g.n;
     if (g.n == 0) { ret true; }
-    # the members, then the tabs from the next aligned offset, in bytes the
-    # context lends and keeps, so a steady frame allocates nothing
-    val al:   usize = context.LENT_ALIGN;
-    val mb:   usize = (g.n * $size_of(Member) + al - 1) / al * al;
-    val base: ptr   = context.borrow(ctx, mb + g.n * $size_of(tabs.Tab));
-    if (base == nil) { ret false; }
-    p.m     = base::*Member;
-    p.tabs  = (base::usize + mb)::*tabs.Tab;
+    # scratch for this frame alone, so a steady frame allocates nothing
+    p.m    = context.frame_alloc[Member](ctx, g.n);
+    p.tabs = context.frame_alloc[tabs.Tab](ctx, g.n);
+    if (p.m == nil || p.tabs == nil) { ret false; }
     g.items = p.m;
     g.n     = 0;
     state.each[widget.Docked](ctx, gather_one, (?g)::ptr);

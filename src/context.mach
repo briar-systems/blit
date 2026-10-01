@@ -478,8 +478,8 @@ pub rec TextLine {
 # pre_len:      bytes in the composition, 0 when there is none
 # pre_caret:    the composition's caret as a byte offset into pre
 # pre_owner:    id of the focus holder the composition was typed into
-# lent:         bytes borrow lends, kept across frames, nil before the first
-# lent_cap:     bytes allocated for lent
+# arena:        the frame arena's blocks, chained, kept across frames, nil before the first
+# arena_at:     the block frame_alloc bumps from, nil before the first
 # ids:          seeds of the open id scopes, innermost last
 # ids_cap:      seeds allocated for ids
 # id_sp:        open id scopes, saved or not
@@ -615,8 +615,8 @@ pub rec Context {
     pre_len:      usize;
     pre_caret:    usize;
     pre_owner:    u64;
-    lent:         ptr;
-    lent_cap:     usize;
+    arena:        *Block;
+    arena_at:     *Block;
     ids:          *u64;
     ids_cap:      usize;
     id_sp:        usize;
@@ -790,8 +790,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.pre_len      = 0;
     ctx.pre_caret    = 0;
     ctx.pre_owner    = 0;
-    ctx.lent         = nil;
-    ctx.lent_cap     = 0;
+    ctx.arena        = nil;
+    ctx.arena_at     = nil;
     ctx.ids          = nil;
     ctx.ids_cap      = 0;
     ctx.id_sp        = 0;
@@ -888,12 +888,14 @@ pub fun free(ctx: *Context) err[allo.Error] {
         ctx.pre_cap = 0;
         ctx.pre_len = 0;
     }
-    if (ctx.lent != nil) {
-        val el: err[allo.Error] = allo.deallocate_raw(ctx.a, ctx.lent, ctx.lent_cap, LENT_ALIGN);
+    for (ctx.arena != nil) {
+        val b:    *Block          = ctx.arena;
+        val next: *Block          = b.next;
+        val el:   err[allo.Error] = allo.deallocate_raw(ctx.a, b::ptr, BLOCK_HEAD + b.cap, BLOCK_ALIGN);
         if (sel el.err) { ret el; }
-        ctx.lent     = nil;
-        ctx.lent_cap = 0;
+        ctx.arena = next;
     }
+    ctx.arena_at = nil;
     if (ctx.clip != nil) {
         val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
         if (sel ec.err) { ret ec; }
@@ -992,6 +994,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
         ctx.clocked = 1;
     }
     ctx.timed = 1;
+    frame_reset(ctx);
 
     sheet.unwind(?ctx.sheet, ?ctx.theme);
 
@@ -2189,34 +2192,85 @@ fun room[T](ctx: *Context, items: *T, cap: *usize, need: usize, init: usize) *T 
     ret r.ok;
 }
 
-# alignment of the bytes borrow lends
-pub val LENT_ALIGN: usize = 16;
-
-# lend at least n bytes of scratch, aligned to LENT_ALIGN, for work within one
-# call that would otherwise allocate and free each frame
-#
-# the bytes are kept and grow only, so a steady frame allocates nothing. they
-# hold whatever the last borrower left and stay the caller's until the next
-# borrow, so a borrower must not call anything that borrows while it holds
-# them.
+# one block of the frame arena, its bytes following the header
 # ---
+# next: the block chained after it, nil for the last
+# cap:  bytes the block holds after its header
+# used: bytes handed out this frame
+rec Block {
+    next: *Block;
+    cap:  usize;
+    used: usize;
+}
+
+# bytes before a block's data, keeping the data aligned as the block is
+val BLOCK_HEAD: usize = 32;
+
+# alignment blocks are allocated at
+val BLOCK_ALIGN: usize = 16;
+
+# bytes the first block holds
+val BLOCK_INIT: usize = 4096;
+
+# memory for n values of T that lives until the frame ends
+#
+# for work a frame does that would otherwise allocate and free each frame.
+# allocations come from blocks the context keeps across frames, so any number
+# may be live at once, nested users included, and a steady frame allocates
+# nothing. a block that runs out chains another and nothing handed out ever
+# moves. everything is reclaimed at the next begin.
+# ---
+# [T]: element type
 # ctx: context
-# n:   bytes needed
-# ret: the bytes, or nil with oom set when they could not grow
-pub fun borrow(ctx: *Context, n: usize) ptr {
-    if (n <= ctx.lent_cap) { ret ctx.lent; }
-    var cap: usize = ctx.lent_cap * 2;
-    if (cap < n) { cap = n; }
-    var r: res[ptr, allo.Error];
-    if (ctx.lent == nil) { r = allo.allocate_raw(ctx.a, cap, LENT_ALIGN); }
-    or                   { r = allo.reallocate_raw(ctx.a, ctx.lent, ctx.lent_cap, cap, LENT_ALIGN); }
+# n:   values needed
+# ret: the memory, uninitialised, or nil with oom set when no block could be had
+pub fun frame_alloc[T](ctx: *Context, n: usize) *T {
+    ret frame_bytes(ctx, n * $size_of(T), $align_of(T))::*T;
+}
+
+# n bytes aligned to align from the frame arena, nil with oom set on failure
+fun frame_bytes(ctx: *Context, n: usize, align: usize) ptr {
+    var b: *Block = ctx.arena_at;
+    for (b != nil) {
+        val base: usize = b::usize + BLOCK_HEAD;
+        val at:   usize = (base + b.used + align - 1) / align * align;
+        if (at + n <= base + b.cap) {
+            b.used       = at + n - base;
+            ctx.arena_at = b;
+            ret at::ptr;
+        }
+        b = b.next;
+    }
+
+    # chain a block at least twice the last, with room to align
+    var cap:  usize  = BLOCK_INIT;
+    var last: *Block = ctx.arena;
+    for (last != nil && last.next != nil) { last = last.next; }
+    if (last != nil && last.cap * 2 > cap) { cap = last.cap * 2; }
+    if (n + align > cap)                   { cap = n + align; }
+    val r: res[ptr, allo.Error] = allo.allocate_raw(ctx.a, BLOCK_HEAD + cap, BLOCK_ALIGN);
     if (sel r.err) {
         ctx.oom = 1;
         ret nil;
     }
-    ctx.lent     = r.ok;
-    ctx.lent_cap = cap;
-    ret r.ok;
+    val nb: *Block = r.ok::*Block;
+    nb.next = nil;
+    nb.cap  = cap;
+    nb.used = 0;
+    if (last == nil) { ctx.arena = nb; }
+    or               { last.next = nb; }
+    ctx.arena_at = nb;
+    ret frame_bytes(ctx, n, align);
+}
+
+# reclaim everything the frame arena handed out, keeping its blocks
+fun frame_reset(ctx: *Context) {
+    var b: *Block = ctx.arena;
+    for (b != nil) {
+        b.used = 0;
+        b      = b.next;
+    }
+    ctx.arena_at = ctx.arena;
 }
 
 # fold a draw-list result into the context's oom flag
@@ -4214,6 +4268,78 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
 pub fun end_surface(ctx: *Context, surf: Surface) {
     pop_origin(ctx);
     pop_clip(ctx);
+}
+
+# fill n values at p with seed, seed + 1, ...
+#[testing]
+fun fill_seq(p: *u64, n: usize, seed: u64) {
+    var i: usize = 0;
+    for (i < n) {
+        p[i] = seed + i::u64;
+        i    = i + 1;
+    }
+}
+
+# whether n values at p still run from seed
+#[testing]
+fun is_seq(p: *u64, n: usize, seed: u64) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != seed + i::u64) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the blocks the frame arena holds
+#[testing]
+fun blocks(ctx: *Context) usize {
+    var n: usize  = 0;
+    var b: *Block = ctx.arena;
+    for (b != nil) {
+        n = n + 1;
+        b = b.next;
+    }
+    ret n;
+}
+
+test frame_alloc__nested_users_keep_their_memory {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var in: input.Input;
+
+    var held: usize = 0;
+    var f:    usize = 0;
+    for (f < 2) {
+        begin(?ctx, in, 100.0::f32, 100.0::f32);
+        # an outer user holds its memory while an inner one takes more than a
+        # block holds, chaining another, and neither moves the other's
+        val outer: *u64 = frame_alloc[u64](?ctx, 100);
+        if (outer == nil) { ret 2; }
+        fill_seq(outer, 100, 7);
+        val inner: *u64 = frame_alloc[u64](?ctx, 2000);
+        if (inner == nil) { ret 2; }
+        fill_seq(inner, 2000, 900);
+        val small: *u8  = frame_alloc[u8](?ctx, 3);
+        val after: *u64 = frame_alloc[u64](?ctx, 10);
+        if (small == nil || after == nil) { ret 2; }
+        if (after::usize % 8 != 0)        { ret 3; }
+        fill_seq(after, 10, 50);
+        if (!is_seq(outer, 100, 7) || !is_seq(inner, 2000, 900)) { ret 4; }
+        end(?ctx);
+        # the second frame reuses the blocks the first chained
+        if (f == 0)                           { held = blocks(?ctx); }
+        if (held < 2 || blocks(?ctx) != held) { ret 5; }
+        f = f + 1;
+    }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
 }
 
 test clip__runs_carry_their_scissor {
