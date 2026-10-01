@@ -116,9 +116,10 @@ fun dense(ctx: *blit.context.Context, s: *State) {
     modes[2] = "Age";
     modes[3] = "Heat";
 
-    val area: blit.widget.DockArea = blit.widget.begin_dock(ctx, ?s.dock);
+    val area: blit.widget.DockArea = blit.widget.begin_dock(ctx, "dock", ?s.dock);
     var k:    usize                = 0;
     for (k < SECTIONS) {
+        blit.context.push_id_int(ctx, k::u64);
         if (blit.widget.section(ctx, titles[k], ?s.open[k])) {
             blit.widget.text(ctx, "the quick brown fox jumps over the lazy dog");
             blit.widget.buttons(ctx, ?acts[0], 3);
@@ -128,6 +129,7 @@ fun dense(ctx: *blit.context.Context, s: *State) {
             blit.widget.segmented(ctx, ?modes[0], 4, ?s.choices[k]);
             blit.widget.note(ctx, "a note long enough to wrap onto a second line in a docked panel");
         }
+        blit.context.pop_id(ctx);
         k = k + 1;
     }
     blit.widget.end_dock(ctx, ?s.dock, area);
@@ -136,7 +138,7 @@ fun dense(ctx: *blit.context.Context, s: *State) {
 # a panel holding a list of ROWS items
 fun rows(ctx: *blit.context.Context, s: *State) {
     val b: blit.widget.Block = blit.widget.begin_panel(ctx, 8.0::f32, 8.0::f32, 400.0::f32);
-    blit.widget.list(ctx, ?s.list, s.rows, ROWS, nil, 700.0::f32);
+    blit.widget.list(ctx, "rows", ?s.list, s.rows, ROWS, nil, 700.0::f32);
     blit.widget.end_panel(ctx, b);
 }
 
@@ -145,26 +147,30 @@ fun chart(ctx: *blit.context.Context, s: *State) {
     var series: blit.chart.Series;
     series.values = s.samples;
     series.fill   = 1;
-    blit.chart.line(ctx, 20.0::f32, 20.0::f32, 1240.0::f32, 760.0::f32, ?series, 1, SAMPLES, blit.chart.options());
+    blit.chart.line(ctx, "samples", 20.0::f32, 20.0::f32, 1240.0::f32, 760.0::f32, ?series, 1, SAMPLES, blit.chart.options());
 }
 
 # overlapping windows, each a section holding a scroll region of controls
 fun windows(ctx: *blit.context.Context, s: *State) {
     var k: usize = 0;
     for (k < WINDOWS) {
+        blit.context.push_id_int(ctx, k::u64);
         val b: blit.widget.Block = blit.widget.begin_window(ctx, ?s.wins[k]);
         if (s.wins[k].open != 0 && blit.widget.section(ctx, "contents", ?s.wopen[k])) {
-            val r: blit.widget.ScrollArea = blit.widget.begin_scroll(ctx, ?s.scrolls[k], 200.0::f32);
+            val r: blit.widget.ScrollArea = blit.widget.begin_scroll(ctx, "scroll", ?s.scrolls[k], 200.0::f32);
             var i: usize                  = 0;
             for (i < 6) {
+                blit.context.push_id_int(ctx, i::u64);
                 blit.widget.text(ctx, "a row of window content");
                 blit.widget.button(ctx, "Apply");
                 blit.widget.slider_f(ctx, "level", ?s.values[i], 0.0::f32, 1.0::f32);
+                blit.context.pop_id(ctx);
                 i = i + 1;
             }
             blit.widget.end_scroll(ctx, ?s.scrolls[k], r);
         }
         blit.widget.end_window(ctx, ?s.wins[k], b);
+        blit.context.pop_id(ctx);
         k = k + 1;
     }
 }

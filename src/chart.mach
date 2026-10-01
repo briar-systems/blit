@@ -15,9 +15,9 @@
 #
 # every color and length comes from the context's theme (see blit.theme) at the
 # context's scale: series k draws in theme.series[k % theme.SERIES]. a chart
-# takes one id in call order and claims its plot, so its read-out follows the
-# same topmost-claimant routing as every widget and is stable while the call
-# order is. nothing is allocated: a chart only pushes vertices.
+# takes its id from a key in the current id scope (see context.id_of) and
+# claims its plot, so its read-out follows the same topmost-claimant routing as
+# every widget. nothing is allocated: a chart only pushes vertices.
 
 use std.types.size.usize;
 use std.types.string.str;
@@ -582,8 +582,8 @@ fun cursor(ctx: *context.Context, mx: *f32, my: *f32) {
 }
 
 # claim the plot for the next frame and report whether the cursor is over it
-fun hovered(ctx: *context.Context, p: *Plot) u8 {
-    val id:  u64 = context.next_id(ctx);
+fun hovered(ctx: *context.Context, key: str, p: *Plot) u8 {
+    val id:  u64 = context.id_of(ctx, key);
     val hov: u8  = context.claim(ctx, id, p.x0, p.y0, p.x1, p.y1);
     if (hov != 0) { ctx.hot = id; }
     ret hov;
@@ -634,6 +634,7 @@ fun read_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, index: usize, valu
 # marker and a read-out of that value.
 # ---
 # ctx:    context
+# key:    the chart's key in the current id scope
 # x:      chart left in local pixels
 # y:      chart top in local pixels
 # w:      chart width in pixels
@@ -643,7 +644,7 @@ fun read_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, index: usize, valu
 # count:  how many values each series holds
 # opt:    ranges and axes
 # ret:    what the cursor is over
-pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Series, ns: usize, count: usize, opt: Options) Hover {
+pub fun line(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, series: *Series, ns: usize, count: usize, opt: Options) Hover {
     var none: Hover;
     var dlo:  f32   = 0.0::f32;
     var dhi:  f32   = 0.0::f32;
@@ -659,7 +660,7 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
 
     context.push_clip(ctx, x, y, x + w, y + h);
     if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
-    val hov: u8 = hovered(ctx, ?p);
+    val hov: u8 = hovered(ctx, key, ?p);
 
     val width: f32 = context.px(ctx, ctx.theme.line_w);
     val half:  f32 = width / 2.0::f32;
@@ -719,6 +720,7 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
 # the bar whose slot the cursor is in and draws a read-out of its value.
 # ---
 # ctx:    context
+# key:    the chart's key in the current id scope
 # x:      chart left in local pixels
 # y:      chart top in local pixels
 # w:      chart width in pixels
@@ -727,7 +729,7 @@ pub fun line(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, series: *Ser
 # count:  how many values
 # opt:    ranges and axes
 # ret:    what the cursor is over
-pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize, opt: Options) Hover {
+pub fun bars(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize, opt: Options) Hover {
     var none: Hover;
     var dlo:  f32 = 0.0::f32;
     var dhi:  f32 = 0.0::f32;
@@ -738,7 +740,7 @@ pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32
 
     context.push_clip(ctx, x, y, x + w, y + h);
     if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
-    val hov: u8 = hovered(ctx, ?p);
+    val hov: u8 = hovered(ctx, key, ?p);
 
     context.push_clip(ctx, p.x0, p.y0, p.x1, p.y1);
     val c:    draw.Color = series_color(ctx, 0);
@@ -779,6 +781,7 @@ pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32
 # reports the sample nearest the cursor and marks it.
 # ---
 # ctx:    context
+# key:    the chart's key in the current id scope
 # x:      left in local pixels
 # y:      top in local pixels
 # w:      width in pixels
@@ -786,7 +789,7 @@ pub fun bars(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32
 # values: the values, drawn in theme.series[0]
 # count:  how many values
 # ret:    what the cursor is over
-pub fun sparkline(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize) Hover {
+pub fun sparkline(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, values: *f32, count: usize) Hover {
     var none:  Hover;
     val width: f32 = context.px(ctx, ctx.theme.line_w);
     val half:  f32 = width / 2.0::f32;
@@ -809,7 +812,7 @@ pub fun sparkline(ctx: *context.Context, x: f32, y: f32, w: f32, h: f32, values:
     if (count > 1) { p.b = (p.x1 - p.x0) / (count - 1)::f32; }
 
     context.push_clip(ctx, x, y, x + w, y + h);
-    val hov: u8         = hovered(ctx, ?p);
+    val hov: u8         = hovered(ctx, key, ?p);
     val c:   draw.Color = series_color(ctx, 0);
     trace(ctx, ?p, values, width, c);
     var out: Hover;
@@ -846,7 +849,7 @@ fun bare() Options {
 #[testing]
 fun frame_line(ctx: *context.Context, in: input.Input, series: *Series, opt: Options) Hover {
     context.begin(ctx, in, 400.0::f32, 300.0::f32);
-    val h: Hover = line(ctx, 0.0::f32, 0.0::f32, context.px(ctx, 200.0::f32), context.px(ctx, 100.0::f32), series, 2, 5, opt);
+    val h: Hover = line(ctx, "line", 0.0::f32, 0.0::f32, context.px(ctx, 200.0::f32), context.px(ctx, 100.0::f32), series, 2, 5, opt);
     context.end(ctx);
     ret h;
 }
@@ -901,7 +904,7 @@ test line__hover_reads_nearest_sample_and_series {
 #[testing]
 fun frame_bars(ctx: *context.Context, in: input.Input, values: *f32) Hover {
     context.begin(ctx, in, 400.0::f32, 300.0::f32);
-    val h: Hover = bars(ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, values, 4, bare());
+    val h: Hover = bars(ctx, "bars", 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, values, 4, bare());
     context.end(ctx);
     ret h;
 }
@@ -944,7 +947,7 @@ test bars__hover_reads_positive_and_negative {
 #[testing]
 fun frame_spark(ctx: *context.Context, in: input.Input, values: *f32) Hover {
     context.begin(ctx, in, 400.0::f32, 300.0::f32);
-    val h: Hover = sparkline(ctx, 10.0::f32, 10.0::f32, 40.0::f32, 10.0::f32, values, 4);
+    val h: Hover = sparkline(ctx, "spark", 10.0::f32, 10.0::f32, 40.0::f32, 10.0::f32, values, 4);
     context.end(ctx);
     ret h;
 }
@@ -973,7 +976,7 @@ test sparkline__hover_reads_nearest_sample {
 fun frame_surface(ctx: *context.Context, in: input.Input, series: *Series) Hover {
     context.begin(ctx, in, 400.0::f32, 300.0::f32);
     val surf: context.Surface = context.begin_surface(ctx, 50.0::f32, 50.0::f32, 80.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
-    val h:    Hover           = line(ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, series, 2, 5, bare());
+    val h:    Hover           = line(ctx, "line", 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, series, 2, 5, bare());
     context.end_surface(ctx, surf);
     context.end(ctx);
     ret h;
@@ -996,9 +999,9 @@ test clip__charts_stay_inside_clip_and_surface {
     var v: [4]f32 = [4]f32{3.0::f32, -2.0::f32, 5.0::f32, -4.0::f32};
     context.begin(?ctx, at(0.0::f32, 0.0::f32), 400.0::f32, 300.0::f32);
     context.push_clip(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 50.0::f32);
-    val l: Hover = line(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?ss[0], 2, 5, options());
-    val b: Hover = bars(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4, options());
-    val s: Hover = sparkline(?ctx, 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4);
+    val l: Hover = line(?ctx, "line", 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?ss[0], 2, 5, options());
+    val b: Hover = bars(?ctx, "bars", 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4, options());
+    val s: Hover = sparkline(?ctx, "spark", 0.0::f32, 0.0::f32, 200.0::f32, 100.0::f32, ?v[0], 4);
     context.pop_clip(?ctx);
     context.end(?ctx);
     if (context.draw_count(?ctx) == 0)                                { ret 2; }

@@ -2,9 +2,9 @@
 # painter helpers widgets build on
 #
 # the context owns the per-frame draw list and the current input, tracks a simple
-# top-to-bottom layout cursor, and assigns stable widget ids by call order. it is
-# also the painter: quad/glyph/text_at emit into the draw list through the font
-# and its atlas so widgets never touch the draw list or font directly. a
+# top-to-bottom layout cursor, and holds the id stack widget ids are scoped by.
+# it is also the painter: quad/glyph/text_at emit into the draw list through
+# the font and its atlas so widgets never touch the draw list or font directly. a
 # draw-list growth failure is recorded in `oom` rather than silently dropping
 # geometry; check ok().
 #
@@ -61,6 +61,14 @@
 # wake_at, so an idle interface can sleep until input arrives instead of
 # drawing every frame. the IME's composition in progress is kept here, for
 # the focus holder to show at its caret (preedit).
+#
+# a widget's id is its key hashed into the seed of the current id scope (see
+# blit.id), so it survives widgets before it appearing and disappearing.
+# push_id_str and push_id_int open a scope and pop_id closes it, and
+# containers open one of their own, so the same label under two windows is two
+# widgets. id_of hands out the id a key gets in the current scope. two claims
+# with one id in a frame are recorded as collisions, readable until the next
+# begin.
 
 use std.types.error.err;
 use std.types.option.opt;
@@ -79,15 +87,18 @@ use blit.draw;
 use blit.font;
 use gly: blit.glyph;
 use blit.hit;
+use bid: blit.id;
 use blit.input;
 use blit.store;
 use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.set;
 use std.math.float.sqrt_f32;
 use std.text.utf8;
 
-# capacity the clip, origin and layer stacks start with, doubling from there
+# capacity the clip, origin, layer and id stacks and the collision list start
+# with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
 # capacity the span list starts with, doubling from there
@@ -169,7 +180,6 @@ pub rec Area {
 # cx:           layout cursor x
 # cy:           layout cursor y
 # pw:           current panel width
-# seq:          widget id counter, reset each frame
 # hot:          id of the widget hovered this frame (0 = none)
 # active:       id of the widget being interacted with, persists across frames (0 = none)
 # drag_off_x:   cursor-to-origin x offset captured when a drag begins
@@ -233,6 +243,14 @@ pub rec Area {
 # pre_len:      bytes in the composition, 0 when there is none
 # pre_caret:    the composition's caret as a byte offset into pre
 # pre_owner:    id of the focus holder the composition was typed into
+# ids:          seeds of the open id scopes, innermost last
+# ids_cap:      seeds allocated for ids
+# id_sp:        open id scopes, saved or not
+# hover_seen:   claims the hovered widget recorded so far this frame
+# seen:         ids claimed so far this frame
+# collided:     ids claimed again this frame, once per repeat claim
+# collided_cap: ids allocated for collided
+# collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
 pub rec Context {
     dl:           draw.DrawList;
@@ -244,7 +262,6 @@ pub rec Context {
     cx:           f32;
     cy:           f32;
     pw:           f32;
-    seq:          u64;
     hot:          u64;
     active:       u64;
     drag_off_x:   f32;
@@ -308,6 +325,14 @@ pub rec Context {
     pre_len:      usize;
     pre_caret:    usize;
     pre_owner:    u64;
+    ids:          *u64;
+    ids_cap:      usize;
+    id_sp:        usize;
+    hover_seen:   u64;
+    seen:         set.Set[u64];
+    collided:     *u64;
+    collided_cap: usize;
+    collided_len: usize;
     store:        store.Store;
 }
 
@@ -360,7 +385,6 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.cx           = 0.0::f32;
     ctx.cy           = 0.0::f32;
     ctx.pw           = 0.0::f32;
-    ctx.seq          = 0;
     ctx.hot          = 0;
     ctx.active       = 0;
     ctx.drag_off_x   = 0.0::f32;
@@ -420,12 +444,20 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.pre_len      = 0;
     ctx.pre_caret    = 0;
     ctx.pre_owner    = 0;
+    ctx.ids          = nil;
+    ctx.ids_cap      = 0;
+    ctx.id_sp        = 0;
+    ctx.hover_seen   = 0;
+    ctx.seen         = set.init[u64](a);
+    ctx.collided     = nil;
+    ctx.collided_cap = 0;
+    ctx.collided_len = 0;
     store.init(?ctx.store, a);
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition and state
+# composition, state and id bookkeeping
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
@@ -465,6 +497,16 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel et.err) { ret et; }
     ctx.style_ids = nil;
     ctx.style_cap = 0;
+    val ei: err[allo.Error] = allo.deallocate[u64](ctx.a, ctx.ids, ctx.ids_cap);
+    if (sel ei.err) { ret ei; }
+    ctx.ids     = nil;
+    ctx.ids_cap = 0;
+    val ed: err[allo.Error] = allo.deallocate[u64](ctx.a, ctx.collided, ctx.collided_cap);
+    if (sel ed.err) { ret ed; }
+    ctx.collided     = nil;
+    ctx.collided_cap = 0;
+    val en: err[allo.Error] = set.dnit[u64](?ctx.seen);
+    if (sel en.err) { ret en; }
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
     val e1: err[allo.Error] = draw.free(?ctx.out);
@@ -478,7 +520,7 @@ pub fun free(ctx: *Context) err[allo.Error] {
 
 # start a frame: store input (carrying the previous buttons into prev_down),
 # take dt from the host's clock, resolve the hovered claimant, clear the draw
-# list, and reset ids, layout and layers
+# list, and reset the id scopes, collisions, layout and layers
 #
 # hover is the topmost of the previous frame's claims under this frame's
 # cursor, and nothing while no pointer is present. a primary press on anything
@@ -506,7 +548,6 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.cx  = 0.0::f32;
     ctx.cy  = 0.0::f32;
     ctx.pw  = 0.0::f32;
-    ctx.seq = 0;
     ctx.hot = 0;
     ctx.oom = 0;
 
@@ -552,6 +593,11 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.ime_on       = 0;
     take_preedit(ctx);
 
+    ctx.id_sp        = 0;
+    ctx.hover_seen   = 0;
+    ctx.collided_len = 0;
+    set.clear[u64](?ctx.seen);
+
     draw.reset(?ctx.dl);
 }
 
@@ -578,7 +624,7 @@ pub fun end(ctx: *Context) {
 # as drawn in that frame.
 # ---
 # ctx: context
-# id:  the widget's id from next_id, 0 to drop the focus
+# id:  the widget's id (see id_of), 0 to drop the focus
 pub fun focus(ctx: *Context, id: u64) {
     ctx.focus       = id;
     ctx.focus_drawn = 0;
@@ -808,13 +854,111 @@ fun take_preedit(ctx: *Context) {
     }
 }
 
-# allocate the next widget id for this frame (stable while call order is)
+# the seed of the innermost saved id scope
+fun seed(ctx: *Context) u64 {
+    var n: usize = ctx.id_sp;
+    if (n > ctx.ids_cap) { n = ctx.ids_cap; }
+    if (n == 0)          { ret bid.ROOT; }
+    ret ctx.ids[n - 1];
+}
+
+# open an id scope seeded by id until the matching pop_id
+#
+# the stack grows like the clip stack. a scope that cannot be saved sets oom,
+# and widgets in it take their ids in the innermost saved scope until it is
+# popped.
+fun push_seed(ctx: *Context, id: u64) {
+    ctx.ids = room[u64](ctx, ctx.ids, ?ctx.ids_cap, ctx.id_sp + 1, CLIP_DEPTH);
+    if (ctx.id_sp < ctx.ids_cap) { ctx.ids[ctx.id_sp] = id; }
+    ctx.id_sp = ctx.id_sp + 1;
+}
+
+# open an id scope keyed by a string, until the matching pop_id
+#
+# ids made inside it are hashed from the scope's seed, so the same key in two
+# scopes gives two ids. the string is hashed as it is, without label markers.
 # ---
 # ctx: context
-# ret: a nonzero widget id
-pub fun next_id(ctx: *Context) u64 {
-    ctx.seq = ctx.seq + 1;
-    ret ctx.seq;
+# s:   the scope's key
+pub fun push_id_str(ctx: *Context, s: str) {
+    push_seed(ctx, bid.of_str(seed(ctx), s));
+}
+
+# open an id scope keyed by an integer, such as a row index, until the
+# matching pop_id
+# ---
+# ctx: context
+# n:   the scope's key
+pub fun push_id_int(ctx: *Context, n: u64) {
+    push_seed(ctx, bid.of_int(seed(ctx), n));
+}
+
+# open an id scope seeded by a widget's own id, as containers do, until the
+# matching pop_id
+# ---
+# ctx: context
+# id:  the container's id
+pub fun push_id(ctx: *Context, id: u64) {
+    push_seed(ctx, id);
+}
+
+# close the innermost id scope, ignored when none is open
+# ---
+# ctx: context
+pub fun pop_id(ctx: *Context) {
+    if (ctx.id_sp > 0) { ctx.id_sp = ctx.id_sp - 1; }
+}
+
+# the id a widget labelled or keyed key gets in the current scope
+#
+# a label's "##" and "###" markers apply (see blit.id), so this is the id
+# button(ctx, key) or text_field(ctx, key, ...) would claim here, for focus,
+# state lookups and tests.
+# ---
+# ctx: context
+# key: the widget's label or key
+# ret: a nonzero id
+pub fun id_of(ctx: *Context, key: str) u64 {
+    ret bid.of_label(seed(ctx), key);
+}
+
+# how many claims this frame repeated an id already claimed in it
+#
+# each is a widget whose key collides with another's in one scope, so input
+# meant for one reaches both. complete after end(), kept until the next begin.
+# ---
+# ctx: context
+# ret: the collision count
+pub fun collisions(ctx: *Context) usize {
+    ret ctx.collided_len;
+}
+
+# the id of one of the frame's collisions
+# ---
+# ctx:   context
+# index: collision index below collisions()
+# ret:   the repeated id, 0 for an index out of range
+pub fun collision_at(ctx: *Context, index: usize) u64 {
+    if (index >= ctx.collided_len) { ret 0; }
+    ret ctx.collided[index];
+}
+
+# note a claim's id: a repeat within the frame is a collision, and a claim by
+# the hovered widget is counted
+fun note_id(ctx: *Context, id: u64) {
+    if (id == 0)         { ret; }
+    if (id == ctx.hover) { ctx.hover_seen = ctx.hover_seen + 1; }
+    val r: res[bool, allo.Error] = set.insert[u64](?ctx.seen, id);
+    if (sel r.err) {
+        ctx.oom = 1;
+        ret;
+    }
+    if (r.ok) { ret; }
+    ctx.collided = room[u64](ctx, ctx.collided, ?ctx.collided_cap, ctx.collided_len + 1, CLIP_DEPTH);
+    if (ctx.collided_len < ctx.collided_cap) {
+        ctx.collided[ctx.collided_len] = id;
+        ctx.collided_len               = ctx.collided_len + 1;
+    }
 }
 
 # whether the frame's geometry is complete (no draw-list growth failed)
@@ -1226,6 +1370,7 @@ fun add_claim(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) usize 
         ret NO_CLAIM;
     }
     ctx.ordinal = ctx.ordinal + 1;
+    note_id(ctx, id);
     ret r.ok;
 }
 
@@ -1237,7 +1382,7 @@ fun add_claim(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) usize 
 # this frame's clipped rect.
 # ---
 # ctx: context
-# id:  the widget's id from next_id
+# id:  the widget's id (see id_of)
 # x0:  left x in pixels
 # y0:  top y in pixels
 # x1:  right x in pixels
@@ -1265,7 +1410,7 @@ pub fun claim(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
 # covering its own widgets.
 # ---
 # ctx: context
-# id:  the container's id from next_id
+# id:  the container's id, 0 for an anonymous one
 # ret: a handle for fill_claim, or NO_CLAIM when refused
 pub fun reserve_claim(ctx: *Context, id: u64) usize {
     ret add_claim(ctx, id, 0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
