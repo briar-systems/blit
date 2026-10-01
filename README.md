@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -189,11 +189,12 @@ in.time    = clock_seconds();       # the host's monotonic clock, as f64
 in.present = 1;                     # 0 while the pointer is off the surface
 in.mx      = x;
 in.my      = y;
-in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held this frame
+in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held after the frame's last event
 in.mods    = blit.input.MOD_SHIFT;   # MOD_* bits held this frame
 in.wheel   = dy_pixels;             # both wheels in pixels
 in.wheel_x = dx_pixels;
-blit.input.type_text(?in, cp);      # then every event, in arrival order
+blit.input.press_button(?in, blit.input.BUTTON_LEFT, bx, by); # then every event, in arrival order
+blit.input.type_text(?in, cp);
 blit.context.begin(?ctx, in, w, h);
 # ... widgets ...
 blit.context.end(?ctx);
@@ -207,7 +208,19 @@ blit.context.end(?ctx);
   `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
   `blit.input.pressed`, `released` and `held` take the button. The context
   carries `prev_down` across frames. With `present` 0 nothing is hovered and
-  `in_rect` misses. Widgets act on the left button.
+  `in_rect` misses. Widgets act on the left button through `blit.interact`
+  (see Interaction).
+- **Button events.** A host that only samples the buttons sets `down` and
+  nothing more, and a press and release that both land between two frames are
+  then lost. A host that sees each one also adds it as it arrives,
+  `press_button(?in, button, x, y)` and `release_button(?in, button, x, y)`
+  with the cursor where it happened, and still sets `down` to the buttons held
+  after the last of them. `begin` hands them to widgets in order, at most one
+  change of a button per frame, holding the rest back and asking for the next
+  frame through `next_frame`, so a quick click is a press in one frame and a
+  release in the next, and a double click is a click, then a press. A frame
+  that applies one sees the cursor where it happened, so `pressed` and
+  `released` keep their per-frame meaning.
 - **Keyboard events.** `type_text(?in, cp)` for each typed codepoint,
   `press_key(?in, code, mods)` for each key press or repeat,
   `release_key(?in, code, mods)` for each release and `compose(?in, text,
@@ -229,8 +242,8 @@ blit.context.end(?ctx);
   window, in screen pixels, none while nothing takes text.
 - **Scheduling.** Widgets call `blit.context.wake_at(?ctx, t)` for a time they
   need a frame by (a hover delay, an animation, a caret blink). After `end`,
-  `next_frame(?ctx)` is `some(0)` to draw again now, `some(t)` to draw by time
-  `t`, or `none` to draw only on input, so an idle tool can sleep instead of
+  `next_frame(?ctx)` is `some(0)` to draw again now (also while button events
+  are held back), `some(t)` to draw by time `t`, or `none` to draw only on input, so an idle tool can sleep instead of
   redrawing every frame.
 
 ## Keyboard, focus & text fields
@@ -298,8 +311,54 @@ Coordinates compose one way:
 - **A layer is a new root.** Inside `push_layer` (and so inside a popup) the
   origin is zero and the clip is the whole screen.
 - **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
-  screen pixels. Use a `Surface`'s `local_mx`/`local_my` for the cursor in its
-  local space.
+  screen pixels. `blit.context.local_mx(?ctx)`/`local_my` are the cursor in the
+  current local space, as are a `Surface`'s `local_mx`/`local_my` and a hit's
+  `mx`/`my`.
+
+## Interaction
+
+`blit.interact.hit(?ctx, id, x0, y0, x1, y1, buttons)` is how every widget
+meets the pointer, built-in or not: it claims the rect in the current local
+space (clipped and layered like geometry) and returns a `blit.interact.Hit`
+for the `BUTTON_*` bits it answers to. Every built-in widget and chart calls
+it, so a custom control behaves exactly like one.
+
+```mach
+val id: u64 = blit.context.id_of(?ctx, "node");
+val h:  blit.interact.Hit = blit.interact.hit(?ctx, id, x0, y0, x1, y1,
+    blit.input.BUTTON_LEFT | blit.input.BUTTON_RIGHT);
+if (h.double)                                         { open_node(); }
+or (h.clicked && h.button == blit.input.BUTTON_RIGHT) { open_menu(h.mx, h.my); }
+if (h.held) { drag_by(h.dx, h.dy); }
+```
+
+- **Hover.** `hot` while it is the topmost claimant under the cursor.
+- **Owning the pointer.** A press over it with one of its buttons makes it
+  `active` until that button comes up, and `pressed` on that frame. A press
+  while another button owns the pointer takes nothing. While active, `held`
+  says the button is still down and `dx`/`dy` are the cursor's travel since the
+  press, wherever the cursor goes. `released` is the frame the button comes up,
+  over it or not, and `clicked` is a release over it. `button` is the
+  `BUTTON_*` bit it acted on.
+- **Double clicks.** The context keeps each button's last press
+  (`blit.context.last_press`): its time, where it landed in screen space, the
+  claimant it landed on and its run of clicks. A press on the same claimant
+  within the double-click time and distance of the one before extends the run:
+  `clicks` is 1, 2 or 3 for a single, double or triple click, and `double` is
+  the second.
+  `blit.context.set_double_click(?ctx, seconds, pixels)` sets the threshold
+  (`DOUBLE_TIME`, 0.3 s, and `DOUBLE_DIST`, 6 unscaled pixels, by default), so
+  a host can pass its platform's settings.
+- **Hover only.** `buttons` 0 reports hover and the cursor and never owns the
+  pointer, as a chart's read-out does.
+- **Moving with a drag.** `blit.interact.drag(?ctx, id, ?dx, ?dy)` reports the
+  same travel without claiming, for a part that moves with its drag (a title
+  bar, a scrollbar thumb) and must place its rect before claiming it.
+- **Focus.** A widget that takes the keyboard does it on `pressed` with
+  `blit.context.focus(?ctx, id)`. Its id is `id_of(?ctx, key)` in the scope it
+  was drawn in, so a caller that refuses a text field's entry (`ENTERED` with
+  text it will not take) calls `focus` with that id to hand the keyboard
+  straight back, and `focused(?ctx, id)` says whether it holds it.
 
 ## Widgets & layout
 
@@ -341,8 +400,9 @@ a popup over later widgets, its open state kept in the state store under its
 id, `blit.widget.begin_window`/`end_window` is a
 draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
 x, y, w)`/`end_popup` opens an overlay column, and
-`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
-rect for consumer-drawn affordances.
+`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` is a left click on an
+arbitrary rect for consumer-drawn affordances, the simplest use of
+`blit.interact.hit`.
 
 ## Widget ids
 
@@ -373,7 +433,11 @@ were. 0 is never an id: it means "no widget".
   items) take ids derived from the widget's id with a fixed suffix or index.
 - **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
   that label or key gets in the current scope, for `focus`, state lookups and
-  tests.
+  tests. `blit.id.of_path(blit.id.ROOT, "Settings/Audio/volume")` names a
+  widget from outside its scopes: each segment is a container's label or key
+  (a window's title, a dock's, popup's, scroll region's or list's key, a
+  `push_id_str` key) and the last is the widget's. A key holding `/` cannot
+  be named by a path; use its id.
 - **Collisions.** Two claims with one id in a frame are recorded:
   `blit.context.collisions(?ctx)` counts them after `end` and
   `collision_at(?ctx, i)` names each repeated id, until the next `begin`.
@@ -476,9 +540,9 @@ click is always the one visibly on top.
   `merge(?ctx, ch)`. A lower channel paints beneath a higher one whatever the
   order they were drawn in, so the background can be any shape. Splits nest,
   and each is merged on the layer it was made on.
-- **Claims.** Interactive widgets call `blit.context.claim(?ctx, id, x0, y0,
-  x1, y1)`, which records the rect with the key (layer, then claim order) and
-  returns whether the widget is hovered. Containers call `reserve_claim` before
+- **Claims.** Interactive widgets claim through `blit.interact.hit`, which calls
+  `blit.context.claim(?ctx, id, x0, y0, x1, y1)`: it records the rect with the
+  key (layer, then claim order) and returns whether the widget is hovered. Containers call `reserve_claim` before
   their children and `fill_claim` at their end, so their empty areas stop input
   instead of letting it reach what they cover.
 - **Routing.** Frame N's input goes only to the topmost of frame N-1's claims
@@ -575,11 +639,13 @@ cell. Colors and texels are premultiplied.
 - **Runs.** `run_count` / `run_at` divide the index list into runs, in paint
   order. A `Run` is plain numbers: `kind` (u32), `tex` (u64), `page`, `layer`
   and `filter` (u32), the scissor `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1`
-  (f32) and `start` and `count` (usize, in indices). Every index lies in one
-  run. Draw the runs in order:
-  - **Kind.** `blit.context.RUN_TRIANGLES` (0) is the only kind today: bind,
-    scissor and draw as below. Skip a run of any other kind, so later kinds
-    (such as consumer spans) need no change to a renderer that ignores them.
+  (f32), `start` and `count` (usize, in indices), and for a consumer span
+  `id` and `data` (u64) and its rect `x0`, `y0`, `x1`, `y1` (f32). Every index
+  lies in one run. Draw the runs in order:
+  - **Kind.** `blit.context.RUN_TRIANGLES` (0): bind, scissor and draw as
+    below. `blit.context.RUN_CUSTOM` (1) is a consumer span (see below). Skip a
+    run of any other kind, so later kinds need no change to a renderer that
+    ignores them.
   - **Texture.** When `tex` is `blit.draw.ATLAS` (0), bind atlas page `page`.
     Otherwise `tex` is the consumer's own texture handle, passed through
     untouched, and `filter` asks for `FILTER_NEAREST` (0) or `FILTER_LINEAR` (1)
@@ -593,6 +659,14 @@ cell. Colors and texels are premultiplied.
     with `GL_SCISSOR_TEST` enabled.
   - **Draw.** `glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT,
     start * 4)`: indices are absolute vertex numbers, so no base vertex.
+  - **Consumer spans.** A `RUN_CUSTOM` run holds no indices (`count` 0). Set
+    its scissor, call the app's own drawing for `id` with `data` and the rect
+    (`x0`, `y0`, `x1`, `y1`, screen pixels, y down), then restore blit's state
+    (program, buffers, blend, texture binding) before the next run.
+    `blit.context.custom(?ctx, x0, y0, x1, y1, id, data)` places one: the rect
+    is in local space like every rect, it takes the current clip and layer,
+    and it sorts like any run, so a popup on a higher layer, or anything drawn
+    after it, paints over it. `id` and `data` are passed through untouched.
 - **State.** Blend premultiplied: `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)`.
   Disable face culling (triangles come in either winding) and depth testing.
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
@@ -624,7 +698,7 @@ cell. Colors and texels are premultiplied.
   FragColor   = aColor * texture(atlas, aUV);
   ```
 - **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
-  events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
+  and button events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
   clipboard and answer `wants_paste`, upload the changed atlas pages, the
   vertices and the indices, and draw each run as above.
 - **From 0.9.** A renderer written for the 0.9 contract changes in these
@@ -635,8 +709,75 @@ cell. Colors and texels are premultiplied.
   - apply each run's scissor
   - blend `ONE` / `ONE_MINUS_SRC_ALPHA` where it blended `SRC_ALPHA` /
     `ONE_MINUS_SRC_ALPHA`, and leave face culling off
-  - skip runs whose `kind` is not `RUN_TRIANGLES`
+  - call back into the app for `RUN_CUSTOM` runs, and skip runs of any other
+    kind that is not `RUN_TRIANGLES`
   - upload consumer textures premultiplied
+
+## Testing with the driver
+
+`blit.driver` runs an interface headless, the way blit's own tests do, so an
+app built on blit can test its interface. A `Driver` owns a context and an
+input, a screen size and a clock, and runs the interface through a callback
+between `begin` and `end`, one frame per `step`:
+
+```mach
+fun ui(ctx: *blit.context.Context, user: ptr) {
+    val app: *App = user::*App;
+    # ... widgets, as in a frame, without begin and end ...
+}
+
+var d: blit.driver.Driver;
+val made: err[allo.Error] = blit.driver.init(?d, ?a, 800.0::f32, 600.0::f32, ui, (?app)::ptr);
+blit.driver.step(?d);                               # lay out once
+val save: u64 = blit.driver.find(?d, "Settings/Save");
+blit.driver.click(?d, save);
+blit.driver.click(?d, blit.driver.find(?d, "Settings/name"));
+blit.driver.type_text(?d, "untitled");
+blit.driver.key(?d, blit.input.KEY_ENTER, 0);
+if (!str_equals(blit.driver.text_of(?d, save), "Save")) { ... }
+blit.driver.free(?d);
+```
+
+- **Finding.** `find(?d, path)` is the id a label path names from the root
+  (see Widget ids), `at(?d, x, y)` the widget a pointer there reaches and
+  `inside(?d, x0, y0, x1, y1)` the topmost widget drawn wholly inside a rect.
+  Any id works, `blit.context.id_of` and `blit.id.child` included.
+- **Acting.** `hover`, `click`, `double_click`, `right_click` and
+  `click_with(?d, id, button)` move the pointer onto the widget's centre in a
+  frame of their own, since input routes by the previous frame's claims, then
+  press and release a frame each. `drag(?d, id, x, y)` presses on the widget
+  and moves to the point in `DRAG_STEPS` held frames before releasing, and
+  `drag_onto(?d, id, target)` drops on another widget's centre. `scroll(?d,
+  id, dx, dy)` turns the wheels over a widget, `type_text(?d, s)` types text in
+  one frame, and `key(?d, code, mods)` presses a key in one frame and releases
+  it in the next. `move`, `leave`, `press` and `release` drive the pointer and
+  buttons by hand, a frame each, and a press or release is sent as a button
+  event at the pointer as well as in `down`. An action on a widget the last frame did not draw runs
+  nothing and returns false.
+- **Frames.** Each step carries the clock (`d.time`, advanced by `d.dt`, 1/60
+  s by default) and clears the frame's key events, wheel and paste, so input
+  set between steps lands in exactly one frame. `d.ctx` and `d.in` are the
+  context and input, free to read and set between steps.
+- **Queries** read the last frame: `drawn`, `rect` (the screen rect the widget
+  claimed, clipped, none when it was not visible), `hot`, `active` and
+  `focused`, and `text_in(?d, x0, y0, x1, y1)` and `text_of(?d, id)`, the
+  text drawn inside a rect or a widget's rect. Text lines whose box has its
+  centre inside are joined in drawing order: directly when one continues the
+  last on its row, by a space further along the row, by a newline otherwise.
+- **Snapshots.** `snapshot(?d)` is a stable text dump of the last frame's draw
+  list for golden comparison: the screen size, then each run with its kind,
+  texture, page, layer, filter and scissor. A consumer span adds its callback
+  id, data and rect, and any other run its triangle count, followed by its
+  geometry one shape a line. A flat-coloured, axis-aligned rect is a `quad`
+  (its corners' position and uv, then its colour), anything else a `tri` of
+  three vertices. Positions print to two decimals, uvs to four, colours as
+  the premultiplied 0 to 255 channels emitted.
+
+The driver's text (`text_in`, `text_of`, `snapshot`) stays valid until the
+next of those calls. The context underneath keeps per-widget rects from its
+claims (`blit.context.rect_of`, `widget_at`, `widget_in`) and, while
+`set_trace(?ctx, 1)` is on, every drawn line of text (`traced_count`,
+`traced_at`), off by default so an app's frames pay nothing for it.
 
 ## Build & test
 
@@ -657,7 +798,16 @@ mach build demo/harness
 demo/harness/out/linux-x86_64/debug/bin/harness
 ```
 
-`demo/panel/` builds and runs the same way.
+`demo/panel/` builds and runs the same way, driven by `blit.driver`. Its
+test compares the scripted panel's last frame with the golden snapshot
+`demo/panel/src/bin/panel.snap`, and `panel --snapshot` prints a new one when
+a change to the draw list is meant. `mach dep pull demo/panel` again after
+changing blit, since a demo builds against its pulled copy:
+
+```
+mach test demo/panel
+demo/panel/out/linux-x86_64/debug/bin/panel --snapshot > demo/panel/src/bin/panel.snap
+```
 
 ## Benchmark
 
