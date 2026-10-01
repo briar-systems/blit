@@ -37,6 +37,9 @@ fwd blit.payload;
 fwd blit.dnd;
 fwd blit.driver;
 fwd blit.menu;
+fwd blit.overlay;
+fwd blit.toast;
+fwd blit.tooltip;
 
 # blit library version
 pub val VERSION: str = "0.9.0";
