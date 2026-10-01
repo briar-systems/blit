@@ -56,6 +56,7 @@ use std.types.string.str_len;
 
 use blit.context;
 use blit.draw;
+use blit.driver;
 use blit.field;
 use blit.font;
 use gly: blit.glyph;
@@ -1574,8 +1575,9 @@ pub rec DockArea {
 # opened in turn stack inward and context.free_area reports what they leave
 # for the rest of the screen. its whole rect stops input to what it covers,
 # and its body scrolls when its widgets are taller than it. call it at the
-# root, outside surfaces and layers, and pair it with end_dock. its body is an
-# id scope derived from the dock's key.
+# root, outside surfaces and layers, and pair it with end_dock. its body is
+# the id scope of the dock's key, so a label path through the dock is
+# "<key>/<label>".
 # ---
 # ctx: context
 # key: the dock's key in the current id scope
@@ -1608,7 +1610,7 @@ pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
     ctx.cx = ctx.ox;
     ctx.cy = ctx.oy;
     ctx.pw = maxf(a.x1 - a.x0 - in * 2.0::f32, 0.0::f32);
-    r.body = scroll_at(ctx, bid.child(context.id_of(ctx, key), "#body"), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
+    r.body = scroll_at(ctx, context.id_of(ctx, key), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
     ret r;
 }
 
@@ -1732,29 +1734,6 @@ fun frame_button(ctx: *context.Context, in: input.Input) bool {
     ret clicked;
 }
 
-test button__clicks_on_release_inside_after_press {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # hover first: a widget is interactive from the frame after it first claims
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != false) { ret 2; }
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1)) != false) { ret 3; }
-    if (ctx.active != context.id_of(?ctx, "ok"))                       { ret 4; }
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != true)  { ret 5; }
-
-    # a release outside after a press inside is no click
-    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
-    if (frame_button(?ctx, input_at(500.0::f32, 500.0::f32, 0)) != false) { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
 # whether the context asks for a frame now
 #[testing]
 fun asks_now(ctx: *context.Context) bool {
@@ -1809,70 +1788,6 @@ test button__clicks_on_presses_and_releases_between_frames {
     ret 0;
 }
 
-# a frame holding one panel with one checkbox
-#[testing]
-fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val toggled: bool  = checkbox(ctx, "on", st);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret toggled;
-}
-
-test checkbox__toggles_on_click {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var st: u8 = 0;
-    frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st);
-    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 1), ?st) != false) { ret 2; }
-    if (st != 0)                                                             { ret 3; }
-    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st) != true)  { ret 4; }
-    if (st != 1)                                                             { ret 5; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame holding one panel with one slider over [0, 10]
-#[testing]
-fun frame_slider(ctx: *context.Context, in: input.Input, v: *f32) {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    slider_f(ctx, "x", v, 0.0::f32, 10.0::f32);
-    end_panel(ctx, p);
-    context.end(ctx);
-}
-
-test slider__maps_cursor_linearly {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # left end -> lo, middle -> midpoint, right end -> hi, held from the press
-    var v: f32 = 5.0::f32;
-    frame_slider(?ctx, input_at(0.0::f32, 5.0::f32, 0), ?v);
-    frame_slider(?ctx, input_at(0.0::f32, 5.0::f32, 1), ?v);
-    if (v != 0.0::f32) { ret 2; }
-    frame_slider(?ctx, input_at(50.0::f32, 5.0::f32, 1), ?v);
-    if (v != 5.0::f32) { ret 3; }
-    frame_slider(?ctx, input_at(100.0::f32, 5.0::f32, 1), ?v);
-    if (v != 10.0::f32) { ret 4; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
 # whether the dropdown with header id is open
 #[testing]
 fun dropdown_open(ctx: *context.Context, id: u64) u8 {
@@ -1886,6 +1801,259 @@ fun set_dropdown_open(ctx: *context.Context, id: u64, open: u8) {
     st.open = open;
 }
 
+# what the probe panel's widgets reported, across frames
+# ---
+# clicks: times the ok button clicked
+# on:     the checkbox's state
+# flip:   the toggle's state
+# flips:  times the toggle flipped
+# choice: the segmented choice
+# chosen: times the segmented choice changed
+# v:      the slider's value, in [0, 10]
+# pick:   the dropdown's selection
+# picked: times the dropdown's selection changed
+#[testing]
+rec Probe {
+    clicks: usize;
+    on:     u8;
+    flip:   u8;
+    flips:  usize;
+    choice: usize;
+    chosen: usize;
+    v:      f32;
+    pick:   usize;
+    picked: usize;
+}
+
+# a 100 pixel panel of one of each control, the dropdown last so its options
+# cover nothing
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p:    *Probe = user::*Probe;
+    var segs: [3]str;
+    segs[0] = "a";
+    segs[1] = "b";
+    segs[2] = "c";
+    var opts: [3]str;
+    opts[0] = "one";
+    opts[1] = "two";
+    opts[2] = "three";
+    val b: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    if (button(ctx, "ok")) { p.clicks = p.clicks + 1; }
+    checkbox(ctx, "on", ?p.on);
+    if (toggle(ctx, "flip", ?p.flip))           { p.flips = p.flips + 1; }
+    if (segmented(ctx, ?segs[0], 3, ?p.choice)) { p.chosen = p.chosen + 1; }
+    slider_f(ctx, "x", ?p.v, 0.0::f32, 10.0::f32);
+    if (dropdown(ctx, "pick", ?p.pick, ?opts[0], 3) != 0) { p.picked = p.picked + 1; }
+    end_panel(ctx, b);
+}
+
+# a driver over the probe panel on a 200 pixel screen, laid out once
+#[testing]
+fun probe(d: *driver.Driver, a: *allo.Allocator, p: *Probe) u8 {
+    val e: err[allo.Error] = driver.init(d, a, 200.0::f32, 200.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret 0; }
+    driver.step(d);
+    ret 1;
+}
+
+test button__clicks_on_release_inside_after_press {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # pressed it is active, and it clicks on the release
+    val ok: u64 = driver.find(?d, "ok");
+    if (!str_equals(driver.text_of(?d, ok), "ok")) { ret 2; }
+    driver.hover(?d, ok);
+    driver.press(?d, input.BUTTON_LEFT);
+    if (p.clicks != 0 || !driver.active(?d, ok)) { ret 3; }
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.clicks != 1) { ret 4; }
+
+    # a release outside after a press inside is no click
+    driver.hover(?d, ok);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, 150.0::f32, 150.0::f32);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.clicks != 1 || driver.active(?d, ok)) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test checkbox__and_toggle_flip_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "on"));
+    if (p.on != 1) { ret 2; }
+    val flip: u64 = driver.find(?d, "flip");
+    driver.click(?d, flip);
+    if (p.flip != 1 || p.flips != 1) { ret 3; }
+
+    # a press dragged off the row and released there does not flip it back
+    driver.drag(?d, flip, 150.0::f32, 150.0::f32);
+    if (p.flip != 1 || p.flips != 1) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test segmented__chooses_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "c"));
+    if (p.choice != 2 || p.chosen != 1) { ret 2; }
+    # choosing the chosen segment again is no change
+    driver.click(?d, driver.find(?d, "c"));
+    if (p.chosen != 1) { ret 3; }
+    # a press on the first released over the second chooses nothing
+    driver.drag_onto(?d, driver.find(?d, "a"), driver.find(?d, "b"));
+    if (p.choice != 2 || p.chosen != 1) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test slider__maps_cursor_linearly {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # the track spans the panel's width: its left end is lo, its right end hi
+    val x: u64               = driver.find(?d, "x");
+    val r: opt[context.Area] = driver.rect(?d, x);
+    if (sel r.none) { ret 2; }
+    val y: f32 = (r.some.y0 + r.some.y1) / 2.0::f32;
+    driver.drag(?d, x, r.some.x0, y);
+    if (p.v != 0.0::f32) { ret 3; }
+    driver.drag(?d, x, (r.some.x0 + r.some.x1) / 2.0::f32, y);
+    if (p.v != 5.0::f32) { ret 4; }
+    driver.drag(?d, x, r.some.x1 + 50.0::f32, y);
+    if (p.v != 10.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test dropdown__opens_and_selects {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # the header opens it without changing the selection
+    val pick: u64 = driver.find(?d, "pick");
+    val two:  u64 = bid.child_int(bid.child(pick, "#popup"), 1);
+    if (driver.drawn(?d, two)) { ret 2; }
+    driver.click(?d, pick);
+    if (p.picked != 0 || dropdown_open(?d.ctx, pick) == 0) { ret 3; }
+    if (!str_equals(driver.text_of(?d, two), "two"))       { ret 4; }
+
+    # an option selects and closes it
+    driver.click(?d, two);
+    if (p.pick != 1 || p.picked != 1)     { ret 5; }
+    if (dropdown_open(?d.ctx, pick) != 0) { ret 6; }
+    # the frame that chose still drew the options, the next one does not
+    driver.step(?d);
+    if (driver.drawn(?d, two)) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a dock and a window, each holding a widget a label path names
+# ---
+# side: the dock, holding "ok" above more than it can show
+# win:  the "Settings" window, holding the "name" field
+# f:    the field's state
+#[testing]
+rec Nest {
+    side: Dock;
+    win:  Window;
+    f:    field.Field;
+}
+
+#[testing]
+fun nest_ui(ctx: *context.Context, user: ptr) {
+    val n:  *Nest    = user::*Nest;
+    val dk: DockArea = begin_dock(ctx, "side", ?n.side);
+    button(ctx, "ok");
+    space(ctx, 1000.0::f32);
+    end_dock(ctx, ?n.side, dk);
+    val b: Block = begin_window(ctx, ?n.win);
+    text_field(ctx, "name", ?n.f, nil);
+    end_window(ctx, ?n.win, b);
+}
+
+test driver__paths_keys_and_wheel_reach_nested_widgets {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var buf: [64]u8;
+    var n:   Nest;
+    n.side.side = context.Side.left{};
+    n.side.size = 80.0::f32;
+    n.win       = Window{x: 100.0::f32, y: 10.0::f32, w: 120.0::f32, open: 1, title: "Settings"};
+    field.init(?n.f, ?buf[0], 64, 0, nil);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, nest_ui, (?n)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.step(?d);
+
+    # a dock's and a window's widgets sit under their keys
+    val ok:   u64 = driver.find(?d, "side/ok");
+    val name: u64 = driver.find(?d, "Settings/name");
+    if (!driver.drawn(?d, ok) || !driver.drawn(?d, name)) { ret 2; }
+    val r: opt[context.Area] = driver.rect(?d, name);
+    if (sel r.none)                                                            { ret 3; }
+    if (r.some.x0 < 100.0::f32)                                                { ret 3; }
+    if (driver.at(?d, r.some.x0 + 1.0::f32, r.some.y0 + 1.0::f32) != name)     { ret 4; }
+    if (driver.inside(?d, r.some.x0, r.some.y0, r.some.x1, r.some.y1) != name) { ret 5; }
+    driver.hover(?d, ok);
+    if (!driver.hot(?d, ok) || driver.hot(?d, name)) { ret 6; }
+
+    # a clicked field takes typed text and keys
+    driver.click(?d, name);
+    if (!driver.focused(?d, name)) { ret 7; }
+    driver.type_text(?d, "hey");
+    driver.key(?d, input.KEY_BACKSPACE, 0);
+    if (!str_equals(field.text(?n.f), "he"))         { ret 8; }
+    if (!str_equals(driver.text_of(?d, name), "he")) { ret 9; }
+
+    # the wheel over the dock scrolls its body
+    driver.scroll(?d, ok, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (n.side.scroll.offset != 30.0::f32) { ret 10; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # a frame holding one panel with one three-option dropdown
 #[testing]
 fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str) u8 {
@@ -1895,37 +2063,6 @@ fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts:
     end_panel(ctx, p);
     context.end(ctx);
     ret changed;
-}
-
-test dropdown__opens_and_selects {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var opts: [3]str;
-    opts[0] = "a";
-    opts[1] = "bb";
-    opts[2] = "ccc";
-    var picked: usize = 0;
-
-    # hover, press and release the header -> opens, no selection change
-    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]);
-    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0]);
-    if (frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]) != 0) { ret 2; }
-    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0)                          { ret 3; }
-
-    # press and release the second option row (y in [40, 56))
-    frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 1), ?picked, ?opts[0]);
-    if (frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 0), ?picked, ?opts[0]) != 1) { ret 4; }
-    if (picked != 1)                                                                     { ret 5; }
-    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) != 0)                           { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
 }
 
 test dropdown__open_overlays_later_widgets {
@@ -2786,89 +2923,6 @@ test layout__cells_space_advance_and_columns {
     ret 0;
 }
 
-# a frame holding a panel with a three-way segmented choice
-#[testing]
-fun frame_segmented(ctx: *context.Context, in: input.Input, choice: *usize) bool {
-    var labels: [3]str;
-    labels[0] = "a";
-    labels[1] = "b";
-    labels[2] = "c";
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val changed: bool  = segmented(ctx, ?labels[0], 3, choice);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret changed;
-}
-
-test segmented__chooses_on_click {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # the third segment spans x [69.3, 100)
-    var choice: usize = 0;
-    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice);
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice) != false) { ret 2; }
-    if (ctx.active != context.id_of(?ctx, "c"))                                    { ret 3; }
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != true)  { ret 4; }
-    if (choice != 2)                                                               { ret 5; }
-
-    # choosing the chosen segment again is no change
-    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice);
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != false) { ret 6; }
-
-    # a press on the first released over the second chooses nothing
-    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?choice);
-    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?choice);
-    frame_segmented(?ctx, input_at(50.0::f32, 8.0::f32, 0), ?choice);
-    if (choice != 2) { ret 7; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame holding a panel with one toggle
-#[testing]
-fun frame_toggle(ctx: *context.Context, in: input.Input, st: *u8) bool {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val flipped: bool  = toggle(ctx, "on", st);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret flipped;
-}
-
-test toggle__flips_on_click {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # the whole row takes the click, label included
-    var st: u8 = 0;
-    frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st);
-    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?st) != false) { ret 2; }
-    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st) != true)  { ret 3; }
-    if (st != 1)                                                            { ret 4; }
-
-    # a press dragged off the row and released there does not flip it back
-    frame_toggle(?ctx, input_at(90.0::f32, 8.0::f32, 1), ?st);
-    frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?st);
-    if (frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?st) != false) { ret 5; }
-    if (st != 1)                                                               { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
 # a frame holding a panel with one slider showing reading
 #[testing]
 fun frame_reading(ctx: *context.Context, in: input.Input, v: *f32, reading: str) bool {
@@ -3479,7 +3533,7 @@ test ids__scopes_nest_through_containers {
     val one:  u64 = context.id_of(?ctx, "one");
     val pop:  u64 = bid.of_label(one, "pop");
     val reg:  u64 = bid.of_label(pop, "reg");
-    val body: u64 = bid.child(context.id_of(?ctx, "dock"), "#body");
+    val body: u64 = context.id_of(?ctx, "dock");
 
     context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 400.0::f32, 400.0::f32);
     val dk: DockArea = begin_dock(?ctx, "dock", ?d);
