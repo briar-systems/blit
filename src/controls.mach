@@ -121,7 +121,10 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
     val cx: f32        = x0 + r;
     val cy: f32        = y0 + r;
     context.circle(ctx, cx, cy, r, bg);
-    if (@choice == value) { context.circle(ctx, cx, cy, r - pad(ctx), ctx.theme.accent); }
+    if (@choice == value) {
+        context.circle(ctx, cx, cy, r - pad(ctx), ctx.theme.accent);
+        context.mark_current(ctx, id);
+    }
 
     context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ctx.theme.text);
     ret changed;

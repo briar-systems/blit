@@ -603,6 +603,7 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
         if (s.has != 0 && s.key == t.key) {
             bg  = ctx.theme.accent;
             ink = ctx.theme.accent_text;
+            context.mark_current(ctx, tid);
         }
         or (h.active) { bg = ctx.theme.control_on; }
         or (h.hot)    { bg = ctx.theme.control_hot; }

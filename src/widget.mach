@@ -732,6 +732,7 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
     var bg:  draw.Color = tint(ctx, h, ctx.theme.control, ctx.theme.control_hot, ctx.theme.control_on);
     var ink: draw.Color = ctx.theme.text;
     if (on) {
+        context.mark_current(ctx, h.id);
         bg  = ctx.theme.accent;
         ink = ctx.theme.accent_text;
     }
@@ -1211,6 +1212,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
             val ho: interact.Hit = interact.hit(ctx, oid, ox0, oy0, ox1, oy1, PRESS);
             hand(ctx, ho);
+            if (i == @selected) { context.mark_current(ctx, oid); }
             if (ho.clicked) {
                 @selected = i;
                 changed   = 1;

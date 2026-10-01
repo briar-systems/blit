@@ -3,7 +3,8 @@
 # a drag editor changes a number by dragging across it: the value moves by
 # speed per pixel of horizontal travel, and FINE times as far while shift is
 # held, so a held modifier slows only the motion made while it is down. a
-# double click turns it into a text field holding the value, all selected:
+# double click, or enter or space while it holds the keyboard, turns it into
+# a text field holding the value, all selected:
 # enter or a press elsewhere commits what was typed and escape leaves the
 # value as it was. a number editor is that text field always, with steppers
 # that add or take away a step. drag_n edits 2 to 4 values side by side in
@@ -51,6 +52,7 @@ use fmt: std.format;
 use io:  std.io.writer;
 use tp:  std.text.parse;
 
+use blit.anim;
 use blit.context;
 use blit.draw;
 use drv: blit.driver;
@@ -756,7 +758,7 @@ fun drag_cell(ctx: *context.Context, key: str, sp: *Spec, p: ptr, x0: f32, y0: f
     }
 
     val id: u64          = context.id_of(ctx, key);
-    val h:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    val h:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT | interact.FOCUS);
     if (h.hot || h.active) { context.set_cursor(ctx, input.CURSOR_RESIZE_EW); }
     val d: *Drag = state.get[Drag](ctx, id);
     if (h.pressed) {
@@ -765,12 +767,10 @@ fun drag_cell(ctx: *context.Context, key: str, sp: *Spec, p: ptr, x0: f32, y0: f
         d.moved = 0.0;
         d.start = load(sp.kind, p);
     }
-    if (h.double)                            { start(ctx, key, format(sp.kind, load(sp.kind, p), ?text[0]), number_char); }
+    if (h.double || h.activated)             { start(ctx, key, format(sp.kind, load(sp.kind, p), ?text[0]), number_char); }
     or (h.held && pull(ctx, sp, p, d, h.dx)) { changed = true; }
 
-    var bg: draw.Color = ctx.theme.control;
-    if (h.hot)    { bg = ctx.theme.control_hot; }
-    if (h.active) { bg = ctx.theme.control_on; }
+    val bg: draw.Color = anim.tint(ctx, id, h.hot, h.active, ctx.theme.control, ctx.theme.control_hot, ctx.theme.control_on);
     context.fill(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, bg);
     cell_text(ctx, format(sp.kind, load(sp.kind, p), ?text[0]), x0, y0, x1, y1, ctx.theme.text);
     ret changed;
@@ -830,16 +830,19 @@ pub fun drag_scalars(ctx: *context.Context, label: str, k: u8, v: ptr, n: usize,
     var cells: usize = n;
     if (cells < 1) { cells = 1; }
     if (cells > 4) { cells = 4; }
-    var sp: Spec         = spec(k, speed, lo, hi);
-    val r:  context.Area = row(ctx, label, cells, 0.0::f32);
-    val g:  f32          = widget.row_gap(ctx);
-    context.push_id(ctx, context.id_of(ctx, label));
-    var changed: bool  = false;
-    var i:       usize = 0;
+    var sp:  Spec         = spec(k, speed, lo, hi);
+    val r:   context.Area = row(ctx, label, cells, 0.0::f32);
+    val g:   f32          = widget.row_gap(ctx);
+    val eid: u64          = context.id_of(ctx, label);
+    context.push_id(ctx, eid);
+    val grp:     interact.Group = interact.begin_group(ctx, bid.child(eid, "#cells"), interact.ROW);
+    var changed: bool           = false;
+    var i:       usize          = 0;
     for (i < cells) {
         if (drag_cell(ctx, CELLS[i], ?sp, nth(k, v, i), cell_x0(r, g, i, cells), r.y0, cell_x1(r, g, i, cells), r.y1)) { changed = true; }
         i = i + 1;
     }
+    interact.end_group(ctx, grp);
     context.pop_id(ctx);
     ret changed;
 }
@@ -889,13 +892,16 @@ pub fun range_scalars(ctx: *context.Context, label: str, k: u8, a: ptr, b: ptr, 
     val whole: Spec         = spec(k, speed, lo, hi);
     val r:     context.Area = row(ctx, label, 2, 0.0::f32);
     val g:     f32          = widget.row_gap(ctx);
-    context.push_id(ctx, context.id_of(ctx, label));
-    var sa: Spec = whole;
+    val eid:   u64          = context.id_of(ctx, label);
+    context.push_id(ctx, eid);
+    val grp: interact.Group = interact.begin_group(ctx, bid.child(eid, "#cells"), interact.ROW);
+    var sa:  Spec           = whole;
     sa.hi = clamp(k, load(k, b), whole.lo, whole.hi);
     var changed: bool = drag_cell(ctx, CELLS[0], ?sa, a, cell_x0(r, g, 0, 2), r.y0, cell_x1(r, g, 0, 2), r.y1);
     var sb:      Spec = whole;
     sb.lo = clamp(k, load(k, a), whole.lo, whole.hi);
     if (drag_cell(ctx, CELLS[1], ?sb, b, cell_x0(r, g, 1, 2), r.y0, cell_x1(r, g, 1, 2), r.y1)) { changed = true; }
+    interact.end_group(ctx, grp);
     context.pop_id(ctx);
     ret changed;
 }
