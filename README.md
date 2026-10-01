@@ -1324,6 +1324,17 @@ its state where it wants to.
 
 `blit.menu` draws a menu bar, the menus it drops, submenus and context menus.
 A bar is the next item of the current layout frame, one row high across it.
+A main bar (`begin_main_bar`, closed by the same `end_bar`) instead takes its
+row off the top of the free area, as a docked container does, so a dock space
+placed from `blit.context.free_area` after it starts below it:
+
+```mach
+var bar: blit.menu.Menu = blit.menu.begin_main_bar(?ctx, "main");
+...
+blit.menu.end_bar(?ctx, ?bar);
+blit.dock.space(?ctx, "work", blit.context.free_area(?ctx));
+```
+
 Each menu's body runs every frame, open or not, so its items answer their
 shortcuts while it is closed:
 
