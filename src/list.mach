@@ -15,9 +15,9 @@
 # hit, selection and scrolling. anything the drawer claims sits above the row
 # and takes its own input. rows scrolled out of view are passed over in blocks
 # rather than laid out one by one, so a list costs the rows in view and, with
-# a query or a matcher, one test per item. the list's natural width is that of
-# the widest row it lays out: those in view, the one either side and the one
-# the keyboard moves to.
+# a query or a matcher, one test per item. the list's natural width is the
+# widest row it has laid out so far (List.width), so a container sized to its
+# content settles as rows scroll into view and never narrows while scrolling.
 #
 # a row's id and hit are passed to its drawer, which is where a drag source or
 # a drop target for reordering rows attaches.
@@ -66,11 +66,15 @@ pub def Drawer: fun(*context.Context, ptr, Row);
 #           it is selected, which makes the list a multiple selection
 # cursor:   with marks, the item the keyboard last moved to or a click
 #           landed on, where the arrows move from
+# width:    the widest row the list has laid out, its natural width, which
+#           only grows while it scrolls. 0 when the list has no items, and
+#           set to 0 by the caller when its labels change to measure afresh
 pub rec List {
     selected: usize;
     scroll:   widget.Scroll;
     marks:    *u8;
     cursor:   usize;
+    width:    f32;
 }
 
 # what a list shows this frame
@@ -261,6 +265,7 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
     var changed: bool              = false;
     if (rh <= 0.0::f32) { rh = widget.control_height(ctx); }
     val top: f32 = area.top;
+    if (r.count == 0) { l.width = 0.0::f32; }
 
     # the list's own stop, over the region it scrolls in
     val view:  context.Area = context.Area{x0: 0.0::f32, y0: area.top, x1: area.w, y1: area.top + area.h};
@@ -312,7 +317,9 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
         pass(f, held, rh);
         held = 0;
         j    = j + 1;
-        val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), natural_w(ctx, ?r, i), rh);
+        val nw: f32 = natural_w(ctx, ?r, i);
+        if (nw > l.width) { l.width = nw; }
+        val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), l.width, rh);
         if (i == aim) {
             if (l.marks != nil) {
                 var mods: u8 = 0;
@@ -533,6 +540,73 @@ test list__selects_scrolls_and_searches {
     if (p.l.selected != 3) { ret 10; }
 
     val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# one frame of a list in a window sized to its content, scrolled to offset,
+# returning the window's width
+#[testing]
+fun auto_frame(ctx: *context.Context, l: *List, r: Rows, offset: f32) f32 {
+    var win: widget.Window = widget.window("w", 0.0::f32, 0.0::f32, 40.0::f32, 0.0::f32);
+    win.min_w = 40.0::f32;
+    win.flags = widget.WINDOW_AUTO_SIZE;
+    var in: input.Input;
+    in.mx           = -1.0::f32;
+    in.my           = -1.0::f32;
+    l.scroll.offset = offset;
+    context.begin(ctx, in, 600.0::f32, 400.0::f32);
+    val b: widget.WindowArea = widget.begin_window(ctx, win);
+    show(ctx, "list", l, r, 60.0::f32);
+    widget.end_window(ctx, b);
+    context.end(ctx);
+    ret widget.window_state(ctx, "w").w;
+}
+
+test list__natural_width_never_shrinks_while_scrolling {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var labels: [20]str;
+    var k:      usize = 0;
+    for (k < 20) {
+        labels[k] = "a";
+        k         = k + 1;
+    }
+    labels[15] = "a label far wider than the rest";
+    var l: List;
+    l.selected = 20;
+
+    # down to the wide row and back up, the window never narrowing, and wider
+    # once the wide row was seen
+    var offs: [3]f32;
+    offs[0] = 0.0::f32;
+    offs[1] = 300.0::f32;
+    offs[2] = 0.0::f32;
+    var last:  f32   = 0.0::f32;
+    var first: f32   = 0.0::f32;
+    var s:     usize = 0;
+    for (s < 3) {
+        var n: usize = 0;
+        for (n < 30) {
+            val w: f32 = auto_frame(?ctx, ?l, rows(?labels[0], 20), offs[s]);
+            if (w < last) { ret 2; }
+            last = w;
+            n    = n + 1;
+        }
+        if (s == 0) { first = last; }
+        s = s + 1;
+    }
+    if (last <= first) { ret 3; }
+
+    # a list emptied measures afresh
+    auto_frame(?ctx, ?l, rows(?labels[0], 0), 0.0::f32);
+    if (l.width != 0.0::f32) { ret 4; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
 }
