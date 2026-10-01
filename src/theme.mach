@@ -141,7 +141,7 @@ pub val PROGRESS: u32 = 33;
 pub val PROGRESS_BAR: u32 = 34;
 # a separator: border its rule and border_w its width, mark a label, inset.r between label and rule
 pub val SEPARATOR: u32 = 35;
-# a tree's row, on while selected: mark the caret
+# a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent
 pub val TREE_ITEM: u32 = 36;
 # where a drag would drop: fill and border
 pub val DROP_TARGET: u32 = 37;
@@ -530,7 +530,7 @@ val KIND_INFO: [53]Name = [53]Name{
     Name{name: "progress", doc: "a progress bar's track and its text"},
     Name{name: "progress_bar", doc: "a progress bar's done part"},
     Name{name: "separator", doc: "a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule"},
-    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret"},
+    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent"},
     Name{name: "drop_target", doc: "where a drag would drop: fill and border"},
     Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"},
     Name{name: "menu_bar", doc: "a menu bar's background"},

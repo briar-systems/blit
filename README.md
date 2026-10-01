@@ -392,7 +392,7 @@ shows.
 | `progress` | a progress bar's track and its text |
 | `progress_bar` | a progress bar's done part |
 | `separator` | a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule |
-| `tree_item` | a tree's row, on while selected: mark the caret |
+| `tree_item` | a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent |
 | `drop_target` | where a drag would drop: fill and border |
 | `drag_preview` | what a drag carries, drawn at the cursor |
 | `menu_bar` | a menu bar's background |
