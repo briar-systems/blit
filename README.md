@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.band`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -295,8 +295,8 @@ Coordinates compose one way:
 - **A child never draws outside its parent.** Clips are kept in screen space
   and every new clip, including a surface's region, is intersected with the
   active one, whatever rect you pass.
-- **A layer is a new root.** Inside `push_layer` (and so inside a popup) the
-  origin is zero and the clip is the whole screen.
+- **A band is a new root.** Inside `push_band` (and so inside a window, a dock
+  or a popup) the origin is zero and the clip is the whole screen.
 - **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
   screen pixels. Use a `Surface`'s `local_mx`/`local_my` for the cursor in its
   local space.
@@ -338,11 +338,61 @@ sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, its open state kept in the state store under its
-id, `blit.widget.begin_window`/`end_window` is a
-draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
-x, y, w)`/`end_popup` opens an overlay column, and
-`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
-rect for consumer-drawn affordances.
+id, `blit.widget.begin_window`/`end_window` is a full window (see
+Windows), `blit.widget.begin_popup(?ctx, key, open, x, y, w)`/`end_popup`
+opens an overlay column, and `blit.widget.region_clicked(?ctx, key, x0, y0,
+x1, y1)` hit-tests an arbitrary rect for consumer-drawn affordances.
+
+## Windows
+
+```mach
+use blit;
+
+# once: windows save and load with the state store
+blit.widget.persist_windows(?ctx);
+
+# per frame: the rect is where the window first opens, the store keeps the rest
+var tools: blit.widget.Window = blit.widget.window("tools", 40.0::f32, 40.0::f32, 220.0::f32, 300.0::f32);
+tools.min_w = 160.0::f32;
+val w: blit.widget.WindowArea = blit.widget.begin_window(?ctx, tools);
+if (w.body != 0) {
+    blit.widget.button(?ctx, "go");
+}
+blit.widget.end_window(?ctx, w);
+
+# reopen it after its close button closed it
+blit.widget.window_state(?ctx, "tools").closed = 0;
+```
+
+- **Identity and state.** A window is its title's id (see Widget ids). Its
+  place, size, stack order, and open, collapsed, pinned and locked flags are a
+  `WindowState` the context's store keeps under that id, so reordering the
+  calls never moves or restacks a window, and `persist_windows` saves and
+  loads them with everything else the store persists, as `[window.<id>]`
+  tables. `Window` is only what the call declares: the rect the window first
+  opens at, its size bounds (`min_w`, `min_h`, `max_w`, `max_h`, 0 for none)
+  and its flags. `window_state(?ctx, key)` reaches the state to open, close,
+  pin or lock a window from code.
+- **Chrome.** The titlebar drags the window and holds a collapse box on the
+  left and a close button on the right. Grips straddling every edge and corner
+  resize it within its bounds and ask for the matching resize cursor. A
+  locked window neither moves nor resizes.
+- **Body.** The body is a scroll region under the titlebar that scrolls by
+  wheel and scrollbar when its widgets are taller than it. With
+  `WINDOW_AUTO_SIZE` the height follows the widgets instead. Place widgets
+  only while `body` is 1: a closed or collapsed window has none. The window's
+  coordinates are screen pixels, wherever it is called.
+- **Stacking.** Windows live in the windows band, above docks and beneath
+  popups. A press anywhere on a window brings it to the front, whatever order
+  the windows are called in, and a pinned window stays in front of every
+  unpinned one.
+- **Flags.** `WINDOW_NO_TITLE`, `WINDOW_NO_RESIZE`, `WINDOW_NO_MOVE`,
+  `WINDOW_NO_BACKGROUND` (the body still stops input), `WINDOW_NO_CLOSE` and
+  `WINDOW_AUTO_SIZE`, combined with `|`.
+
+This is a breaking change: `begin_window` takes a `Window` declaration by
+value and returns a `WindowArea`, `end_window` takes only that, and `Window`
+no longer holds `open` or the window's live position.
 
 ## Widget ids
 
@@ -411,7 +461,7 @@ entry, so a widget never reads another's bytes.
   string it keeps, since the parsed document is freed when `load` returns.
 
 The store is one owner, not the only one. Widgets that take a caller-owned
-record (`Window`, `Scroll`, `List`, `Field`) keep taking it, so an app can own
+record (`Scroll`, `List`, `Field`) keep taking it, so an app can own
 its state where it wants to.
 
 ## Charts
@@ -463,12 +513,23 @@ blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
 Paint order and input order come from one key, so the widget that receives a
 click is always the one visibly on top.
 
-- **Layers.** `blit.context.push_layer` raises subsequent geometry and claims
-  onto an overlay above everything on lower layers, in screen coordinates with
-  the clip reset to the screen. `pop_layer` returns. `end()` composes the draw
-  list by layer, keeping call order within a layer, so a popup opened early in
-  the frame still paints over a window called after it. `run_at` reports each
-  run's `layer`.
+- **Bands.** Layers come in bands, listed bottom to top as data in
+  `blit.band`: base content, docked content, floating windows, overlays,
+  popups and menus, modals, tooltips and the drag preview. A layer is a band
+  and a slot within it (`band.layer(b, slot)`, `band_of`, `slot_of`).
+  `blit.context.push_band(?ctx, b, slot)` puts subsequent geometry and claims
+  on a layer of band `b`, in screen coordinates with the clip reset to the
+  screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
+  band shares one slot, a nesting band (popups, modals) stacks a child one
+  slot above a parent of the same band, and an ordered band (windows) takes
+  the slot given, a window's z. `end()` composes the draw list by layer,
+  keeping call order within a layer, so a popup opened early in the frame
+  still paints over a window called after it, and sibling popups share a
+  layer. `run_at` reports each run's `layer`. `push_layer` and `pop_layer`
+  remain, deprecated, as `push_band(?ctx, band.POPUPS, 0)` and `pop_band`.
+- **Window order.** The context keeps the windows' z order:
+  `blit.context.raise` hands out a z above every window and `track_z` notes a
+  drawn window's, so `end()` can renumber them once they grow large.
 - **Channels.** A container that paints its background once its contents are
   known (a panel, window or popup) splits the runs drawn after it into
   channels: `ch = blit.context.split(?ctx, 2)`, `set_channel(?ctx, ch, 1)` for
