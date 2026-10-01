@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -355,8 +355,8 @@ Coordinates compose one way:
 - **A child never draws outside its parent.** Clips are kept in screen space
   and every new clip, including a surface's region, is intersected with the
   active one, whatever rect you pass.
-- **A layer is a new root.** Inside `push_layer` (and so inside a popup) the
-  origin is zero and the clip is the whole screen.
+- **A band is a new root.** Inside `push_band` (and so inside a window, a dock
+  or a popup) the origin is zero and the clip is the whole screen.
 - **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
   screen pixels. `blit.context.local_mx(?ctx)`/`local_my` are the cursor in the
   current local space, as are a `Surface`'s `local_mx`/`local_my` and a hit's
@@ -447,9 +447,9 @@ if (t.dropped) { move_layer(@(t.data::*u64), here); }
   in `data` and `n` and the starting widget in `source`. A target accepting
   several types calls `target` once per type with the same hit. A target with
   nothing else to do claims its rect with `interact.hit` and no buttons.
-- **Preview.** `begin_preview` opens a layer above the interface and returns
-  the source's rect in screen pixels, kept under the pointer where the press
-  grabbed it. The source draws anything there, and the layer claims nothing,
+- **Preview.** `begin_preview` opens a layer in the drag band, above every
+  other band (see Layers & input routing), and returns the source's rect in
+  screen pixels, kept under the pointer where the press grabbed it. The source draws anything there, and the layer claims nothing,
   so targets beneath still see the pointer.
 - **Cancel.** Escape ends a drag at once, and the source cannot start another
   until its button comes up. A release over no target ends it as missed.
@@ -568,12 +568,66 @@ sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, its open state kept in the state store under its
-id, `blit.widget.begin_window`/`end_window` is a
-draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
-x, y, w)`/`end_popup` opens an overlay column, and
-`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` is a left click on an
-arbitrary rect for consumer-drawn affordances, the simplest use of
-`blit.interact.hit`.
+id, `blit.widget.begin_window`/`end_window` is a full window (see
+Windows), `blit.widget.begin_popup(?ctx, key, open, x, y, w)`/`end_popup`
+opens an overlay column, and `blit.widget.region_clicked(?ctx, key, x0, y0,
+x1, y1)` is a left click on an arbitrary rect for consumer-drawn affordances,
+the simplest use of `blit.interact.hit`.
+
+## Windows
+
+```mach
+use blit;
+
+# once: windows save and load with the state store
+blit.widget.persist_windows(?ctx);
+
+# per frame: the rect is where the window first opens, the store keeps the rest
+var tools: blit.widget.Window = blit.widget.window("tools", 40.0::f32, 40.0::f32, 220.0::f32, 300.0::f32);
+tools.min_w = 160.0::f32;
+val w: blit.widget.WindowArea = blit.widget.begin_window(?ctx, tools);
+if (w.body != 0) {
+    blit.widget.button(?ctx, "go");
+}
+blit.widget.end_window(?ctx, w);
+
+# reopen it after its close button closed it
+blit.widget.window_state(?ctx, "tools").closed = 0;
+```
+
+- **Identity and state.** A window is its title's id (see Widget ids). Its
+  place, size, stack order, and open, collapsed, pinned and locked flags are a
+  `WindowState` the context's store keeps under that id, so reordering the
+  calls never moves or restacks a window, and `persist_windows` saves and
+  loads them with everything else the store persists, as `[window.<id>]`
+  tables. `Window` is only what the call declares: the rect the window first
+  opens at, its size bounds (`min_w`, `min_h`, `max_w`, `max_h`, 0 for none)
+  and its flags. `window_state(?ctx, key)` reaches the state to open, close,
+  pin or lock a window from code.
+- **Chrome.** The titlebar drags the window and holds a collapse box on the
+  left and a close button on the right. Grips just outside every edge and corner
+  resize it within its bounds and ask for the matching resize cursor. A
+  locked window neither moves nor resizes.
+- **Body.** The body is a layout column (see Widgets & layout) in a scroll region
+  under the titlebar, which scrolls by wheel and scrollbar when its widgets
+  are taller than it. With `WINDOW_AUTO_SIZE` the window fits its widgets
+  instead, within its bounds and without grips: as tall as they reach this
+  frame, and as wide as the widest of them and its titlebar measured the frame
+  before. An auto-sized window declared 0 wide lays out its first frame
+  hidden, only to measure. Place widgets only while `body` is 1: a closed or
+  collapsed window has none. The window's coordinates are screen pixels,
+  wherever it is called.
+- **Stacking.** Windows live in the windows band, above docks and beneath
+  popups. A press anywhere on a window brings it to the front, whatever order
+  the windows are called in, and a pinned window stays in front of every
+  unpinned one.
+- **Flags.** `WINDOW_NO_TITLE`, `WINDOW_NO_RESIZE`, `WINDOW_NO_MOVE`,
+  `WINDOW_NO_BACKGROUND` (the body still stops input), `WINDOW_NO_CLOSE` and
+  `WINDOW_AUTO_SIZE`, combined with `|`.
+
+This is a breaking change: `begin_window` takes a `Window` declaration by
+value and returns a `WindowArea`, `end_window` takes only that, and `Window`
+no longer holds `open` or the window's live position.
 
 ## Small controls
 
@@ -628,8 +682,8 @@ were. 0 is never an id: it means "no widget".
   button called `ok`. Repeated rows built from one label, such as buttons in a
   loop, take `push_id_int` with their index. The stack grows from the
   context's allocator.
-- **Parts.** A widget's internal parts (a window's title and collapse box, a
-  scrollbar thumb, a popup's outside claim, a dropdown's options, a list's
+- **Parts.** A widget's internal parts (a window's title, collapse box, close
+  button, resize grips and body, a scrollbar thumb, a popup's outside claim, a dropdown's options, a list's
   items) take ids derived from the widget's id with a fixed suffix or index.
 - **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
   that label or key gets in the current scope, for `focus`, state lookups and
@@ -675,8 +729,54 @@ entry, so a widget never reads another's bytes.
   string it keeps, since the parsed document is freed when `load` returns.
 
 The store is one owner, not the only one. Widgets that take a caller-owned
-record (`Window`, `Scroll`, `List`, `Field`) keep taking it, so an app can own
+record (`Scroll`, `List`, `Field`) keep taking it, so an app can own
 its state where it wants to.
+
+## Menus
+
+`blit.menu` draws a menu bar, the menus it drops, submenus and context menus.
+A bar is the next item of the current layout frame, one row high across it.
+Each menu's body runs every frame, open or not, so its items answer their
+shortcuts while it is closed:
+
+```mach
+var bar:  blit.menu.Menu = blit.menu.begin_bar(?ctx, "main");
+var file: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?bar, "File");
+var save: blit.menu.Item = blit.menu.of("Save");
+save.shortcut = blit.menu.keys('S', blit.menu.MOD_PRIMARY);
+if (blit.menu.item(?ctx, ?file, save)) { ... }
+var recent: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?file, "Recent");
+blit.menu.item(?ctx, ?recent, blit.menu.of("notes.txt"));
+blit.menu.end_menu(?ctx, ?recent);
+blit.menu.end_menu(?ctx, ?file);
+blit.menu.end_bar(?ctx, ?bar);
+
+var cm: blit.menu.Menu = blit.menu.begin_context(?ctx, "canvas", x0, y0, x1, y1);
+if (blit.menu.item(?ctx, ?cm, blit.menu.of("Cut"))) { ... }
+blit.menu.end_menu(?ctx, ?cm);
+```
+
+- **Opening.** A bar header opens on a press, and while one is open, moving
+  onto another opens that one. A submenu row opens its menu on hover. A context
+  menu opens at the cursor on a right press over its region, or through
+  `open_context`.
+- **Items.** An `Item` carries a label, a `Shortcut` shown at its right, a
+  check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
+  drawn before the label (text, nil for none) and a disabled flag.
+- **Shortcuts.** An item fires when its key is pressed with exactly its
+  modifiers, open or closed, and stays quiet while another widget holds the
+  keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
+  ctrl or super (see `input.shortcut`), shown as `Cmd` on darwin and `Ctrl`
+  elsewhere.
+- **Focus.** An open tree owns the keyboard: it takes the focus when it opens
+  and gives it back to the previous holder the frame after it closes.
+- **Keys.** The deepest open menu takes up and down (over enabled items),
+  enter, right and left (into and out of submenus, and across a bar's headers)
+  and escape.
+- **Closing.** A click or enter on an item closes the whole tree, and so does
+  a press of any button outside it, which is consumed.
+- **Ids.** A bar's key, then each header and submenu label, then the item's
+  label: `driver.find(?d, "main/File/Recent/notes.txt")`.
 
 ## Charts
 
@@ -727,12 +827,25 @@ blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
 Paint order and input order come from one key, so the widget that receives a
 click is always the one visibly on top.
 
-- **Layers.** `blit.context.push_layer` raises subsequent geometry and claims
-  onto an overlay above everything on lower layers, in screen coordinates with
-  the clip reset to the screen. `pop_layer` returns. `end()` composes the draw
-  list by layer, keeping call order within a layer, so a popup opened early in
-  the frame still paints over a window called after it. `run_at` reports each
-  run's `layer`.
+- **Bands.** Layers come in bands, listed bottom to top as data in
+  `blit.band`: base content, docked content, floating windows, overlays,
+  popups and menus, modals, tooltips and the drag preview. A layer is a band
+  and a slot within it (`band.layer(b, slot)`, `band_of`, `slot_of`).
+  `blit.context.push_band(?ctx, b, slot)` puts subsequent geometry and claims
+  on a layer of band `b`, in screen coordinates with the clip reset to the
+  screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
+  band shares one slot, a nesting band (popups, modals) stacks a child one
+  slot above a parent of the same band, and an ordered band (windows) takes
+  the slot given, a window's z. `end()` composes the draw list by layer,
+  keeping call order within a layer, so a popup opened early in the frame
+  still paints over a window called after it, and sibling popups share a
+  layer. `run_at` reports each run's `layer`. `push_layer` and `pop_layer`
+  remain, deprecated, as `push_band(?ctx, band.POPUPS, 0)` and `pop_band`.
+- **Window order.** The context keeps the windows' z order:
+  `blit.context.raise` hands out a z above every window and `note_z` notes
+  one a window kept. Once z passes `Z_RENUMBER`, the windows renumber every
+  z the store keeps, drawn this frame or not, and `restack` tells the context
+  where they ended.
 - **Channels.** A container that paints its background once its contents are
   known (a panel, window or popup) splits the runs drawn after it into
   channels: `ch = blit.context.split(?ctx, 2)`, `set_channel(?ctx, ch, 1)` for

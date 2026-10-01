@@ -15,9 +15,10 @@
 # it takes the drop. a target accepting several types asks once per type with
 # the same hit. Escape cancels a drag, and so does a release over no target.
 #
-# the source draws the preview: begin_preview opens a layer above the
-# interface and hands back the rect the source grabbed, following the
-# pointer, and the source paints whatever it wants there before end_preview.
+# the source draws the preview: begin_preview opens a layer in the drag band,
+# above every other band (see blit.band), and hands back the rect the source
+# grabbed, following the pointer, and the source paints whatever it wants
+# there before end_preview.
 # the preview claims nothing, so targets beneath it still see the pointer.
 #
 # a source learns how its drag ended in the frames after: dropped on a target,
@@ -35,6 +36,7 @@ use std.types.string.str;
 use allo: std.allocator;
 use std.allocator.page;
 
+use blit.band;
 use blit.context;
 use blit.draw;
 use blit.driver;
@@ -168,17 +170,14 @@ pub fun source(ctx: *context.Context, h: interact.Hit, kind: str, data: ptr, n: 
     ret d;
 }
 
-# the layer the preview draws on, above the interface
-#
-# the one place the preview's layer is chosen: the window layer bands (#82)
-# redirect it to their drag preview band, above every other band.
+# open the drag preview band, above every other band (see blit.band)
 fun open_layer(ctx: *context.Context) {
-    context.push_layer(ctx);
+    context.push_band(ctx, band.DRAG, 0);
 }
 
-# close the layer open_layer opened
+# close the band open_layer opened
 fun close_layer(ctx: *context.Context) {
-    context.pop_layer(ctx);
+    context.pop_band(ctx);
 }
 
 # open the drag preview, when a drag is in flight
@@ -284,6 +283,7 @@ pub fun set_threshold(ctx: *context.Context, dist: f32) {
 # preview: the last preview rect opened
 # px:      the pointer x the last preview opened at
 # py:      the pointer y the last preview opened at
+# layer:   the layer the last preview drew on
 #[testing]
 rec Pair {
     left:    blit_widget.Window;
@@ -298,6 +298,7 @@ rec Pair {
     preview: Preview;
     px:      f32;
     py:      f32;
+    layer:   u32;
 }
 
 # a row in the current window, claimed for the left button
@@ -320,8 +321,8 @@ fun pair_ui(ctx: *context.Context, user: ptr) {
     var x1: f32;
     var y1: f32;
 
-    val bl: blit_widget.Block = blit_widget.begin_window(ctx, ?p.left);
-    val hs: interact.Hit      = row(ctx, "item", ?x0, ?y0, ?x1, ?y1);
+    val bl: blit_widget.WindowArea = blit_widget.begin_window(ctx, p.left);
+    val hs: interact.Hit           = row(ctx, "item", ?x0, ?y0, ?x1, ?y1);
     p.drag = source(ctx, hs, "item", (?p.value)::ptr, $size_of(u64), x0, y0, x1, y1);
     if (p.drag.on) {
         p.ons = p.ons + 1;
@@ -329,14 +330,15 @@ fun pair_ui(ctx: *context.Context, user: ptr) {
         p.preview = pv;
         p.px      = ctx.in.mx;
         p.py      = ctx.in.my;
+        p.layer   = context.layer_of(ctx);
         context.box(ctx, theme.DRAG_PREVIEW, theme.NORMAL, pv.x0, pv.y0, pv.x1, pv.y1);
         end_preview(ctx, pv);
     }
-    blit_widget.end_window(ctx, ?p.left, bl);
+    blit_widget.end_window(ctx, bl);
 
-    val br: blit_widget.Block = blit_widget.begin_window(ctx, ?p.right);
-    val ht: interact.Hit      = row(ctx, "slot", ?x0, ?y0, ?x1, ?y1);
-    val d:  Drop              = target(ctx, ht, "item", x0, y0, x1, y1);
+    val br: blit_widget.WindowArea = blit_widget.begin_window(ctx, p.right);
+    val ht: interact.Hit           = row(ctx, "slot", ?x0, ?y0, ?x1, ?y1);
+    val d:  Drop                   = target(ctx, ht, "item", x0, y0, x1, y1);
     if (d.over) { p.overs = p.overs + 1; }
     if (d.dropped && d.n == $size_of(u64)) {
         p.got   = @(d.data::*u64);
@@ -344,14 +346,18 @@ fun pair_ui(ctx: *context.Context, user: ptr) {
     }
     val ho: interact.Hit = row(ctx, "other", ?x0, ?y0, ?x1, ?y1);
     if (target(ctx, ho, "file", x0, y0, x1, y1).over) { p.others = p.others + 1; }
-    blit_widget.end_window(ctx, ?p.right, br);
+    blit_widget.end_window(ctx, br);
 }
 
 #[testing]
 fun pair(d: *driver.Driver, a: *allo.Allocator, p: *Pair) bool {
-    p.left  = blit_widget.Window{x: 10.0::f32, y: 10.0::f32, w: 120.0::f32, open: 1, title: "From"};
-    p.right = blit_widget.Window{x: 200.0::f32, y: 10.0::f32, w: 120.0::f32, open: 1, title: "To"};
-    p.value = 42;
+    p.left        = blit_widget.window("From", 10.0::f32, 10.0::f32, 120.0::f32, 0.0::f32);
+    p.left.min_w  = 120.0::f32;
+    p.left.flags  = blit_widget.WINDOW_AUTO_SIZE;
+    p.right       = p.left;
+    p.right.title = "To";
+    p.right.x     = 200.0::f32;
+    p.value       = 42;
     val e: err[allo.Error] = driver.init(d, a, 400.0::f32, 200.0::f32, pair_ui, p::ptr);
     if (sel e.err) { ret false; }
     driver.step(d);
@@ -385,6 +391,7 @@ test dnd__drops_across_windows_and_cancels {
     if (p.preview.x1 - p.preview.x0 != 120.0::f32)   { ret 9; }
     if (p.px < p.preview.x0 || p.px >= p.preview.x1) { ret 10; }
     if (p.py < p.preview.y0 || p.py >= p.preview.y1) { ret 11; }
+    if (p.layer != band.layer(band.DRAG, 0))         { ret 11; }
 
     # the other type's target never sees it, and a release over it misses
     p.value = 7;

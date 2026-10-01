@@ -63,7 +63,7 @@ pub val LABEL: u32 = 0;
 pub val LAYOUT: u32 = 1;
 # a panel's background and padding
 pub val PANEL: u32 = 2;
-# a window's body
+# a window's body and its shadow: margin the resize grips outside its edges
 pub val WINDOW: u32 = 3;
 # a window's titlebar: text the title, mark the collapse glyph
 pub val WINDOW_TITLE: u32 = 4;
@@ -384,7 +384,7 @@ pub val KIND_NAMES: [39]Name = [39]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin between cells, columns and rows placed by hand, and a generic container's pad"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
-    Name{name: "window", doc: "a window's body, pad around its column"},
+    Name{name: "window", doc: "a window's body and its shadow, pad around its column, margin the resize grips outside its edges"},
     Name{name: "window_title", doc: "a window's titlebar: text the title, mark the collapse glyph, hot under the cursor"},
     Name{name: "dock", doc: "a docked panel: fill the body, border its inner edge, pad around its column"},
     Name{name: "popup", doc: "a popup's body, such as a dropdown's options"},
@@ -974,10 +974,11 @@ pub fun derive(t: *Theme) {
     t.styles[LAYOUT] = s;
     t.styles[LIST]   = s;
 
-    t.styles[PANEL]  = below(t, t.panel);
-    t.styles[WINDOW] = below(t, t.window);
-    t.styles[POPUP]  = below(t, t.window);
-    t.styles[MENU]   = below(t, t.window);
+    t.styles[PANEL]         = below(t, t.panel);
+    t.styles[WINDOW]        = below(t, t.window);
+    t.styles[WINDOW].margin = edges(t.pad);
+    t.styles[POPUP]         = below(t, t.window);
+    t.styles[MENU]          = below(t, t.window);
 
     s       = base(t);
     s.inset = edges(t.pad);
