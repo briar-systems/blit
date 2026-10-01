@@ -186,6 +186,9 @@ rec Fold {
 # hi:     row past the last in view
 # rh:     row height in pixels
 # lh:     line height in pixels, the indent of one level and the caret's side
+# x0:     left of the rows in the region's local pixels
+# x1:     right of the rows
+# y:      top of the first row
 # ev:     the frame's event, filled once the walk ends
 # toggle: the node a caret or double click opens or closes after the walk
 # pick:   the node a click selects after the walk
@@ -201,6 +204,9 @@ rec Walk {
     hi:     usize;
     rh:     f32;
     lh:     f32;
+    x0:     f32;
+    x1:     f32;
+    y:      f32;
     ev:     Event;
     toggle: u64;
     pick:   u64;
@@ -264,9 +270,9 @@ pub fun invalidate(t: *Tree) {
 fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
     val ctx: *context.Context = w.ctx;
     val pad: f32              = context.px(ctx, ctx.theme.pad);
-    val x0:  f32              = ctx.cx;
-    val x1:  f32              = ctx.cx + ctx.pw;
-    val y0:  f32              = row::f32 * w.rh;
+    val x0:  f32              = w.x0;
+    val x1:  f32              = w.x1;
+    val y0:  f32              = w.y + row::f32 * w.rh;
     val y1:  f32              = y0 + w.rh;
     val cx:  f32              = x0 + pad + depth::f32 * w.lh;
     val tx:  f32              = cx + w.lh + pad;
@@ -539,16 +545,22 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.rh    = context.px(ctx, ctx.theme.row);
     val fit: f32 = w.lh + context.px(ctx, ctx.theme.pad) * 2.0::f32;
     if (fit > w.rh) { w.rh = fit; }
+    val a: context.Area = widget.avail(ctx);
+    w.x0 = a.x0;
+    w.x1 = a.x1;
+    w.y  = a.y0;
     if (w.rh > 0.0::f32) {
-        w.lo = (t.scroll.offset / w.rh)::usize;
-        val end: f32 = (t.scroll.offset + r.h) / w.rh;
+        var from: f32 = t.scroll.offset - w.y;
+        if (from < 0.0::f32) { from = 0.0::f32; }
+        w.lo = (from / w.rh)::usize;
+        val end: f32 = (t.scroll.offset - w.y + r.h) / w.rh;
         w.hi = end::usize;
         if (w.hi::f32 < end) { w.hi = w.hi + 1; }
     }
 
     val root: *Fold = state.get[Fold](ctx, t.id);
     level(?w, t.id, t.root, root, 0);
-    ctx.cy = w.row::f32 * w.rh;
+    widget.space(ctx, w.row::f32 * w.rh);
     widget.end_scroll(ctx, ?t.scroll, r);
 
     if (w.toggle != 0) {
