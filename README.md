@@ -148,8 +148,9 @@ blit.context.set_scale(?ctx, 2.0::f32);
   interface, layout and hit rects included, for a HiDPI display or a user's
   choice. Lengths you pass (panel and window widths, dock sizes, your own
   geometry) stay in pixels. `blit.context.px(?ctx, v)` scales them to match.
-  `blit.widget.row_gap(?ctx)`, `text_row_height` and `control_row_height`
-  report the spacing at the current theme and scale.
+  `blit.widget.row_gap(?ctx)`, `text_row_height`, `control_row_height` and
+  `control_height` (a control row without its gap) report the spacing at the
+  current theme and scale.
 - **Rows fit their text.** A control row is `row` tall, or a line of text plus
   `pad` above and below if that is taller, so a larger glyph source never
   overflows its rows.
@@ -430,10 +431,26 @@ any geometry and works inside surfaces, docks and windows alike.
   same without one.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
-- **Lists.** `list(?ctx, key, ?l, ?items[0], count, query, h)` is a scrolling list
-  `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
-  none), and only the items holding `query`, ignoring ASCII case, are shown,
-  so a search box the caller keeps narrows it.
+- **Lists.** `blit.list.show(?ctx, key, ?l, rows, h)` is a scrolling list `h`
+  pixels tall, described each frame by a `blit.list.Rows`:
+  `blit.list.rows(?labels[0], count)` fills one with labels alone, and its
+  fields add the rest. `details` holds a secondary label per row, drawn
+  right-aligned in the dim text color, with the label clipped short of it.
+  `match(user, index, query)` decides which items are shown, defaulting to the
+  items whose label holds `query`, ignoring ASCII case (`blit.list.matches`,
+  for a matcher to build on). `draw(ctx, user, row)` paints a row's content in
+  place of the labels: the list still claims the row, paints its hover and
+  selection face beneath and scrolls it, so a drawn row keeps hit, selection
+  and scrolling, and anything the drawer claims sits above the row. The
+  `blit.list.Row` it receives carries the item, the row's id and `Hit` (where
+  a drag source or drop target for reordering attaches), its rect, whether it
+  is selected and the text colors for that. `row_h` sets a row height other
+  than the theme's. Clicking a row selects its item (`List.selected`, the
+  count for none). With `List.marks` pointing at one byte per item the list is
+  a multiple selection: a click selects an item alone, ctrl (command on
+  darwin) toggles it, and shift selects the shown items from the last one
+  clicked. A row's id is its item index under the list's, so it keeps its hit
+  identity as the query or matcher changes.
 
 `demo/panel/` builds a docked application panel from these widgets alone, in
 the shape of an application's side panel (a header, then run, view and files
@@ -488,7 +505,7 @@ were. 0 is never an id: it means "no widget".
 
 This is a breaking change from call-order ids: `blit.context.next_id` and
 `Context.seq` are gone, and `begin_popup`, `begin_scroll`, `begin_dock`,
-`list`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
+`blit.list.show`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
 `sparkline` take a key argument after the context.
 
 ## State store
