@@ -129,8 +129,6 @@ pub rec ModalState {
 # max_w:  greatest width
 # ch:     the channels its body's background and widgets draw in
 # claim:  its body's reserved claim, beneath its widgets
-# seen:   the hovered widget's claims before it, to tell whether the
-#         cursor is over it
 pub rec ModalArea {
     id:     u64;
     st:     *ModalState;
@@ -148,7 +146,6 @@ pub rec ModalArea {
     max_w:  f32;
     ch:     context.Channels;
     claim:  usize;
-    seen:   u64;
 }
 
 # which modal is on top, kept in the store under one id for every modal
@@ -361,7 +358,6 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
     }
 
     r.shown = 1;
-    r.seen  = ctx.hover_seen;
     context.push_band(ctx, band.MODALS, 0);
     context.push_id(ctx, r.id);
     st.key = hit.key(context.layer_of(ctx), ctx.ordinal);
@@ -448,9 +444,6 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
 # close a modal begun by begin_modal: paint its body beneath its widgets,
 # give its claim its rect, take the size its widgets need for the next frame
 # and leave its band
-#
-# a wheel turned over the modal stops at it, so a scroll region the modal is
-# called inside never scrolls beneath it.
 # ---
 # ctx: context
 # r:   the value begin_modal returned
@@ -473,8 +466,7 @@ pub fun end_modal(ctx: *context.Context, r: ModalArea) {
     context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, r.x0, r.y0, x1, y1);
 
-    if (ctx.hover_seen > r.seen) { ctx.wheel_taken = 1; }
-    if (r.hidden != 0)           { context.pop_measure(ctx); }
+    if (r.hidden != 0) { context.pop_measure(ctx); }
     context.pop_id(ctx);
     context.pop_band(ctx);
 
@@ -641,6 +633,67 @@ test modal__blocks_beneath_while_its_own_widgets_work {
     driver.step(?d);
     if (driver.drawn(?d, act))                     { ret 10; }
     if (!driver.click(?d, under) || pr.under != 2) { ret 11; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a scrolling dock that puts up a modal from inside its body
+# ---
+# dock: the dock's state
+# ask:  1 to open the modal on the next frame
+#[testing]
+rec Deep {
+    dock: widget.Dock;
+    ask:  u8;
+}
+
+#[testing]
+fun deep_ui(ctx: *context.Context, user: ptr) {
+    val dp: *Deep           = user::*Deep;
+    val da: widget.DockArea = widget.begin_dock(ctx, "side", ?dp.dock);
+    widget.button(ctx, "top");
+    if (dp.ask != 0) {
+        open(ctx, "Inner");
+        dp.ask = 0;
+    }
+    val m: ModalArea = begin_modal(ctx, dialog("Inner"));
+    if (m.shown != 0) { widget.button(ctx, "Go"); }
+    end_modal(ctx, m);
+    widget.space(ctx, 1000.0::f32);
+    widget.end_dock(ctx, ?dp.dock, da);
+}
+
+test modal__wheel_over_it_leaves_the_region_beneath_still {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var dp: Deep;
+    dp.dock.side = context.Side.left{};
+    dp.dock.size = 100.0::f32;
+    dp.ask       = 1;
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 600.0::f32, 400.0::f32, deep_ui, (?dp)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 3);
+
+    # over the modal's button and over its scrim above the dock, the dock stays
+    val go: u64 = driver.find(?d, "side/Inner/Go");
+    if (!driver.drawn(?d, go)) { ret 2; }
+    driver.scroll(?d, go, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (dp.dock.scroll.offset != 0.0::f32) { ret 3; }
+    driver.scroll(?d, driver.find(?d, "side/top"), 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (dp.dock.scroll.offset != 0.0::f32) { ret 4; }
+
+    # once it closes the dock takes the wheel again
+    state.get[ModalState](?d.ctx, driver.find(?d, "side/Inner")).open = 0;
+    driver.step(?d);
+    driver.scroll(?d, driver.find(?d, "side/top"), 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (dp.dock.scroll.offset != 30.0::f32) { ret 5; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
