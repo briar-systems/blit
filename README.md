@@ -765,7 +765,8 @@ blit.driver.free(?d);
   last on its row, by a space further along the row, by a newline otherwise.
 - **Snapshots.** `snapshot(?d)` is a stable text dump of the last frame's draw
   list for golden comparison: the screen size, then each run with its kind,
-  texture, page, layer, filter, scissor and triangle count, followed by its
+  texture, page, layer, filter and scissor. A consumer span adds its callback
+  id, data and rect, and any other run its triangle count, followed by its
   geometry one shape a line. A flat-coloured, axis-aligned rect is a `quad`
   (its corners' position and uv, then its colour), anything else a `tri` of
   three vertices. Positions print to two decimals, uvs to four, colours as

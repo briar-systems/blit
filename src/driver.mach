@@ -35,6 +35,7 @@ use blit.draw;
 use blit.font;
 use bid: blit.id;
 use blit.input;
+use blit.interact;
 use allo: std.allocator;
 use std.allocator.page;
 
@@ -625,8 +626,9 @@ fun is_quad(vs: *draw.Vert, ix: *u32, k: usize) bool {
 # a stable text dump of the last frame's draw list, for golden comparison
 #
 # one header line with the screen size, then each run in paint order with its
-# kind, texture, atlas page, layer, filter, scissor and triangle count,
-# followed by its geometry, one shape a line. two triangles that make a
+# kind, texture, atlas page, layer, filter and scissor. a consumer span
+# (context.RUN_CUSTOM) adds its callback id, data and rect; any other run adds
+# its triangle count, followed by its geometry, one shape a line. two triangles that make a
 # flat-coloured, axis-aligned rect are written as one quad, its corners'
 # position and uv, then its colour; any other triangle is written as its
 # three vertices, each a position, uv and colour. positions and the scissor
@@ -670,6 +672,23 @@ pub fun snapshot(d: *Driver) str {
         out_fixed(d, r.clip_x1, 2);
         out_byte(d, ' ');
         out_fixed(d, r.clip_y1, 2);
+        if (r.kind == context.RUN_CUSTOM) {
+            out_str(d, " id ");
+            out_u64(d, r.id);
+            out_str(d, " data ");
+            out_u64(d, r.data);
+            out_str(d, " rect ");
+            out_fixed(d, r.x0, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.y0, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.x1, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.y1, 2);
+            out_byte(d, '\n');
+            i = i + 1;
+            cnt;
+        }
         out_str(d, " tris ");
         out_u64(d, (r.count / 3)::u64);
         out_byte(d, '\n');
@@ -728,9 +747,18 @@ fun has(s: str, needle: str) bool {
     ret false;
 }
 
-# a quad and a claim, then text in runs along one row and onto the next
+# what the probe's box saw: doubles, then right-button clicks
+#[testing]
+rec Seen {
+    doubles: u32;
+    rights:  u32;
+}
+
+# a quad and a box taking both buttons, then text in runs along one row and
+# onto the next, a line and a consumer span
 #[testing]
 fun probe_ui(ctx: *context.Context, user: ptr) {
+    val seen: *Seen = user::*Seen;
     context.quad(ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, draw.rgba(1.0::f32, 0.5::f32, 0.0::f32, 1.0::f32));
     val ink: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     val w:   f32        = context.text_width(ctx, "ab");
@@ -738,16 +766,20 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
     context.text_at(ctx, "cd", 20.0::f32 + w, 0.0::f32, ink);
     context.text_at(ctx, "ef", 60.0::f32, 0.0::f32, ink);
     context.text_at(ctx, "gh\nij", 20.0::f32, 20.0::f32, ink);
-    context.claim(ctx, bid.of_path(bid.ROOT, "box"), 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    val h: interact.Hit = interact.hit(ctx, bid.of_path(bid.ROOT, "box"), 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, input.BUTTON_LEFT | input.BUTTON_RIGHT);
+    if (h.double)                                    { seen.doubles = seen.doubles + 1; }
+    if (h.clicked && h.button == input.BUTTON_RIGHT) { seen.rights = seen.rights + 1; }
     context.line(ctx, 0.0::f32, 40.0::f32, 10.0::f32, 48.0::f32, 1.0::f32, ink);
+    context.custom(ctx, 80.0::f32, 40.0::f32, 90.0::f32, 50.0::f32, 7, 9);
 }
 
-test text_in__joins_rows_and_lines {
+test driver__reads_text_snapshots_and_clicks {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
-    var d:  Driver;
-    val ie: err[allo.Error] = init(?d, ?a, 100.0::f32, 50.0::f32, probe_ui, nil);
+    var seen: Seen;
+    var d:    Driver;
+    val ie:   err[allo.Error] = init(?d, ?a, 100.0::f32, 50.0::f32, probe_ui, (?seen)::ptr);
     if (sel ie.err) { ret 1; }
     step(?d);
 
@@ -762,7 +794,14 @@ test text_in__joins_rows_and_lines {
     if (!has(dump, "screen 100 50\nrun 0 kind 0 tex 0 page 0 layer 0 filter 0 clip 0.00 0.00 100.00 50.00 tris ")) { ret 7; }
     if (!has(dump, "\n  quad 0.00 0.00 10.00 10.00 uv 0.0039 0.0039 0.0039 0.0039 rgba 255 128 0 255\n"))          { ret 8; }
     if (!has(dump, "\n  quad 20.00 0.00 28.00 8.00 uv "))                                                          { ret 9; }
+    if (!has(dump, " id 7 data 9 rect 80.00 40.00 90.00 50.00\n"))                                                 { ret 11; }
     if (!has(dump, "\n  tri "))                                                                                    { ret 10; }
+
+    # clicks reach the box as a host's would send them
+    val box: u64 = find(?d, "box");
+    if (!double_click(?d, box) || seen.doubles != 1 || seen.rights != 0) { ret 12; }
+    if (!right_click(?d, box) || seen.rights != 1)                       { ret 13; }
+    if (click(?d, find(?d, "none")))                                     { ret 14; }
 
     val freed: err[allo.Error] = free(?d);
     if (sel freed.err) { ret 1; }
