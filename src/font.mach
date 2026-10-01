@@ -107,6 +107,24 @@ rec Entry {
     at:     u64;
 }
 
+# slots in the hot table, a power of two
+val HOT_SLOTS: u32 = 512;
+
+# a cached glyph held in the direct-mapped table in front of the cache, so
+# shaping, measuring and drawing text seldom reach the map
+#
+# a slot is a copy of the cache's entry, and the one place an entry changes
+# after it is resolved, being drawn, writes both.
+# ---
+# key:  what the slot holds, valid while full is 1
+# e:    the entry
+# full: 1 once the slot holds a glyph
+rec Hot {
+    key:  Key;
+    e:    Entry;
+    full: u8;
+}
+
 # glyph sources and text styles with their cache and atlas
 # ---
 # a:       allocator for the cache, the atlas and the scratch buffers
@@ -122,6 +140,7 @@ rec Entry {
 # cps_cap: codepoints cps holds
 # run:     glyphs the last shape made
 # run_cap: glyphs run holds
+# hot:     HOT_SLOTS recently used entries, a slot per (source, glyph id, scale) hash
 # missing: glyphs that could not be rasterised or packed, which draw blank
 # oom:     1 once a scratch buffer could not grow and text went unmeasured or undrawn, until its owner clears it
 pub rec Font {
@@ -138,6 +157,7 @@ pub rec Font {
     cps_cap: usize;
     run:     *glyph.Shaped;
     run_cap: usize;
+    hot:     *Hot;
     missing: usize;
     oom:     u8;
 }
@@ -162,7 +182,16 @@ pub fun init(f: *Font, a: *allo.Allocator) err[allo.Error] {
     f.run_cap   = 0;
     f.missing   = 0;
     f.oom       = 0;
-    ret atlas.init(?f.atlas, a);
+    val h: res[*Hot, allo.Error] = allo.allocate[Hot](a, HOT_SLOTS::usize);
+    if (sel h.err) { ret err[allo.Error].err{h.err}; }
+    f.hot = h.ok;
+    forget(f);
+    val at: err[allo.Error] = atlas.init(?f.atlas, a);
+    if (sel at.err) {
+        val freed: err[allo.Error] = allo.deallocate[Hot](a, f.hot, HOT_SLOTS::usize);
+        f.hot = nil;
+    }
+    ret at;
 }
 
 # release the cache, the atlas and the scratch buffers
@@ -190,6 +219,11 @@ pub fun free(f: *Font) err[allo.Error] {
         f.run     = nil;
         f.run_cap = 0;
     }
+    if (f.hot != nil) {
+        val h: err[allo.Error] = allo.deallocate[Hot](f.a, f.hot, HOT_SLOTS::usize);
+        if (sel h.err) { ret h; }
+        f.hot = nil;
+    }
     ret atlas.free(?f.atlas);
 }
 
@@ -204,8 +238,18 @@ pub fun free(f: *Font) err[allo.Error] {
 pub fun set_source(f: *Font, src: glyph.GlyphSource) {
     f.srcs[0] = src;
     gmap.clear[Key, Entry](?f.cache);
+    forget(f);
     atlas.reset(?f.atlas);
     f.missing = 0;
+}
+
+# empty the hot table, as the cache it fronts is dropped
+fun forget(f: *Font) {
+    var i: usize = 0;
+    for (i < HOT_SLOTS::usize) {
+        f.hot[i].full = 0;
+        i             = i + 1;
+    }
 }
 
 # hold one more glyph source for styles to name
@@ -364,6 +408,30 @@ fun entry(f: *Font, si: u32, id: u32, scale: f32) Entry {
     ret e;
 }
 
+# the entry for a glyph at a scale through the hot table, resolving it the
+# first time
+#
+# a face's glyphs take consecutive slots from a base its source and scale pick
+# among four, so the codepoints of a script at one scale never evict each
+# other and a second face at another scale rarely does. the slot stays valid
+# until the next lookup.
+fun hot(f: *Font, si: u32, id: u32, scale: f32) *Entry {
+    val bits: u32  = scale:~u32;
+    val band: u32  = ((bits >> 16) ^ (bits >> 23) ^ si) & 3;
+    val h:    *Hot = ?f.hot[((id ^ (band << 7)) & (HOT_SLOTS - 1))::usize];
+    if (h.full != 0 && h.key.id == id && h.key.scale == bits && h.key.source == si) { ret ?h.e; }
+    h.e    = entry(f, si, id, scale);
+    h.key  = Key{source: si, id: id, scale: bits};
+    h.full = 1;
+    ret ?h.e;
+}
+
+# the glyph id layout uses for a cached entry of codepoint cp, after fallback
+fun shaped_id(e: *Entry, cp: u32) u32 {
+    if (e.state == 0) { ret e.drawn; }
+    ret cp;
+}
+
 # make sure cps holds at least n codepoints and run at least n glyphs
 fun reserve_run(f: *Font, n: usize) u8 {
     if (n > f.cps_cap) {
@@ -416,10 +484,9 @@ fun shape_cps(f: *Font, si: u32, sc: f32, m: usize) usize {
     var prev: u32   = 0;
     var i:    usize = 0;
     for (i < m) {
-        val cp: u32   = f.cps[i];
-        val e:  Entry = entry(f, si, cp, sc);
-        var id: u32   = cp;
-        if (e.state == 0)             { id = e.drawn; }
+        val cp: u32    = f.cps[i];
+        val e:  *Entry = hot(f, si, cp, sc);
+        val id: u32    = shaped_id(e, cp);
         if (i > 0 && src.kern != nil) { f.run[i - 1].advance = f.run[i - 1].advance + src.kern(src.self, prev, id, sc); }
         f.run[i] = glyph.Shaped{id: id, cluster: i::u32, advance: e.placed.g.advance, dx: 0.0::f32, dy: 0.0::f32};
         prev     = id;
@@ -486,8 +553,7 @@ pub fun advance(f: *Font, id: u32, scale: f32, left: u32, cp: u32) f32 {
     val si:  u32                = face(f, id, scale, ?sc);
     val src: *glyph.GlyphSource = ?f.srcs[si];
     if (src.shape == nil) {
-        val e: Entry = entry(f, si, cp, sc);
-        var w: f32   = e.placed.g.advance;
+        var w: f32 = hot(f, si, cp, sc).placed.g.advance;
         if (left != 0 && left != NEWLINE && !is_control(left) && src.kern != nil) {
             w = w + src.kern(src.self, glyph_id(f, si, left, sc), glyph_id(f, si, cp, sc), sc);
         }
@@ -503,9 +569,7 @@ pub fun advance(f: *Font, id: u32, scale: f32, left: u32, cp: u32) f32 {
 
 # the glyph id a non-shaping source draws a codepoint with, after fallback
 fun glyph_id(f: *Font, si: u32, cp: u32, sc: f32) u32 {
-    val e: Entry = entry(f, si, cp, sc);
-    if (e.state == 0) { ret e.drawn; }
-    ret cp;
+    ret shaped_id(hot(f, si, cp, sc), cp);
 }
 
 # whether a style's source has its own glyph for a codepoint, rather than a
@@ -628,7 +692,7 @@ fun rasterise(f: *Font, si: u32, e: *Entry, scale: f32) {
 
 # a glyph of a source ready to draw, rasterising it when it has no cell
 fun place_in(f: *Font, si: u32, id: u32, sc: f32) Placed {
-    var e: Entry = entry(f, si, id, sc);
+    val e: *Entry = hot(f, si, id, sc);
     # a fallback shares the cell of the glyph it falls back to
     if (e.state == 0 && e.drawn != id) { ret place_in(f, si, e.drawn, sc); }
     if (e.state == 1) {
@@ -640,9 +704,9 @@ fun place_in(f: *Font, si: u32, id: u32, sc: f32) Placed {
     }
     or (e.state == 2)                          { ret e.placed; }
     or (e.state == 3 && e.at == f.atlas.frame) { ret e.placed; }
-    rasterise(f, si, ?e, sc);
+    rasterise(f, si, e, sc);
     var k:    Key                   = Key{source: si, id: id, scale: sc:~u32};
-    val kept: res[bool, allo.Error] = gmap.insert[Key, Entry](?f.cache, k, e);
+    val kept: res[bool, allo.Error] = gmap.insert[Key, Entry](?f.cache, k, @e);
     ret e.placed;
 }
 
@@ -720,6 +784,8 @@ test font__fractional_kerned_utf8_with_fallback {
     val ie: err[allo.Error] = init(?f, ?a);
     if (sel ie.err) { ret 1; }
 
+    # glyphs measured from the built-in source are dropped with it
+    if (measure(?f, STYLE_BODY, 1.0::f32, "AV") != 16.0::f32) { ret 2; }
     var rasters: u64 = 0;
     set_source(?f, glyph.GlyphSource{
         self: (?rasters)::ptr, line: test_line, glyph: test_glyph, kern: test_kern, raster: test_raster, shape: nil
