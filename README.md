@@ -374,7 +374,7 @@ shows.
 | `field` | a text field: mark the hint, focused while it holds the keyboard |
 | `field_caret` | a text field's caret and its composition underline: fill, min_w the width |
 | `field_select` | the highlight behind selected text: fill |
-| `section` | a collapsible section heading: mark the caret |
+| `section` | a collapsible section heading: mark the caret, min_w its size, 0 to follow the caption's ascent |
 | `scrollbar` | a scrollbar's track: min_w its width, margin.l between it and the content |
 | `scrollbar_thumb` | a scrollbar's thumb: min_h its least length |
 | `list` | a list's body |
@@ -969,6 +969,9 @@ instead of `ox` and `pw`.
   true, then `end_section(?ctx, s)` whatever it is. Opening or closing, the
   rows show in a clip that grows or shrinks to the height they last took
   whole, over the theme's `MOTION_OPEN`, and the layout below follows it.
+  The caret is as tall as the caption's ascent in the current text style,
+  whatever the line height, or the section style's `min_w` when it sets one
+  (`section.min_w`).
 - **Buttons.** `button` spans the column, `buttons(?ctx, ?labels[0], n)` is a
   row of n, and `button_grid(?ctx, ?labels[0], n, cols, on)` wraps them cols
   to a row with button `on` drawn chosen. Both return the index clicked, or n.
