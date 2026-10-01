@@ -31,6 +31,7 @@ use gallery.sections.disabled;
 use gallery.sections.dnd;
 use gallery.sections.docking;
 use gallery.sections.icons;
+use gallery.sections.ids;
 use gallery.sections.inspector;
 use gallery.sections.keyboard;
 use gallery.sections.layout;
@@ -56,6 +57,8 @@ use gallery.sections.windows;
 val CODE_WIDGETS:   [_]u8;
 #[embed("sections/layout.mach")]
 val CODE_LAYOUT:    [_]u8;
+#[embed("sections/ids.mach")]
+val CODE_IDS:       [_]u8;
 #[embed("sections/controls.mach")]
 val CODE_CONTROLS:  [_]u8;
 #[embed("sections/values.mach")]
@@ -104,7 +107,7 @@ val CODE_DISABLED:  [_]u8;
 val CODE_INSPECTOR: [_]u8;
 
 # how many sections there are
-pub val COUNT: usize = 25;
+pub val COUNT: usize = 26;
 
 # the gallery window's title and key
 val TITLE: str = "blit gallery";
@@ -133,6 +136,7 @@ rec Section {
 rec States {
     widgets:   widgets.State;
     layout:    layout.State;
+    ids:       ids.State;
     controls:  controls.State;
     values:    values.State;
     text:      text.State;
@@ -171,8 +175,8 @@ rec States {
 # insp:  the interface inspector
 # st:    every section's state
 pub rec Gallery {
-    secs:  [25]Section;
-    names: [25]str;
+    secs:  [26]Section;
+    names: [26]str;
     nav:   blit.list.List;
     shown: usize;
     code:  blit.field.Field;
@@ -202,6 +206,7 @@ pub fun make(g: *Gallery, a: *allo.Allocator) bool {
     val s: *States = ?g.st;
     widgets.init(?s.widgets);
     layout.init(?s.layout);
+    ids.init(?s.ids, a);
     controls.init(?s.controls);
     values.init(?s.values);
     text.init(?s.text, a);
@@ -228,29 +233,30 @@ pub fun make(g: *Gallery, a: *allo.Allocator) bool {
 
     g.secs[0]  = sec("Widgets", widgets.show, nil, (?s.widgets)::ptr, ?CODE_WIDGETS[0], $length_of(CODE_WIDGETS));
     g.secs[1]  = sec("Layout", layout.show, nil, (?s.layout)::ptr, ?CODE_LAYOUT[0], $length_of(CODE_LAYOUT));
-    g.secs[2]  = sec("Controls", controls.show, nil, (?s.controls)::ptr, ?CODE_CONTROLS[0], $length_of(CODE_CONTROLS));
-    g.secs[3]  = sec("Values and colour", values.show, nil, (?s.values)::ptr, ?CODE_VALUES[0], $length_of(CODE_VALUES));
-    g.secs[4]  = sec("Text", text.show, nil, (?s.text)::ptr, ?CODE_TEXT[0], $length_of(CODE_TEXT));
-    g.secs[5]  = sec("Lists", lists.show, nil, (?s.lists)::ptr, ?CODE_LISTS[0], $length_of(CODE_LISTS));
-    g.secs[6]  = sec("Trees", trees.show, nil, (?s.trees)::ptr, ?CODE_TREES[0], $length_of(CODE_TREES));
-    g.secs[7]  = sec("Tables", tables.show, nil, (?s.tables)::ptr, ?CODE_TABLES[0], $length_of(CODE_TABLES));
-    g.secs[8]  = sec("Tabs", tabs.show, nil, (?s.tabs)::ptr, ?CODE_TABS[0], $length_of(CODE_TABS));
-    g.secs[9]  = sec("Menus", menus.show, nil, (?s.menus)::ptr, ?CODE_MENUS[0], $length_of(CODE_MENUS));
-    g.secs[10] = sec("Windows", windows.show, windows.root, (?s.windows)::ptr, ?CODE_WINDOWS[0], $length_of(CODE_WINDOWS));
-    g.secs[11] = sec("Docking", docking.show, docking.root, (?s.docking)::ptr, ?CODE_DOCKING[0], $length_of(CODE_DOCKING));
-    g.secs[12] = sec("Modals", modals.show, nil, (?s.modals)::ptr, ?CODE_MODALS[0], $length_of(CODE_MODALS));
-    g.secs[13] = sec("Overlays", overlays.show, overlays.root, (?s.overlays)::ptr, ?CODE_OVERLAYS[0], $length_of(CODE_OVERLAYS));
-    g.secs[14] = sec("Toasts", toasts.show, toasts.root, (?s.toasts)::ptr, ?CODE_TOASTS[0], $length_of(CODE_TOASTS));
-    g.secs[15] = sec("Tooltips", tooltips.show, nil, (?s.tooltips)::ptr, ?CODE_TOOLTIPS[0], $length_of(CODE_TOOLTIPS));
-    g.secs[16] = sec("Drag and drop", dnd.show, nil, (?s.dnd)::ptr, ?CODE_DND[0], $length_of(CODE_DND));
-    g.secs[17] = sec("Charts", charts.show, nil, (?s.charts)::ptr, ?CODE_CHARTS[0], $length_of(CODE_CHARTS));
-    g.secs[18] = sec("Icons", icons.show, nil, (?s.icons)::ptr, ?CODE_ICONS[0], $length_of(CODE_ICONS));
-    g.secs[19] = sec("Shapes and paths", shapes.show, nil, (?s.shapes)::ptr, ?CODE_SHAPES[0], $length_of(CODE_SHAPES));
-    g.secs[20] = sec("Style and themes", style.show, nil, (?s.style)::ptr, ?CODE_STYLE[0], $length_of(CODE_STYLE));
-    g.secs[21] = sec("Animation", motion.show, nil, (?s.motion)::ptr, ?CODE_MOTION[0], $length_of(CODE_MOTION));
-    g.secs[22] = sec("Keyboard", keyboard.show, nil, (?s.keyboard)::ptr, ?CODE_KEYBOARD[0], $length_of(CODE_KEYBOARD));
-    g.secs[23] = sec("Disabled", disabled.show, nil, (?s.disabled)::ptr, ?CODE_DISABLED[0], $length_of(CODE_DISABLED));
-    g.secs[24] = sec("Inspector", inspector.show, nil, (?s.inspector)::ptr, ?CODE_INSPECTOR[0], $length_of(CODE_INSPECTOR));
+    g.secs[2]  = sec("Ids and state", ids.show, nil, (?s.ids)::ptr, ?CODE_IDS[0], $length_of(CODE_IDS));
+    g.secs[3]  = sec("Controls", controls.show, nil, (?s.controls)::ptr, ?CODE_CONTROLS[0], $length_of(CODE_CONTROLS));
+    g.secs[4]  = sec("Values and colour", values.show, nil, (?s.values)::ptr, ?CODE_VALUES[0], $length_of(CODE_VALUES));
+    g.secs[5]  = sec("Text", text.show, nil, (?s.text)::ptr, ?CODE_TEXT[0], $length_of(CODE_TEXT));
+    g.secs[6]  = sec("Lists", lists.show, nil, (?s.lists)::ptr, ?CODE_LISTS[0], $length_of(CODE_LISTS));
+    g.secs[7]  = sec("Trees", trees.show, nil, (?s.trees)::ptr, ?CODE_TREES[0], $length_of(CODE_TREES));
+    g.secs[8]  = sec("Tables", tables.show, nil, (?s.tables)::ptr, ?CODE_TABLES[0], $length_of(CODE_TABLES));
+    g.secs[9]  = sec("Tabs", tabs.show, nil, (?s.tabs)::ptr, ?CODE_TABS[0], $length_of(CODE_TABS));
+    g.secs[10] = sec("Menus", menus.show, nil, (?s.menus)::ptr, ?CODE_MENUS[0], $length_of(CODE_MENUS));
+    g.secs[11] = sec("Windows", windows.show, windows.root, (?s.windows)::ptr, ?CODE_WINDOWS[0], $length_of(CODE_WINDOWS));
+    g.secs[12] = sec("Docking", docking.show, docking.root, (?s.docking)::ptr, ?CODE_DOCKING[0], $length_of(CODE_DOCKING));
+    g.secs[13] = sec("Modals", modals.show, nil, (?s.modals)::ptr, ?CODE_MODALS[0], $length_of(CODE_MODALS));
+    g.secs[14] = sec("Overlays", overlays.show, overlays.root, (?s.overlays)::ptr, ?CODE_OVERLAYS[0], $length_of(CODE_OVERLAYS));
+    g.secs[15] = sec("Toasts", toasts.show, toasts.root, (?s.toasts)::ptr, ?CODE_TOASTS[0], $length_of(CODE_TOASTS));
+    g.secs[16] = sec("Tooltips", tooltips.show, nil, (?s.tooltips)::ptr, ?CODE_TOOLTIPS[0], $length_of(CODE_TOOLTIPS));
+    g.secs[17] = sec("Drag and drop", dnd.show, nil, (?s.dnd)::ptr, ?CODE_DND[0], $length_of(CODE_DND));
+    g.secs[18] = sec("Charts", charts.show, nil, (?s.charts)::ptr, ?CODE_CHARTS[0], $length_of(CODE_CHARTS));
+    g.secs[19] = sec("Icons", icons.show, nil, (?s.icons)::ptr, ?CODE_ICONS[0], $length_of(CODE_ICONS));
+    g.secs[20] = sec("Shapes and paths", shapes.show, nil, (?s.shapes)::ptr, ?CODE_SHAPES[0], $length_of(CODE_SHAPES));
+    g.secs[21] = sec("Style and themes", style.show, nil, (?s.style)::ptr, ?CODE_STYLE[0], $length_of(CODE_STYLE));
+    g.secs[22] = sec("Animation", motion.show, nil, (?s.motion)::ptr, ?CODE_MOTION[0], $length_of(CODE_MOTION));
+    g.secs[23] = sec("Keyboard", keyboard.show, nil, (?s.keyboard)::ptr, ?CODE_KEYBOARD[0], $length_of(CODE_KEYBOARD));
+    g.secs[24] = sec("Disabled", disabled.show, nil, (?s.disabled)::ptr, ?CODE_DISABLED[0], $length_of(CODE_DISABLED));
+    g.secs[25] = sec("Inspector", inspector.show, nil, (?s.inspector)::ptr, ?CODE_INSPECTOR[0], $length_of(CODE_INSPECTOR));
 
     var k: usize = 0;
     for (k < COUNT) {
@@ -271,6 +277,7 @@ pub fun unmake(g: *Gallery, a: *allo.Allocator) bool {
     val f3: err[allo.Error] = blit.inspect.free(?g.insp);
     if (sel f3.err)                 { ok = false; }
     if (!text.free(?g.st.text))     { ok = false; }
+    if (!ids.free(?g.st.ids))       { ok = false; }
     if (!toasts.free(?g.st.toasts)) { ok = false; }
     if (!shapes.free(?g.st.shapes)) { ok = false; }
     ret ok;
