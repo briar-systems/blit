@@ -22,9 +22,12 @@
 # pointer. the keyboard follows: a modal takes the focus the frame it opens
 # (see context.focus), takes it back whenever it is the top modal and no
 # widget holds it, and gives it back to the widget that held it before the
-# frame after it closes, as an open menu does. escape closes the top modal
-# while it holds the keyboard itself, so escape in a text field inside it
-# ends the edit first. its titlebar's close button closes it too.
+# frame after it closes, as an open menu does. tab and the arrows move the
+# keyboard among the stops of the top modal alone (see blit.band's trap), from
+# the modal itself onto its first stop. escape closes the top modal while it
+# holds the keyboard itself or a stop inside it takes no text, so escape in a
+# text field inside it ends the edit first. its titlebar's close button
+# closes it too.
 #
 # confirm is a whole dialog built from it: a message and a row of buttons,
 # returning the button chosen.
@@ -353,7 +356,7 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
         ret r;
     }
     hold(ctx, r.id, st, true, top);
-    if (top && ctx.focus == r.id && escaped(ctx)) {
+    if (top && (ctx.focus == r.id || !context.typing(ctx)) && escaped(ctx)) {
         dismiss(ctx, ?r, CLOSE_ESCAPE);
         ret r;
     }
@@ -416,7 +419,7 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
         val y1: f32 = y0 + th;
         var hx: interact.Hit;
         if (closer) {
-            hx = interact.hit(ctx, bid.child(r.id, "#close"), x1 - th, y0, x1, y1, input.BUTTON_LEFT);
+            hx = interact.hit(ctx, bid.child(r.id, "#close"), x1 - th, y0, x1, y1, input.BUTTON_LEFT | interact.FOCUS);
             if (hx.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
             if (hx.clicked) {
                 dismiss(ctx, ?r, CLOSE_BUTTON);
@@ -626,9 +629,9 @@ test modal__blocks_beneath_while_its_own_widgets_work {
     if (pr.under != 1 || pr.docked != 1) { ret 5; }
     if (!is_open(?d.ctx, "First"))       { ret 6; }
 
-    # its own button works, and escape closes it
-    if (!driver.click(?d, act) || pr.inner != 1)       { ret 7; }
-    if (!driver.focused(?d, driver.find(?d, "First"))) { ret 8; }
+    # its own button works and takes the keyboard, and escape closes it
+    if (!driver.click(?d, act) || pr.inner != 1) { ret 7; }
+    if (!driver.focused(?d, act))                { ret 8; }
     driver.key(?d, input.KEY_ESCAPE, 0);
     if (is_open(?d.ctx, "First")) { ret 9; }
     driver.step(?d);
@@ -664,6 +667,62 @@ fun deep_ui(ctx: *context.Context, user: ptr) {
     end_modal(ctx, m);
     widget.space(ctx, 1000.0::f32);
     bdock.end_dock(ctx, ?dp.dock, da);
+}
+
+test modal__keyboard_stays_inside_the_top_modal {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+    val under:  u64 = driver.find(?d, "under");
+    val docked: u64 = driver.find(?d, "side/docked");
+    val more:   u64 = driver.find(?d, "First/More");
+
+    # tab moves from the modal onto its stops and never leaves them
+    open(?d.ctx, "First");
+    driver.steps(?d, 3);
+    var met: bool  = false;
+    var k:   usize = 0;
+    for (k < 6) {
+        driver.key(?d, input.KEY_TAB, 0);
+        val f: u64 = driver.focus_of(?d);
+        if (f == under || f == docked || f == 0) { ret 2; }
+        if (f == more)                           { met = true; }
+        k = k + 1;
+    }
+    if (!met) { ret 3; }
+
+    # enter on its button opens the second modal over it, which keeps the
+    # keyboard to itself the same way
+    k = 0;
+    for (k < 6 && driver.focus_of(?d) != more) {
+        driver.key(?d, input.KEY_TAB, 0);
+        k = k + 1;
+    }
+    driver.key(?d, input.KEY_ENTER, 0);
+    driver.steps(?d, 3);
+    if (!up(?d, "First/Second")) { ret 4; }
+    val act: u64 = driver.find(?d, "First/Second/Act");
+    met = false;
+    k   = 0;
+    for (k < 4) {
+        driver.key(?d, input.KEY_TAB, 0);
+        val f: u64 = driver.focus_of(?d);
+        if (f == more || f == under || f == 0) { ret 5; }
+        if (f == act)                          { met = true; }
+        k = k + 1;
+    }
+    if (!met) { ret 6; }
+
+    # escape from a stop inside it closes the top modal alone
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (up(?d, "First/Second") || !up(?d, "First")) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
 }
 
 test modal__wheel_over_it_leaves_the_region_beneath_still {

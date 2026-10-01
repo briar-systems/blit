@@ -168,6 +168,10 @@ pub val NAV_FOCUS:  u8 = 0x80;
 pub val NAV_ARROWS: u8 = 0x40;
 pub val NAV_TEXT:   u8 = 0x20;
 
+# a stop marked as its group's current member (see mark_current), where tab
+# enters the group
+val NAV_CURRENT: u8 = 0x10;
+
 # the arrows that move between the members of a group
 #
 # row:    left and right
@@ -1245,6 +1249,26 @@ pub fun add_stop(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, fla
     ret true;
 }
 
+# mark a stop registered this frame as its group's current member, the
+# chosen segment, the checked radio or the selected tab, where tab enters
+# the group
+#
+# a group with no current member is entered at the member that last held
+# the keyboard, else at the first tab reaches.
+# ---
+# ctx: context
+# id:  the stop's widget id
+pub fun mark_current(ctx: *Context, id: u64) {
+    var i: usize = ctx.stops_len;
+    for (i > 0) {
+        i = i - 1;
+        if (ctx.stops[i].id == id) {
+            ctx.stops[i].flags = ctx.stops[i].flags | NAV_CURRENT;
+            ret;
+        }
+    }
+}
+
 # how many tab stops the frame registered so far
 # ---
 # ctx: context
@@ -1357,6 +1381,12 @@ fun tab_from(ctx: *Context, i: usize, back: bool, trap: u32, trapped: bool) usiz
         if (group != 0 && ctx.before[k].group == group) { cnt; }
         val g: u64 = ctx.before[k].group;
         if (g == 0) { ret k; }
+        var m: usize = 0;
+        for (m < n) {
+            val o: Stop = ctx.before[m];
+            if (o.group == g && (o.flags & NAV_CURRENT) != 0 && reachable(ctx, m, trap, trapped)) { ret m; }
+            m = m + 1;
+        }
         val last: usize = stop_in(ctx.before, n, recalled(ctx, g));
         if (last < n && ctx.before[last].group == g && reachable(ctx, last, trap, trapped)) { ret last; }
         ret k;
@@ -1387,14 +1417,17 @@ fun arrow_from(ctx: *Context, i: usize, back: bool, trap: u32, trapped: bool) us
 # previous frame's tab stops
 #
 # tab steps to the next stop in call order and shift tab to the one before,
-# wrapping, with a group of stops counting as one: tab enters a group at the
-# member that last held the keyboard, else the first it reaches. the arrows
+# wrapping, with a group of stops counting as one: tab enters a group at its
+# current member (see mark_current), else the member that last held the
+# keyboard, else the first it reaches. the arrows
 # along a group's axis move between its members, unless the holder takes
 # them itself (NAV_ARROWS or NAV_TEXT). with nothing focused, tab resumes
 # from the stop that last held the focus, else starts at an end. a focus held
 # by anything that is not a stop owns the keys, and so does a press of a
 # modifier other than shift. a band that traps the keyboard keeps every move
-# inside its topmost layer holding a stop.
+# inside its topmost layer holding a stop, and there tab moves on from a
+# holder that is not a stop as well, as from a modal holding the keyboard
+# onto its first stop.
 fun navigate(ctx: *Context) {
     if (ctx.before_len == 0) { ret; }
     var trap:    u32   = 0;
@@ -1422,12 +1455,12 @@ fun navigate(ctx: *Context) {
         }
         if (code == 0 || (mods & other) != 0) { cnt; }
         val held: usize = stop_in(ctx.before, ctx.before_len, ctx.focus);
-        if (ctx.focus != 0 && held >= ctx.before_len) { ret; }
+        if (ctx.focus != 0 && held >= ctx.before_len && (!trapped || code != input.KEY_TAB)) { cnt; }
 
         if (code == input.KEY_TAB) {
             val back: bool  = (mods & input.MOD_SHIFT) != 0;
             var from: usize = held;
-            if (from >= ctx.before_len) {
+            if (from >= ctx.before_len && ctx.focus == 0) {
                 from = stop_in(ctx.before, ctx.before_len, ctx.last_stop);
                 if (from < ctx.before_len && !reachable(ctx, from, trap, trapped)) { from = ctx.before_len; }
             }
