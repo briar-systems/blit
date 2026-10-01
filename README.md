@@ -729,6 +729,17 @@ if (h.held) { drag_by(h.dx, h.dy); }
   was drawn in, so a caller that refuses a text field's entry (`ENTERED` with
   text it will not take) calls `focus` with that id to hand the keyboard
   straight back, and `focused(?ctx, id)` says whether it holds it.
+- **Disabled.** `blit.context.begin_disabled(?ctx, cond)` and
+  `end_disabled(?ctx)` wrap widgets that draw and lay out, keeping their ids
+  and state, but take no input when `cond` holds. Inside, `hit` still claims
+  the rect but reports nothing hot, pressed, clicked or dragged, the focus is
+  neither given nor kept (a holder that becomes disabled loses it), scroll
+  regions and tables take no wheel, menu items and their shortcuts never fire,
+  and every kind paints in its `DISABLED` state through `box` and `paint_of`.
+  Scopes nest, and one with `cond` false inside a disabling one stays
+  disabled, so a caller writes one call, not a branch.
+  `blit.context.disabled(?ctx)` says whether the call site is disabled, for a
+  custom control that reads input other than through `hit`.
 
 ## Drag and drop
 
