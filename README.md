@@ -29,50 +29,101 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
 
-Text comes from a glyph source, a record of functions over the source's own
-state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, layout, the glyph
-cache and the atlas, and asks the source only for what a face knows:
+Text comes from glyph sources, records of functions over each source's own
+state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, line breaking, the
+glyph cache and the atlas, and asks a source only for what a face knows:
 
 ```mach
 pub rec GlyphSource {
     self:   ptr;
-    line:   fun(ptr, f32) LineMetrics;              # (self, scale)
-    glyph:  fun(ptr, u32, f32, *Glyph) bool;        # (self, codepoint, scale, out)
-    kern:   fun(ptr, u32, u32, f32) f32;            # (self, left, right, scale), or nil
-    raster: fun(ptr, u32, f32, *u8, usize) bool;    # (self, codepoint, scale, coverage, stride)
+    line:   fun(ptr, f32) LineMetrics;                        # (self, scale)
+    glyph:  fun(ptr, u32, f32, *Glyph) bool;                  # (self, glyph id, scale, out)
+    kern:   fun(ptr, u32, u32, f32) f32;                      # (self, left id, right id, scale), or nil
+    raster: fun(ptr, u32, f32, *u8, usize) bool;              # (self, glyph id, scale, coverage, stride)
+    shape:  fun(ptr, *u32, usize, f32, *Shaped, usize) usize; # (self, run, n, scale, out, cap), or nil
 }
 ```
 
+- **Glyph ids, with an optional shaper.** Everything past shaping is keyed on
+  glyph id. A shaping source (ligatures, combining marks, complex scripts)
+  turns a line's codepoints into `Shaped` glyphs: an id, the cluster it came
+  from, an advance with kerning included and an offset. A source with `shape`
+  nil has glyph ids that are its codepoints, one to one, kerned pair by pair
+  through `kern`, as the bitmap font and a simple TrueType face do. Such a
+  source only adds `shape: nil` to the record it filled before.
 - **Metrics are floats** in pixels at the scale asked for: `LineMetrics` is
   ascent, descent and gap, and a `Glyph` is its advance, the rect its bitmap
   covers relative to the pen on the baseline (y down), and the bitmap's size in
-  texels. Scale is the interface scale (`ctx.scale`, 1.0 by default), so text at
-  200% is rasterised at that size, not stretched.
-- **Glyphs come on demand.** A codepoint is measured the first time it is laid
-  out and rasterised the first time it is drawn, then cached per scale.
-  Measuring never rasterises.
-- **Codepoints, not bytes.** Text is UTF-8. A codepoint the source lacks draws
-  as U+FFFD, or `?` when it lacks that too. Control codepoints take no space and
-  a newline starts the next line.
-- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is the
-  default, so a context needs no configuration. `blit.context.set_glyph_source`
-  plugs in another between frames, such as a TrueType face from the host. blit
-  itself never depends on one.
+  texels. Scale is a text style's size times the interface scale (`ctx.scale`,
+  1.0 by default), so text at 200% is rasterised at that size, not stretched.
+- **Glyphs come on demand.** A glyph is measured the first time it is laid
+  out and rasterised the first time it is drawn, then cached by source, glyph
+  id and scale. Measuring never rasterises.
+- **Codepoints, not bytes.** Text is UTF-8. A codepoint a non-shaping source
+  lacks draws as U+FFFD, or `?` when it lacks that too. A shaper falls back
+  itself, its glyph id 0 being the missing glyph. Control codepoints take no
+  space and a newline starts the next line.
+- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is
+  source 0, so a context needs no configuration. `blit.context.set_glyph_source`
+  replaces source 0 between frames, such as with a TrueType face from the host,
+  and `add_glyph_source` holds more. blit itself never depends on one.
+- **The atlas evicts.** When every page is full, the page least recently drawn
+  from is cleared and refilled. A page drawn from this frame is never evicted,
+  so a glyph drawn this frame is never dropped, and a glyph whose page was
+  evicted is rasterised again when it is next drawn.
 
-`blit.context.text_width` and `line_height` measure at the context's scale, and
-`blit.font.advance` steps one codepoint at a time for layout built outside
-blit.
+### Text styles
+
+A style (`blit.font.Style`) names a glyph source and a size relative to that
+source's own, so one face serves body text, headings and small print. Style 0,
+`blit.font.STYLE_BODY`, is source 0 at size 1.0. Register more with
+`blit.context.add_style`, change one with `set_style`, and draw in one with
+`push_style`/`pop_style`. Every text call, `text_at`, `text_span`, `glyph`,
+`text_width`, `line_height`, and every widget that draws text, uses the
+current style, and every frame starts in the body style.
+
+```mach
+val heading: opt[u32] = blit.context.add_style(?ctx, blit.font.Style{source: 0, size: 2.0::f32});
+blit.context.push_style(?ctx, heading.some);
+blit.widget.text(?ctx, "Simulation");
+blit.context.pop_style(?ctx);
+```
+
+`blit.context.text_width_n` measures a byte range, and `glyph_advance` steps
+one codepoint at a time for layout built outside blit, without a shaper's
+ligatures.
+
+### Truncation and rich spans
+
+`blit.text.fit` cuts one line to a width with an ellipsis at the end
+(`CUT_END`), at the start for paths (`CUT_START`) or in the middle
+(`CUT_MIDDLE`), as byte offsets into the caller's string, and `fit_at` draws
+it. The ellipsis is U+2026 when the style's source has it, else `...`.
+
+A rich line is a run of `blit.text.Span`s, each text in its own style and
+color, on one shared baseline: `spans_at` draws it, `spans_width` and
+`spans_line` measure it, and `blit.widget.rich` draws it at the cursor.
+
+```mach
+var sp: [4]blit.text.Span;
+sp[0] = blit.text.Span{s: "gen ",   style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[1] = blit.text.Span{s: "13",     style: bold,                 color: t.text};
+sp[2] = blit.text.Span{s: "  pop ", style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[3] = blit.text.Span{s: "9,252",  style: bold,                 color: t.text};
+blit.widget.rich(?ctx, ?sp[0], 4);
+```
 
 ## Theme & scale
 
 Every color and length a widget draws with comes from a theme, a plain record
 (`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
-`window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
+`window`, `dock`, `header`, `header_hot`), `edge`, three text tiers `text`,
+`text_dim` and `text_faint` (hints and placeholders),
 `accent` and `accent_text` (text on an accent fill), `warn`, control states (`control`, `control_hot`, `control_on`,
 `track`, `handle`, `handle_on`), the text selection highlight `select`, and the
 metrics `row`, `gap`, `pad`, `handle_w`, `bar_w`, `thumb_min`, `corner`,
@@ -345,7 +396,9 @@ cell.
 
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
   pages, each an RGBA8 square of `blit.atlas.PAGE_SIDE` (512) texels at
-  `page_pixels(at, i)`. Pages open as glyphs arrive and never resize. Each has a
+  `page_pixels(at, i)`. Pages open as glyphs arrive and never resize, and past
+  `blit.atlas.PAGE_MAX` (16) the least recently drawn one is cleared and
+  reused, wholly dirty. Each has a
   `page_version` bumped on every write and a `page_dirty` rect: upload the dirty
   rect of each changed page before drawing, then `page_clean` it. Every glyph
   has a transparent gutter, so linear filtering is safe. The built-in font at
