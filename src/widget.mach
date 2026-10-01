@@ -1581,8 +1581,9 @@ pub rec DockArea {
 # opened in turn stack inward and context.free_area reports what they leave
 # for the rest of the screen. its whole rect stops input to what it covers,
 # and its body scrolls when its widgets are taller than it. call it at the
-# root, outside surfaces and layers, and pair it with end_dock. its body is an
-# id scope derived from the dock's key.
+# root, outside surfaces and layers, and pair it with end_dock. its body is
+# the id scope of the dock's key, so a label path through the dock is
+# "<key>/<label>".
 # ---
 # ctx: context
 # key: the dock's key in the current id scope
@@ -1615,7 +1616,7 @@ pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
     ctx.cx = ctx.ox;
     ctx.cy = ctx.oy;
     ctx.pw = maxf(a.x1 - a.x0 - in * 2.0::f32, 0.0::f32);
-    r.body = scroll_at(ctx, bid.child(context.id_of(ctx, key), "#body"), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
+    r.body = scroll_at(ctx, context.id_of(ctx, key), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
     ret r;
 }
 
@@ -3413,7 +3414,7 @@ test ids__scopes_nest_through_containers {
     val one:  u64 = context.id_of(?ctx, "one");
     val pop:  u64 = bid.of_label(one, "pop");
     val reg:  u64 = bid.of_label(pop, "reg");
-    val body: u64 = bid.child(context.id_of(?ctx, "dock"), "#body");
+    val body: u64 = context.id_of(?ctx, "dock");
 
     context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 400.0::f32, 400.0::f32);
     val dk: DockArea = begin_dock(?ctx, "dock", ?d);
