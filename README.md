@@ -414,7 +414,8 @@ cell.
 - **Color.** Colors are straight rgba as authored. When the target encodes sRGB
   on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
   in linear light, so the encoding brings it back to what was authored. Alpha is
-  never converted.
+  never converted. Each distinct color is converted once and cached on the
+  context (`blit.draw.LinearCache`), so sRGB output costs next to nothing.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
   straight rgba.
@@ -450,6 +451,36 @@ demo/harness/out/linux-x86_64/debug/bin/harness
 ```
 
 `demo/panel/` builds and runs the same way.
+
+## Benchmark
+
+`demo/bench/` measures blit's per-frame cost on a few representative
+interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
+line chart of 100,000 samples, and six overlapping windows each holding a
+section and a scroll region. Each scene runs with sRGB output off and then on,
+and the table reports the mean frame time, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. It is local only,
+never a CI job. Build it in the release profile:
+
+```
+mach dep pull demo/bench
+mach build demo/bench -p release
+demo/bench/out/linux-x86_64/release/bin/bench
+```
+
+Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+
+```
+scene          srgb    us/frame  vertices  runs  allocs   srgb cost
+dense panel    off        292.4      5298     1       0
+dense panel    on         295.6      5298     1       0   +1.0%
+10k row list   off        123.6      1704     1       0
+10k row list   on         124.1      1704     1       0   +0.4%
+100k chart     off       1924.6     15738     1       0
+100k chart     on        1966.7     15738     1       0   +2.1%
+windows        off        273.9      5472     1       0
+windows        on         277.5      5472     1       0   +1.3%
+```
 
 ## Conventions
 

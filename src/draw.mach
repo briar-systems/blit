@@ -11,6 +11,7 @@
 # for the atlas. the context records which handle each span of the list samples
 # (see blit.context.Run).
 
+use std.types.bool.bool;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
@@ -141,6 +142,51 @@ pub fun srgb_to_linear(c: f32) f32 {
 # ret: the color in linear light
 pub fun linear(c: Color) Color {
     ret rgba(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b), c.a);
+}
+
+# slots in a LinearCache, a power of two
+pub val LINEAR_SLOTS: usize = 64;
+
+# authored colors and their linear() conversions, so an sRGB painter converts
+# each distinct color once rather than once per quad
+#
+# direct-mapped on the color's exact bits, so a hit returns exactly what linear
+# returned for those bits. a zeroed cache is valid: its slots hold transparent
+# black, which linear maps to itself.
+# ---
+# keys: authored colors
+# vals: linear(keys[i]) for each slot
+pub rec LinearCache {
+    keys: [LINEAR_SLOTS]Color;
+    vals: [LINEAR_SLOTS]Color;
+}
+
+# the slot a color's bits hash to
+fun slot(c: Color) usize {
+    var h: u64 = c.r:~u32::u64;
+    h = (h ^ c.g:~u32::u64) * 0x9E3779B97F4A7C15;
+    h = (h ^ c.b:~u32::u64) * 0x9E3779B97F4A7C15;
+    h = (h ^ c.a:~u32::u64) * 0x9E3779B97F4A7C15;
+    ret (h >> 40)::usize & (LINEAR_SLOTS - 1);
+}
+
+# whether two colors have the same bits in every channel
+fun same(x: Color, y: Color) bool {
+    ret x.r:~u32 == y.r:~u32 && x.g:~u32 == y.g:~u32 && x.b:~u32 == y.b:~u32 && x.a:~u32 == y.a:~u32;
+}
+
+# linear(c), converted once per distinct color held in the cache
+# ---
+# lc:  the cache, updated on a miss
+# c:   color as authored
+# ret: the color in linear light, identical to linear(c)
+pub fun linear_cached(lc: *LinearCache, c: Color) Color {
+    val i: usize = slot(c);
+    if (same(lc.keys[i], c)) { ret lc.vals[i]; }
+    val l: Color = linear(c);
+    lc.keys[i] = c;
+    lc.vals[i] = l;
+    ret l;
 }
 
 # a single vertex: pixel-space position, atlas uv, and color
@@ -448,5 +494,29 @@ test linear__decodes_srgb_and_keeps_alpha {
     if (c.a != 0.5::f32)                        { ret 3; }
     # the linear segment near black
     if (srgb_to_linear(0.02::f32) != 0.02::f32 / 12.92::f32) { ret 4; }
+    ret 0;
+}
+
+test linear_cached__matches_linear_bit_for_bit {
+    var lc: LinearCache;
+    var n:  usize = 0;
+    # two passes over more colors than slots, so misses and evictions run
+    for (n < 2) {
+        var i: usize = 0;
+        for (i < 300) {
+            val f: f32   = i::f32 / 299.0::f32;
+            val c: Color = rgba(f, 1.0::f32 - f, f * f, 0.5::f32 + f / 2.0::f32);
+            val l: Color = linear(c);
+            # the first call converts or reads an older slot, the second hits
+            if (!same(linear_cached(?lc, c), l)) { ret 1; }
+            if (!same(linear_cached(?lc, c), l)) { ret 1; }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+    # a zeroed cache answers transparent black correctly
+    var fresh: LinearCache;
+    val z:     Color = rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
+    if (!same(linear_cached(?fresh, z), linear(z))) { ret 2; }
     ret 0;
 }
