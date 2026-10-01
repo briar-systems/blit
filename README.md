@@ -189,11 +189,12 @@ in.time    = clock_seconds();       # the host's monotonic clock, as f64
 in.present = 1;                     # 0 while the pointer is off the surface
 in.mx      = x;
 in.my      = y;
-in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held this frame
+in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held after the frame's last event
 in.mods    = blit.input.MOD_SHIFT;   # MOD_* bits held this frame
 in.wheel   = dy_pixels;             # both wheels in pixels
 in.wheel_x = dx_pixels;
-blit.input.type_text(?in, cp);      # then every event, in arrival order
+blit.input.press_button(?in, blit.input.BUTTON_LEFT, bx, by); # then every event, in arrival order
+blit.input.type_text(?in, cp);
 blit.context.begin(?ctx, in, w, h);
 # ... widgets ...
 blit.context.end(?ctx);
@@ -209,6 +210,17 @@ blit.context.end(?ctx);
   carries `prev_down` across frames. With `present` 0 nothing is hovered and
   `in_rect` misses. Widgets act on the left button through `blit.interact`
   (see Interaction).
+- **Button events.** A host that only samples the buttons sets `down` and
+  nothing more, and a press and release that both land between two frames are
+  then lost. A host that sees each one also adds it as it arrives,
+  `press_button(?in, button, x, y)` and `release_button(?in, button, x, y)`
+  with the cursor where it happened, and still sets `down` to the buttons held
+  after the last of them. `begin` hands them to widgets in order, at most one
+  change of a button per frame, holding the rest back and asking for the next
+  frame through `next_frame`, so a quick click is a press in one frame and a
+  release in the next, and a double click is a click, then a press. A frame
+  that applies one sees the cursor where it happened, so `pressed` and
+  `released` keep their per-frame meaning.
 - **Keyboard events.** `type_text(?in, cp)` for each typed codepoint,
   `press_key(?in, code, mods)` for each key press or repeat,
   `release_key(?in, code, mods)` for each release and `compose(?in, text,
@@ -230,8 +242,8 @@ blit.context.end(?ctx);
   window, in screen pixels, none while nothing takes text.
 - **Scheduling.** Widgets call `blit.context.wake_at(?ctx, t)` for a time they
   need a frame by (a hover delay, an animation, a caret blink). After `end`,
-  `next_frame(?ctx)` is `some(0)` to draw again now, `some(t)` to draw by time
-  `t`, or `none` to draw only on input, so an idle tool can sleep instead of
+  `next_frame(?ctx)` is `some(0)` to draw again now (also while button events
+  are held back), `some(t)` to draw by time `t`, or `none` to draw only on input, so an idle tool can sleep instead of
   redrawing every frame.
 
 ## Keyboard, focus & text fields
@@ -671,7 +683,7 @@ cell. Colors and texels are premultiplied.
   FragColor   = aColor * texture(atlas, aUV);
   ```
 - **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
-  events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
+  and button events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
   clipboard and answer `wants_paste`, upload the changed atlas pages, the
   vertices and the indices, and draw each run as above.
 - **From 0.9.** A renderer written for the 0.9 contract changes in these

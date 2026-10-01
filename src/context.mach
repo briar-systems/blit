@@ -111,6 +111,9 @@ use std.text.utf8;
 # with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
+# capacity the held-back button events start with, doubling from there
+pub val BUTTON_DEPTH: usize = 16;
+
 # capacity the run list starts with, doubling from there
 pub val RUN_DEPTH: usize = 64;
 
@@ -321,6 +324,10 @@ pub rec Area {
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
+# backlog:      button events held back for the frames after, in arrival order
+# backlog_cap:  events allocated for backlog
+# backlog_len:  events held in backlog
+# lag:          1 if the frame left button events or the cursor behind the host's, else 0
 pub rec Context {
     dl:           draw.DrawList;
     in:           input.Input;
@@ -411,6 +418,10 @@ pub rec Context {
     collided_cap: usize;
     collided_len: usize;
     store:        store.Store;
+    backlog:      *input.Event;
+    backlog_cap:  usize;
+    backlog_len:  usize;
+    lag:          u8;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -533,18 +544,29 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.collided     = nil;
     ctx.collided_cap = 0;
     ctx.collided_len = 0;
+    ctx.backlog      = nil;
+    ctx.backlog_cap  = 0;
+    ctx.backlog_len  = 0;
+    ctx.lag          = 0;
     store.init(?ctx.store, a);
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, state and id bookkeeping
+# composition, held-back button events, state and id bookkeeping
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    if (ctx.backlog != nil) {
+        val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
+        if (sel eh.err) { ret eh; }
+        ctx.backlog     = nil;
+        ctx.backlog_cap = 0;
+        ctx.backlog_len = 0;
+    }
     if (ctx.pre != nil) {
         val ep: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.pre, ctx.pre_cap);
         if (sel ep.err) { ret ep; }
@@ -606,8 +628,17 @@ pub fun free(ctx: *Context) err[allo.Error] {
 }
 
 # start a frame: store input (carrying the previous buttons into prev_down),
-# take dt from the host's clock, resolve the hovered claimant, clear the draw
-# list, and reset the id scopes, collisions, layout and layers
+# apply its button events, take dt from the host's clock, resolve the hovered
+# claimant, clear the draw list, and reset the id scopes, collisions, layout
+# and layers
+#
+# button events queue behind any held back from earlier frames and apply in
+# order until one would change a button already changed this frame. the rest
+# wait for the frames after, which next_frame asks for, so a press and release
+# between two frames are a press in one frame and a release in the next. a
+# frame that applies one takes the cursor where the last applied happened. a
+# button no event is waiting on takes the input's down, so a host that only
+# samples the buttons is read as it always was.
 #
 # hover is the topmost of the previous frame's claims under this frame's
 # cursor, and nothing while no pointer is present. a primary press on anything
@@ -638,6 +669,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.pw  = 0.0::f32;
     ctx.hot = 0;
     ctx.oom = 0;
+    trickle(ctx, prev);
 
     ctx.lx      = 0.0::f32;
     ctx.ly      = 0.0::f32;
@@ -845,8 +877,9 @@ pub fun wake_at(ctx: *Context, t: f64) {
 
 # when the host should draw the next frame, read after end
 #
-# some(0) asks for one now: a wake time has already passed, or a widget asked
-# for the clipboard, which only the next frame can deliver. some(t) asks for
+# some(0) asks for one now: a wake time has already passed, a widget asked
+# for the clipboard, which only the next frame can deliver, or button events
+# are held back for the frames after (see begin). some(t) asks for
 # one by time t on the host's clock. none means nothing is pending, and an
 # idle host can sleep until input arrives.
 # ---
@@ -854,6 +887,7 @@ pub fun wake_at(ctx: *Context, t: f64) {
 # ret: some(0) for now, some(t) by time t, none for only on input
 pub fun next_frame(ctx: *Context) opt[f64] {
     if (ctx.paste_wanted != 0)   { ret opt[f64].some{0.0::f64}; }
+    if (ctx.lag != 0)            { ret opt[f64].some{0.0::f64}; }
     if (ctx.wake_on == 0)        { ret opt[f64].none{}; }
     if (ctx.wake <= ctx.in.time) { ret opt[f64].some{0.0::f64}; }
     ret opt[f64].some{ctx.wake};
@@ -957,6 +991,71 @@ pub fun last_press(ctx: *Context, button: u8) Press {
     }
     var none: Press;
     ret none;
+}
+
+# queue the frame's button events behind those held back, apply them in order
+# until a button would change twice, and hold the rest for the frames after
+#
+# ctx.in is this frame's input, and prev the buttons held last frame.
+fun trickle(ctx: *Context, prev: u8) {
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        i = i + 1;
+        if (!sel e.down && !sel e.up) { cnt; }
+        ctx.backlog = room[input.Event](ctx, ctx.backlog, ?ctx.backlog_cap, ctx.backlog_len + 1, BUTTON_DEPTH);
+        if (ctx.backlog_len >= ctx.backlog_cap) { cnt; }
+        ctx.backlog[ctx.backlog_len] = e;
+        ctx.backlog_len              = ctx.backlog_len + 1;
+    }
+
+    var down:    u8    = prev;
+    var changed: u8    = 0;
+    var moved:   u8    = 0;
+    var x:       f32   = ctx.in.mx;
+    var y:       f32   = ctx.in.my;
+    var n:       usize = 0;
+    for (n < ctx.backlog_len) {
+        val e:  input.Event  = ctx.backlog[n];
+        var b:  input.Button = input.Button{button: 0, x: 0.0::f32, y: 0.0::f32};
+        var on: u8           = 0;
+        if (sel e.down) {
+            b  = e.down;
+            on = b.button;
+        }
+        if (sel e.up) { b = e.up; }
+        if ((down & b.button) == on) {
+            n = n + 1;
+            cnt;
+        }
+        if ((changed & b.button) != 0) { brk; }
+        down    = (down & (b.button ^ 0xFF)) | on;
+        changed = changed | b.button;
+        moved   = 1;
+        x       = b.x;
+        y       = b.y;
+        n       = n + 1;
+    }
+
+    var waiting: u8    = 0;
+    var k:       usize = 0;
+    for (n + k < ctx.backlog_len) {
+        val e: input.Event = ctx.backlog[n + k];
+        if (sel e.down) { waiting = waiting | e.down.button; }
+        if (sel e.up)   { waiting = waiting | e.up.button; }
+        ctx.backlog[k] = e;
+        k              = k + 1;
+    }
+    ctx.backlog_len = k;
+
+    ctx.in.down = (down & waiting) | (ctx.in.down & (waiting ^ 0xFF));
+    ctx.lag     = 0;
+    if (k != 0) { ctx.lag = 1; }
+    if (moved != 0) {
+        if (x != ctx.in.mx || y != ctx.in.my) { ctx.lag = 1; }
+        ctx.in.mx = x;
+        ctx.in.my = y;
+    }
 }
 
 # take the frame's last composition event as the composition in progress,
