@@ -1,0 +1,75 @@
+# animation: values that ease toward a target on the host's clock
+#
+# motion is state: blit.anim keeps each animated value in the store under an
+# id, so a widget asks every frame for its value with the target it wants
+# and the value eases there from wherever it stands. the built-in widgets
+# ease their faces, slide their knobs, unfold their sections and glide their
+# scroll regions by the theme's motion fields. a value asks for frames only
+# while it moves, so a settled interface sleeps.
+
+use std.types.bool.false;
+
+use blit;
+
+# what the section animates
+# ---
+# drawer: the drawer is open
+# open:   the section below is open
+# still:  motion is reduced, so everything jumps to its end
+pub rec State {
+    drawer: u8;
+    open:   u8;
+    still:  u8;
+}
+
+pub fun init(s: *State) {
+    s.open = 1;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State            = user::*State;
+    val t: *blit.theme.Theme = blit.context.theme_of(ctx);
+
+    # a host passes on its platform's reduced motion setting
+    if (blit.widget.toggle(ctx, "Reduce motion", ?s.still)) { blit.context.set_reduce_motion(ctx, s.still); }
+
+    # a value with a target: the drawer's width eases open and shut
+    blit.controls.separator_label(ctx, "A value toward a target");
+    blit.widget.toggle(ctx, "Drawer open", ?s.drawer);
+    val id:     u64 = blit.context.id_of(ctx, "drawer");
+    var target: f32 = 0.0::f32;
+    if (s.drawer != 0) { target = 1.0::f32; }
+    val k: f32               = blit.anim.value(ctx, id, target, blit.theme.MOTION_OPEN);
+    val h: f32               = blit.context.px(ctx, 28.0::f32);
+    val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    blit.context.quad(ctx, r.x0, r.y0, r.x1, r.y1, t.track);
+    blit.context.quad(ctx, r.x0, r.y0, blit.anim.lerp(r.x0, r.x1, k), r.y1, t.accent);
+
+    # a fade: 0 to 1 while hovered, back to 0 after, mixing two colours
+    blit.controls.separator_label(ctx, "A hover fade");
+    val b:   blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h * 2.0::f32), 0.0::f32, h * 2.0::f32);
+    val bid: u64               = blit.context.id_of(ctx, "glow");
+    val hit: blit.interact.Hit = blit.interact.hit(ctx, bid, b.x0, b.y0, b.x1, b.y1, 0);
+    val f:   f32               = blit.anim.fade(ctx, blit.id.child(bid, "#hot"), hit.hot, blit.theme.MOTION_HOVER);
+    blit.context.rounded_rect(ctx, b.x0, b.y0, b.x1, b.y1, blit.draw.radii(blit.context.px(ctx, 8.0::f32)), blit.anim.mix(t.control, t.accent, f));
+    blit.context.text_at(ctx, "hover me", b.x0 + blit.context.px(ctx, 8.0::f32), b.y0 + blit.context.px(ctx, 8.0::f32), t.text);
+
+    # a kind's box eases between the paints of the states it passes through
+    blit.controls.separator_label(ctx, "A box easing between states");
+    val c:   blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    val cid: u64               = blit.context.id_of(ctx, "eased");
+    val ch:  blit.interact.Hit = blit.interact.hit(ctx, cid, c.x0, c.y0, c.x1, c.y1, blit.input.BUTTON_LEFT);
+    val p:   blit.theme.Paint  = blit.anim.box(ctx, cid, blit.theme.BUTTON, blit.theme.pick(ch.hot, ch.active, false, false), c.x0, c.y0, c.x1, c.y1);
+    blit.context.text_at(ctx, "press and hold", c.x0 + blit.context.px(ctx, 8.0::f32), c.y0 + (h - blit.context.line_height(ctx)) / 2.0::f32, p.text);
+
+    # a section unfolds and folds, and the layout below follows it
+    blit.controls.separator_label(ctx, "Folding");
+    val sec: blit.widget.Section = blit.widget.begin_section(ctx, "Unfolds", ?s.open);
+    if (sec.body) {
+        blit.widget.text(ctx, "one");
+        blit.widget.text(ctx, "two");
+        blit.widget.text(ctx, "three");
+    }
+    blit.widget.end_section(ctx, sec);
+    blit.widget.text(ctx, "below the section");
+}

@@ -1,0 +1,67 @@
+# controls: radio buttons, progress bars, separators and a combo box
+#
+# the small controls a tool expects, each placed across the column like the
+# widgets, from blit.controls.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# what the controls edit
+# ---
+# quality: the radio group's choice
+# shape:   the stacked radios' choice
+# done:    the progress bar's fraction
+# font:    the combo box's choice
+pub rec State {
+    quality: usize;
+    shape:   usize;
+    done:    f32;
+    font:    usize;
+}
+
+pub fun init(s: *State) {
+    s.quality = 1;
+    s.done    = 0.4::f32;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    # radios sharing one choice make a group
+    blit.controls.separator_label(ctx, "Radio buttons");
+    blit.controls.radio(ctx, "Low", ?s.quality, 0);
+    blit.controls.radio(ctx, "Medium", ?s.quality, 1);
+    blit.controls.radio(ctx, "High", ?s.quality, 2);
+    var shapes: [3]str;
+    shapes[0] = "Square";
+    shapes[1] = "Circle";
+    shapes[2] = "Hexagon";
+    blit.controls.radios(ctx, ?shapes[0], 3, ?s.shape);
+
+    blit.controls.separator_label(ctx, "Progress");
+    blit.widget.slider_f(ctx, "Done", ?s.done, 0.0::f32, 1.0::f32);
+    blit.controls.progress(ctx, s.done, "copying");
+    blit.controls.progress(ctx, s.done, nil);
+    # work of unknown length sweeps, asking for frames only while drawn
+    blit.controls.progress_busy(ctx, "indexing");
+
+    blit.controls.separator_label(ctx, "Separators");
+    blit.widget.text(ctx, "above the rule");
+    blit.controls.separator(ctx);
+    blit.widget.text(ctx, "below the rule");
+
+    # a select whose popup filters its options as you type
+    blit.controls.separator_label(ctx, "Combo");
+    var fonts: [8]str;
+    fonts[0] = "DejaVu Sans";
+    fonts[1] = "DejaVu Sans Mono";
+    fonts[2] = "DejaVu Serif";
+    fonts[3] = "Fira Code";
+    fonts[4] = "Inter";
+    fonts[5] = "JetBrains Mono";
+    fonts[6] = "Noto Sans";
+    fonts[7] = "Source Code Pro";
+    blit.controls.combo(ctx, "Font", ?s.font, ?fonts[0], 8);
+}

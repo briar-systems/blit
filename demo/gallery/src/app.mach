@@ -1,0 +1,397 @@
+# the blit gallery: one window showing every widget, layout and style
+# feature blit has, each section beside the code that builds it
+#
+# the screen is a dock space, the desk, and the gallery is a window docked
+# in it: a list of sections on the left, the chosen section's widgets in the
+# middle and its source on the right, in a read-only text area. each section
+# is a file of its own under src/sections, and the code shown is that file,
+# embedded, so what you read is what runs. a section that puts things
+# outside the gallery (windows, overlays, toasts) does it in a root hook
+# drawn every frame, so they stay up while another section is shown.
+#
+# a host with a window and a renderer makes a Gallery once and runs ui every
+# frame between blit.context.begin and end. script drives it headless
+# through blit.driver instead, visiting every section (see bin/main.mach).
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+use gallery.sections.charts;
+use gallery.sections.controls;
+use gallery.sections.disabled;
+use gallery.sections.dnd;
+use gallery.sections.docking;
+use gallery.sections.icons;
+use gallery.sections.ids;
+use gallery.sections.inspector;
+use gallery.sections.keyboard;
+use gallery.sections.layout;
+use gallery.sections.lists;
+use gallery.sections.menus;
+use gallery.sections.modals;
+use gallery.sections.motion;
+use gallery.sections.overlays;
+use gallery.sections.shapes;
+use gallery.sections.style;
+use gallery.sections.tables;
+use gallery.sections.tabs;
+use gallery.sections.text;
+use gallery.sections.toasts;
+use gallery.sections.tooltips;
+use gallery.sections.trees;
+use gallery.sections.values;
+use gallery.sections.widgets;
+use gallery.sections.windows;
+
+# the code of each section, shown beside it
+#[embed("sections/widgets.mach")]
+val CODE_WIDGETS:   [_]u8;
+#[embed("sections/layout.mach")]
+val CODE_LAYOUT:    [_]u8;
+#[embed("sections/ids.mach")]
+val CODE_IDS:       [_]u8;
+#[embed("sections/controls.mach")]
+val CODE_CONTROLS:  [_]u8;
+#[embed("sections/values.mach")]
+val CODE_VALUES:    [_]u8;
+#[embed("sections/text.mach")]
+val CODE_TEXT:      [_]u8;
+#[embed("sections/lists.mach")]
+val CODE_LISTS:     [_]u8;
+#[embed("sections/trees.mach")]
+val CODE_TREES:     [_]u8;
+#[embed("sections/tables.mach")]
+val CODE_TABLES:    [_]u8;
+#[embed("sections/tabs.mach")]
+val CODE_TABS:      [_]u8;
+#[embed("sections/menus.mach")]
+val CODE_MENUS:     [_]u8;
+#[embed("sections/windows.mach")]
+val CODE_WINDOWS:   [_]u8;
+#[embed("sections/docking.mach")]
+val CODE_DOCKING:   [_]u8;
+#[embed("sections/modals.mach")]
+val CODE_MODALS:    [_]u8;
+#[embed("sections/overlays.mach")]
+val CODE_OVERLAYS:  [_]u8;
+#[embed("sections/toasts.mach")]
+val CODE_TOASTS:    [_]u8;
+#[embed("sections/tooltips.mach")]
+val CODE_TOOLTIPS:  [_]u8;
+#[embed("sections/dnd.mach")]
+val CODE_DND:       [_]u8;
+#[embed("sections/charts.mach")]
+val CODE_CHARTS:    [_]u8;
+#[embed("sections/icons.mach")]
+val CODE_ICONS:     [_]u8;
+#[embed("sections/shapes.mach")]
+val CODE_SHAPES:    [_]u8;
+#[embed("sections/style.mach")]
+val CODE_STYLE:     [_]u8;
+#[embed("sections/motion.mach")]
+val CODE_MOTION:    [_]u8;
+#[embed("sections/keyboard.mach")]
+val CODE_KEYBOARD:  [_]u8;
+#[embed("sections/disabled.mach")]
+val CODE_DISABLED:  [_]u8;
+#[embed("sections/inspector.mach")]
+val CODE_INSPECTOR: [_]u8;
+
+# how many sections there are
+pub val COUNT: usize = 26;
+
+# the gallery window's title and key
+val TITLE: str = "blit gallery";
+
+# bytes the code view holds, more than the longest section's file
+val CODE_CAP: usize = 32768;
+
+# one section of the gallery
+# ---
+# name: what the list of sections calls it
+# show: draws its widgets in the gallery's middle column
+# root: draws what it keeps outside the gallery, every frame, nil for none
+# user: its state, handed to show and root
+# code: its source
+# len:  bytes of source
+rec Section {
+    name: str;
+    show: fun(*blit.context.Context, ptr);
+    root: fun(*blit.context.Context, ptr);
+    user: ptr;
+    code: *u8;
+    len:  usize;
+}
+
+# every section's state
+rec States {
+    widgets:   widgets.State;
+    layout:    layout.State;
+    ids:       ids.State;
+    controls:  controls.State;
+    values:    values.State;
+    text:      text.State;
+    lists:     lists.State;
+    trees:     trees.State;
+    tables:    tables.State;
+    tabs:      tabs.State;
+    menus:     menus.State;
+    windows:   windows.State;
+    docking:   docking.State;
+    modals:    modals.State;
+    overlays:  overlays.State;
+    toasts:    toasts.State;
+    tooltips:  tooltips.State;
+    dnd:       dnd.State;
+    charts:    charts.State;
+    icons:     icons.State;
+    shapes:    shapes.State;
+    style:     style.State;
+    motion:    motion.State;
+    keyboard:  keyboard.State;
+    disabled:  disabled.State;
+    inspector: inspector.State;
+}
+
+# the gallery, kept across frames
+# ---
+# secs:  the sections, in the order the list shows them
+# names: their names, for the list
+# nav:   the list of sections, its selection the section shown
+# shown: the section whose code the code view holds, COUNT for none yet
+# code:  the code view's text
+# buf:   the bytes the code view's text lives in
+# view:  the code view's wrapped rows and scroll
+# body:  the middle column's scroll state
+# insp:  the interface inspector
+# st:    every section's state
+pub rec Gallery {
+    secs:  [26]Section;
+    names: [26]str;
+    nav:   blit.list.List;
+    shown: usize;
+    code:  blit.field.Field;
+    buf:   *u8;
+    view:  blit.textarea.TextArea;
+    body:  blit.widget.Scroll;
+    insp:  blit.inspect.Inspector;
+    st:    States;
+}
+
+# a section of the table
+fun sec(name: str, show: fun(*blit.context.Context, ptr), root: fun(*blit.context.Context, ptr), user: ptr, code: *u8, len: usize) Section {
+    ret Section{name: name, show: show, root: root, user: user, code: code, len: len};
+}
+
+# set the gallery up: every section's state and the table that lists them
+pub fun make(g: *Gallery, a: *allo.Allocator) bool {
+    val r: res[*u8, allo.Error] = allo.allocate[u8](a, CODE_CAP);
+    if (sel r.err) { ret false; }
+    g.buf = r.ok;
+    blit.field.init(?g.code, g.buf, CODE_CAP, 0, nil);
+    g.code.flags = blit.field.READ_ONLY | blit.field.LINES;
+    blit.textarea.init(?g.view, a);
+    blit.inspect.init(?g.insp, a);
+    g.shown = COUNT;
+
+    val s: *States = ?g.st;
+    widgets.init(?s.widgets);
+    layout.init(?s.layout);
+    ids.init(?s.ids, a);
+    controls.init(?s.controls);
+    values.init(?s.values);
+    text.init(?s.text, a);
+    lists.init(?s.lists);
+    trees.init(?s.trees);
+    tables.init(?s.tables);
+    tabs.init(?s.tabs);
+    menus.init(?s.menus);
+    windows.init(?s.windows);
+    docking.init(?s.docking);
+    modals.init(?s.modals);
+    overlays.init(?s.overlays);
+    toasts.init(?s.toasts, a);
+    tooltips.init(?s.tooltips);
+    dnd.init(?s.dnd);
+    charts.init(?s.charts);
+    icons.init(?s.icons);
+    shapes.init(?s.shapes, a);
+    style.init(?s.style);
+    motion.init(?s.motion);
+    keyboard.init(?s.keyboard);
+    disabled.init(?s.disabled);
+    inspector.init(?s.inspector, ?g.insp);
+
+    g.secs[0]  = sec("Widgets", widgets.show, nil, (?s.widgets)::ptr, ?CODE_WIDGETS[0], $length_of(CODE_WIDGETS));
+    g.secs[1]  = sec("Layout", layout.show, nil, (?s.layout)::ptr, ?CODE_LAYOUT[0], $length_of(CODE_LAYOUT));
+    g.secs[2]  = sec("Ids and state", ids.show, nil, (?s.ids)::ptr, ?CODE_IDS[0], $length_of(CODE_IDS));
+    g.secs[3]  = sec("Controls", controls.show, nil, (?s.controls)::ptr, ?CODE_CONTROLS[0], $length_of(CODE_CONTROLS));
+    g.secs[4]  = sec("Values and colour", values.show, nil, (?s.values)::ptr, ?CODE_VALUES[0], $length_of(CODE_VALUES));
+    g.secs[5]  = sec("Text", text.show, nil, (?s.text)::ptr, ?CODE_TEXT[0], $length_of(CODE_TEXT));
+    g.secs[6]  = sec("Lists", lists.show, nil, (?s.lists)::ptr, ?CODE_LISTS[0], $length_of(CODE_LISTS));
+    g.secs[7]  = sec("Trees", trees.show, nil, (?s.trees)::ptr, ?CODE_TREES[0], $length_of(CODE_TREES));
+    g.secs[8]  = sec("Tables", tables.show, nil, (?s.tables)::ptr, ?CODE_TABLES[0], $length_of(CODE_TABLES));
+    g.secs[9]  = sec("Tabs", tabs.show, nil, (?s.tabs)::ptr, ?CODE_TABS[0], $length_of(CODE_TABS));
+    g.secs[10] = sec("Menus", menus.show, nil, (?s.menus)::ptr, ?CODE_MENUS[0], $length_of(CODE_MENUS));
+    g.secs[11] = sec("Windows", windows.show, windows.root, (?s.windows)::ptr, ?CODE_WINDOWS[0], $length_of(CODE_WINDOWS));
+    g.secs[12] = sec("Docking", docking.show, docking.root, (?s.docking)::ptr, ?CODE_DOCKING[0], $length_of(CODE_DOCKING));
+    g.secs[13] = sec("Modals", modals.show, nil, (?s.modals)::ptr, ?CODE_MODALS[0], $length_of(CODE_MODALS));
+    g.secs[14] = sec("Overlays", overlays.show, overlays.root, (?s.overlays)::ptr, ?CODE_OVERLAYS[0], $length_of(CODE_OVERLAYS));
+    g.secs[15] = sec("Toasts", toasts.show, toasts.root, (?s.toasts)::ptr, ?CODE_TOASTS[0], $length_of(CODE_TOASTS));
+    g.secs[16] = sec("Tooltips", tooltips.show, nil, (?s.tooltips)::ptr, ?CODE_TOOLTIPS[0], $length_of(CODE_TOOLTIPS));
+    g.secs[17] = sec("Drag and drop", dnd.show, nil, (?s.dnd)::ptr, ?CODE_DND[0], $length_of(CODE_DND));
+    g.secs[18] = sec("Charts", charts.show, nil, (?s.charts)::ptr, ?CODE_CHARTS[0], $length_of(CODE_CHARTS));
+    g.secs[19] = sec("Icons", icons.show, nil, (?s.icons)::ptr, ?CODE_ICONS[0], $length_of(CODE_ICONS));
+    g.secs[20] = sec("Shapes and paths", shapes.show, nil, (?s.shapes)::ptr, ?CODE_SHAPES[0], $length_of(CODE_SHAPES));
+    g.secs[21] = sec("Style and themes", style.show, nil, (?s.style)::ptr, ?CODE_STYLE[0], $length_of(CODE_STYLE));
+    g.secs[22] = sec("Animation", motion.show, nil, (?s.motion)::ptr, ?CODE_MOTION[0], $length_of(CODE_MOTION));
+    g.secs[23] = sec("Keyboard", keyboard.show, nil, (?s.keyboard)::ptr, ?CODE_KEYBOARD[0], $length_of(CODE_KEYBOARD));
+    g.secs[24] = sec("Disabled", disabled.show, nil, (?s.disabled)::ptr, ?CODE_DISABLED[0], $length_of(CODE_DISABLED));
+    g.secs[25] = sec("Inspector", inspector.show, nil, (?s.inspector)::ptr, ?CODE_INSPECTOR[0], $length_of(CODE_INSPECTOR));
+
+    var k: usize = 0;
+    for (k < COUNT) {
+        g.names[k] = g.secs[k].name;
+        k          = k + 1;
+    }
+    g.nav.selected = 0;
+    ret true;
+}
+
+# release what the gallery allocated
+pub fun unmake(g: *Gallery, a: *allo.Allocator) bool {
+    var ok: bool            = true;
+    val f1: err[allo.Error] = allo.deallocate[u8](a, g.buf, CODE_CAP);
+    if (sel f1.err) { ok = false; }
+    val f2: err[allo.Error] = blit.textarea.free(?g.view);
+    if (sel f2.err) { ok = false; }
+    val f3: err[allo.Error] = blit.inspect.free(?g.insp);
+    if (sel f3.err)                 { ok = false; }
+    if (!text.free(?g.st.text))     { ok = false; }
+    if (!ids.free(?g.st.ids))       { ok = false; }
+    if (!toasts.free(?g.st.toasts)) { ok = false; }
+    if (!shapes.free(?g.st.shapes)) { ok = false; }
+    ret ok;
+}
+
+# put a section's source in the code view
+fun load_code(g: *Gallery, k: usize) {
+    val s: *Section = ?g.secs[k];
+    var n: usize    = s.len;
+    if (n > CODE_CAP - 1) { n = CODE_CAP - 1; }
+    var i: usize = 0;
+    for (i < n) {
+        g.buf[i] = s.code[i];
+        i        = i + 1;
+    }
+    g.buf[n] = 0;
+
+    # the field is read-only, so the text goes in under it, as set would
+    # type it, and its revision moves so the view lays it out again
+    var chars: usize = 0;
+    i = 0;
+    for (i < n) {
+        if ((g.buf[i] & 0xC0u8) != 0x80u8) { chars = chars + 1; }
+        i = i + 1;
+    }
+    g.code.len           = n;
+    g.code.chars         = chars;
+    g.code.caret         = 0;
+    g.code.anchor        = 0;
+    g.code.first         = 0;
+    g.code.rev           = g.code.rev + 1;
+    g.view.scroll.offset = 0.0::f32;
+    g.shown              = k;
+}
+
+# the gallery's body: sections, the chosen one's widgets and its code
+fun body(ctx: *blit.context.Context, g: *Gallery, h: f32) {
+    val r:   blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    val gap: f32               = blit.widget.row_gap(ctx);
+    val nav: f32               = blit.context.px(ctx, 170.0::f32);
+    val mid: f32               = (r.x1 - r.x0 - nav - gap * 2.0::f32) * 0.5::f32;
+    val x1:  f32               = r.x0 + nav;
+    val x2:  f32               = x1 + gap;
+    val x3:  f32               = x2 + mid;
+    val x4:  f32               = x3 + gap;
+
+    blit.context.push_layout(ctx, blit.layout.column(r.x0, r.y0, nav, h, gap));
+    blit.list.show(ctx, "sections", ?g.nav, blit.list.rows(?g.names[0], COUNT), h);
+    blit.context.pop_layout(ctx);
+    if (g.nav.selected >= COUNT) { g.nav.selected = 0; }
+    val k: usize = g.nav.selected;
+
+    blit.context.push_layout(ctx, blit.layout.column(x2, r.y0, mid, h, gap));
+    blit.context.push_id_str(ctx, g.secs[k].name);
+    val sc: blit.widget.ScrollArea = blit.widget.begin_scroll(ctx, "demo", ?g.body, h);
+    g.secs[k].show(ctx, g.secs[k].user);
+    blit.widget.end_scroll(ctx, ?g.body, sc);
+    blit.context.pop_id(ctx);
+    blit.context.pop_layout(ctx);
+
+    if (g.shown != k) { load_code(g, k); }
+    blit.context.push_layout(ctx, blit.layout.column(x4, r.y0, r.x1 - x4, h, gap));
+    blit.textarea.text_area(ctx, "code", ?g.code, ?g.view, h);
+    blit.context.pop_layout(ctx);
+}
+
+# one frame of the gallery
+pub fun ui(ctx: *blit.context.Context, user: ptr) {
+    val g: *Gallery = user::*Gallery;
+
+    # the desk: a dock space over the screen, holding the gallery until a
+    # section docks more beside it
+    val desk: u64 = blit.context.id_of(ctx, "desk");
+    if (blit.dock.empty(ctx, desk)) { blit.dock.add(ctx, blit.dock.root(ctx, desk), blit.context.id_of(ctx, TITLE)); }
+    blit.dock.space(ctx, "desk", blit.context.free_area(ctx));
+
+    val wa: blit.widget.WindowArea = blit.widget.begin_window(ctx, blit.widget.window(TITLE, 0.0::f32, 0.0::f32, ctx.sw, ctx.sh));
+    if (wa.body != 0) { body(ctx, g, wa.scroll.h); }
+    blit.widget.end_window(ctx, wa);
+
+    var k: usize = 0;
+    for (k < COUNT) {
+        if (g.secs[k].root != nil) { g.secs[k].root(ctx, g.secs[k].user); }
+        k = k + 1;
+    }
+
+    # last, so it reads the whole frame
+    blit.inspect.show(ctx, ?g.insp);
+}
+
+# the id of the row the list of sections shows section k on
+pub fun nav_row(d: *blit.driver.Driver, k: usize) u64 {
+    ret blit.id.child_int(blit.driver.find(d, "blit gallery/sections"), k::u64);
+}
+
+# visit every section, settling each, then come back to the first: true
+# when every section was drawn whole with no id drawn twice
+pub fun script(d: *blit.driver.Driver, g: *Gallery) bool {
+    blit.driver.step(d);
+    blit.driver.settle(d);
+    var k: usize = 0;
+    for (k < COUNT) {
+        val row: u64 = nav_row(d, k);
+        if (!blit.driver.click(d, row)) { ret false; }
+        blit.driver.settle(d);
+        blit.driver.step(d);
+        if (g.nav.selected != k)                  { ret false; }
+        if (blit.context.ok(?d.ctx) == 0)         { ret false; }
+        if (blit.context.collisions(?d.ctx) != 0) { ret false; }
+        k = k + 1;
+    }
+    if (!blit.driver.click(d, nav_row(d, 0))) { ret false; }
+    blit.driver.settle(d);
+    blit.driver.leave(d);
+    blit.driver.step(d);
+    ret g.nav.selected == 0;
+}

@@ -1,0 +1,32 @@
+# tooltips: an overlay over a widget once the pointer rests on it
+#
+# a tooltip is named by the widget's id after the widget is drawn. it shows
+# after a delay, asking for that frame through wake_at, follows the pointer
+# or sits under the widget, claims nothing and stays on the surface.
+
+use blit;
+
+pub rec State {
+    x: u8;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    blit.widget.button(ctx, "Save");
+    blit.tooltip.text(ctx, blit.context.id_of(ctx, "Save"), "write the file to disk");
+
+    # any widgets, below the widget rather than at the pointer, sooner
+    blit.widget.button(ctx, "Details");
+    var t: blit.tooltip.Tip = blit.tooltip.tip();
+    t.follow = 0;
+    t.delay  = 0.2::f64;
+    val tip: blit.tooltip.Shown = blit.tooltip.begin(ctx, blit.context.id_of(ctx, "Details"), t);
+    if (tip.open != 0) {
+        blit.widget.text(ctx, "notes.txt");
+        blit.controls.separator(ctx);
+        blit.widget.text(ctx, "2.4 KiB, saved a minute ago");
+        blit.controls.progress(ctx, 0.3::f32, "30% synced");
+    }
+    blit.tooltip.end(ctx, tip);
+}

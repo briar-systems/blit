@@ -1,0 +1,63 @@
+# value editors and the colour picker
+#
+# blit.value edits numbers of any integer or float type without loss: drag
+# across a cell, shift to go fine, double click or enter to type a value.
+# blit.color.picker edits a colour in hue, saturation and value.
+
+use blit;
+
+# what the editors edit
+# ---
+# count:  a whole number dragged
+# ratio:  a float dragged in bounds
+# pos:    three floats in one row
+# lo:     the low end of a range
+# hi:     the high end of a range
+# seed:   a 64-bit number typed exactly
+# step:   a number with steppers
+# accent: a colour in a square and a bar
+# tint:   a colour in a ring, with alpha
+pub rec State {
+    count:  i32;
+    ratio:  f32;
+    pos:    [3]f32;
+    lo:     f64;
+    hi:     f64;
+    seed:   u64;
+    step:   i64;
+    accent: blit.draw.Color;
+    tint:   blit.draw.Color;
+}
+
+pub fun init(s: *State) {
+    s.count  = 12;
+    s.ratio  = 0.25::f32;
+    s.pos[0] = 1.0::f32;
+    s.pos[1] = 2.5::f32;
+    s.pos[2] = -4.0::f32;
+    s.lo     = 20.0::f64;
+    s.hi     = 80.0::f64;
+    s.seed   = 18446744073709551557;
+    s.step   = 3;
+    s.accent = blit.draw.hex(0x5B9DFF, 1.0::f32);
+    s.tint   = blit.draw.hex(0xF0A040, 0.6::f32);
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    blit.controls.separator_label(ctx, "Drag");
+    blit.value.drag[i32](ctx, "Count", ?s.count, 0.25::f64, 0, 100);
+    blit.value.drag[f32](ctx, "Ratio", ?s.ratio, 0.01::f64, 0.0::f32, 1.0::f32);
+    blit.value.drag_n[f32](ctx, "Position", ?s.pos[0], 3, 0.1::f64, 0.0::f32, 0.0::f32);
+    blit.value.drag_range[f64](ctx, "Range", ?s.lo, ?s.hi, 0.5::f64, 0.0::f64, 100.0::f64);
+
+    # equal bounds leave a value to its type's range, every digit exact
+    blit.controls.separator_label(ctx, "Typed");
+    blit.value.number[u64](ctx, "Seed", ?s.seed, 1, 0, 0);
+    blit.value.number[i64](ctx, "Step", ?s.step, 1, -10, 10);
+
+    blit.controls.separator_label(ctx, "Colour");
+    blit.color.picker(ctx, "Accent", ?s.accent, 0);
+    blit.color.picker(ctx, "Tint", ?s.tint, blit.color.RING | blit.color.ALPHA);
+}

@@ -1,0 +1,68 @@
+# overlays: widgets floating above the interface without being windows
+#
+# an overlay is placed by an anchor, not by the layout, sizes to its content
+# and draws no chrome unless its style gives it some. it claims nothing
+# itself, so the world under its empty space stays interactive. fade runs its
+# opacity by the pointer's distance. the HUD here is drawn by the section's
+# root hook every frame.
+
+use std.types.bool.false;
+
+use blit;
+
+# the HUD and the note
+# ---
+# hud:    the corner readout is shown
+# note:   the note under the button is shown
+# frames: frames drawn while the HUD showed
+pub rec State {
+    hud:    u8;
+    note:   u8;
+    frames: u64;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    blit.widget.toggle(ctx, "A HUD in the top right corner", ?s.hud);
+    blit.widget.toggle(ctx, "A note under the button", ?s.note);
+    # a button placed by hand, so its rect is known in local pixels
+    val h: f32               = blit.widget.control_height(ctx);
+    val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fixed(blit.context.px(ctx, 120.0::f32)), blit.layout.fixed(h), 0.0::f32, h);
+    blit.widget.button_at(ctx, "Anchor", r.x0, r.y0, r.x1, r.y1, false);
+
+    # an overlay on a rect: below it, flipped above when it would run off
+    # the surface
+    if (s.note != 0) {
+        var o: blit.overlay.Overlay = blit.overlay.on_rect(r, blit.overlay.BOTTOM_LEFT, blit.overlay.TOP_LEFT);
+        o.keep = 1;
+        o.kind = blit.overlay.KIND_TOOLTIP;
+        val sh: blit.overlay.Shown = blit.overlay.begin(ctx, "note", o);
+        blit.widget.text(ctx, "placed under the button");
+        blit.overlay.end(ctx, sh);
+    }
+}
+
+pub fun root(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    if (s.hud == 0) { ret; }
+    s.frames = s.frames + 1;
+
+    # fades to a fifth of its opacity as the pointer comes near
+    var hud: blit.overlay.Overlay = blit.overlay.on_surface(blit.overlay.TOP_RIGHT);
+    hud.dx   = -16.0::f32;
+    hud.dy   = 40.0::f32;
+    hud.fade = blit.overlay.Fade{dist: 120.0::f32, near: 0.2::f32, far: 1.0::f32};
+    val sh:  blit.overlay.Shown = blit.overlay.begin(ctx, "hud", hud);
+    var buf: [48]u8;
+    blit.widget.text(ctx, "frames");
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](s.frames), ?buf[0]));
+    blit.widget.text(ctx, "cursor");
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](ctx.in.mx::u64), ?buf[0]));
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](ctx.in.my::u64), ?buf[0]));
+    blit.overlay.end(ctx, sh);
+}

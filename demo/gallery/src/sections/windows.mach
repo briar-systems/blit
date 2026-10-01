@@ -1,0 +1,84 @@
+# windows: floating windows that move, resize, collapse, close and stack
+#
+# a window is its title's id. where it is, its size, its stack order and its
+# flags live in the context's store, so the call only declares where it
+# first opens and its bounds. a press anywhere on a window brings it to the
+# front. the windows here are drawn by the section's root hook, every frame,
+# so they stay up while another section is shown.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# which windows are open, and how
+# ---
+# sample: the plain window is open
+# fitted: the auto-sized window is open
+# pin:    the plain window stays above every unpinned window
+# lock:   the plain window neither moves nor resizes
+# hits:   clicks on the plain window's button
+# was:    whether each window was open last frame
+pub rec State {
+    sample: u8;
+    fitted: u8;
+    pin:    u8;
+    lock:   u8;
+    hits:   u64;
+    was:    [2]u8;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    blit.widget.note(ctx, "Windows float above the gallery. Drag a titlebar to move one, the edges to resize it, the box on the left to collapse it.");
+    blit.widget.toggle(ctx, "A window", ?s.sample);
+    blit.widget.toggle(ctx, "Pinned in front", ?s.pin);
+    blit.widget.toggle(ctx, "Locked in place", ?s.lock);
+    blit.widget.toggle(ctx, "A window fitted to its widgets", ?s.fitted);
+}
+
+# open or close a window by its state: a window that was open and is now
+# closed was closed by its close button
+fun sync(ctx: *blit.context.Context, key: str, open: *u8, was: *u8) {
+    val st: *blit.widget.WindowState = blit.widget.window_state(ctx, key);
+    if (@was != 0 && st.closed != 0) { @open = 0; }
+    st.closed = 1 - @open;
+    @was      = @open;
+}
+
+pub fun root(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    sync(ctx, "Sample window", ?s.sample, ?s.was[0]);
+    val st: *blit.widget.WindowState = blit.widget.window_state(ctx, "Sample window");
+    st.pinned = s.pin;
+    st.locked = s.lock;
+    var w: blit.widget.Window = blit.widget.window("Sample window", 420.0::f32, 160.0::f32, 260.0::f32, 200.0::f32);
+    w.min_w = 180.0::f32;
+    w.max_w = 480.0::f32;
+    val a: blit.widget.WindowArea = blit.widget.begin_window(ctx, w);
+    if (a.body != 0) {
+        blit.widget.text(ctx, "A window's body scrolls");
+        if (blit.widget.button(ctx, "Press")) { s.hits = s.hits + 1; }
+        var i: usize = 0;
+        for (i < 8) {
+            blit.context.push_id_int(ctx, i::u64);
+            blit.widget.button(ctx, "row");
+            blit.context.pop_id(ctx);
+            i = i + 1;
+        }
+    }
+    blit.widget.end_window(ctx, a);
+
+    sync(ctx, "Fitted window", ?s.fitted, ?s.was[1]);
+    var f: blit.widget.Window = blit.widget.window("Fitted window", 720.0::f32, 220.0::f32, 0.0::f32, 0.0::f32);
+    f.flags = blit.widget.WINDOW_AUTO_SIZE;
+    val b: blit.widget.WindowArea = blit.widget.begin_window(ctx, f);
+    if (b.body != 0) {
+        blit.widget.text(ctx, "As wide and tall as its widgets");
+        blit.widget.button(ctx, "OK");
+    }
+    blit.widget.end_window(ctx, b);
+}

@@ -1,0 +1,74 @@
+# icons: a vector icon set drawn from path data, at any size and colour
+#
+# every icon id is a codepoint in the private use area, so text holding one
+# draws the icon in place, a line tall and tinted with the text: labels and
+# buttons take icons with no change. add_icon registers icons of your own in
+# the same path form.
+
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# the built-ins' names, in id order
+val NAMES: [20]str = [20]str{
+    "play", "pause", "step", "stop", "close", "chevron right", "chevron left", "chevron down",
+    "chevron up", "plus", "minus", "search", "settings", "help", "pin", "dock centre",
+    "dock left", "dock right", "dock top", "dock bottom"
+};
+
+# a triangle pointing right in a 24 pixel box: a move, two lines and a close
+val ARROW: [10]f32 = [10]f32{0.0, 2.0, 2.0, 1.0, 22.0, 12.0, 1.0, 2.0, 22.0, 4.0};
+
+# the app's own icon
+# ---
+# arrow: its id, 0 before it is registered
+pub rec State {
+    arrow: u32;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State            = user::*State;
+    val t: *blit.theme.Theme = blit.context.theme_of(ctx);
+
+    # every built-in, drawn by id at 24 pixels with its name
+    blit.controls.separator_label(ctx, "Built-in icons");
+    val size: f32 = blit.context.px(ctx, 24.0::f32);
+    val cell: f32 = blit.context.px(ctx, 120.0::f32);
+    val row:  f32 = size + blit.context.px(ctx, 6.0::f32);
+    var i:    u32 = 0;
+    for (i < blit.icon.BUILTIN_COUNT) {
+        if (i % 2 == 1) { blit.widget.same_line(ctx); }
+        val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fixed(cell), blit.layout.fixed(row), cell, row);
+        blit.context.icon_at(ctx, i, r.x0, r.y0, size, t.text);
+        blit.context.text_at(ctx, NAMES[i], r.x0 + size + blit.context.px(ctx, 6.0::f32), r.y0 + (size - blit.context.line_height(ctx)) / 2.0::f32, t.text_dim);
+        i = i + 1;
+    }
+
+    # an icon in text is a codepoint like any other
+    blit.controls.separator_label(ctx, "In labels");
+    var media: [3]str;
+    media[0] = blit.icon.STR_PLAY;
+    media[1] = blit.icon.STR_PAUSE;
+    media[2] = blit.icon.STR_STOP;
+    blit.widget.buttons(ctx, ?media[0], 3);
+    blit.widget.button(ctx, "\xF3\xB0\x80\x8B Search");
+
+    blit.controls.separator_label(ctx, "Your own");
+    if (s.arrow == 0) {
+        val id: opt[u32] = blit.context.add_icon(ctx, blit.icon.Icon{data: ?ARROW[0], n: 10, w: 24.0::f32, h: 24.0::f32});
+        if (sel id.some) { s.arrow = id.some; }
+    }
+    if (s.arrow != 0) {
+        val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fixed(size * 4.0::f32), blit.layout.fixed(size), size * 4.0::f32, size);
+        blit.context.icon_at(ctx, s.arrow, r.x0, r.y0, size, t.accent);
+        blit.context.icon_at(ctx, s.arrow, r.x0 + size * 1.5::f32, r.y0 + size * 0.25::f32, size * 0.5::f32, t.text);
+        var label: [8]u8;
+        val n:     usize = blit.icon.encode(s.arrow, ?label[0], 8);
+        label[n] = 0;
+        blit.widget.button(ctx, ?label[0]);
+    }
+}
