@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -158,21 +158,94 @@ blit.context.set_scale(?ctx, 2.0::f32);
   `blit.context.fill`, a feathered rounded rect (see Shapes & paths). The
   default is square, one quad per rect.
 
-## Docked containers
+## Docking
 
-Alongside floating windows, `blit.widget.begin_dock(?ctx, key, ?d)`/`end_dock`
-attach a panel to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
-takes a strip from the frame's free area, so docks opened in turn stack inward,
-and `blit.context.free_area` reports what they leave for the rest of the screen,
-such as a world view. Call docks at the root.
+`blit.dock` docks windows into a dock space, Dear ImGui style: a space fills
+a rect with a tree of splits and tab stacks, windows dragged over it dock
+into it, and tabs dragged out of it float again.
 
-A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
+```mach
+# once: the layout saves and loads with the windows
+blit.dock.persist(?ctx);
+blit.widget.persist_windows(?ctx);
+
+# per frame: a default layout while there is none, such as before a load
+val sid: u64 = blit.context.id_of(?ctx, "main");
+if (blit.dock.empty(?ctx, sid)) {
+    val root: u64 = blit.dock.root(?ctx, sid);
+    val left: u64 = blit.dock.split(?ctx, root, blit.context.Side.left{}, 0.25);
+    blit.dock.add(?ctx, left, blit.context.id_of(?ctx, "Scene"));
+    blit.dock.add(?ctx, root, blit.context.id_of(?ctx, "Viewport"));
+}
+# the space first, then its windows, exactly as they are drawn floating
+blit.dock.space(?ctx, "main", blit.context.free_area(?ctx));
+val w: blit.widget.WindowArea = blit.widget.begin_window(?ctx, scene);
+if (w.body != 0) { ... }
+blit.widget.end_window(?ctx, w);
+```
+
+- **The tree.** A split node divides its rect between two children along an
+  axis by a ratio, and a leaf is a tab stack of windows. `root`, `split` (a
+  new empty leaf on one side of a node, taking a share of it), `add` (dock a
+  window as a leaf's last tab), `remove` (float it again) and `node_of` build
+  and read it in code. A window is its title's id. The tree lives in the
+  state store, one small entry per space, node and docked window, so a layout
+  of any size fits, and everything in it is pinned.
+- **Drawing.** `space(?ctx, key, area)` lays the tree out over the rect, in
+  the docked band, and draws a splitter between the children of every split
+  and a tab bar (`blit.tabs`) across the top of every leaf. Each docked window
+  learns where its body goes through `blit.widget.Docked`, and its own
+  `begin_window` draws it there without chrome, only while its tab is
+  selected. Its content code, its ids, its scroll and every widget's state are
+  the same as when it floats. Draw the space before its windows, or they lag
+  it by a frame.
+- **Splitters.** Dragging a splitter moves its split, keeping each side at
+  least a few rows, or a docked window's declared `min_w` and `min_h`.
+- **Tabs.** A leaf's tab bar selects, reorders by drag, closes (the window's
+  `WindowState.closed`) and tears off its windows: a tab released over no
+  target floats there. A tab dragged onto another leaf's tab bar joins it. A
+  leaf whose windows are all closed or not drawn gives its room to its
+  sibling, and comes back when they do.
+- **Docking by drag.** A window's titlebar is a drag source of
+  `widget.WINDOW_KIND` carrying its id. While it, or a docked window's tab, is
+  dragged over a space, the space shows drop zones over the leaf under the
+  pointer (the centre docks as a tab, four edges split the leaf) and near its
+  own outer edges (splitting the whole space), with a preview of where the
+  window would land. A window released over a leaf's tab bar docks as a tab.
+  Holding shift, or the modifiers `set_suppress` picks, shows no zones and
+  docks nothing.
+- **Persistence.** `persist` registers the spaces, nodes and docked windows
+  as `[dock.<id>]`, `[docknode.<id>]` and `[docked.<id>]` tables, loaded
+  pinned, so a loaded layout waits for its space however late it is drawn.
+  `empty` tells a space with no layout yet, to build a default one only then.
+- **Look.** The chrome draws from the theme: the `dock` background, `handle`
+  and `handle_on` splitters, `control` and `accent` zones, and the `select`
+  tint for the preview.
+
+### Side panels
+
+`blit.dock.begin_dock(?ctx, key, ?d)`/`end_dock` attach a side panel to a
+screen edge (`blit.context.Side`: left, right, top or bottom) in one call. Each
+panel takes a strip from the frame's free area, so panels opened in turn stack
+inward, and `blit.context.free_area` reports what they leave for the rest of
+the screen, such as a world view. Call them at the root.
+
+The strip is a dock space whose root holds the panel's own content. Alone it
+looks like a plain panel, with no tab bar. Windows dragged over it dock
+beside it or as tabs with it, and then its key labels its tab. The panel
+itself never floats, and while another tab is selected its widgets lay out
+without drawing or claiming, so the caller places them every frame either way.
+
+A panel's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
 open one as the next item of the layout on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
+
+This is a breaking change: `begin_dock`, `end_dock`, `Dock` and `DockArea`
+moved from `blit.widget` to `blit.dock`, unchanged otherwise.
 
 ## Input & the host contract
 
@@ -458,7 +531,10 @@ if (t.dropped) { move_layer(@(t.data::*u64), here); }
   window, dock, popup or surface: the claim order that routes every hover
   decides which target is under the pointer. `carried(?ctx, kind)` peeks at a
   drag in flight, for a widget that shows where a drag would land before it
-  is over a target.
+  is over a target, with `released` set on the frame its button comes up.
+  `take(?ctx)` then takes it as dropped, for a target that works out where it
+  lands from the pointer, such as a dock whose zones lie under the window
+  being dragged.
 
 ## Widgets & layout
 
@@ -621,6 +697,11 @@ blit.widget.window_state(?ctx, "tools").closed = 0;
   popups. A press anywhere on a window brings it to the front, whatever order
   the windows are called in, and a pinned window stays in front of every
   unpinned one.
+- **Docking.** The titlebar is a drag source of `WINDOW_KIND` carrying the
+  window's id, which a dock space takes in (see Docking). A docked window
+  draws in the rect its dock lays out, with no chrome and no grips, its body a
+  scroll region as when it floats (`WINDOW_AUTO_SIZE` does not apply there),
+  and has no body while another tab of its stack is selected.
 - **Flags.** `WINDOW_NO_TITLE`, `WINDOW_NO_RESIZE`, `WINDOW_NO_MOVE`,
   `WINDOW_NO_BACKGROUND` (the body still stops input), `WINDOW_NO_CLOSE` and
   `WINDOW_AUTO_SIZE`, combined with `|`.
@@ -714,7 +795,9 @@ entry, so a widget never reads another's bytes.
   0 keeps everything), so state for widgets that stopped drawing does not pile
   up. A `get` between frames counts toward the next frame.
   `pin[T](?ctx, id, 1)` keeps an entry however long it goes untouched, and
-  `pin[T](?ctx, id, 0)` lets it age out again.
+  `pin[T](?ctx, id, 0)` lets it age out again. `find[T](?ctx, id)` looks an
+  entry up without making or reaching it, nil when there is none, and
+  `drop[T](?ctx, id)` drops it at once.
 - **Failure.** Entries are allocator-backed and the store grows. When it cannot,
   `get` sets the context's oom (see `context.ok`) and hands back zeroed scratch
   state that every refused entry shares, never a dangling pointer. A state type
@@ -727,6 +810,8 @@ entry, so a widget never reads another's bytes.
   through `std.data.toml`, zeroes each entry and runs the kind's load hook over
   its table. Tables of unregistered kinds are skipped. A load hook copies any
   string it keeps, since the parsed document is freed when `load` returns.
+  `keep[T](?ctx, 1)` loads a registered kind's entries pinned, for state that
+  must wait for whatever reaches it.
 
 The store is one owner, not the only one. Widgets that take a caller-owned
 record (`Scroll`, `List`, `Field`) keep taking it, so an app can own

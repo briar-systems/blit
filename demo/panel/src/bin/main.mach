@@ -42,7 +42,7 @@ use blit;
 # open_order: the layers section is open
 # order:      the layers, top first, reordered by dragging them
 rec Panel {
-    side:       blit.widget.Dock;
+    side:       blit.dock.Dock;
     open_run:   u8;
     open_view:  u8;
     open_files: u8;
@@ -247,14 +247,14 @@ fun layers(ctx: *blit.context.Context, p: *Panel) {
 
 # one frame of the panel, docked to the right of the screen
 fun ui(ctx: *blit.context.Context, user: ptr) {
-    val p:    *Panel               = user::*Panel;
-    val dock: blit.widget.DockArea = blit.widget.begin_dock(ctx, "panel", ?p.side);
+    val p:    *Panel             = user::*Panel;
+    val dock: blit.dock.DockArea = blit.dock.begin_dock(ctx, "panel", ?p.side);
     header(ctx, p);
     run(ctx, p);
     view(ctx, p);
     files(ctx, p);
     layers(ctx, p);
-    blit.widget.end_dock(ctx, ?p.side, dock);
+    blit.dock.end_dock(ctx, ?p.side, dock);
 }
 
 # the panel as the demo opens it
