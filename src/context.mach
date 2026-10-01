@@ -1,8 +1,9 @@
 # the immediate-mode context: draw list, input, layout, and the
 # painter helpers widgets build on
 #
-# the context owns the per-frame draw list and the current input, tracks a simple
-# top-to-bottom layout cursor, and holds the id stack widget ids are scoped by.
+# the context owns the per-frame draw list and the current input, holds the
+# stack of layout frames containers push and pop (see blit.layout), and holds
+# the id stack widget ids are scoped by.
 # it is also the painter: quad/glyph/text_at emit into the draw list through
 # the font and its atlas so widgets never touch the draw list or font directly. a
 # draw-list growth failure is recorded in `oom` rather than silently dropping
@@ -101,6 +102,7 @@ use gly: blit.glyph;
 use blit.hit;
 use bid: blit.id;
 use blit.input;
+use blit.layout;
 use blit.path;
 use blit.store;
 use blit.tess;
@@ -111,8 +113,8 @@ use std.collections.set;
 use vec: std.collections.vector;
 use std.text.utf8;
 
-# capacity the clip, origin, layer and id stacks and the collision list start
-# with, doubling from there
+# capacity the clip, origin, layer, layout and id stacks and the collision
+# list start with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
 # capacity the held-back button events start with, doubling from there
@@ -128,6 +130,9 @@ pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 # (see set_double_click)
 pub val DOUBLE_TIME: f64 = 0.3;
 pub val DOUBLE_DIST: f32 = 6.0;
+
+# a coordinate beyond any surface, where a measuring scope's clip sits
+val NOWHERE: f32 = 3.0e38;
 
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
@@ -283,11 +288,6 @@ pub rec TextLine {
 # in:           input for the current frame
 # sw:           screen width in pixels
 # sh:           screen height in pixels
-# ox:           layout origin x (panel left)
-# oy:           layout origin y (panel top)
-# cx:           layout cursor x
-# cy:           layout cursor y
-# pw:           current panel width
 # hot:          id of the widget hovered this frame (0 = none)
 # active:       id of the widget owning the pointer since a press on it, persists across frames (0 = none)
 # active_btn:   the input.BUTTON_* bit whose press made active the owner
@@ -330,6 +330,11 @@ pub rec TextLine {
 # layers:       saved parent layers, grown on demand
 # layers_cap:   layers allocated for layers
 # font:         the glyph sources, the text styles, the glyph cache and the atlas
+# frames:       the open layout frames, innermost last, grown on demand
+# frames_cap:   frames allocated for frames
+# frame_sp:     open layout frames, saved or not
+# spare:        the frame handed out while the stack cannot grow
+# measuring:    open push_measure scopes, which draw and claim nothing
 # style:        id of the text style text is drawn in
 # style_sp:     text style stack depth
 # style_ids:    saved parent text styles, grown on demand
@@ -385,11 +390,6 @@ pub rec Context {
     in:           input.Input;
     sw:           f32;
     sh:           f32;
-    ox:           f32;
-    oy:           f32;
-    cx:           f32;
-    cy:           f32;
-    pw:           f32;
     hot:          u64;
     active:       u64;
     active_btn:   u8;
@@ -432,6 +432,11 @@ pub rec Context {
     layers:       *u32;
     layers_cap:   usize;
     font:         font.Font;
+    frames:       *layout.Frame;
+    frames_cap:   usize;
+    frame_sp:     usize;
+    spare:        layout.Frame;
+    measuring:    usize;
     style:        u32;
     style_sp:     usize;
     style_ids:    *u32;
@@ -520,11 +525,6 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
 
     ctx.sw         = 0.0::f32;
     ctx.sh         = 0.0::f32;
-    ctx.ox         = 0.0::f32;
-    ctx.oy         = 0.0::f32;
-    ctx.cx         = 0.0::f32;
-    ctx.cy         = 0.0::f32;
-    ctx.pw         = 0.0::f32;
     ctx.hot        = 0;
     ctx.active     = 0;
     ctx.active_btn = 0;
@@ -567,6 +567,10 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer_sp     = 0;
     ctx.layers       = nil;
     ctx.layers_cap   = 0;
+    ctx.frames       = nil;
+    ctx.frames_cap   = 0;
+    ctx.frame_sp     = 0;
+    ctx.measuring    = 0;
     ctx.style        = font.STYLE_BODY;
     ctx.style_sp     = 0;
     ctx.style_ids    = nil;
@@ -682,6 +686,10 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel ey.err) { ret ey; }
     ctx.layers     = nil;
     ctx.layers_cap = 0;
+    val ef: err[allo.Error] = allo.deallocate[layout.Frame](ctx.a, ctx.frames, ctx.frames_cap);
+    if (sel ef.err) { ret ef; }
+    ctx.frames     = nil;
+    ctx.frames_cap = 0;
     val et: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.style_ids, ctx.style_cap);
     if (sel et.err) { ret et; }
     ctx.style_ids = nil;
@@ -741,25 +749,22 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     }
     ctx.timed = 1;
 
-    ctx.sw  = sw;
-    ctx.sh  = sh;
-    ctx.ox  = 0.0::f32;
-    ctx.oy  = 0.0::f32;
-    ctx.cx  = 0.0::f32;
-    ctx.cy  = 0.0::f32;
-    ctx.pw  = 0.0::f32;
-    ctx.hot = 0;
-    ctx.oom = 0;
+    ctx.sw       = sw;
+    ctx.sh       = sh;
+    ctx.frame_sp = 0;
+    ctx.hot      = 0;
+    ctx.oom      = 0;
     trickle(ctx, prev);
 
-    ctx.lx      = 0.0::f32;
-    ctx.ly      = 0.0::f32;
-    ctx.clip_x0 = 0.0::f32;
-    ctx.clip_y0 = 0.0::f32;
-    ctx.clip_x1 = sw;
-    ctx.clip_y1 = sh;
-    ctx.clip_sp = 0;
-    ctx.org_sp  = 0;
+    ctx.lx        = 0.0::f32;
+    ctx.ly        = 0.0::f32;
+    ctx.clip_x0   = 0.0::f32;
+    ctx.clip_y0   = 0.0::f32;
+    ctx.clip_x1   = sw;
+    ctx.clip_y1   = sh;
+    ctx.clip_sp   = 0;
+    ctx.measuring = 0;
+    ctx.org_sp    = 0;
 
     ctx.tex       = draw.ATLAS;
     ctx.page      = 0;
@@ -1924,6 +1929,7 @@ pub fun push_layer(ctx: *Context) {
     ctx.clip_y0 = 0.0::f32;
     ctx.clip_x1 = ctx.sw;
     ctx.clip_y1 = ctx.sh;
+    if (ctx.measuring != 0) { clip_nowhere(ctx); }
     push_origin(ctx, 0.0::f32, 0.0::f32);
 }
 
@@ -1937,6 +1943,99 @@ pub fun pop_layer(ctx: *Context) {
     ctx.layer_sp = ctx.layer_sp - 1;
     if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
     or                                 { ctx.layer = ctx.layer - 1; }
+}
+
+# lay out without drawing or claiming until the matching pop_measure
+#
+# everything placed in the scope is measured as usual, but its geometry is
+# dropped and its claims are never recorded, so nothing in it is hovered or
+# clicked. a layer opened inside it stays hidden too. a layout that needs a
+# size it has not measured yet (see blit.widget.begin_stack) spends its first
+# frame here, so a guess is never seen or clicked.
+# ---
+# ctx: context
+pub fun push_measure(ctx: *Context) {
+    save_clip(ctx);
+    clip_nowhere(ctx);
+    ctx.measuring = ctx.measuring + 1;
+}
+
+# end the scope push_measure opened, drawing and claiming again
+# ---
+# ctx: context
+pub fun pop_measure(ctx: *Context) {
+    if (ctx.measuring == 0) { ret; }
+    ctx.measuring = ctx.measuring - 1;
+    pop_clip(ctx);
+}
+
+# whether a push_measure scope is open
+# ---
+# ctx: context
+# ret: true while geometry and claims are dropped
+pub fun measuring(ctx: *Context) bool {
+    ret ctx.measuring != 0;
+}
+
+# clip to a rect no geometry or claim reaches, past any coordinate in use
+fun clip_nowhere(ctx: *Context) {
+    ctx.clip_x0 = NOWHERE;
+    ctx.clip_y0 = NOWHERE;
+    ctx.clip_x1 = NOWHERE;
+    ctx.clip_y1 = NOWHERE;
+}
+
+# open a layout frame inside the current one (see blit.layout)
+#
+# containers push the frame their content is laid out in and pop it at their
+# end, so the parent's pen is untouched until the container places itself.
+# the stack grows with nesting; if it cannot, oom is set, top_layout hands out a
+# spare frame until the matching pop and depth still balances.
+# ---
+# ctx: context
+# f:   the new frame
+pub fun push_layout(ctx: *Context, f: layout.Frame) {
+    ctx.frames = room[layout.Frame](ctx, ctx.frames, ?ctx.frames_cap, ctx.frame_sp + 1, CLIP_DEPTH);
+    if (ctx.frame_sp < ctx.frames_cap) { ctx.frames[ctx.frame_sp] = f; }
+    or                                 { ctx.spare = f; }
+    ctx.frame_sp = ctx.frame_sp + 1;
+}
+
+# close the innermost layout frame, back to its parent
+# ---
+# ctx: context
+pub fun pop_layout(ctx: *Context) {
+    if (ctx.frame_sp > 0) { ctx.frame_sp = ctx.frame_sp - 1; }
+}
+
+# the innermost layout frame, nil when none is open
+#
+# the pointer is valid until the next push_layout.
+# ---
+# ctx: context
+# ret: the frame
+pub fun top_layout(ctx: *Context) *layout.Frame {
+    ret layout_at(ctx, 0);
+}
+
+# the frame depth levels out from the innermost, nil past the root
+# ---
+# ctx:   context
+# depth: 0 for the innermost, 1 for its parent
+# ret:   the frame
+pub fun layout_at(ctx: *Context, depth: usize) *layout.Frame {
+    if (depth >= ctx.frame_sp) { ret nil; }
+    val i: usize = ctx.frame_sp - 1 - depth;
+    if (i < ctx.frames_cap) { ret ?ctx.frames[i]; }
+    ret ?ctx.spare;
+}
+
+# how many layout frames are open
+# ---
+# ctx: context
+# ret: the depth, 0 before the first is pushed
+pub fun layout_depth(ctx: *Context) usize {
+    ret ctx.frame_sp;
 }
 
 # move a local rect into screen space and clip it to the active rect

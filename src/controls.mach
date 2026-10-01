@@ -1,0 +1,623 @@
+# the small controls: radio buttons, progress bars, separators and a combo box
+#
+# each places itself in the current layout frame like blit.widget's widgets
+# (see widget.place), the bars, separators and combo filling the width and a
+# radio button fitting its label, draws through the painter and claims through
+# interact.hit, with every color and length from the theme.
+#
+# a radio button sets a shared choice to its own value. a progress bar fills to
+# a fraction, or sweeps a segment across while the amount of work is unknown,
+# asking for frames only while it is drawn (see context.wake_at). a separator
+# is a rule across the column, with or without a label. a combo is a select
+# whose popup holds a filter field: typing narrows the options, the arrows move
+# the highlight among those left and enter picks it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+
+use blit.context;
+use blit.draw;
+use drv: blit.driver;
+use blit.field;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.widget;
+use allo: std.allocator;
+use std.allocator.page;
+
+# seconds an indeterminate progress bar's segment takes to sweep across it once
+pub val BUSY_PERIOD: f64 = 1.5;
+
+# most option rows a combo's popup shows before it scrolls
+pub val COMBO_ROWS: usize = 8;
+
+# bytes a combo's filter text holds, the terminator included
+pub val COMBO_FILTER: usize = 256;
+
+# the theme's space inside chrome, at the context's scale
+fun pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.pad);
+}
+
+# the corner radius of a control, at the context's scale
+fun corner(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.corner);
+}
+
+# height of a control row, without the gap below it
+fun row_h(ctx: *context.Context) f32 {
+    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+}
+
+# a control-shaped fill: rounded to the theme's corner on every side
+fun face(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, c);
+}
+
+# ask for the hand pointer over a clickable control while it is hovered
+fun hand(ctx: *context.Context, h: interact.Hit) {
+    if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
+}
+
+# the top of a line of text centred in a row h tall at y
+fun text_top(ctx: *context.Context, y: f32, h: f32) f32 {
+    ret y + (h - context.line_height(ctx)) / 2.0::f32;
+}
+
+# clamp v to [lo, hi]
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# a radio button beside its label that sets @choice to value when clicked
+#
+# the circle is filled with the accent while @choice is value. buttons sharing
+# one choice make a group, each keyed by its label.
+# ---
+# ctx:    context
+# label:  text drawn to the right of the circle, and its key
+# choice: pointer to the group's chosen value, updated in place
+# value:  the value this button stands for
+# ret:    true if the choice changed this frame
+pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) bool {
+    val id:  u64          = context.id_of(ctx, label);
+    val box: f32          = row_h(ctx);
+    val tw:  f32          = context.text_width_n(ctx, label, bid.shown(label));
+    val at:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), box + pad(ctx) + tw, box);
+    val x0:  f32          = at.x0;
+    val y0:  f32          = at.y0;
+    val tx:  f32          = x0 + box + pad(ctx);
+    val x1:  f32          = tx + tw;
+    val hr:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + box, input.BUTTON_LEFT);
+    hand(ctx, hr);
+
+    var changed: bool = false;
+    if (hr.clicked && @choice != value) {
+        @choice = value;
+        changed = true;
+    }
+
+    var bg: draw.Color = ctx.theme.control;
+    if (hr.hot) { bg = ctx.theme.control_hot; }
+    val r:  f32 = box / 2.0::f32;
+    val cx: f32 = x0 + r;
+    val cy: f32 = y0 + r;
+    context.circle(ctx, cx, cy, r, bg);
+    if (@choice == value) { context.circle(ctx, cx, cy, r - pad(ctx), ctx.theme.accent); }
+
+    context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ctx.theme.text);
+    ret changed;
+}
+
+# n radio buttons stacked down the column, button i standing for value i
+# ---
+# ctx:    context
+# labels: pointer to an array of n labels (pass ?labels[0])
+# n:      how many buttons
+# choice: pointer to the chosen index, updated in place
+# ret:    true if the choice changed this frame
+pub fun radios(ctx: *context.Context, labels: *str, n: usize, choice: *usize) bool {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < n) {
+        if (radio(ctx, labels[i], choice, i)) { changed = true; }
+        i = i + 1;
+    }
+    ret changed;
+}
+
+# place a progress bar filling the width, fitting the text s over it
+fun bar_at(ctx: *context.Context, s: str) context.Area {
+    var tw: f32 = 0.0::f32;
+    if (s != nil) { tw = context.text_width(ctx, s); }
+    ret widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx) * 2.0::f32, row_h(ctx));
+}
+
+# text centred over a progress bar from x0 to x1, h tall at y0
+fun bar_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, h: f32) {
+    if (s == nil) { ret; }
+    val tw: f32 = context.text_width(ctx, s);
+    context.text_at(ctx, s, x0 + (x1 - x0 - tw) / 2.0::f32, text_top(ctx, y0, h), ctx.theme.text);
+}
+
+# a progress bar across the column filled to frac of its width
+# ---
+# ctx:  context
+# frac: the fraction done, clamped to [0, 1]
+# s:    text centred over the bar, such as a percentage, nil for none
+pub fun progress(ctx: *context.Context, frac: f32, s: str) {
+    val at: context.Area = bar_at(ctx, s);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val h:  f32          = at.y1 - at.y0;
+    val x1: f32          = at.x1;
+    face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
+    val fx: f32 = x0 + (x1 - x0) * clampf(frac, 0.0::f32, 1.0::f32);
+    if (fx > x0) { face(ctx, x0, y0, fx, y0 + h, ctx.theme.accent); }
+    bar_text(ctx, s, x0, y0, x1, h);
+}
+
+# an indeterminate progress bar across the column, a third of its width
+# sweeping across it every BUSY_PERIOD seconds
+#
+# the segment's place comes from input.time, so the bar keeps no state. it
+# asks for a frame by the time the segment next moves a pixel (see
+# context.wake_at), so it animates while drawn and an interface without one
+# can go idle.
+# ---
+# ctx: context
+# s:   text centred over the bar, nil for none
+pub fun progress_busy(ctx: *context.Context, s: str) {
+    val at: context.Area = bar_at(ctx, s);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val h:  f32          = at.y1 - at.y0;
+    val x1: f32          = at.x1;
+    val w:  f32          = x1 - x0;
+    face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
+
+    # the segment enters from the left and leaves at the right, travelling w + seg
+    val seg:    f32 = w / 3.0::f32;
+    val travel: f32 = w + seg;
+    if (travel > 0.0::f32) {
+        val turns: f64 = ctx.in.time / BUSY_PERIOD;
+        val phase: f32 = (turns - turns::i64::f64)::f32;
+        val sx:    f32 = x0 - seg + travel * phase;
+        val s0:    f32 = clampf(sx, x0, x1);
+        val s1:    f32 = clampf(sx + seg, x0, x1);
+        if (s1 > s0) { face(ctx, s0, y0, s1, y0 + h, ctx.theme.accent); }
+        context.wake_at(ctx, ctx.in.time + BUSY_PERIOD / travel::f64);
+    }
+    bar_text(ctx, s, x0, y0, x1, h);
+}
+
+# a rule across the column in the theme's edge color, edge_w thick
+# ---
+# ctx: context
+pub fun separator(ctx: *context.Context) {
+    val ew: f32          = context.px(ctx, ctx.theme.edge_w);
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), 0.0::f32, ew);
+    context.quad(ctx, at.x0, at.y0, at.x1, at.y1, ctx.theme.edge);
+}
+
+# a labelled rule: dim text on the left and the rule running on from it to
+# the column's right edge, through the middle of the line
+# ---
+# ctx:   context
+# label: text drawn on the left; text after "##" is not drawn
+pub fun separator_label(ctx: *context.Context, label: str) {
+    val lh: f32          = context.line_height(ctx);
+    val n:  usize        = bid.shown(label);
+    val tw: f32          = context.text_width_n(ctx, label, n);
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx), lh);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val x1: f32          = at.x1;
+    context.text_span(ctx, label, n, x0, y0, ctx.theme.text_dim);
+
+    var rx: f32 = x0;
+    if (n > 0) { rx = x0 + tw + pad(ctx); }
+    val ew: f32 = context.px(ctx, ctx.theme.edge_w);
+    val ry: f32 = y0 + (lh - ew) / 2.0::f32;
+    if (rx < x1) { context.quad(ctx, rx, ry, x1, ry + ew, ctx.theme.edge); }
+}
+
+# the state a combo keeps in the context's store under its header's id
+# ---
+# open:   1 while the popup is shown, else 0
+# hi:     the highlighted option's index, the option count for none
+# filter: the filter field, editing buf
+# scroll: the option list's scroll state
+# mx:     the cursor's x the last frame the popup was drawn, in screen pixels
+# my:     the cursor's y then
+# buf:    the filter's text
+pub rec ComboState {
+    open:   u8;
+    hi:     usize;
+    filter: field.Field;
+    scroll: widget.Scroll;
+    mx:     f32;
+    my:     f32;
+    buf:    [COMBO_FILTER]u8;
+}
+
+# the first option from index i on, stepping by dir (1 or -1), that holds the
+# filter, or count when none does
+fun combo_step(st: *ComboState, options: *str, count: usize, i: usize, dir: i64) usize {
+    var k: i64 = i::i64;
+    for (k >= 0 && k < count::i64) {
+        if (widget.matches(options[k::usize], field.text(?st.filter))) { ret k::usize; }
+        k = k + dir;
+    }
+    ret count;
+}
+
+# move the highlight by the frame's up and down presses, up to an enter or
+# escape, keeping it on the first or last match at either end
+fun combo_arrows(ctx: *context.Context, st: *ComboState, options: *str, count: usize) bool {
+    var moved: bool  = false;
+    var i:     usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        i = i + 1;
+        if (!sel e.key) { cnt; }
+        val c: u32 = e.key.code;
+        if (c == input.KEY_ENTER || c == input.KEY_ESCAPE) { brk; }
+        var to: usize = count;
+        if (c == input.KEY_DOWN && st.hi + 1 < count)         { to = combo_step(st, options, count, st.hi + 1, 1); }
+        or (c == input.KEY_UP && st.hi > 0 && st.hi <= count) { to = combo_step(st, options, count, st.hi - 1, -1); }
+        if (to < count) {
+            st.hi = to;
+            moved = true;
+        }
+    }
+    ret moved;
+}
+
+# scroll the option list just enough to show the highlighted option, rows rh
+# tall and step apart in a list lh tall
+fun combo_reveal(st: *ComboState, options: *str, count: usize, step: f32, rh: f32, lh: f32) {
+    if (st.hi >= count) { ret; }
+    var row: usize = 0;
+    var i:   usize = 0;
+    for (i < st.hi) {
+        if (widget.matches(options[i], field.text(?st.filter))) { row = row + 1; }
+        i = i + 1;
+    }
+    val top: f32 = row::f32 * step;
+    if (top < st.scroll.offset)           { st.scroll.offset = top; }
+    if (top + rh > st.scroll.offset + lh) { st.scroll.offset = top + rh - lh; }
+}
+
+# close a combo's popup, giving back the keyboard when its filter holds it
+fun combo_close(ctx: *context.Context, st: *ComboState, fid: u64) {
+    st.open = 0;
+    if (fid != 0 && ctx.focus == fid) { context.unfocus(ctx); }
+}
+
+# a select whose popup filters its options by what is typed
+#
+# clicking the header opens a popup beneath it holding a filter field, which
+# takes the keyboard, and the options that hold its text, ignoring ascii case.
+# the up and down arrows move the highlight among them, the cursor moving over
+# an option highlights it, and enter or a click picks one, sets @selected and
+# closes. escape, or a press anywhere outside the popup, closes it without a
+# pick. COMBO_ROWS options show at once and the rest scroll. the open state,
+# filter, highlight and scroll are a ComboState the context's state store
+# keeps under the header's id (see blit.state), and the popup overlays later
+# widgets rather than pushing them down.
+# ---
+# ctx:      context
+# label:    text drawn on the left of the header, and its key
+# selected: pointer to the selected index, updated in place
+# options:  pointer to an array of count option strings (pass ?opts[0])
+# count:    number of options
+# ret:      1 if the selection changed this frame, else 0
+pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str, count: usize) u8 {
+    val id: u64         = context.id_of(ctx, label);
+    val st: *ComboState = state.get[ComboState](ctx, id);
+    var wo: f32         = 0.0::f32;
+    var k:  usize       = 0;
+    for (k < count) {
+        wo = maxf(wo, context.text_width(ctx, options[k]));
+        k  = k + 1;
+    }
+    val h:  f32          = row_h(ctx);
+    val nw: f32          = context.text_width_n(ctx, label, bid.shown(label)) + wo + pad(ctx) * 3.0::f32;
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nw, h);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val x1: f32          = at.x1;
+
+    var opening: bool         = false;
+    val hd:      interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + h, input.BUTTON_LEFT);
+    hand(ctx, hd);
+    if (hd.clicked && st.open != 0) { st.open = 0; }
+    or (hd.clicked) {
+        st.open   = 1;
+        opening   = true;
+        st.scroll = widget.Scroll{offset: 0.0::f32, content: 0.0::f32};
+        field.init(?st.filter, ?st.buf[0], COMBO_FILTER, 0, nil);
+        st.hi = @selected;
+        if (st.hi >= count) { st.hi = combo_step(st, options, count, 0, 1); }
+    }
+
+    var bg: draw.Color = ctx.theme.control;
+    if (hd.hot)       { bg = ctx.theme.control_hot; }
+    if (st.open != 0) { bg = ctx.theme.control_on; }
+    face(ctx, x0, y0, x1, y0 + h, bg);
+    val ty: f32 = text_top(ctx, y0, h);
+    context.text_span(ctx, label, bid.shown(label), x0 + pad(ctx), ty, ctx.theme.text);
+    if (@selected < count) {
+        val cur: str = options[@selected];
+        context.text_at(ctx, cur, x1 - pad(ctx) - context.text_width(ctx, cur), ty, ctx.theme.text);
+    }
+
+    context.push_id(ctx, id);
+    val pop:     widget.Popup = widget.begin_popup(ctx, "popup", st.open, x0, y0 + h + widget.row_gap(ctx), x1 - x0);
+    var fid:     u64          = 0;
+    var changed: u8           = 0;
+    if (pop.open != 0) {
+        fid = context.id_of(ctx, "filter");
+        if (opening || !context.typing(ctx)) { context.focus(ctx, fid); }
+        val had: bool = context.focused(ctx, fid);
+        val out: u8   = widget.text_field(ctx, "filter", ?st.filter, nil);
+
+        var moved: bool = false;
+        if ((out & field.EDITED) != 0 || (st.hi < count && !widget.matches(options[st.hi], field.text(?st.filter)))) {
+            st.hi = combo_step(st, options, count, 0, 1);
+            moved = true;
+        }
+        if (had && combo_arrows(ctx, st, options, count)) { moved = true; }
+
+        var shown: usize = 0;
+        var i:     usize = 0;
+        for (i < count) {
+            if (widget.matches(options[i], field.text(?st.filter))) { shown = shown + 1; }
+            i = i + 1;
+        }
+        var rows: usize = shown;
+        if (rows > COMBO_ROWS) { rows = COMBO_ROWS; }
+        # rows stand a control row and a gap apart, the last without its gap
+        val step: f32 = widget.control_row_height(ctx);
+        var lh:   f32 = 0.0::f32;
+        if (rows > 0) { lh = rows::f32 * step - widget.row_gap(ctx); }
+        if (moved)    { combo_reveal(st, options, count, step, h, lh); }
+
+        var pick: usize = count;
+        # the cursor takes the highlight only when it moves, so it never undoes an arrow
+        val follow: bool = !opening && (ctx.in.mx != st.mx || ctx.in.my != st.my);
+        st.mx = ctx.in.mx;
+        st.my = ctx.in.my;
+
+        if ((out & field.ENTERED) != 0) {
+            pick = st.hi;
+            if (pick >= count) { context.focus(ctx, fid); }
+        }
+        if (rows > 0) {
+            val r:   widget.ScrollArea = widget.begin_scroll(ctx, "options", ?st.scroll, lh);
+            val top: f32               = st.scroll.offset;
+            i = 0;
+            for (i < count) {
+                if (widget.matches(options[i], field.text(?st.filter))) {
+                    val row: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), context.text_width(ctx, options[i]) + pad(ctx) * 2.0::f32, h);
+                    val oy0: f32          = row.y0;
+                    val oy1: f32          = row.y1;
+                    if (oy1 > top && oy0 < top + r.h) {
+                        val ox0: f32          = row.x0;
+                        val ox1: f32          = row.x1;
+                        val ho:  interact.Hit = interact.hit(ctx, bid.child_int(r.id, i::u64), ox0, oy0, ox1, oy1, input.BUTTON_LEFT);
+                        hand(ctx, ho);
+                        if (ho.hot && follow) { st.hi = i; }
+                        if (ho.clicked)       { pick = i; }
+
+                        var ink: draw.Color = ctx.theme.text;
+                        if (i == @selected) {
+                            face(ctx, ox0, oy0, ox1, oy1, ctx.theme.accent);
+                            ink = ctx.theme.accent_text;
+                        }
+                        or (i == st.hi) { face(ctx, ox0, oy0, ox1, oy1, ctx.theme.control_hot); }
+                        context.text_at(ctx, options[i], ox0 + pad(ctx), text_top(ctx, oy0, h), ink);
+                    }
+                }
+                i = i + 1;
+            }
+            widget.end_scroll(ctx, ?st.scroll, r);
+        }
+
+        if (pick < count) {
+            if (@selected != pick) { changed = 1; }
+            @selected = pick;
+            combo_close(ctx, st, fid);
+        }
+        if ((out & field.ESCAPED) != 0) { combo_close(ctx, st, fid); }
+    }
+    widget.end_popup(ctx, pop);
+    context.pop_id(ctx);
+    if (pop.dismissed != 0) { combo_close(ctx, st, fid); }
+    ret changed;
+}
+
+# what the probe interface draws with and what it saw
+#[testing]
+rec Probe {
+    busy:    u8;
+    frac:    f32;
+    choice:  usize;
+    radioed: usize;
+    picked:  usize;
+    combos:  usize;
+    radio:   [3]str;
+    opts:    [5]str;
+}
+
+# a panel of every control: a bar, a busy bar when asked, three radios, the
+# separators and a combo over five fruit
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p: *Probe       = user::*Probe;
+    val b: widget.Block = widget.begin_panel(ctx, 0.0::f32, 0.0::f32, 160.0::f32);
+    progress(ctx, p.frac, "half");
+    if (p.busy != 0)                            { progress_busy(ctx, nil); }
+    if (radios(ctx, ?p.radio[0], 3, ?p.choice)) { p.radioed = p.radioed + 1; }
+    separator_label(ctx, "more##rule");
+    separator(ctx);
+    if (combo(ctx, "pick", ?p.picked, ?p.opts[0], 5) != 0) { p.combos = p.combos + 1; }
+    widget.end_panel(ctx, b);
+}
+
+# a driver over the probe interface
+#[testing]
+fun probe(d: *drv.Driver, a: *allo.Allocator, p: *Probe) bool {
+    p.frac     = 0.5::f32;
+    p.radio[0] = "a";
+    p.radio[1] = "b";
+    p.radio[2] = "c";
+    p.opts[0]  = "apple";
+    p.opts[1]  = "banana";
+    p.opts[2]  = "cherry";
+    p.opts[3]  = "mango";
+    p.opts[4]  = "grape";
+    val e: err[allo.Error] = drv.init(d, a, 200.0::f32, 400.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret false; }
+    drv.step(d);
+    ret true;
+}
+
+test radio__sets_the_choice_to_its_value {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+
+    if (!drv.click(?d, drv.find(?d, "c")) || p.choice != 2 || p.radioed != 1) { ret 2; }
+    # clicking the chosen one again changes nothing
+    if (!drv.click(?d, drv.find(?d, "c")) || p.choice != 2 || p.radioed != 1) { ret 3; }
+    if (!drv.click(?d, drv.find(?d, "a")) || p.choice != 0 || p.radioed != 2) { ret 4; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test progress__fills_and_busy_asks_for_frames_only_while_drawn {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+
+    # half the 160 pixel column filled, under its text, and nothing to wake for
+    if (!str_contains(drv.snapshot(?d), "\n  quad 0.00 0.00 80.00 16.00 "))              { ret 2; }
+    if (!str_equals(drv.text_in(?d, 0.0::f32, 0.0::f32, 160.0::f32, 16.0::f32), "half")) { ret 3; }
+    val idle: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel idle.none) { ret 4; }
+
+    # a busy bar asks for the frame its segment next moves a pixel in: it
+    # travels 160 + 160 / 3 pixels each period
+    p.busy = 1;
+    drv.step(?d);
+    val now:  f64      = d.ctx.in.time;
+    val want: f64      = now + BUSY_PERIOD / (160.0::f64 + 160.0::f64 / 3.0::f64);
+    val next: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel next.some)                                                       { ret 5; }
+    if (next.some - want > 0.000001::f64 || want - next.some > 0.000001::f64) { ret 6; }
+
+    p.busy = 0;
+    drv.step(?d);
+    val after: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel after.none) { ret 7; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test separator__rules_the_column_with_and_without_a_label {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+
+    # rows of 16 and gaps of 4: the bar, three radios, then the labelled rule
+    # at y 80, its rule through the middle of the 8 pixel line after "more"
+    # and its padding, then the plain rule at y 92
+    if (!str_equals(drv.text_in(?d, 0.0::f32, 80.0::f32, 160.0::f32, 88.0::f32), "more")) { ret 2; }
+    val dump: str = drv.snapshot(?d);
+    if (!str_contains(dump, "\n  quad 36.00 83.50 160.00 84.50 ")) { ret 3; }
+    if (!str_contains(dump, "\n  quad 0.00 92.00 160.00 93.00 "))  { ret 4; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test combo__filters_as_typed_and_picks_with_enter {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+    val filter: u64 = drv.find(?d, "pick/popup/filter");
+    val list:   u64 = drv.find(?d, "pick/popup/options");
+
+    # opening hands the filter the keyboard and lists every option
+    if (!drv.click(?d, drv.find(?d, "pick")) || !drv.focused(?d, filter))                 { ret 2; }
+    if (!drv.drawn(?d, bid.child_int(list, 0)) || !drv.drawn(?d, bid.child_int(list, 4))) { ret 3; }
+
+    # typing narrows the options to those holding the text, any case
+    drv.type_text(?d, "AN");
+    if (drv.drawn(?d, bid.child_int(list, 0)) || drv.drawn(?d, bid.child_int(list, 2)))   { ret 4; }
+    if (!drv.drawn(?d, bid.child_int(list, 1)) || !drv.drawn(?d, bid.child_int(list, 3))) { ret 5; }
+
+    # the highlight starts on the first match, down moves it to the next, and
+    # enter picks it and closes
+    drv.key(?d, input.KEY_DOWN, 0);
+    drv.key(?d, input.KEY_ENTER, 0);
+    if (p.picked != 3 || p.combos != 1)                  { ret 6; }
+    if (drv.drawn(?d, filter) || context.typing(?d.ctx)) { ret 7; }
+
+    # reopened, the filter is empty again; escape closes without a pick
+    if (!drv.click(?d, drv.find(?d, "pick")))                               { ret 8; }
+    if (!drv.drawn(?d, bid.child_int(list, 0)) || !drv.focused(?d, filter)) { ret 9; }
+    drv.type_text(?d, "zz");
+    if (drv.drawn(?d, bid.child_int(list, 3))) { ret 10; }
+    drv.key(?d, input.KEY_ENTER, 0);
+    if (!drv.focused(?d, filter) || p.picked != 3) { ret 11; }
+    drv.key(?d, input.KEY_ESCAPE, 0);
+    if (drv.drawn(?d, filter) || p.picked != 3 || p.combos != 1) { ret 12; }
+
+    # a click on an option picks it
+    drv.click(?d, drv.find(?d, "pick"));
+    if (!drv.click(?d, bid.child_int(list, 2)) || p.picked != 2 || p.combos != 2) { ret 13; }
+    drv.step(?d);
+    if (drv.drawn(?d, filter) || context.typing(?d.ctx)) { ret 14; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
