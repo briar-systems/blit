@@ -171,7 +171,9 @@ pub fun save(ctx: *context.Context) res[str, allo.Error] {
 # text: the document, NUL-terminated
 # ret:  ok, or the failure, positioned in the text where it has a position
 pub fun load(ctx: *context.Context, text: str) err[toml.TomlError] {
-    ret store.load(?ctx.store, text);
+    val e: err[toml.TomlError] = store.load(?ctx.store, text);
+    context.redraw(ctx);
+    ret e;
 }
 
 rec Pane {

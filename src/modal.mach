@@ -213,7 +213,9 @@ pub fun dialog(title: str) Modal {
 # ctx: context
 # key: the modal's title or key
 pub fun open(ctx: *context.Context, key: str) {
-    state.get[ModalState](ctx, context.id_of(ctx, key)).open = 1;
+    val st: *ModalState = state.get[ModalState](ctx, context.id_of(ctx, key));
+    if (st.open == 0) { context.redraw(ctx); }
+    st.open = 1;
 }
 
 # take down the modal keyed key in the current id scope
@@ -221,7 +223,9 @@ pub fun open(ctx: *context.Context, key: str) {
 # ctx: context
 # key: the modal's title or key
 pub fun close(ctx: *context.Context, key: str) {
-    state.get[ModalState](ctx, context.id_of(ctx, key)).open = 0;
+    val st: *ModalState = state.get[ModalState](ctx, context.id_of(ctx, key));
+    if (st.open != 0) { context.redraw(ctx); }
+    st.open = 0;
 }
 
 # whether the modal keyed key in the current id scope is up

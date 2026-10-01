@@ -188,13 +188,15 @@ pub fun selected(ctx: *context.Context, bar: u64) opt[u64] {
 
 # select a tab of a bar from code, scrolling it into view
 #
-# the change shows from the next frame, and that frame's event reports it.
+# the change shows from the next frame, which it asks for, and that frame's
+# event reports it.
 # ---
 # ctx: context
 # bar: the bar's id
 # key: the tab's key
 pub fun select(ctx: *context.Context, bar: u64, key: u64) {
     val s: *State = state.get[State](ctx, bar);
+    if (s.has == 0 || s.key != key) { context.redraw(ctx); }
     s.key    = key;
     s.has    = 1;
     s.follow = 1;
@@ -216,7 +218,8 @@ pub fun index(ctx: *context.Context, bar: u64, key: u64) opt[usize] {
 
 # move a tab of a bar to an index from code, as a drag within the bar does
 #
-# the tabs between shift along. the move shows from the next frame. a tab the
+# the tabs between shift along. the move shows from the next frame, which it
+# asks for when the tab moves. a tab the
 # bar has not placed yet takes the index when it first appears.
 # ---
 # ctx: context
@@ -231,8 +234,9 @@ pub fun move(ctx: *context.Context, bar: u64, key: u64, to: usize) {
         ret;
     }
     val old: f64 = r.at - 1.0::f64;
-    if (t < old) { r.at = t + 0.5::f64; }
-    or (t > old) { r.at = t + 1.5::f64; }
+    if (t < old)  { r.at = t + 0.5::f64; }
+    or (t > old)  { r.at = t + 1.5::f64; }
+    if (t != old) { context.redraw(ctx); }
 }
 
 # a tab's rank, 0 when it has none

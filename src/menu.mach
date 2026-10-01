@@ -898,12 +898,14 @@ fun open_at(st: *MenuState, x: f32, y: f32) {
 }
 
 # open a context menu at the cursor, such as from a widget's own right click;
-# it draws from its next begin_context
+# it draws from its next begin_context, and asks for the frame that runs it
 # ---
 # ctx: context
 # key: the menu's key, in the scope its begin_context runs in
 pub fun open_context(ctx: *context.Context, key: str) {
-    open_at(state.get[MenuState](ctx, context.id_of(ctx, key)), ctx.in.mx, ctx.in.my);
+    val st: *MenuState = state.get[MenuState](ctx, context.id_of(ctx, key));
+    if (st.open == 0 || st.x != ctx.in.mx || st.y != ctx.in.my) { context.redraw(ctx); }
+    open_at(st, ctx.in.mx, ctx.in.my);
 }
 
 # whether a context menu is open

@@ -373,6 +373,7 @@ pub fun split(ctx: *context.Context, id: u64, side: context.Side, share: f32) u6
     }
     n.parent            = s;
     node(ctx, f).parent = s;
+    context.redraw(ctx);
     ret f;
 }
 
@@ -448,6 +449,7 @@ fun place(ctx: *context.Context, leaf: u64, window: u64, rank: f64) {
         state.pin[widget.Docked](ctx, window, 1);
     }
     dk.id = window;
+    if (dk.node != leaf || dk.rank != rank || n.front != window) { context.redraw(ctx); }
     if (dk.node != leaf) {
         if (dk.node != 0) { leave(ctx, dk); }
         dk.node = leaf;
@@ -468,6 +470,7 @@ pub fun remove(ctx: *context.Context, window: u64) {
     if (dk == nil)    { ret; }
     if (dk.node != 0) { leave(ctx, dk); }
     state.drop[widget.Docked](ctx, window);
+    context.redraw(ctx);
 }
 
 # the leaf a window is docked in

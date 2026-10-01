@@ -174,7 +174,9 @@ pub fun set(ctx: *context.Context, id: u32, path: str, v: th.Value) bool {
     val p: opt[th.Path] = th.path(?ctx.theme, path);
     if (sel p.none) { ret false; }
     val e: err[allo.Error] = sheet.class_set(?ctx.sheet, id, path, th.FIELDS[p.some.field].unit, v);
-    ret sel e.ok;
+    if (sel e.err) { ret false; }
+    context.redraw(ctx);
+    ret true;
 }
 
 # apply a class's settings to the widgets drawn until the matching pop
@@ -211,6 +213,7 @@ pub fun load_theme(ctx: *context.Context, text: str) err[th.LoadError] {
     var out:  err[th.LoadError] = read;
     if (sel read.ok) { out = sheet.read_classes(?ctx.sheet, ?ctx.theme, ?root); }
     val d: err[allo.Error] = toml.dnit(ctx.a, ?root);
+    if (sel read.ok) { context.redraw(ctx); }
     if (sel out.err) { ret out; }
     if (sel d.err)   { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{d.err}}}; }
     ret out;
