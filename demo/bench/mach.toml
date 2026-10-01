@@ -1,0 +1,63 @@
+[project]
+id      = "bench"
+version = "0.1.0"
+mach    = "^6"
+src     = "src"
+out     = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa     = "x86_64"
+os      = "linux"
+abi     = "sysv64"
+default = true
+
+[target.windows-x86_64]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
+[target.linux-arm64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.darwin-aarch64]
+isa = "aarch64"
+os  = "darwin"
+abi = "aapcs64"
+
+[profile.debug]
+opt           = 0
+debug         = true
+simd          = "scalarize"
+vectorize     = false
+float_reassoc = false
+default       = true
+
+[profile.release]
+opt           = 2
+debug         = false
+simd          = "scalarize"
+vectorize     = true
+float_reassoc = false
+
+[artifact.bench]
+kind    = "bin"
+default = true
+entry   = "bin/main.mach"
+out     = "bin/bench{artifact.suffix}"
+targets = ["*"]
+link    = []
+need    = []
+
+[dep.blit]
+path = "../.."
+
+# blit's own committed pin, so the demo builds against exactly the std blit does
+[dep.std]
+path = "../../dep/std"

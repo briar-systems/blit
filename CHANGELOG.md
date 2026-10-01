@@ -7,9 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- The clip, origin and layer stacks and the span list grow with the frame (#97): `CLIP_DEPTH` and `RUN_DEPTH` are initial capacities, not limits, so deep nesting and many spans no longer restore stale clips and origins or draw with the wrong texture and layer. An allocation failure sets `oom`.
-
 ## [0.9.0] - 2026-09-30
 
 ### Added
