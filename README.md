@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -208,7 +208,8 @@ blit.context.end(?ctx);
   `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
   `blit.input.pressed`, `released` and `held` take the button. The context
   carries `prev_down` across frames. With `present` 0 nothing is hovered and
-  `in_rect` misses. Widgets act on the left button.
+  `in_rect` misses. Widgets act on the left button through `blit.interact`
+  (see Interaction).
 - **Button events.** A host that only samples the buttons sets `down` and
   nothing more, and a press and release that both land between two frames are
   then lost. A host that sees each one also adds it as it arrives,
@@ -310,8 +311,54 @@ Coordinates compose one way:
 - **A layer is a new root.** Inside `push_layer` (and so inside a popup) the
   origin is zero and the clip is the whole screen.
 - **The cursor is screen space.** `ctx.in.mx`/`my` and `input_visible` are in
-  screen pixels. Use a `Surface`'s `local_mx`/`local_my` for the cursor in its
-  local space.
+  screen pixels. `blit.context.local_mx(?ctx)`/`local_my` are the cursor in the
+  current local space, as are a `Surface`'s `local_mx`/`local_my` and a hit's
+  `mx`/`my`.
+
+## Interaction
+
+`blit.interact.hit(?ctx, id, x0, y0, x1, y1, buttons)` is how every widget
+meets the pointer, built-in or not: it claims the rect in the current local
+space (clipped and layered like geometry) and returns a `blit.interact.Hit`
+for the `BUTTON_*` bits it answers to. Every built-in widget and chart calls
+it, so a custom control behaves exactly like one.
+
+```mach
+val id: u64 = blit.context.id_of(?ctx, "node");
+val h:  blit.interact.Hit = blit.interact.hit(?ctx, id, x0, y0, x1, y1,
+    blit.input.BUTTON_LEFT | blit.input.BUTTON_RIGHT);
+if (h.double)                                         { open_node(); }
+or (h.clicked && h.button == blit.input.BUTTON_RIGHT) { open_menu(h.mx, h.my); }
+if (h.held) { drag_by(h.dx, h.dy); }
+```
+
+- **Hover.** `hot` while it is the topmost claimant under the cursor.
+- **Owning the pointer.** A press over it with one of its buttons makes it
+  `active` until that button comes up, and `pressed` on that frame. A press
+  while another button owns the pointer takes nothing. While active, `held`
+  says the button is still down and `dx`/`dy` are the cursor's travel since the
+  press, wherever the cursor goes. `released` is the frame the button comes up,
+  over it or not, and `clicked` is a release over it. `button` is the
+  `BUTTON_*` bit it acted on.
+- **Double clicks.** The context keeps each button's last press
+  (`blit.context.last_press`): its time, where it landed in screen space, the
+  claimant it landed on and its run of clicks. A press on the same claimant
+  within the double-click time and distance of the one before extends the run:
+  `clicks` is 1, 2 or 3 for a single, double or triple click, and `double` is
+  the second.
+  `blit.context.set_double_click(?ctx, seconds, pixels)` sets the threshold
+  (`DOUBLE_TIME`, 0.3 s, and `DOUBLE_DIST`, 6 unscaled pixels, by default), so
+  a host can pass its platform's settings.
+- **Hover only.** `buttons` 0 reports hover and the cursor and never owns the
+  pointer, as a chart's read-out does.
+- **Moving with a drag.** `blit.interact.drag(?ctx, id, ?dx, ?dy)` reports the
+  same travel without claiming, for a part that moves with its drag (a title
+  bar, a scrollbar thumb) and must place its rect before claiming it.
+- **Focus.** A widget that takes the keyboard does it on `pressed` with
+  `blit.context.focus(?ctx, id)`. Its id is `id_of(?ctx, key)` in the scope it
+  was drawn in, so a caller that refuses a text field's entry (`ENTERED` with
+  text it will not take) calls `focus` with that id to hand the keyboard
+  straight back, and `focused(?ctx, id)` says whether it holds it.
 
 ## Widgets & layout
 
@@ -353,8 +400,9 @@ a popup over later widgets, its open state kept in the state store under its
 id, `blit.widget.begin_window`/`end_window` is a
 draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
 x, y, w)`/`end_popup` opens an overlay column, and
-`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
-rect for consumer-drawn affordances.
+`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` is a left click on an
+arbitrary rect for consumer-drawn affordances, the simplest use of
+`blit.interact.hit`.
 
 ## Widget ids
 
@@ -488,9 +536,9 @@ click is always the one visibly on top.
   `merge(?ctx, ch)`. A lower channel paints beneath a higher one whatever the
   order they were drawn in, so the background can be any shape. Splits nest,
   and each is merged on the layer it was made on.
-- **Claims.** Interactive widgets call `blit.context.claim(?ctx, id, x0, y0,
-  x1, y1)`, which records the rect with the key (layer, then claim order) and
-  returns whether the widget is hovered. Containers call `reserve_claim` before
+- **Claims.** Interactive widgets claim through `blit.interact.hit`, which calls
+  `blit.context.claim(?ctx, id, x0, y0, x1, y1)`: it records the rect with the
+  key (layer, then claim order) and returns whether the widget is hovered. Containers call `reserve_claim` before
   their children and `fill_claim` at their end, so their empty areas stop input
   instead of letting it reach what they cover.
 - **Routing.** Frame N's input goes only to the topmost of frame N-1's claims
