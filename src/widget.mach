@@ -1806,6 +1806,7 @@ pub fun dock_placed(ctx: *context.Context, dk: *Docked) bool {
 # hidden: 1 while an auto-sized window with no width yet lays out only to
 #         measure, drawing and claiming nothing
 # docked: 1 while it draws where its dock placed it
+# area:   the rect a docked window fills, its body padded within it
 # need_w: the width the titlebar needs
 # min_w:  least width
 # max_w:  greatest width
@@ -1824,6 +1825,7 @@ pub rec WindowArea {
     sc:     *Scroll;
     hidden: u8;
     docked: u8;
+    area:   context.Area;
     need_w: f32;
     min_w:  f32;
     max_w:  f32;
@@ -2013,7 +2015,8 @@ fun bound(v: f32) f32 {
 # a dock takes in (see blit.dock). a docked window instead draws in the rect
 # its dock last laid out (see Docked), in the docked band, with no chrome, its
 # body a scroll region whatever its flags, and has no body while another tab
-# of its stack is selected. its content and ids are the same either way.
+# of its stack is selected. its content, ids and body padding are the same
+# either way.
 # widgets placed while the returned body is 1 fill it, in screen pixels. the
 # window is an id scope for them. pair every begin_window with an end_window,
 # closed or not.
@@ -2195,8 +2198,9 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     ret r;
 }
 
-# begin_window for a window its dock holds: no chrome, a scroll region over
-# the rect the dock laid out, and nothing at all while another tab is selected
+# begin_window for a window its dock holds: no chrome, a scroll region padded
+# within the rect the dock laid out as a floating body is, and nothing at all
+# while another tab is selected
 fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked) WindowArea {
     var out:  WindowArea = r;
     val bare: u8         = (win.flags & WINDOW_NO_TITLE) != 0;
@@ -2214,9 +2218,14 @@ fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked)
     out.claim = context.reserve_claim(ctx, out.id);
     out.ch    = context.split(ctx, 2);
     context.set_channel(ctx, out.ch, 1);
-    val body_id: u64 = bid.child(out.id, "#body");
+    out.area = context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1};
+    val p:       theme.Edges  = padding(ctx, theme.WINDOW);
+    val body_id: u64          = bid.child(out.id, "#body");
+    val inner:   context.Area = context.Area{
+        x0: dk.x0 + p.l, y0: dk.y0 + p.t, x1: maxf(dk.x1 - p.r, dk.x0 + p.l), y1: maxf(dk.y1 - p.b, dk.y0 + p.t)
+    };
     out.sc     = state.get[Scroll](ctx, body_id);
-    out.scroll = scroll_in(ctx, body_id, out.sc, context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1}, 0);
+    out.scroll = scroll_in(ctx, body_id, out.sc, inner, 0);
     ret out;
 }
 
@@ -2224,10 +2233,10 @@ fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked)
 fun end_docked(ctx: *context.Context, r: WindowArea) {
     end_scroll(ctx, r.sc, r.scroll);
     context.set_channel(ctx, r.ch, 0);
-    val x0: f32 = r.scroll.x;
-    val y0: f32 = r.scroll.y;
-    val x1: f32 = r.scroll.x + r.scroll.w;
-    val y1: f32 = r.scroll.y + r.scroll.h;
+    val x0: f32 = r.area.x0;
+    val y0: f32 = r.area.y0;
+    val x1: f32 = r.area.x1;
+    val y1: f32 = r.area.y1;
     if ((r.flags & WINDOW_NO_BACKGROUND) == 0) { context.box_face(ctx, theme.DOCK, theme.NORMAL, x0, y0, x1, y1, context.CORNERS_ALL, 0); }
     context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
