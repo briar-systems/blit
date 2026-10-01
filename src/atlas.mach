@@ -1,13 +1,22 @@
 # the glyph atlas: fixed-size RGBA8 pages that glyphs are packed into on demand
 #
-# every texel is white rgb with the glyph's coverage in alpha, so the consumer's
-# `aColor * texture(page, uv)` tints text, and each page carries an opaque white
-# block that solid quads sample through the same shader and texture.
+# every texel is premultiplied white, the glyph's coverage in all four
+# channels, so the consumer's `aColor * texture(page, uv)` tints text with a
+# premultiplied vertex color, and each page carries an opaque white block that
+# solid shapes sample through the same shader and texture.
 #
 # a page never resizes. vertices bake their uvs when they are emitted and the
 # frame is drawn later, so growing a page would move every quad recorded
 # against it. a full page is left as it is and a new one is opened, up to
 # PAGE_MAX, which costs the consumer one more texture and a span break.
+#
+# past PAGE_MAX the atlas evicts by page. the frame counter (tick) and a stamp
+# of the last frame each page was drawn from (touch) pick the least recently
+# used page, which is cleared and refilled. a page drawn from this frame is
+# never evicted, since quads already emitted sample it, so a glyph drawn this
+# frame is never dropped. a page's generation says it was cleared, so a cache
+# holding cells on it knows they are gone. only when every page is drawn from
+# in one frame is a glyph refused.
 #
 # glyphs are shelf-packed with a transparent gutter around each, so linear
 # filtering never pulls in a neighbour. every write bumps the page's version
@@ -66,6 +75,8 @@ pub rec Slot {
 # shelf_x: next free x on the open shelf
 # shelf_y: top of the open shelf
 # shelf_h: height of the open shelf, the tallest bitmap on it
+# used:    last frame the page was drawn from, 0 for never
+# gen:     bumped every time the page is cleared, dropping what was packed on it
 pub rec Page {
     pixels:  *u8;
     version: u64;
@@ -73,6 +84,8 @@ pub rec Page {
     shelf_x: usize;
     shelf_y: usize;
     shelf_h: usize;
+    used:    u64;
+    gen:     u32;
 }
 
 # the pages glyphs are packed into
@@ -80,10 +93,14 @@ pub rec Page {
 # a:     allocator backing the pages
 # pages: the pages, `count` of them live
 # count: pages opened
+# open:  page glyphs are packed into next
+# frame: frame counter, advanced by tick
 pub rec Atlas {
     a:     *allo.Allocator;
     pages: [16]Page;
     count: usize;
+    open:  usize;
+    frame: u64;
 }
 
 # open an atlas with its first page, so solid quads always have a white texel
@@ -94,6 +111,8 @@ pub rec Atlas {
 pub fun init(at: *Atlas, a: *allo.Allocator) err[allo.Error] {
     at.a     = a;
     at.count = 0;
+    at.open  = 0;
+    at.frame = 1;
     ret open_page(at);
 }
 
@@ -123,25 +142,38 @@ pub fun reset(at: *Atlas) {
         clear_page(?at.pages[i]);
         i = i + 1;
     }
+    at.open = 0;
 }
 
-# clear a page to transparent white around its white block
+# start a frame, so pages drawn from in earlier frames become evictable
+# ---
+# at: atlas
+pub fun tick(at: *Atlas) {
+    at.frame = at.frame + 1;
+}
+
+# mark a page drawn from this frame, keeping it from eviction until the next
+# ---
+# at:    atlas
+# index: page index below page_count
+pub fun touch(at: *Atlas, index: usize) {
+    if (index < at.count) { at.pages[index].used = at.frame; }
+}
+
+# clear a page to transparent around its white block
 fun clear_page(p: *Page) {
-    val n: usize = PAGE_SIDE * PAGE_SIDE;
+    val n: usize = PAGE_SIDE * PAGE_SIDE * 4;
     var i: usize = 0;
     for (i < n) {
-        p.pixels[i * 4 + 0] = 255;
-        p.pixels[i * 4 + 1] = 255;
-        p.pixels[i * 4 + 2] = 255;
-        p.pixels[i * 4 + 3] = 0;
-        i                   = i + 1;
+        p.pixels[i] = 0;
+        i           = i + 1;
     }
     var y: usize = 0;
     for (y < WHITE) {
         var x: usize = 0;
-        for (x < WHITE) {
-            p.pixels[(y * PAGE_SIDE + x) * 4 + 3] = 255;
-            x                                     = x + 1;
+        for (x < WHITE * 4) {
+            p.pixels[y * PAGE_SIDE * 4 + x] = 255;
+            x                               = x + 1;
         }
         y = y + 1;
     }
@@ -149,6 +181,8 @@ fun clear_page(p: *Page) {
     p.shelf_y = 0;
     p.shelf_h = WHITE;
     p.version = p.version + 1;
+    p.gen     = p.gen + 1;
+    p.used    = 0;
     p.dirty   = Region{x0: 0, y0: 0, x1: PAGE_SIDE::u32, y1: PAGE_SIDE::u32};
 }
 
@@ -160,6 +194,7 @@ fun open_page(at: *Atlas) err[allo.Error] {
     p.pixels = r.ok;
     clear_page(?p);
     at.pages[at.count] = p;
+    at.open            = at.count;
     at.count           = at.count + 1;
     ret err[allo.Error].ok{};
 }
@@ -179,11 +214,26 @@ fun fit(p: *Page, w: usize, h: usize, x: *usize, y: *usize) u8 {
     ret 1;
 }
 
-# pack a w x h coverage bitmap into the newest page with room, opening a page
-# when the newest is full
+# the least recently used page not drawn from this frame, cleared for reuse
+fun evict(at: *Atlas) opt[usize] {
+    var best: usize = at.count;
+    var i:    usize = 0;
+    for (i < at.count) {
+        val u: u64 = at.pages[i].used;
+        if (u < at.frame && (best == at.count || u < at.pages[best].used)) { best = i; }
+        i = i + 1;
+    }
+    if (best == at.count) { ret opt[usize].none{}; }
+    clear_page(?at.pages[best]);
+    ret opt[usize].some{best};
+}
+
+# pack a w x h coverage bitmap into the open page, opening a page when it is
+# full, or past PAGE_MAX clearing the least recently used one
 #
-# a bitmap larger than a page, or one arriving with PAGE_MAX pages full, is
-# refused rather than cropped.
+# the page it lands on counts as drawn from this frame. a bitmap larger than a
+# page, or one arriving with every page drawn from this frame, is refused
+# rather than cropped.
 # ---
 # at:     atlas to pack into
 # cov:    w * h coverage bytes, row-major with rows `stride` bytes apart
@@ -198,26 +248,38 @@ pub fun pack(at: *Atlas, cov: *u8, stride: usize, w: usize, h: usize) opt[Slot] 
 
     var x: usize = 0;
     var y: usize = 0;
-    if (fit(?at.pages[at.count - 1], w, h, ?x, ?y) == 0) {
-        if (at.count >= PAGE_MAX) { ret opt[Slot].none{}; }
-        val opened: err[allo.Error] = open_page(at);
-        if (sel opened.err)                                  { ret opt[Slot].none{}; }
-        if (fit(?at.pages[at.count - 1], w, h, ?x, ?y) == 0) { ret opt[Slot].none{}; }
+    if (fit(?at.pages[at.open], w, h, ?x, ?y) == 0) {
+        if (at.count < PAGE_MAX) {
+            val opened: err[allo.Error] = open_page(at);
+            if (sel opened.err) { ret opt[Slot].none{}; }
+        }
+        or {
+            val freed: opt[usize] = evict(at);
+            if (sel freed.none) { ret opt[Slot].none{}; }
+            at.open = freed.some;
+        }
+        if (fit(?at.pages[at.open], w, h, ?x, ?y) == 0) { ret opt[Slot].none{}; }
     }
 
-    val p:  *Page = ?at.pages[at.count - 1];
+    val p:  *Page = ?at.pages[at.open];
     var ry: usize = 0;
     for (ry < h) {
         var rx: usize = 0;
         for (rx < w) {
-            p.pixels[((y + ry) * PAGE_SIDE + x + rx) * 4 + 3] = cov[ry * stride + rx];
-            rx                                                = rx + 1;
+            val at: usize = ((y + ry) * PAGE_SIDE + x + rx) * 4;
+            val c:  u8    = cov[ry * stride + rx];
+            p.pixels[at + 0] = c;
+            p.pixels[at + 1] = c;
+            p.pixels[at + 2] = c;
+            p.pixels[at + 3] = c;
+            rx               = rx + 1;
         }
         ry = ry + 1;
     }
     p.version = p.version + 1;
+    p.used    = at.frame;
     grow_dirty(?p.dirty, x::u32, y::u32, (x + w)::u32, (y + h)::u32);
-    ret opt[Slot].some{Slot{page: (at.count - 1)::u32, x: x::u32, y: y::u32}};
+    ret opt[Slot].some{Slot{page: at.open::u32, x: x::u32, y: y::u32}};
 }
 
 # grow a dirty rect to cover another
@@ -269,6 +331,16 @@ pub fun page_version(at: *Atlas, index: usize) u64 {
     ret at.pages[index].version;
 }
 
+# a page's generation, bumped every time it is cleared and its glyphs dropped
+# ---
+# at:    atlas
+# index: page index below page_count
+# ret:   generation, 0 for an index out of range
+pub fun page_gen(at: *Atlas, index: usize) u32 {
+    if (index >= at.count) { ret 0; }
+    ret at.pages[index].gen;
+}
+
 # texels written to a page since its last page_clean
 # ---
 # at:    atlas
@@ -302,6 +374,7 @@ test pack__fills_pages_then_opens_more {
     white_uv(?u, ?v);
     val wx: usize = (u * PAGE_SIDE::f32)::usize;
     if (page_pixels(?at, 0)[(wx * PAGE_SIDE + wx) * 4 + 3] != 255) { ret 2; }
+    if (page_pixels(?at, 0)[(wx * PAGE_SIDE + wx) * 4] != 255)     { ret 2; }
     if (page_dirty(?at, 0).x1 != PAGE_SIDE::u32)                   { ret 3; }
     page_clean(?at, 0);
 
@@ -310,7 +383,10 @@ test pack__fills_pages_then_opens_more {
     if (sel s.none) { ret 4; }
     val p0: *u8  = page_pixels(?at, 0);
     val sl: Slot = s.some;
-    if (p0[((sl.y + 1) * PAGE_SIDE::u32 + sl.x + 1) * 4 + 3] != 40) { ret 5; }
+    # coverage lands premultiplied, in every channel
+    val ti: u32 = ((sl.y + 1) * PAGE_SIDE::u32 + sl.x + 1) * 4;
+    if (p0[ti] != 40 || p0[ti + 2] != 40 || p0[ti + 3] != 40) { ret 5; }
+    if (p0[(sl.y * PAGE_SIDE::u32 + sl.x + 2) * 4] != 0)      { ret 11; }
     val d: Region = page_dirty(?at, 0);
     if (d.x0 != sl.x || d.x1 != sl.x + 2) { ret 6; }
 

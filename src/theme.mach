@@ -30,6 +30,7 @@ pub val SERIES: usize = 8;
 # edge:        the edge line a dock draws on its inner side
 # text:        text
 # text_dim:    secondary text and glyphs, such as a collapse marker
+# text_faint:  the faintest text, for hints and placeholders such as an empty text field's hint
 # accent:      a mark that is on, such as a checked box, a chosen segment or a selected row, and a focused text field's outline
 # accent_text: text and marks drawn on an accent fill
 # warn:        warnings, for consumers drawing their own content; no widget uses it
@@ -63,6 +64,7 @@ pub rec Theme {
     edge:        draw.Color;
     text:        draw.Color;
     text_dim:    draw.Color;
+    text_faint:  draw.Color;
     accent:      draw.Color;
     accent_text: draw.Color;
     warn:        draw.Color;
@@ -102,6 +104,7 @@ pub fun default() Theme {
     t.edge        = draw.rgba(0.20::f32, 0.20::f32, 0.25::f32, 1.0::f32);
     t.text        = draw.rgba(0.92::f32, 0.92::f32, 0.95::f32, 1.0::f32);
     t.text_dim    = draw.rgba(0.60::f32, 0.60::f32, 0.66::f32, 1.0::f32);
+    t.text_faint  = draw.rgba(0.42::f32, 0.42::f32, 0.47::f32, 1.0::f32);
     t.accent      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 1.0::f32);
     t.accent_text = draw.rgba(0.06::f32, 0.10::f32, 0.06::f32, 1.0::f32);
     t.warn        = draw.rgba(0.91::f32, 0.50::f32, 0.42::f32, 1.0::f32);

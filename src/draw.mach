@@ -1,9 +1,11 @@
-# the draw list, a growable buffer of colored, textured triangle vertices
+# the draw list, a growable indexed list of colored, textured triangles
 #
-# widgets accumulate vertices here; each frame the consumer uploads data()/count()
-# to a dynamic vertex buffer and renders them as GL_TRIANGLES. positions are in
-# pixel space, u/v index the sampled texture in [0, 1], and rgba is straight
-# (not premultiplied) with each channel in [0, 1].
+# widgets accumulate vertices and u32 indices here; each frame the consumer
+# uploads data()/count() and indices()/index_count() and draws the indices as
+# triangles. positions are in pixel space, u/v index the sampled texture in
+# [0, 1], and vertex rgba is premultiplied by its alpha with each channel in
+# [0, 1]. colors are authored straight (Color) and premultiplied as they are
+# emitted.
 #
 # a vertex samples either the font atlas or a texture the consumer owns. the
 # consumer's texture is named by an opaque integer handle blit only passes
@@ -18,9 +20,11 @@ use std.types.size.usize;
 
 use allo: std.allocator;
 use std.allocator.page;
+use vec: std.collections.vector;
 use std.math.float;
 
-# vertex capacity allocated by init before any growth
+# vertex capacity allocated by init before any growth, with half as many
+# indices again
 pub val INIT_CAP: usize = 1024;
 
 # the texture handle naming blit's own font atlas, never a consumer texture
@@ -144,6 +148,103 @@ pub fun linear(c: Color) Color {
     ret rgba(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b), c.a);
 }
 
+# a color given as 0xRRGGBB with a separate alpha
+# ---
+# rgb: red, green and blue bytes, red in bits 16..23
+# a:   alpha channel in [0, 1]
+# ret: the color, straight
+pub fun hex(rgb: u32, a: f32) Color {
+    val r: u32 = (rgb >> 16) & 0xFF;
+    val g: u32 = (rgb >> 8) & 0xFF;
+    val b: u32 = rgb & 0xFF;
+    ret rgba(r::f32 / 255.0::f32, g::f32 / 255.0::f32, b::f32 / 255.0::f32, a);
+}
+
+# a straight color with its color channels multiplied by its alpha
+#
+# the draw list holds premultiplied colors, which blend with ONE /
+# ONE_MINUS_SRC_ALPHA and composite feathered edges without fringes.
+# ---
+# c:   straight color
+# ret: the premultiplied color
+pub fun premultiply(c: Color) Color {
+    ret rgba(c.r * c.a, c.g * c.a, c.b * c.a, c.a);
+}
+
+# a point in pixels
+# ---
+# x: x in pixels
+# y: y in pixels
+pub rec Point {
+    x: f32;
+    y: f32;
+}
+
+# a radius per corner of a rect, in pixels
+# ---
+# tl: top-left radius
+# tr: top-right radius
+# br: bottom-right radius
+# bl: bottom-left radius
+pub rec Radii {
+    tl: f32;
+    tr: f32;
+    br: f32;
+    bl: f32;
+}
+
+# the same radius on every corner
+# ---
+# r:   radius in pixels
+# ret: the radii
+pub fun radii(r: f32) Radii {
+    ret Radii{tl: r, tr: r, br: r, bl: r};
+}
+
+# a linear gradient from c0 at (x0, y0) to c1 at (x1, y1)
+#
+# the color is constant along lines perpendicular to the axis and clamps to
+# the end colors beyond the two points. points are in the local space the
+# shape is drawn in. the colors are interpolated after conversion and
+# premultiplying, as every vertex is.
+# ---
+# x0: start x in local pixels
+# y0: start y in local pixels
+# x1: end x in local pixels
+# y1: end y in local pixels
+# c0: color at the start
+# c1: color at the end
+pub rec Gradient {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+    c0: Color;
+    c1: Color;
+}
+
+# a linear gradient from c0 at (x0, y0) to c1 at (x1, y1)
+# ---
+# x0:  start x in local pixels
+# y0:  start y in local pixels
+# c0:  color at the start
+# x1:  end x in local pixels
+# y1:  end y in local pixels
+# c1:  color at the end
+# ret: the gradient
+pub fun gradient(x0: f32, y0: f32, c0: Color, x1: f32, y1: f32, c1: Color) Gradient {
+    ret Gradient{x0: x0, y0: y0, x1: x1, y1: y1, c0: c0, c1: c1};
+}
+
+# how a stroke turns a corner: its outer edges meet at a point
+pub val JOIN_MITER: u8 = 0;
+
+# how a stroke turns a corner: its outer edges are cut straight across
+pub val JOIN_BEVEL: u8 = 1;
+
+# how a stroke turns a corner: its outer edges follow an arc
+pub val JOIN_ROUND: u8 = 2;
+
 # slots in a LinearCache, a power of two
 pub val LINEAR_SLOTS: usize = 64;
 
@@ -189,15 +290,15 @@ pub fun linear_cached(lc: *LinearCache, c: Color) Color {
     ret l;
 }
 
-# a single vertex: pixel-space position, atlas uv, and color
+# a single vertex: pixel-space position, texture uv, and premultiplied color
 # ---
 # x: pixel-space x
 # y: pixel-space y
-# u: atlas u in [0, 1]
-# v: atlas v in [0, 1]
-# r: red channel
-# g: green channel
-# b: blue channel
+# u: texture u in [0, 1]
+# v: texture v in [0, 1]
+# r: red channel, premultiplied by a
+# g: green channel, premultiplied by a
+# b: blue channel, premultiplied by a
 # a: alpha channel
 pub rec Vert {
     x: f32;
@@ -210,50 +311,47 @@ pub rec Vert {
     a: f32;
 }
 
-# a growable vertex buffer accumulated over one frame
+# the largest vertex count a u32 index reaches
+val VERT_MAX: usize = 0xFFFFFFFF;
+
+# a growable indexed triangle list accumulated over one frame
+#
+# every three indices name one triangle's vertices. writers reserve room for a
+# whole shape first, then put its vertices and triangles, so a refused growth
+# never leaves half a shape behind.
 # ---
-# verts: backing buffer (nil before init)
-# cap:   capacity in vertices
-# len:   vertices currently used
-# a:     allocator backing the buffer
+# verts: vertices, in emission order
+# idx:   u32 indices into verts, three per triangle
 pub rec DrawList {
-    verts: *Vert;
-    cap:   usize;
-    len:   usize;
-    a:     *allo.Allocator;
+    verts: vec.Vector[Vert];
+    idx:   vec.Vector[u32];
 }
 
-# allocate a draw list's initial backing buffer
+# allocate a draw list's initial backing buffers
 # ---
 # dl:  draw list to initialize
-# a:   allocator to back the buffer
+# a:   allocator to back the buffers
 # ret: ok, or the allocator's refusal with the draw list left empty
 pub fun init(dl: *DrawList, a: *allo.Allocator) err[allo.Error] {
-    dl.a     = a;
-    dl.len   = 0;
-    dl.cap   = 0;
-    dl.verts = nil;
-
-    val r: res[*Vert, allo.Error] = allo.allocate[Vert](a, INIT_CAP);
-    if (sel r.err) { ret err[allo.Error].err{r.err}; }
-    dl.verts = r.ok;
-    dl.cap   = INIT_CAP;
+    dl.verts = vec.init[Vert](a);
+    dl.idx   = vec.init[u32](a);
+    val e: err[allo.Error] = reserve(dl, INIT_CAP, INIT_CAP + INIT_CAP / 2);
+    if (sel e.err) {
+        val f: err[allo.Error] = free(dl);
+        ret e;
+    }
     ret err[allo.Error].ok{};
 }
 
-# release the backing buffer and reset the draw list to empty
+# release the backing buffers and reset the draw list to empty
 # ---
 # dl:  draw list to free
-# ret: ok, or the allocator's refusal with the draw list still owning its buffer
+# ret: ok, or the allocator's refusal with the draw list still owning what it could not free
 pub fun free(dl: *DrawList) err[allo.Error] {
     if (dl == nil) { ret err[allo.Error].ok{}; }
-
-    val freed: err[allo.Error] = allo.deallocate[Vert](dl.a, dl.verts, dl.cap);
-    if (sel freed.err) { ret freed; }
-    dl.verts = nil;
-    dl.cap   = 0;
-    dl.len   = 0;
-    ret err[allo.Error].ok{};
+    val ev: err[allo.Error] = vec.dnit[Vert](?dl.verts);
+    if (sel ev.err) { ret ev; }
+    ret vec.dnit[u32](?dl.idx);
 }
 
 # clear the draw list for a new frame, keeping allocated capacity
@@ -261,7 +359,8 @@ pub fun free(dl: *DrawList) err[allo.Error] {
 # dl: draw list to reset
 pub fun reset(dl: *DrawList) {
     if (dl == nil) { ret; }
-    dl.len = 0;
+    vec.clear[Vert](?dl.verts);
+    vec.clear[u32](?dl.idx);
 }
 
 # number of vertices currently in the draw list
@@ -269,7 +368,7 @@ pub fun reset(dl: *DrawList) {
 # dl:  draw list to query
 # ret: vertex count
 pub fun count(dl: *DrawList) usize {
-    ret dl.len;
+    ret dl.verts.len;
 }
 
 # pointer to the first vertex, for upload (nil if never grown)
@@ -277,127 +376,121 @@ pub fun count(dl: *DrawList) usize {
 # dl:  draw list to query
 # ret: pointer to the vertex buffer
 pub fun data(dl: *DrawList) *Vert {
-    ret dl.verts;
+    ret dl.verts.data;
 }
 
-# ensure room for at least one more vertex, doubling capacity when full
+# number of indices currently in the draw list, three per triangle
+# ---
+# dl:  draw list to query
+# ret: index count
+pub fun index_count(dl: *DrawList) usize {
+    ret dl.idx.len;
+}
+
+# pointer to the first index, for upload (nil if never grown)
+# ---
+# dl:  draw list to query
+# ret: pointer to the u32 index buffer
+pub fun indices(dl: *DrawList) *u32 {
+    ret dl.idx.data;
+}
+
+# ensure room for nv more vertices and ni more indices
+#
+# a draw list never holds more vertices than a u32 index can name.
 # ---
 # dl:  draw list to grow
-# ret: ok, or the allocator's refusal with the buffer left as it was
-fun grow(dl: *DrawList) err[allo.Error] {
-    if (dl.len < dl.cap) { ret err[allo.Error].ok{}; }
-
-    var new_cap: usize = dl.cap * 2;
-    if (new_cap == 0) { new_cap = INIT_CAP; }
-
-    val r: res[*Vert, allo.Error] = allo.reallocate[Vert](dl.a, dl.verts, dl.cap, new_cap);
-    if (sel r.err) { ret err[allo.Error].err{r.err}; }
-    dl.verts = r.ok;
-    dl.cap   = new_cap;
+# nv:  vertices about to be put
+# ni:  indices about to be put
+# ret: ok, or the allocator's refusal with the buffers left as they were
+pub fun reserve(dl: *DrawList, nv: usize, ni: usize) err[allo.Error] {
+    if (nv > VERT_MAX || dl.verts.len > VERT_MAX - nv) { ret err[allo.Error].err{allo.Error.overflow{}}; }
+    val rv: res[usize, allo.Error] = vec.reserve[Vert](?dl.verts, nv);
+    if (sel rv.err) { ret err[allo.Error].err{rv.err}; }
+    val ri: res[usize, allo.Error] = vec.reserve[u32](?dl.idx, ni);
+    if (sel ri.err) { ret err[allo.Error].err{ri.err}; }
     ret err[allo.Error].ok{};
 }
 
-# ensure capacity for at least n vertices in total
+# append a vertex into room made by reserve
 # ---
-# dl:  draw list to grow
-# n:   vertex count the buffer must hold
-# ret: ok, or the allocator's refusal with the buffer left as it was
-pub fun reserve(dl: *DrawList, n: usize) err[allo.Error] {
-    if (n <= dl.cap) { ret err[allo.Error].ok{}; }
-
-    var new_cap: usize = dl.cap * 2;
-    if (new_cap < n) { new_cap = n; }
-
-    val r: res[*Vert, allo.Error] = allo.reallocate[Vert](dl.a, dl.verts, dl.cap, new_cap);
-    if (sel r.err) { ret err[allo.Error].err{r.err}; }
-    dl.verts = r.ok;
-    dl.cap   = new_cap;
-    ret err[allo.Error].ok{};
+# dl:  draw list with room for it
+# v:   the vertex
+# ret: its index
+pub fun put(dl: *DrawList, v: Vert) u32 {
+    val i: usize = dl.verts.len;
+    dl.verts.data[i] = v;
+    dl.verts.len     = i + 1;
+    ret i::u32;
 }
 
-# append one vertex, growing the buffer if full
+# append one triangle into room made by reserve
 # ---
-# dl:  draw list to append to
-# v:   vertex to append
-# ret: ok, or the allocator's refusal with the vertex not appended
-pub fun push_vert(dl: *DrawList, v: Vert) err[allo.Error] {
-    val g: err[allo.Error] = grow(dl);
-    if (sel g.err) { ret g; }
-    dl.verts[dl.len] = v;
-    dl.len           = dl.len + 1;
-    ret err[allo.Error].ok{};
+# dl: draw list with room for three indices
+# a:  first vertex index
+# b:  second vertex index
+# c:  third vertex index
+pub fun tri(dl: *DrawList, a: u32, b: u32, c: u32) {
+    val i: usize = dl.idx.len;
+    dl.idx.data[i]     = a;
+    dl.idx.data[i + 1] = b;
+    dl.idx.data[i + 2] = c;
+    dl.idx.len         = i + 3;
 }
 
-# append an axis-aligned quad as two triangles (6 vertices)
+# append the two triangles of the quad a b c d, in order around it, into
+# room made by reserve
+# ---
+# dl: draw list with room for six indices
+# a:  first corner
+# b:  second corner
+# c:  third corner
+# d:  fourth corner
+pub fun quad_tris(dl: *DrawList, a: u32, b: u32, c: u32, d: u32) {
+    tri(dl, a, b, c);
+    tri(dl, a, c, d);
+}
+
+# a vertex at (x, y) sampling (u, v) in color c
+# ---
+# x:   x in pixels
+# y:   y in pixels
+# u:   texture u
+# v:   texture v
+# c:   premultiplied color
+# ret: the vertex
+pub fun vert(x: f32, y: f32, u: f32, v: f32, c: Color) Vert {
+    ret Vert{x: x, y: y, u: u, v: v, r: c.r, g: c.g, b: c.b, a: c.a};
+}
+
+# append an axis-aligned quad as four vertices and two triangles
 #
 # (x0, y0) is the top-left corner and (x1, y1) the bottom-right, with (u0, v0)
-# and (u1, v1) the matching atlas corners. all six vertices share color c.
+# and (u1, v1) the matching texture corners. all four vertices share color c.
 # ---
 # dl:  draw list to append to
 # x0:  left x in pixels
 # y0:  top y in pixels
 # x1:  right x in pixels
 # y1:  bottom y in pixels
-# u0:  left atlas u
-# v0:  top atlas v
-# u1:  right atlas u
-# v1:  bottom atlas v
-# c:   fill color
-# ret: ok, or the allocator's refusal after the vertices that fit
+# u0:  left u
+# v0:  top v
+# u1:  right u
+# v1:  bottom v
+# c:   premultiplied color
+# ret: ok, or the allocator's refusal with nothing appended
 pub fun push_quad(dl: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: Color) err[allo.Error] {
-    var tl: Vert;
-    tl.x = x0;
-    tl.y = y0;
-    tl.u = u0;
-    tl.v = v0;
-    tl.r = c.r;
-    tl.g = c.g;
-    tl.b = c.b;
-    tl.a = c.a;
-    var tr: Vert;
-    tr.x = x1;
-    tr.y = y0;
-    tr.u = u1;
-    tr.v = v0;
-    tr.r = c.r;
-    tr.g = c.g;
-    tr.b = c.b;
-    tr.a = c.a;
-    var br: Vert;
-    br.x = x1;
-    br.y = y1;
-    br.u = u1;
-    br.v = v1;
-    br.r = c.r;
-    br.g = c.g;
-    br.b = c.b;
-    br.a = c.a;
-    var bl: Vert;
-    bl.x = x0;
-    bl.y = y1;
-    bl.u = u0;
-    bl.v = v1;
-    bl.r = c.r;
-    bl.g = c.g;
-    bl.b = c.b;
-    bl.a = c.a;
-
-    val e0: err[allo.Error] = push_vert(dl, tl);
-    if (sel e0.err) { ret e0; }
-    val e1: err[allo.Error] = push_vert(dl, tr);
-    if (sel e1.err) { ret e1; }
-    val e2: err[allo.Error] = push_vert(dl, br);
-    if (sel e2.err) { ret e2; }
-    val e3: err[allo.Error] = push_vert(dl, tl);
-    if (sel e3.err) { ret e3; }
-    val e4: err[allo.Error] = push_vert(dl, br);
-    if (sel e4.err) { ret e4; }
-    val e5: err[allo.Error] = push_vert(dl, bl);
-    if (sel e5.err) { ret e5; }
+    val room: err[allo.Error] = reserve(dl, 4, 6);
+    if (sel room.err) { ret room; }
+    val tl: u32 = put(dl, vert(x0, y0, u0, v0, c));
+    val tr: u32 = put(dl, vert(x1, y0, u1, v0, c));
+    val br: u32 = put(dl, vert(x1, y1, u1, v1, c));
+    val bl: u32 = put(dl, vert(x0, y1, u0, v1, c));
+    quad_tris(dl, tl, tr, br, bl);
     ret err[allo.Error].ok{};
 }
 
-test push_quad__six_verts_at_corners {
+test push_quad__four_verts_two_triangles {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -409,27 +502,25 @@ test push_quad__six_verts_at_corners {
     val c:  Color           = rgba(1.0::f32, 0.5::f32, 0.25::f32, 1.0::f32);
     val pe: err[allo.Error] = push_quad(?dl, 10.0::f32, 20.0::f32, 30.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
     if (sel pe.err) { ret 1; }
+    val pe2: err[allo.Error] = push_quad(?dl, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, c);
+    if (sel pe2.err) { ret 1; }
 
-    if (count(?dl) != 6) { ret 1; }
-
+    if (count(?dl) != 8 || index_count(?dl) != 12) { ret 2; }
     val p: *Vert = data(?dl);
-    if (p[0].x != 10.0::f32) { ret 1; }
-    if (p[0].y != 20.0::f32) { ret 1; }
-    if (p[1].x != 30.0::f32) { ret 1; }
-    if (p[1].y != 20.0::f32) { ret 1; }
-    if (p[2].x != 30.0::f32) { ret 1; }
-    if (p[2].y != 40.0::f32) { ret 1; }
-    if (p[5].x != 10.0::f32) { ret 1; }
-    if (p[5].y != 40.0::f32) { ret 1; }
-    if (p[0].r != 1.0::f32)  { ret 1; }
-    if (p[0].a != 1.0::f32)  { ret 1; }
+    if (p[0].x != 10.0::f32 || p[0].y != 20.0::f32) { ret 3; }
+    if (p[2].x != 30.0::f32 || p[2].y != 40.0::f32) { ret 4; }
+    if (p[3].x != 10.0::f32 || p[3].y != 40.0::f32) { ret 5; }
+    # the second quad's triangles name its own vertices
+    val ix: *u32 = indices(?dl);
+    if (ix[0] != 0 || ix[1] != 1 || ix[2] != 2 || ix[5] != 3) { ret 6; }
+    if (ix[6] != 4 || ix[11] != 7)                            { ret 7; }
 
     val freed: err[allo.Error] = free(?dl);
     if (sel freed.err) { ret 1; }
     ret 0;
 }
 
-test push_vert__growth_keeps_earlier_verts {
+test reserve__growth_keeps_earlier_verts {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -440,46 +531,18 @@ test push_vert__growth_keeps_earlier_verts {
 
     var i: usize = 0;
     for (i < INIT_CAP + 10) {
+        val e: err[allo.Error] = reserve(?dl, 1, 0);
+        if (sel e.err) { ret 1; }
         var v: Vert;
         v.x = i::f32;
-        v.y = 0.0::f32;
-        val e: err[allo.Error] = push_vert(?dl, v);
-        if (sel e.err) { ret 1; }
+        val at: u32 = put(?dl, v);
+        if (at::usize != i) { ret 2; }
         i = i + 1;
     }
 
-    if (count(?dl) != INIT_CAP + 10) { ret 1; }
-    if (dl.cap <= INIT_CAP)          { ret 1; }
-
+    if (count(?dl) != INIT_CAP + 10) { ret 3; }
     val p: *Vert = data(?dl);
-    if (p[0].x != 0.0::f32)                       { ret 1; }
-    if (p[INIT_CAP - 1].x != (INIT_CAP - 1)::f32) { ret 1; }
-    if (p[INIT_CAP + 9].x != (INIT_CAP + 9)::f32) { ret 1; }
-
-    val freed: err[allo.Error] = free(?dl);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-test reserve__grows_only_past_capacity {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-
-    var dl: DrawList;
-    val ie: err[allo.Error] = init(?dl, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var v: Vert;
-    v.x = 3.0::f32;
-    val pe: err[allo.Error] = push_vert(?dl, v);
-    if (sel pe.err) { ret 1; }
-
-    val small: err[allo.Error] = reserve(?dl, 10);
-    if (sel small.err || dl.cap != INIT_CAP) { ret 2; }
-    val big: err[allo.Error] = reserve(?dl, INIT_CAP * 3);
-    if (sel big.err || dl.cap < INIT_CAP * 3)          { ret 3; }
-    if (count(?dl) != 1 || data(?dl)[0].x != 3.0::f32) { ret 4; }
+    if (p[0].x != 0.0::f32 || p[INIT_CAP + 9].x != (INIT_CAP + 9)::f32) { ret 4; }
 
     val freed: err[allo.Error] = free(?dl);
     if (sel freed.err) { ret 1; }
@@ -494,6 +557,15 @@ test linear__decodes_srgb_and_keeps_alpha {
     if (c.a != 0.5::f32)                        { ret 3; }
     # the linear segment near black
     if (srgb_to_linear(0.02::f32) != 0.02::f32 / 12.92::f32) { ret 4; }
+    ret 0;
+}
+
+test hex__splits_bytes_and_premultiply_scales {
+    val c: Color = hex(0xFF8000, 0.5::f32);
+    if (c.r != 1.0::f32 || c.g != 128.0::f32 / 255.0::f32 || c.b != 0.0::f32) { ret 1; }
+    if (c.a != 0.5::f32)                                                      { ret 2; }
+    val p: Color = premultiply(c);
+    if (p.r != 0.5::f32 || p.g != 64.0::f32 / 255.0::f32 || p.a != 0.5::f32) { ret 3; }
     ret 0;
 }
 

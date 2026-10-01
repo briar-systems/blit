@@ -2,10 +2,10 @@
 
 An immediate-mode GUI library in Mach.
 
-Widgets accumulate a draw list of colored, textured triangles and report
-interaction. The consumer feeds input each frame, runs the widgets, and uploads
-and renders the resulting vertices — blit stays out of the windowing and
-rendering.
+Widgets accumulate an indexed draw list of colored, textured triangles and
+report interaction. The consumer feeds input each frame, runs the widgets, and
+uploads and renders the resulting vertices and indices, so blit stays out of
+the windowing and rendering.
 
 ```mach
 use blit;
@@ -23,56 +23,107 @@ blit.widget.checkbox(?ctx, "running", ?running);
 blit.widget.slider_f(?ctx, "rate", ?rate, 0.0::f32, 1.0::f32);
 blit.widget.end_panel(?ctx, panel);
 blit.context.end(?ctx);
-# upload the atlas pages that changed (see Rendering), then
-# blit.context.draw_verts(?ctx) / draw_count(?ctx), and draw as triangles.
+# upload the atlas pages that changed (see Rendering), then the vertices and
+# indices, and draw each run with its texture and scissor.
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
 
-Text comes from a glyph source, a record of functions over the source's own
-state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, layout, the glyph
-cache and the atlas, and asks the source only for what a face knows:
+Text comes from glyph sources, records of functions over each source's own
+state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, line breaking, the
+glyph cache and the atlas, and asks a source only for what a face knows:
 
 ```mach
 pub rec GlyphSource {
     self:   ptr;
-    line:   fun(ptr, f32) LineMetrics;              # (self, scale)
-    glyph:  fun(ptr, u32, f32, *Glyph) bool;        # (self, codepoint, scale, out)
-    kern:   fun(ptr, u32, u32, f32) f32;            # (self, left, right, scale), or nil
-    raster: fun(ptr, u32, f32, *u8, usize) bool;    # (self, codepoint, scale, coverage, stride)
+    line:   fun(ptr, f32) LineMetrics;                        # (self, scale)
+    glyph:  fun(ptr, u32, f32, *Glyph) bool;                  # (self, glyph id, scale, out)
+    kern:   fun(ptr, u32, u32, f32) f32;                      # (self, left id, right id, scale), or nil
+    raster: fun(ptr, u32, f32, *u8, usize) bool;              # (self, glyph id, scale, coverage, stride)
+    shape:  fun(ptr, *u32, usize, f32, *Shaped, usize) usize; # (self, run, n, scale, out, cap), or nil
 }
 ```
 
+- **Glyph ids, with an optional shaper.** Everything past shaping is keyed on
+  glyph id. A shaping source (ligatures, combining marks, complex scripts)
+  turns a line's codepoints into `Shaped` glyphs: an id, the cluster it came
+  from, an advance with kerning included and an offset. A source with `shape`
+  nil has glyph ids that are its codepoints, one to one, kerned pair by pair
+  through `kern`, as the bitmap font and a simple TrueType face do. Such a
+  source only adds `shape: nil` to the record it filled before.
 - **Metrics are floats** in pixels at the scale asked for: `LineMetrics` is
   ascent, descent and gap, and a `Glyph` is its advance, the rect its bitmap
   covers relative to the pen on the baseline (y down), and the bitmap's size in
-  texels. Scale is the interface scale (`ctx.scale`, 1.0 by default), so text at
-  200% is rasterised at that size, not stretched.
-- **Glyphs come on demand.** A codepoint is measured the first time it is laid
-  out and rasterised the first time it is drawn, then cached per scale.
-  Measuring never rasterises.
-- **Codepoints, not bytes.** Text is UTF-8. A codepoint the source lacks draws
-  as U+FFFD, or `?` when it lacks that too. Control codepoints take no space and
-  a newline starts the next line.
-- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is the
-  default, so a context needs no configuration. `blit.context.set_glyph_source`
-  plugs in another between frames, such as a TrueType face from the host. blit
-  itself never depends on one.
+  texels. Scale is a text style's size times the interface scale (`ctx.scale`,
+  1.0 by default), so text at 200% is rasterised at that size, not stretched.
+- **Glyphs come on demand.** A glyph is measured the first time it is laid
+  out and rasterised the first time it is drawn, then cached by source, glyph
+  id and scale. Measuring never rasterises.
+- **Codepoints, not bytes.** Text is UTF-8. A codepoint a non-shaping source
+  lacks draws as U+FFFD, or `?` when it lacks that too. A shaper falls back
+  itself, its glyph id 0 being the missing glyph. Control codepoints take no
+  space and a newline starts the next line.
+- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is
+  source 0, so a context needs no configuration. `blit.context.set_glyph_source`
+  replaces source 0 between frames, such as with a TrueType face from the host,
+  and `add_glyph_source` holds more. blit itself never depends on one.
+- **The atlas evicts.** When every page is full, the page least recently drawn
+  from is cleared and refilled. A page drawn from this frame is never evicted,
+  so a glyph drawn this frame is never dropped, and a glyph whose page was
+  evicted is rasterised again when it is next drawn.
 
-`blit.context.text_width` and `line_height` measure at the context's scale, and
-`blit.font.advance` steps one codepoint at a time for layout built outside
-blit.
+### Text styles
+
+A style (`blit.font.Style`) names a glyph source and a size relative to that
+source's own, so one face serves body text, headings and small print. Style 0,
+`blit.font.STYLE_BODY`, is source 0 at size 1.0. Register more with
+`blit.context.add_style`, change one with `set_style`, and draw in one with
+`push_style`/`pop_style`. Every text call, `text_at`, `text_span`, `glyph`,
+`text_width`, `line_height`, and every widget that draws text, uses the
+current style, and every frame starts in the body style.
+
+```mach
+val heading: opt[u32] = blit.context.add_style(?ctx, blit.font.Style{source: 0, size: 2.0::f32});
+blit.context.push_style(?ctx, heading.some);
+blit.widget.text(?ctx, "Simulation");
+blit.context.pop_style(?ctx);
+```
+
+`blit.context.text_width_n` measures a byte range, and `glyph_advance` steps
+one codepoint at a time for layout built outside blit, without a shaper's
+ligatures.
+
+### Truncation and rich spans
+
+`blit.text.fit` cuts one line to a width with an ellipsis at the end
+(`CUT_END`), at the start for paths (`CUT_START`) or in the middle
+(`CUT_MIDDLE`), as byte offsets into the caller's string, and `fit_at` draws
+it. The ellipsis is U+2026 when the style's source has it, else `...`.
+
+A rich line is a run of `blit.text.Span`s, each text in its own style and
+color, on one shared baseline: `spans_at` draws it, `spans_width` and
+`spans_line` measure it, and `blit.widget.rich` draws it at the cursor.
+
+```mach
+var sp: [4]blit.text.Span;
+sp[0] = blit.text.Span{s: "gen ",   style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[1] = blit.text.Span{s: "13",     style: bold,                 color: t.text};
+sp[2] = blit.text.Span{s: "  pop ", style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[3] = blit.text.Span{s: "9,252",  style: bold,                 color: t.text};
+blit.widget.rich(?ctx, ?sp[0], 4);
+```
 
 ## Theme & scale
 
 Every color and length a widget draws with comes from a theme, a plain record
 (`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
-`window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
+`window`, `dock`, `header`, `header_hot`), `edge`, three text tiers `text`,
+`text_dim` and `text_faint` (hints and placeholders),
 `accent` and `accent_text` (text on an accent fill), `warn`, control states (`control`, `control_hot`, `control_on`,
 `track`, `handle`, `handle_on`), the text selection highlight `select`, and the
 metrics `row`, `gap`, `pad`, `handle_w`, `bar_w`, `thumb_min`, `corner`,
@@ -102,21 +153,20 @@ blit.context.set_scale(?ctx, 2.0::f32);
 - **Rows fit their text.** A control row is `row` tall, or a line of text plus
   `pad` above and below if that is taller, so a larger glyph source never
   overflows its rows.
-- **Corners from quads.** `corner` rounds controls and containers with one
-  quad per pixel row of each rounded end (`blit.context.fill`), so rounding
-  needs nothing of the renderer and clips like any quad. The default is square,
-  one quad per rect.
+- **Rounded corners.** `corner` rounds controls and containers through
+  `blit.context.fill`, a feathered rounded rect (see Shapes & paths). The
+  default is square, one quad per rect.
 
 ## Docked containers
 
-Alongside floating windows, `blit.widget.begin_dock`/`end_dock` attach a panel
-to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
+Alongside floating windows, `blit.widget.begin_dock(?ctx, key, ?d)`/`end_dock`
+attach a panel to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
 takes a strip from the frame's free area, so docks opened in turn stack inward,
 and `blit.context.free_area` reports what they leave for the rest of the screen,
 such as a world view. Call docks at the root.
 
-A dock's body is a scroll region. `blit.widget.begin_scroll`/`end_scroll` open
-one at the layout cursor on its own: its column is clipped and scrolls by the
+A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
+open one at the layout cursor on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
@@ -186,8 +236,10 @@ blit.context.end(?ctx);
 ## Keyboard, focus & text fields
 
 - **Focus.** One widget at a time holds the keyboard, by id across frames
-  (`blit.context.focus`, `focused`, `unfocus`). A press that lands anywhere
-  else takes it back, and so does a frame that does not draw the holder.
+  (`blit.context.focus`, `focused`, `unfocus`), so
+  `focus(?ctx, blit.context.id_of(?ctx, key))` hands it to a widget from code.
+  A press that lands anywhere else takes it back, and so does a frame that does
+  not draw the holder.
   `blit.context.typing(?ctx)` is true exactly while a widget holds it: read it
   before `begin` to keep the consumer's own key bindings quiet for the keys that
   frame will type into a field.
@@ -195,7 +247,7 @@ blit.context.end(?ctx);
   `blit.context.copied(?ctx)` is text a copy or cut left for the consumer to put
   on the clipboard (nil when none), and `wants_paste(?ctx)` asks for the
   clipboard's text, which the consumer hands to the next frame as `in.paste`.
-- **Text field.** `blit.widget.text_field(?ctx, ?f, hint)` edits a
+- **Text field.** `blit.widget.text_field(?ctx, key, ?f, hint)` edits a
   `blit.field.Field`: UTF-8 in a buffer the consumer owns, with a caret, a
   selection, a maximum length in characters and a per-field filter.
   ```mach
@@ -203,7 +255,7 @@ blit.context.end(?ctx);
   var name: blit.field.Field;
   blit.field.init(?name, ?buf[0], 64, 24, nil); # 24 characters, any printable
   # per frame, inside a panel:
-  val did: u8 = blit.widget.text_field(?ctx, ?name, "name");
+  val did: u8 = blit.widget.text_field(?ctx, "name", ?name, "name");
   if ((did & blit.field.ENTERED) != 0) { ... }
   ```
   A press on the field focuses it and puts the caret under the cursor. It takes
@@ -218,11 +270,12 @@ blit.context.end(?ctx);
 
 ## Clipping & sub-surfaces
 
-Clipping is geometric and CPU-side, so blit stays out of the backend. Push a
-clip rect with `blit.context.push_clip(?ctx, x0, y0, x1, y1)` — intersected with
-the active rect — and restore it with `pop_clip`. Quads fully outside the rect
-are dropped and partial ones are shrunk with their uvs interpolated, and a
-clipped-out widget never becomes hot.
+Push a clip rect with `blit.context.push_clip(?ctx, x0, y0, x1, y1)`,
+intersected with the active rect, and restore it with `pop_clip`. Geometry
+wholly outside the rect is dropped on the CPU, and the rest is kept whole: every
+run of the draw list carries the clip rect it was drawn under, which the
+renderer sets as its scissor (see Rendering). So any shape clips, rotated,
+curved or feathered, and a clipped-out widget never becomes hot.
 
 `blit.context.begin_surface(?ctx, x, y, w, h, scroll_x, scroll_y)` opens a
 clipped region with its own scrolled local coordinate space: emit content and
@@ -251,10 +304,8 @@ Coordinates compose one way:
 ## Widgets & layout
 
 Every widget places itself at the layout cursor, spans the column, advances
-the cursor and emits only quads, so each one clips and scrolls like any
-geometry and works inside surfaces, docks and windows alike. A widget takes
-the same ids every frame whatever it shows, so later widgets keep their hit
-identity.
+the cursor and draws through the painter, so each one clips and scrolls like
+any geometry and works inside surfaces, docks and windows alike.
 
 - **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
   `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
@@ -276,7 +327,7 @@ identity.
   same without one.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
-- **Lists.** `list(?ctx, ?l, ?items[0], count, query, h)` is a scrolling list
+- **Lists.** `list(?ctx, key, ?l, ?items[0], count, query, h)` is a scrolling list
   `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
   none), and only the items holding `query`, ignoring ASCII case, are shown,
   so a search box the caller keeps narrows it.
@@ -288,9 +339,49 @@ sections), and drives it headlessly through `blit.input`.
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, its open state kept in the state store under its
 id, `blit.widget.begin_window`/`end_window` is a
-draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
-opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
+draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
+x, y, w)`/`end_popup` opens an overlay column, and
+`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
 rect for consumer-drawn affordances.
+
+## Widget ids
+
+A widget's id is a 64-bit FNV-1a hash of its key folded into the seed of the
+current id scope and finished with a 64-bit mixer, never its place in the call
+order. A widget drawn only some frames, a clipped row or a reordered window
+therefore moves no other widget's id, and the active drag, the focus holder and
+the open dropdown stay where they
+were. 0 is never an id: it means "no widget".
+
+- **Labels are keys.** A labelled widget (`button`, `checkbox`, `toggle`,
+  `slider`, `dropdown`, `section`, a window's title) is keyed by its label.
+  Text after `##` is hashed but not drawn, so `"Save##toolbar"` shows `Save`
+  and is a different widget from another `"Save"`. A label holding `###` is
+  keyed by the text from `###` on alone, so what it shows can change without
+  changing its id: `"Frames: 12###fps"` and `"Frames: 13###fps"` are one
+  widget. Widgets without a label (`text_field`, `region_clicked`, popups,
+  scroll regions, docks, lists and charts) take a key argument the same way.
+- **Scopes.** `blit.context.push_id_str(?ctx, s)` and `push_id_int(?ctx, n)`
+  open a scope and `pop_id(?ctx)` closes it, and a pop with no scope open is
+  ignored. Windows, open popups and scroll regions (so docks and lists too)
+  open their own scope for what they hold, so two windows can each hold a
+  button called `ok`. Repeated rows built from one label, such as buttons in a
+  loop, take `push_id_int` with their index. The stack grows from the
+  context's allocator.
+- **Parts.** A widget's internal parts (a window's title and collapse box, a
+  scrollbar thumb, a popup's outside claim, a dropdown's options, a list's
+  items) take ids derived from the widget's id with a fixed suffix or index.
+- **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
+  that label or key gets in the current scope, for `focus`, state lookups and
+  tests.
+- **Collisions.** Two claims with one id in a frame are recorded:
+  `blit.context.collisions(?ctx)` counts them after `end` and
+  `collision_at(?ctx, i)` names each repeated id, until the next `begin`.
+
+This is a breaking change from call-order ids: `blit.context.next_id` and
+`Context.seq` are gone, and `begin_popup`, `begin_scroll`, `begin_dock`,
+`list`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
+`sparkline` take a key argument after the context.
 
 ## State store
 
@@ -335,7 +426,7 @@ var series: [2]blit.chart.Series;
 series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 64);
 series[0].fill = 1;
 series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 64);
-val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, blit.chart.options());
+val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, blit.chart.options());
 if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.x, hov.value
 
 # profiler samples: u64 timestamps at uneven spacing, a counter that holds between them
@@ -345,8 +436,8 @@ var heap:  blit.chart.Series = blit.chart.series(blit.chart.u64s(?bytes[0]), n);
 heap.x     = blit.chart.u64s(?t[0]);
 heap.shape = blit.chart.STEP;
 
-blit.chart.bars(?ctx, x, y, w, h, blit.chart.f32s(?net[0]), count, blit.chart.options());
-blit.chart.sparkline(?ctx, x, y, w, h, series[0]);
+blit.chart.bars(?ctx, "net", x, y, w, h, blit.chart.f32s(?net[0]), count, blit.chart.options());
+blit.chart.sparkline(?ctx, "spark", x, y, w, h, series[0]);
 ```
 
 - **Columns.** A `Column` is values of `F32`, `F64` or `U64` at `data + i *
@@ -374,7 +465,7 @@ blit.chart.sparkline(?ctx, x, y, w, h, series[0]);
   otherwise. Ticks step by 1, 2 or 5 times a power of ten and labels come from
   the glyph source, with k, M, G or T for large steps. `Options.axes = 0` gives
   the whole rect to the plot.
-- **Hover.** A chart takes one id in call order and claims its plot, so it
+- **Hover.** A chart takes its id from its key and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
   widget. A line reads, in each series, the sample nearest the cursor (for a
   step series the one whose value holds there) and reports the series nearest
@@ -390,7 +481,7 @@ blit.chart.sparkline(?ctx, x, y, w, h, series[0]);
   screen pixels, and every length is a theme metric at the context's scale.
 - **Plain quads.** Charts emit through the painter like every widget, clipped to
   their rect and to any clip or sub-surface they sit in, and allocate nothing
-  beyond their vertices.
+  beyond their vertices and indices.
 
 ## Layers & input routing
 
@@ -402,7 +493,14 @@ click is always the one visibly on top.
   the clip reset to the screen. `pop_layer` returns. `end()` composes the draw
   list by layer, keeping call order within a layer, so a popup opened early in
   the frame still paints over a window called after it. `run_at` reports each
-  span's `layer`.
+  run's `layer`.
+- **Channels.** A container that paints its background once its contents are
+  known (a panel, window or popup) splits the runs drawn after it into
+  channels: `ch = blit.context.split(?ctx, 2)`, `set_channel(?ctx, ch, 1)` for
+  its children, then `set_channel(?ctx, ch, 0)` to draw its background and
+  `merge(?ctx, ch)`. A lower channel paints beneath a higher one whatever the
+  order they were drawn in, so the background can be any shape. Splits nest,
+  and each is merged on the layer it was made on.
 - **Claims.** Interactive widgets call `blit.context.claim(?ctx, id, x0, y0,
   x1, y1)`, which records the rect with the key (layer, then claim order) and
   returns whether the widget is hovered. Containers call `reserve_claim` before
@@ -429,13 +527,13 @@ click is always the one visibly on top.
 blit draws textures it does not own. A consumer texture is named by an opaque
 `u64` handle, whatever the renderer understands (a GL texture name, an index
 into its own table). blit never creates, owns or binds one, it only passes the
-handle through to the draw list's spans. `0` is reserved for the atlas.
+handle through to the draw list's runs. `0` is reserved for the atlas.
 
 - **Image.** `blit.draw.Image` is a handle, a source rect in uv and a filter.
   `blit.draw.region(tex, tw, th, x, y, w, h, filter)` builds one from a rect in
   texels, `whole(tex, filter)` covers the texture.
 - **Drawing.** `blit.context.image_at(?ctx, img, x0, y0, x1, y1, tint)` stretches
-  the region into a rect, clipped like any geometry with its uvs cut to match.
+  the region into a rect, clipped like any geometry by its run's scissor.
   `blit.widget.image(?ctx, img, w, h)` places it at the layout cursor.
 - **Grids.** `blit.widget.Grid` is a row-major field of cells, each colored by
   the consumer (`colors`) or by mapping `values` through a `Palette` of equal
@@ -444,38 +542,105 @@ handle through to the draw list's spans. `0` is reserved for the atlas.
   texture. A large one is better uploaded as a texture and drawn with
   `FILTER_NEAREST`.
 
+## Shapes & paths
+
+The painter draws shapes in the current local space, clipped by the run's
+scissor like everything else. Every edge but a plain quad's is antialiased by
+feathered geometry: a strip one pixel wide whose outer vertices carry no
+color, so antialiasing needs nothing of the renderer beyond the contract
+below. Curves and arcs stay within a quarter pixel of the true shape, so their
+segment count follows their size on screen and the interface scale.
+
+- **Rects.** `quad` fills a rect with one quad and `frame(?ctx, x0, y0, x1, y1,
+  w, c)` outlines it with a band `w` wide inside its edges, both crisp on whole
+  pixels. `rounded_rect` and `stroke_rounded_rect` take a radius per corner
+  (`blit.draw.Radii`, `blit.draw.radii(r)` for all four), scaled down together
+  when they would overlap. `fill` is a rounded rect with one radius on the
+  corners `CORNERS_*` names.
+- **Triangles, lines and arcs.** `tri` fills a triangle. `line` and
+  `polyline(?ctx, ?pts[0], n, closed, w, join, c)` stroke `w` wide, centred on
+  their points, ending square, with `blit.draw.JOIN_MITER`, `JOIN_BEVEL` or
+  `JOIN_ROUND` at each corner (a miter past 4 half widths bevels). `circle`
+  fills, `stroke_circle` rings inside the radius, and `arc(?ctx, cx, cy, r,
+  a0, a1, w, c)` strokes from angle `a0` to `a1` in radians, clockwise on
+  screen.
+- **Paths.** `blit.path` builds contours of `move`, `line`, `quad` (quadratic),
+  `cubic` and `close` commands into a `Path` the consumer owns:
+  ```mach
+  var p: blit.path.Path = blit.path.init(?a);
+  blit.path.move(?p, 0.0::f32, 0.0::f32);
+  blit.path.cubic(?p, 4.0::f32, -6.0::f32, 12.0::f32, -6.0::f32, 16.0::f32, 0.0::f32);
+  blit.path.line(?p, 8.0::f32, 12.0::f32);
+  blit.path.close(?p);
+  blit.context.fill_path(?ctx, ?p, look.accent);
+  blit.context.stroke_path(?ctx, ?p, 1.5::f32, blit.draw.JOIN_ROUND, look.text);
+  ```
+  A fill takes the nonzero rule, so a hole is a contour wound against its
+  outline and crossing contours fill their union. Contours that overlap still
+  show the faint feathers of the edges they hide, so icons are cleanest drawn
+  as contours that meet without overlapping. Filling costs the square of the
+  edge count, which suits icons and small shapes.
+- **Gradients.** `blit.draw.gradient(x0, y0, c0, x1, y1, c1)` is a linear
+  gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
+  `rounded_rect_gradient` and `fill_path_gradient`.
+- **Colors.** `blit.draw.hex(0xRRGGBB, alpha)` sits beside `blit.draw.rgba`.
+
 ## Rendering
 
-blit emits one vertex stream that draws both solid rectangles and text through
-a single shader per texture. Solid quads sample a white block every atlas page
-carries, so `color * texel` is the flat color; glyph quads sample the glyph's
-cell.
+blit emits one indexed triangle list that draws solid shapes and text through
+a single shader per texture. Solid shapes sample a white block every atlas
+page carries, so `color * texel` is the flat color, and glyphs sample their
+cell. Colors and texels are premultiplied.
 
+- **Buffers.** After `end`, upload the vertices (`draw_verts` / `draw_count`,
+  `blit.draw.Vert`) and the u32 indices (`draw_indices` / `index_count`), three
+  per triangle, in composed paint order. Vertices stay in the order they were
+  drawn. Only the indices are reordered to paint layers and channels.
+- **Runs.** `run_count` / `run_at` divide the index list into runs, in paint
+  order. A `Run` is plain numbers: `kind` (u32), `tex` (u64), `page`, `layer`
+  and `filter` (u32), the scissor `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1`
+  (f32) and `start` and `count` (usize, in indices). Every index lies in one
+  run. Draw the runs in order:
+  - **Kind.** `blit.context.RUN_TRIANGLES` (0) is the only kind today: bind,
+    scissor and draw as below. Skip a run of any other kind, so later kinds
+    (such as consumer spans) need no change to a renderer that ignores them.
+  - **Texture.** When `tex` is `blit.draw.ATLAS` (0), bind atlas page `page`.
+    Otherwise `tex` is the consumer's own texture handle, passed through
+    untouched, and `filter` asks for `FILTER_NEAREST` (0) or `FILTER_LINEAR` (1)
+    sampling. On the atlas `filter` is always `FILTER_NEAREST` and how to sample
+    it stays the renderer's choice. Rebind only when `tex`, `page` or `filter`
+    change.
+  - **Scissor.** The clip is in screen pixels, y down, the space vertices are
+    in. Round each edge to the nearest pixel, scale by the framebuffer's pixels
+    per screen pixel when they differ, and in GL flip y:
+    `glScissor(x0, fb_h - y1, x1 - x0, y1 - y0)`. Set it whenever it changes,
+    with `GL_SCISSOR_TEST` enabled.
+  - **Draw.** `glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT,
+    start * 4)`: indices are absolute vertex numbers, so no base vertex.
+- **State.** Blend premultiplied: `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)`.
+  Disable face culling (triangles come in either winding) and depth testing.
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
   pages, each an RGBA8 square of `blit.atlas.PAGE_SIDE` (512) texels at
-  `page_pixels(at, i)`. Pages open as glyphs arrive and never resize. Each has a
-  `page_version` bumped on every write and a `page_dirty` rect: upload the dirty
-  rect of each changed page before drawing, then `page_clean` it. Every glyph
-  has a transparent gutter, so linear filtering is safe. The built-in font at
-  whole scales looks sharpest with nearest.
-- **Spans.** `run_count`/`run_at` split the draw list into spans that each
-  sample one texture, so every quad's texture is its span's. A `Run` is plain
-  integers: `tex` (u64), `page` (u32), `layer` (u32), `start` and `count`
-  (vertices, usize), `filter` (u32). When `tex` is `blit.draw.ATLAS` (0), bind atlas
-  page `page`. Otherwise `tex` is the consumer's own texture handle, passed
-  through untouched, and `filter` asks for `FILTER_NEAREST` (0) or
-  `FILTER_LINEAR` (1) sampling. On the atlas `filter` is always
-  `FILTER_NEAREST` and how to sample it stays the renderer's choice. Draw
-  spans in order, rebinding only when `tex`, `page` or `filter` differ from
-  the previous span.
-- **Color.** Colors are straight rgba as authored. When the target encodes sRGB
-  on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
-  in linear light, so the encoding brings it back to what was authored. Alpha is
-  never converted. Each distinct color is converted once and cached on the
-  context (`blit.draw.LinearCache`), so sRGB output costs next to nothing.
+  `page_pixels(at, i)`, premultiplied (a glyph's coverage in all four channels,
+  the white block opaque). Pages open as glyphs arrive and never resize, and
+  past `blit.atlas.PAGE_MAX` (16) the least recently drawn one is cleared and
+  reused, wholly dirty. Each has a `page_version` bumped on every write and a
+  `page_dirty` rect: upload the dirty rect of each changed page before drawing,
+  then `page_clean` it. Every glyph has a transparent gutter, so linear
+  filtering is safe. The built-in font at whole scales looks sharpest with
+  nearest.
+- **Consumer textures** are sampled as premultiplied alpha: upload them
+  premultiplied.
+- **Color.** Colors are authored as straight rgba and premultiplied as they are
+  emitted. When the target encodes sRGB on write, call
+  `blit.context.set_srgb(?ctx, 1)`: every color is then converted to linear
+  light before premultiplying, so the encoding brings it back to what was
+  authored. Alpha is never converted. Each distinct color is converted once and
+  cached on the context (`blit.draw.LinearCache`), so sRGB output costs next to
+  nothing. Gradients interpolate the emitted colors.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
-  straight rgba.
+  premultiplied rgba.
 - **Shader.** One `vec2 uScreen` uniform:
   ```glsl
   gl_Position = vec4(aPos.x / uScreen.x * 2.0 - 1.0,
@@ -484,9 +649,18 @@ cell.
   ```
 - **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
   events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
-  clipboard and answer `wants_paste`, then upload `draw_verts` / `draw_count` and draw each span as
-  `GL_TRIANGLES` with its texture bound and `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA`
-  blending.
+  clipboard and answer `wants_paste`, upload the changed atlas pages, the
+  vertices and the indices, and draw each run as above.
+- **From 0.9.** A renderer written for the 0.9 contract changes in these
+  places, and the atlas upload, the vertex layout and the shader stay as they
+  were:
+  - upload the index buffer and draw each run with `glDrawElements` over
+    `start` and `count`, which now count indices, where it drew arrays
+  - apply each run's scissor
+  - blend `ONE` / `ONE_MINUS_SRC_ALPHA` where it blended `SRC_ALPHA` /
+    `ONE_MINUS_SRC_ALPHA`, and leave face culling off
+  - skip runs whose `kind` is not `RUN_TRIANGLES`
+  - upload consumer textures premultiplied
 
 ## Build & test
 
@@ -498,7 +672,7 @@ mach test .
 
 `demo/harness/` is its own project with a path dependency on this checkout. It
 drives a headless frame end to end through a bare `use blit;` and prints the
-vertex count and atlas pages. It takes std from this checkout's `dep/std`, so
+vertex, index and run counts and atlas pages. It takes std from this checkout's `dep/std`, so
 pull the root first:
 
 ```
