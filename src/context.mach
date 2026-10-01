@@ -2222,6 +2222,20 @@ fun same_state(a: Run, b: Run) bool {
         && a.clip_x1 == b.clip_x1 && a.clip_y1 == b.clip_y1;
 }
 
+# whether the pending run draws the way state(ctx) would, read off the
+# context's fields without building the run, as every quad asks
+fun pending(ctx: *Context) bool {
+    val p:      *Run = ?ctx.pend;
+    var page:   u32  = 0;
+    var filter: u32  = ctx.filter;
+    if (ctx.tex == draw.ATLAS) {
+        page   = ctx.page;
+        filter = draw.FILTER_NEAREST;
+    }
+    ret p.kind == RUN_TRIANGLES && p.tex == ctx.tex && p.page == page && p.filter == filter && p.layer == ctx.layer
+        && p.clip_x0 == ctx.clip_x0 && p.clip_y0 == ctx.clip_y0 && p.clip_x1 == ctx.clip_x1 && p.clip_y1 == ctx.clip_y1;
+}
+
 # make the run being accumulated match the current state before a shape's
 # indices are written
 #
@@ -2231,12 +2245,10 @@ fun same_state(a: Run, b: Run) bool {
 # row of images through one sheet costs one run however often the atlas was
 # targeted between them.
 fun open_run(ctx: *Context) {
-    val want: Run   = state(ctx);
-    val len:  usize = draw.index_count(?ctx.dl);
-    if (len > ctx.run_start) {
-        if (same_state(ctx.pend, want)) { ret; }
-        flush_run(ctx);
-    }
+    val len: usize = draw.index_count(?ctx.dl);
+    if (len > ctx.run_start && pending(ctx)) { ret; }
+    val want: Run = state(ctx);
+    if (len > ctx.run_start) { flush_run(ctx); }
     val n: usize = ctx.run_len;
     if (n > ctx.run_floor) {
         val last: Run = ctx.runs[n - 1];
