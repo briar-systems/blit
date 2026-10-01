@@ -168,47 +168,97 @@ rec Hold {
     at: f32;
 }
 
-# the colours and lengths the dock's chrome draws with
+# the dock's kinds' names, registered on a theme by register_kinds
+pub val KIND_SPACE:    str = "dock_space";
+pub val KIND_SPLITTER: str = "dock_splitter";
+pub val KIND_ZONE:     str = "dock_zone";
+pub val KIND_PREVIEW:  str = "dock_preview";
+
+# a dock space's background: behind empty leaves and between nodes
+fun space_style(t: *theme.Theme, k: u32, s: *theme.Style) {
+    s.radius = draw.radii(0.0::f32);
+    theme.fill_all(s, t.dock);
+}
+
+# a splitter between two nodes, drawn while hot or dragged: min_w its thickness
+fun splitter_style(t: *theme.Theme, k: u32, s: *theme.Style) {
+    s.radius = draw.radii(0.0::f32);
+    s.min_w  = t.gap;
+    theme.fills(s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32), t.handle, t.handle_on, t.handle);
+}
+
+# a drop zone's square: at rest, and hot under a drag
+fun zone_style(t: *theme.Theme, k: u32, s: *theme.Style) {
+    s.radius = draw.radii(0.0::f32);
+    theme.fills(s, t.control, t.accent, t.accent, t.accent);
+    theme.outline_all(s, t.edge, t.edge_w);
+}
+
+# where a window would land if dropped
+fun preview_style(t: *theme.Theme, k: u32, s: *theme.Style) {
+    s.radius = draw.radii(0.0::f32);
+    theme.fill_all(s, t.select);
+    theme.outline_all(s, t.accent, t.edge_w);
+}
+
+# register the dock's kinds on a theme: dock_space, dock_splitter, dock_zone
+# and dock_preview
+#
+# a dock registers them on the context's theme the first time it draws; a
+# host that loads a theme file styling them registers them first, so the
+# file can name them.
 # ---
-# bg:       the space's background, behind empty leaves and between nodes
-# edge:     the line on a side panel's inner side
-# edge_w:   its width
-# split:    a splitter under the pointer
-# split_on: a splitter being dragged
-# split_w:  a splitter's thickness
-# zone:     a drop zone at rest
-# zone_on:  the drop zone under the pointer
-# rim:      a drop zone's outline
-# preview:  where a window would land
-# zone_w:   a drop zone's side
+# t:   the theme
+# ret: ok, or the allocator's refusal
+pub fun register_kinds(t: *theme.Theme) err[allo.Error] {
+    val a: res[u32, allo.Error] = theme.register_kind(t, KIND_SPACE, "a dock space's background, behind empty leaves and between nodes", space_style);
+    if (sel a.err) { ret err[allo.Error].err{a.err}; }
+    val b: res[u32, allo.Error] = theme.register_kind(t, KIND_SPLITTER, "a splitter between docked nodes, drawn hot and active: min_w its thickness", splitter_style);
+    if (sel b.err) { ret err[allo.Error].err{b.err}; }
+    val c: res[u32, allo.Error] = theme.register_kind(t, KIND_ZONE, "a drop zone's square, hot under a drag", zone_style);
+    if (sel c.err) { ret err[allo.Error].err{c.err}; }
+    val d: res[u32, allo.Error] = theme.register_kind(t, KIND_PREVIEW, "where a window would land if dropped", preview_style);
+    if (sel d.err) { ret err[allo.Error].err{d.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# the handles and lengths the dock's chrome draws with
+# ---
+# space:    the dock space kind
+# splitter: the splitter kind
+# zone:     the drop zone kind
+# preview:  the drop preview kind
+# split_w:  a splitter's thickness, in pixels
+# zone_w:   a drop zone's side, in pixels
 pub rec Look {
-    bg:       draw.Color;
-    edge:     draw.Color;
-    edge_w:   f32;
-    split:    draw.Color;
-    split_on: draw.Color;
+    space:    u32;
+    splitter: u32;
+    zone:     u32;
+    preview:  u32;
     split_w:  f32;
-    zone:     draw.Color;
-    zone_on:  draw.Color;
-    rim:      draw.Color;
-    preview:  draw.Color;
     zone_w:   f32;
 }
 
-# the dock's look at the context's theme and scale
+# a dock kind's handle, registering the dock's kinds when the theme lacks them
+fun kind(ctx: *context.Context, name: str) u32 {
+    val t:    *theme.Theme = context.theme_of(ctx);
+    val have: opt[u32]     = theme.kind_of(t, name);
+    if (sel have.some) { ret have.some; }
+    val e: err[allo.Error] = register_kinds(t);
+    if (sel e.err) { ctx.oom = 1; }
+    val k: opt[u32] = theme.kind_of(t, name);
+    if (sel k.some) { ret k.some; }
+    ret theme.DOCK;
+}
+
+# the one place the dock reads its look, at the context's theme and scale
 fun look(ctx: *context.Context) Look {
-    val t: *theme.Theme = context.theme_of(ctx);
     var l: Look;
-    l.bg       = t.dock;
-    l.edge     = t.edge;
-    l.edge_w   = context.px(ctx, t.edge_w);
-    l.split    = t.handle;
-    l.split_on = t.handle_on;
-    l.split_w  = context.px(ctx, t.gap);
-    l.zone     = t.control;
-    l.zone_on  = t.accent;
-    l.rim      = t.edge;
-    l.preview  = t.select;
+    l.space    = kind(ctx, KIND_SPACE);
+    l.splitter = kind(ctx, KIND_SPLITTER);
+    l.zone     = kind(ctx, KIND_ZONE);
+    l.preview  = kind(ctx, KIND_PREVIEW);
+    l.split_w  = context.px(ctx, context.look_of(ctx, l.splitter).min_w);
     l.zone_w   = widget.control_height(ctx) * 1.5::f32;
     ret l;
 }
@@ -742,9 +792,7 @@ fun lay(ctx: *context.Context, p: *Pass, id: u64, x0: f32, y0: f32, x1: f32, y1:
     if (hs.hot || hs.active) {
         if (along) { context.set_cursor(ctx, input.CURSOR_RESIZE_EW); }
         or         { context.set_cursor(ctx, input.CURSOR_RESIZE_NS); }
-        var c: draw.Color = p.lk.split;
-        if (hs.active) { c = p.lk.split_on; }
-        context.quad(ctx, sx0, sy0, sx1, sy1, c);
+        context.box(ctx, p.lk.splitter, theme.pick(hs.hot, hs.active, false, false), sx0, sy0, sx1, sy1);
     }
     if (along) {
         lay(ctx, p, n.a, x0, y0, sx0, y1);
@@ -916,10 +964,7 @@ fun preview(ctx: *context.Context, p: *Pass, leaf: u64, z: u8) context.Area {
 
 # draw a zone's square, lit when the pointer is over it
 fun zone_box(ctx: *context.Context, lk: Look, r: context.Area, on: bool) {
-    var c: draw.Color = lk.zone;
-    if (on) { c = lk.zone_on; }
-    context.quad(ctx, r.x0, r.y0, r.x1, r.y1, c);
-    context.frame(ctx, r.x0, r.y0, r.x1, r.y1, maxf(lk.edge_w, 1.0::f32), lk.rim);
+    context.box(ctx, lk.zone, theme.pick(on, false, false, false), r.x0, r.y0, r.x1, r.y1);
 }
 
 # the window a drag in flight over the space would dock, 0 for none
@@ -999,8 +1044,7 @@ fun zones(ctx: *context.Context, p: *Pass, rid: u64) {
     context.push_band(ctx, band.DRAG, 0);
     if (hit != ZONE_NONE) {
         val pv: context.Area = preview(ctx, p, t, hit);
-        context.quad(ctx, pv.x0, pv.y0, pv.x1, pv.y1, p.lk.preview);
-        context.frame(ctx, pv.x0, pv.y0, pv.x1, pv.y1, maxf(p.lk.edge_w, 1.0::f32), p.lk.zone_on);
+        context.box(ctx, p.lk.preview, theme.NORMAL, pv.x0, pv.y0, pv.x1, pv.y1);
     }
     z = ZONE_CENTER;
     for (z <= ZONE_BOTTOM) {
@@ -1075,7 +1119,7 @@ fun draw_space(ctx: *context.Context, sid: u64, a: context.Area) {
     val rid: u64 = root(ctx, sid);
 
     context.push_band(ctx, band.DOCKED, 0);
-    context.quad(ctx, a.x0, a.y0, a.x1, a.y1, p.lk.bg);
+    context.box(ctx, p.lk.space, theme.NORMAL, a.x0, a.y0, a.x1, a.y1);
     val bg: interact.Hit = interact.hit(ctx, 0, a.x0, a.y0, a.x1, a.y1, 0);
     if (!members(ctx, ?p)) {
         ctx.oom = 1;
@@ -1162,13 +1206,15 @@ pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
     widget.dock_note(ctx, dk, key, 1, 0, 0.0::f32, 0.0::f32);
     draw_space(ctx, sid, r.area);
 
-    val a:  context.Area = r.area;
-    val lk: Look         = look(ctx);
+    val a: context.Area = r.area;
     context.push_band(ctx, band.DOCKED, 0);
-    if (sel d.side.left)  { context.quad(ctx, a.x1 - lk.edge_w, a.y0, a.x1, a.y1, lk.edge); }
-    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + lk.edge_w, a.y1, lk.edge); }
-    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - lk.edge_w, a.x1, a.y1, lk.edge); }
-    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + lk.edge_w, lk.edge); }
+    # the side panel's edge, in the dock style, on the inner side alone
+    val ep: *theme.Paint = context.paint_of(ctx, theme.DOCK, theme.NORMAL);
+    val ew: f32          = context.px(ctx, ep.border_w);
+    if (sel d.side.left)  { context.quad(ctx, a.x1 - ew, a.y0, a.x1, a.y1, ep.border); }
+    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + ew, a.y1, ep.border); }
+    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - ew, a.x1, a.y1, ep.border); }
+    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + ew, ep.border); }
 
     var b: context.Area = context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1};
     if (dk.front == 0 || !widget.dock_placed(ctx, dk)) {
@@ -1176,9 +1222,9 @@ pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
         b        = a;
         context.push_measure(ctx);
     }
-    val in: f32 = context.px(ctx, ctx.theme.pad);
-    val h:  f32 = maxf(b.y1 - b.y0 - in * 2.0::f32, 0.0::f32);
-    context.push_layout(ctx, layout.column(b.x0 + in, b.y0 + in, b.x1 - b.x0 - in * 2.0::f32, h, widget.row_gap(ctx)));
+    val in: theme.Edges = context.px_edges(ctx, context.look_of(ctx, theme.DOCK).pad);
+    val h:  f32         = maxf(b.y1 - b.y0 - in.t - in.b, 0.0::f32);
+    context.push_layout(ctx, layout.column(b.x0 + in.l, b.y0 + in.t, b.x1 - b.x0 - in.l - in.r, h, widget.row_gap(ctx)));
     r.body = widget.begin_scroll(ctx, key, ?d.scroll, h);
     ret r;
 }

@@ -54,15 +54,17 @@
 # it is taller than the region, and a section is a collapsible heading that
 # groups the rows beneath it.
 #
-# every color and length a widget draws with comes from the context's theme
-# (see blit.theme), each length multiplied by the context's interface scale,
-# so a theme or a scale changes the whole interface and no widget holds a
-# color or a size of its own.
+# every color and length a widget draws with comes from its kind's style in
+# the context's theme (see blit.theme), painted in the state it is in through
+# context.box, each length multiplied by the context's interface scale, so a
+# theme, an override (see blit.style) or a scale changes the interface and no
+# widget holds a color or a size of its own.
 #
-# a control's face eases between its rest, hover and press colors, a toggle's
-# knob slides, a section opened by begin_section unfolds, and a scroll region
-# glides to where the wheel or the keyboard sent it, each an animated value in
-# the store (see blit.anim) timed by the theme's motion.
+# a control's face eases between the paints of the states it passes through
+# (see blit.anim.box), a toggle's knob slides, a section opened by
+# begin_section unfolds, and a scroll region glides to where the wheel or the
+# keyboard sent it, each an animated value in the store timed by the theme's
+# motion fields.
 #
 # every control is a tab stop (see blit.interact): tab and shift tab move the
 # keyboard through them in call order, enter and space activate the one
@@ -105,27 +107,54 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.data.toml;
 
-# the theme's space inside chrome, at the context's scale
+# a kind's style, overrides included
+fun look(ctx: *context.Context, kind: u32) *theme.Style {
+    ret context.look_of(ctx, kind);
+}
+
+# a kind's paint in a state
+fun ink(ctx: *context.Context, kind: u32, state: u8) *theme.Paint {
+    ret context.paint_of(ctx, kind, state);
+}
+
+# a kind's control inset, at the context's scale
+fun inset(ctx: *context.Context, kind: u32) theme.Edges {
+    ret context.px_edges(ctx, look(ctx, kind).inset);
+}
+
+# a kind's container padding, at the context's scale
+fun padding(ctx: *context.Context, kind: u32) theme.Edges {
+    ret context.px_edges(ctx, look(ctx, kind).pad);
+}
+
+# the layout kind's space between items down a column, at the context's scale
 #
-# with gap, the one place layout reads its spacing from the look.
-fun pad(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.pad);
-}
-
-# the theme's space between layout items, at the context's scale
+# with across, the one place layout reads its spacing from the look.
 fun gap(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.gap);
+    ret context.px(ctx, look(ctx, theme.LAYOUT).margin.b);
 }
 
-# the theme's corner radius, at the context's scale
-fun corner(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.corner);
+# the layout kind's space between cells and columns across a row, at the
+# context's scale
+fun across(ctx: *context.Context) f32 {
+    ret context.px(ctx, look(ctx, theme.LAYOUT).margin.r);
 }
 
-# height of an interactive row: the theme's row height, grown to fit a line of
-# text with padding above and below
+# the state a widget paints in: on, then focused, then active, then hot
+fun state_of(h: interact.Hit, on: bool, focused: bool) u8 {
+    ret theme.pick(h.hot, h.active, on, focused);
+}
+
+# height of a kind's row: its least height, grown to fit a line of text with
+# its inset above and below
+fun row_of(ctx: *context.Context, kind: u32) f32 {
+    val i: theme.Edges = inset(ctx, kind);
+    ret maxf(context.px(ctx, look(ctx, kind).min_h), context.line_height(ctx) + i.t + i.b);
+}
+
+# height of a button row, the row every control takes by default
 fun row_h(ctx: *context.Context) f32 {
-    ret maxf(context.px(ctx, ctx.theme.row), context.line_height(ctx) + pad(ctx) * 2.0::f32);
+    ret row_of(ctx, theme.BUTTON);
 }
 
 # vertical space consumed by one text row, including the following gap
@@ -138,8 +167,8 @@ pub fun control_row_height(ctx: *context.Context) f32 {
     ret row_h(ctx) + gap(ctx);
 }
 
-# height of a control row without the gap below it: the theme's row height,
-# grown to fit a line of text with padding above and below
+# height of a control row without the gap below it: the button style's least
+# height, grown to fit a line of text with its inset above and below
 pub fun control_height(ctx: *context.Context) f32 {
     ret row_h(ctx);
 }
@@ -152,12 +181,12 @@ pub fun row_gap(ctx: *context.Context) f32 {
 # spacing between adjacent layout rows in the default theme at scale 1.0
 #[deprecated("use row_gap(ctx), which follows the theme and scale")]
 pub fun layout_gap() f32 {
-    ret theme.default().gap;
+    ret 4.0::f32;
 }
 
-# a control-shaped fill: rounded to the theme's corner on every side
-fun face(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
-    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, c);
+# the top of a line of text centered in a row from y, h tall
+fun text_top(ctx: *context.Context, y: f32, h: f32) f32 {
+    ret y + (h - context.line_height(ctx)) / 2.0::f32;
 }
 
 # the drawn part of a label, everything before "##", at (x, y)
@@ -455,7 +484,7 @@ fun cell_left(x: f32, w: f32, g: f32, i: usize, n: usize) f32 {
 # ret: the cell's left x in local pixels
 pub fun cell_x0(ctx: *context.Context, i: usize, n: usize) f32 {
     val f: *layout.Frame = top(ctx);
-    ret cell_left(f.x0, f.w, gap(ctx), i, n);
+    ret cell_left(f.x0, f.w, across(ctx), i, n);
 }
 
 # the right edge of cell i of n equal cells across the column
@@ -465,7 +494,7 @@ pub fun cell_x0(ctx: *context.Context, i: usize, n: usize) f32 {
 # n:   how many cells share the column
 # ret: the cell's right x in local pixels
 pub fun cell_x1(ctx: *context.Context, i: usize, n: usize) f32 {
-    ret cell_x0(ctx, i, n) + cell_width(top(ctx).w, gap(ctx), n);
+    ret cell_x0(ctx, i, n) + cell_width(top(ctx).w, across(ctx), n);
 }
 
 # the handle begin_columns returns for next_column and end_columns
@@ -510,7 +539,7 @@ pub fun begin_columns(ctx: *context.Context, n: usize) Columns {
 
 # open the frame of column c.i of the row
 fun enter_column(ctx: *context.Context, c: *Columns) {
-    val g: f32 = gap(ctx);
+    val g: f32 = across(ctx);
     open_column(ctx, cell_left(c.row.x, c.row.w, g, c.i, c.n), c.top, cell_width(c.row.w, g, c.n), 0.0::f32);
 }
 
@@ -543,19 +572,13 @@ pub fun end_columns(ctx: *context.Context, c: *Columns) {
     var it: layout.Item = c.row;
     it.h     = c.bottom - c.top;
     it.nat_h = it.h;
-    it.nat_w = c.need * c.n::f32 + gap(ctx) * (c.n - 1)::f32;
+    it.nat_w = c.need * c.n::f32 + across(ctx) * (c.n - 1)::f32;
     layout.commit(top(ctx), it);
 }
 
 # ask for the hand pointer over a clickable widget while it is hovered
 fun hand(ctx: *context.Context, h: interact.Hit) {
     if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
-}
-
-# a control's face, easing from rest toward hot while hovered and toward on
-# while pressed (see blit.anim.fade)
-fun tint(ctx: *context.Context, h: interact.Hit, rest: draw.Color, hot: draw.Color, on: draw.Color) draw.Color {
-    ret anim.tint(ctx, h.id, h.hot, h.active, rest, hot, on);
 }
 
 # the buttons a control answers to: the left button, as a tab stop
@@ -583,7 +606,8 @@ pub rec Block {
 # w:   panel width in pixels
 # ret: a handle for end_panel
 pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) Block {
-    open_column(ctx, x, y, w, 0.0::f32);
+    val p: theme.Edges = padding(ctx, theme.PANEL);
+    open_column(ctx, x + p.l, y + p.t, maxf(w - p.l - p.r, 0.0::f32), 0.0::f32);
 
     var b: Block;
     b.claim = context.reserve_claim(ctx, 0);
@@ -599,13 +623,14 @@ pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) Block {
 # b:   the value returned by begin_panel
 pub fun end_panel(ctx: *context.Context, b: Block) {
     val f:  *layout.Frame = context.top_layout(ctx);
-    val x0: f32           = f.x0;
-    val y0: f32           = f.y0;
-    val x1: f32           = f.x0 + f.w;
-    val y1: f32           = f.y + pad(ctx);
+    val p:  theme.Edges   = padding(ctx, theme.PANEL);
+    val x0: f32           = f.x0 - p.l;
+    val y0: f32           = f.y0 - p.t;
+    val x1: f32           = f.x0 + f.w + p.r;
+    val y1: f32           = f.y + p.b;
     context.pop_layout(ctx);
     context.set_channel(ctx, b.ch, 0);
-    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, ctx.theme.panel);
+    context.box(ctx, theme.PANEL, theme.NORMAL, x0, y0, x1, y1);
     context.merge(ctx, b.ch);
     context.fill_claim(ctx, b.claim, x0, y0, x1, y1);
 }
@@ -616,7 +641,7 @@ pub fun end_panel(ctx: *context.Context, b: Block) {
 # s:   string to draw
 pub fun text(ctx: *context.Context, s: str) {
     val r: context.Area = place(ctx, layout.fit(), layout.fit(), context.text_width(ctx, s), context.line_height(ctx));
-    context.text_at(ctx, s, r.x0, r.y0, ctx.theme.text);
+    context.text_at(ctx, s, r.x0, r.y0, ink(ctx, theme.LABEL, theme.NORMAL).text);
 }
 
 # draw a rich line of spans at the cursor and advance to the next row
@@ -703,7 +728,7 @@ pub fun note(ctx: *context.Context, s: str) {
     for (k < lines) {
         var next: usize = n;
         val end:  usize = wrap_line(ctx, s, n, i, w, ?next);
-        if (end > i) { context.text_span(ctx, ?s[i], end - i, r.x0, y, ctx.theme.text_dim); }
+        if (end > i) { context.text_span(ctx, ?s[i], end - i, r.x0, y, ink(ctx, theme.LABEL, theme.NORMAL).mark); }
         y = y + lh;
         i = next;
         k = k + 1;
@@ -729,19 +754,13 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
     val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, label), x0, y0, x1, y1, PRESS);
     hand(ctx, h);
 
-    var bg:  draw.Color = tint(ctx, h, ctx.theme.control, ctx.theme.control_hot, ctx.theme.control_on);
-    var ink: draw.Color = ctx.theme.text;
-    if (on) {
-        context.mark_current(ctx, h.id);
-        bg  = ctx.theme.accent;
-        ink = ctx.theme.accent_text;
-    }
-    face(ctx, x0, y0, x1, y1, bg);
+    val st: u8 = state_of(h, on, false);
+    if (on) { context.mark_current(ctx, h.id); }
+    val face: theme.Paint = anim.box(ctx, h.id, theme.BUTTON, st, x0, y0, x1, y1);
 
     val tw: f32 = label_width(ctx, label);
     val tx: f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
-    val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
-    label_at(ctx, label, tx, ty, ink);
+    label_at(ctx, label, tx, text_top(ctx, y0, y1 - y0), face.text);
     ret h.clicked;
 }
 
@@ -754,7 +773,8 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
 # label: button text
 # ret:   true if the button was clicked this frame
 pub fun button(ctx: *context.Context, label: str) bool {
-    val r: context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, label) + pad(ctx) * 2.0::f32, row_h(ctx));
+    val in: theme.Edges  = inset(ctx, theme.BUTTON);
+    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, label) + in.l + in.r, row_h(ctx));
     ret button_at(ctx, label, r.x0, r.y0, r.x1, r.y1, false);
 }
 
@@ -773,12 +793,13 @@ pub fun button(ctx: *context.Context, label: str) bool {
 pub fun button_grid(ctx: *context.Context, labels: *str, n: usize, cols: usize, on: usize) usize {
     var per: usize = cols;
     if (per == 0) { per = 1; }
-    val h:    f32   = row_h(ctx);
-    val g:    f32   = gap(ctx);
-    var cell: f32   = 0.0::f32;
-    var i:    usize = 0;
+    val h:    f32         = row_h(ctx);
+    val g:    f32         = context.px(ctx, look(ctx, theme.BUTTON).margin.r);
+    val in:   theme.Edges = inset(ctx, theme.BUTTON);
+    var cell: f32         = 0.0::f32;
+    var i:    usize       = 0;
     for (i < n) {
-        cell = maxf(cell, label_width(ctx, labels[i]) + pad(ctx) * 2.0::f32);
+        cell = maxf(cell, label_width(ctx, labels[i]) + in.l + in.r);
         i    = i + 1;
     }
     var row: context.Area;
@@ -829,14 +850,15 @@ pub fun segmented(ctx: *context.Context, labels: *str, n: usize, choice: *usize)
 # ret:   true if the state changed this frame
 pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val id:  u64          = context.id_of(ctx, label);
-    val box: f32          = row_h(ctx);
+    val box: f32          = row_of(ctx, theme.CHECKBOX);
+    val sp:  f32          = inset(ctx, theme.CHECKBOX).l;
     val tw:  f32          = label_width(ctx, label);
-    val r:   context.Area = place(ctx, layout.fit(), layout.fit(), box + pad(ctx) + tw, box);
+    val r:   context.Area = place(ctx, layout.fit(), layout.fit(), box + sp + tw, box);
     val x0:  f32          = r.x0;
     val y0:  f32          = r.y0;
     val bx1: f32          = x0 + box;
     val y1:  f32          = y0 + box;
-    val rx1: f32          = bx1 + pad(ctx) + tw;
+    val rx1: f32          = bx1 + sp + tw;
     val hc:  interact.Hit = interact.hit(ctx, id, x0, y0, rx1, y1, PRESS);
     hand(ctx, hc);
 
@@ -848,14 +870,13 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
         toggled = true;
     }
 
-    face(ctx, x0, y0, bx1, y1, tint(ctx, hc, ctx.theme.control, ctx.theme.control_hot, ctx.theme.control_hot));
+    val st: u8 = state_of(hc, false, false);
+    anim.box(ctx, id, theme.CHECKBOX, st, x0, y0, bx1, y1);
     if (@state != 0) {
-        val in: f32 = pad(ctx);
-        face(ctx, x0 + in, y0 + in, bx1 - in, y1 - in, ctx.theme.accent);
+        val m: theme.Edges = padding(ctx, theme.CHECKBOX);
+        context.box(ctx, theme.CHECKBOX_MARK, theme.ON, x0 + m.l, y0 + m.t, bx1 - m.r, y1 - m.b);
     }
-
-    val ty: f32 = y0 + (box - context.line_height(ctx)) / 2.0::f32;
-    label_at(ctx, label, bx1 + pad(ctx), ty, ctx.theme.text);
+    label_at(ctx, label, bx1 + sp, text_top(ctx, y0, box), ink(ctx, theme.CHECKBOX, st).text);
     ret toggled;
 }
 
@@ -870,8 +891,9 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
 # ret:   true if the state changed this frame
 pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val id: u64          = context.id_of(ctx, label);
-    val rh: f32          = row_h(ctx);
-    val nw: f32          = label_width(ctx, label) + pad(ctx) + maxf(rh - pad(ctx), 0.0::f32) * 2.0::f32;
+    val rh: f32          = row_of(ctx, theme.TOGGLE);
+    val tp: theme.Edges  = padding(ctx, theme.TOGGLE);
+    val nw: f32          = label_width(ctx, label) + inset(ctx, theme.TOGGLE).r + maxf(rh - tp.t - tp.b, 0.0::f32) * 2.0::f32;
     val r:  context.Area = place(ctx, wide(), layout.fit(), nw, rh);
     val x0: f32          = r.x0;
     val y0: f32          = r.y0;
@@ -890,28 +912,24 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
         flipped = true;
     }
 
-    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    label_at(ctx, label, x0, ty, ctx.theme.text);
+    val st: u8 = state_of(hs, @state != 0, false);
+    label_at(ctx, label, x0, text_top(ctx, y0, h), ink(ctx, theme.TOGGLE, st).text);
 
-    # the switch is a track twice as wide as it is tall, inset from the row by pad
-    val in: f32 = pad(ctx);
-    val sh: f32 = maxf(h - in, 0.0::f32);
+    # the switch is a track twice as wide as it is tall, inside the row's padding
+    val sh: f32 = maxf(h - tp.t - tp.b, 0.0::f32);
     val sw: f32 = sh * 2.0::f32;
-    val sx: f32 = x1 - sw;
-    val sy: f32 = y0 + (h - sh) / 2.0::f32;
-    # the knob slides between its ends and the colors follow it
+    val sx: f32 = x1 - tp.r - sw;
+    val sy: f32 = y0 + tp.t;
+    anim.box(ctx, id, theme.TOGGLE, st, sx, sy, sx + sw, sy + sh);
+
+    # the knob slides between its ends
     var to: f32 = 0.0::f32;
     if (@state != 0) { to = 1.0::f32; }
-    val on: f32        = anim.value(ctx, bid.child(id, "#knob"), to, theme.MOTION_HOVER);
-    val tc: draw.Color = anim.mix(tint(ctx, hs, ctx.theme.track, ctx.theme.control_hot, ctx.theme.control_hot), ctx.theme.accent, on);
-    val ht: f32        = anim.fade(ctx, bid.child(id, "#hot"), hs.hot, theme.MOTION_HOVER);
-    val kc: draw.Color = anim.mix(anim.mix(ctx.theme.handle, ctx.theme.handle_on, ht), ctx.theme.accent_text, on);
-    face(ctx, sx, sy, sx + sw, sy + sh, tc);
-
-    val ki: f32 = in / 2.0::f32;
-    val k:  f32 = maxf(sh - ki * 2.0::f32, 0.0::f32);
-    val kx: f32 = anim.lerp(sx + ki, sx + sw - ki - k, on);
-    face(ctx, kx, sy + ki, kx + k, sy + ki + k, kc);
+    val on: f32         = anim.value(ctx, bid.child(id, "#slide"), to, theme.MOTION_HOVER);
+    val km: theme.Edges = context.px_edges(ctx, look(ctx, theme.TOGGLE_KNOB).margin);
+    val k:  f32         = maxf(sh - km.t - km.b, 0.0::f32);
+    val kx: f32         = anim.lerp(sx + km.l, sx + sw - km.r - k, on);
+    anim.box(ctx, bid.child(id, "#knob"), theme.TOGGLE_KNOB, st, kx, sy + km.t, kx + k, sy + km.t + k);
     ret flipped;
 }
 
@@ -947,10 +965,12 @@ pub fun slider_f(ctx: *context.Context, label: str, v: *f32, lo: f32, hi: f32) b
 # hi:      maximum value (right end)
 # ret:     true if the value changed this frame
 pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32, hi: f32) bool {
-    val id: u64 = context.id_of(ctx, label);
-    var nw: f32 = label_width(ctx, label) + pad(ctx) * 4.0::f32 + context.px(ctx, ctx.theme.handle_w);
+    val id: u64         = context.id_of(ctx, label);
+    val in: theme.Edges = inset(ctx, theme.SLIDER);
+    val hw: f32         = context.px(ctx, look(ctx, theme.SLIDER_HANDLE).min_w);
+    var nw: f32         = label_width(ctx, label) + (in.l + in.r) * 2.0::f32 + hw;
     if (reading != nil) { nw = nw + context.text_width(ctx, reading); }
-    val r:  context.Area = place(ctx, wide(), layout.fit(), nw, row_h(ctx));
+    val r:  context.Area = place(ctx, wide(), layout.fit(), nw, row_of(ctx, theme.SLIDER));
     val x0: f32          = r.x0;
     val y0: f32          = r.y0;
     val x1: f32          = r.x1;
@@ -984,22 +1004,22 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
         }
     }
 
-    face(ctx, x0, y0, x1, y1, ctx.theme.track);
+    val st: u8 = state_of(hs, false, false);
+    context.box(ctx, theme.SLIDER, st, x0, y0, x1, y1);
 
     var t_out: f32 = 0.0::f32;
     if (hi != lo) { t_out = clampf((@v - lo) / (hi - lo), 0.0::f32, 1.0::f32); }
-    val hw:   f32 = context.px(ctx, ctx.theme.handle_w);
     var span: f32 = (x1 - x0) - hw;
     if (span < 0.0::f32) { span = 0.0::f32; }
     val hx: f32 = x0 + t_out * span;
+    anim.box(ctx, bid.child(id, "#handle"), theme.SLIDER_HANDLE, st, hx, y0, hx + hw, y1);
 
-    face(ctx, hx, y0, hx + hw, y1, tint(ctx, hs, ctx.theme.handle, ctx.theme.handle, ctx.theme.handle_on));
-
-    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    label_at(ctx, label, x0 + pad(ctx), ty, ctx.theme.text);
+    val ty: f32          = text_top(ctx, y0, h);
+    val p:  *theme.Paint = ink(ctx, theme.SLIDER, st);
+    label_at(ctx, label, x0 + in.l, ty, p.text);
     if (reading != nil) {
         val rw: f32 = context.text_width(ctx, reading);
-        context.text_at(ctx, reading, x1 - pad(ctx) - rw, ty, ctx.theme.text_dim);
+        context.text_at(ctx, reading, x1 - in.r - rw, ty, p.mark);
     }
     ret changed;
 }
@@ -1010,11 +1030,14 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
 # dismissed: 1 if a press outside the popup dismissed it this frame
 # ch:        the channels the body's background and children draw in
 # claim:     the popup body's reserved claim
+# kind:      the style its body is padded and painted in, theme.POPUP unless
+#            begin_popup_as named another
 pub rec Popup {
     open:      u8;
     dismissed: u8;
     ch:        context.Channels;
     claim:     usize;
+    kind:      u32;
 }
 
 # open a popup column at (x, y) of width w in the popup band, when @open is
@@ -1042,7 +1065,7 @@ pub rec Popup {
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup(ctx: *context.Context, key: str, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w, true);
+    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w, true, theme.POPUP);
 }
 
 # begin_popup for a popup whose id is already known, such as a part of a widget
@@ -1055,7 +1078,7 @@ pub fun begin_popup(ctx: *context.Context, key: str, open: u8, x: f32, y: f32, w
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup_id(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, id, open, x, y, w, true);
+    ret popup_at(ctx, id, open, x, y, w, true, theme.POPUP);
 }
 
 # open a popup nested in an open popup, which closes with it rather than on a
@@ -1073,13 +1096,31 @@ pub fun begin_popup_id(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32,
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup_nested(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, id, open, x, y, w, false);
+    ret popup_at(ctx, id, open, x, y, w, false, theme.POPUP);
+}
+
+# open a popup whose body is padded and painted in a style of its own, such
+# as a menu's
+# ---
+# ctx:    context
+# id:     the popup's id, which is also the id scope of what it holds
+# open:   nonzero to draw the popup this frame
+# x:      popup left in local pixels
+# y:      popup top in local pixels
+# w:      popup width in pixels
+# nested: true to nest it in the open popup it is opened in, as
+#         begin_popup_nested does, false to open it as begin_popup_id does
+# kind:   the style, such as theme.MENU
+# ret:    a handle for end_popup
+pub fun begin_popup_as(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, nested: bool, kind: u32) Popup {
+    ret popup_at(ctx, id, open, x, y, w, !nested, kind);
 }
 
 # a popup at (x, y), claiming the screen beneath its body when outside is true
-fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, outside: bool) Popup {
+fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, outside: bool, kind: u32) Popup {
     var p: Popup;
     p.claim = context.NO_CLAIM;
+    p.kind  = kind;
     if (open == 0) { ret p; }
     p.open = 1;
 
@@ -1095,7 +1136,8 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, o
     }
 
     p.claim = context.reserve_claim(ctx, 0);
-    open_column(ctx, sx, sy, w, 0.0::f32);
+    val pd: theme.Edges = padding(ctx, kind);
+    open_column(ctx, sx + pd.l, sy + pd.t, maxf(w - pd.l - pd.r, 0.0::f32), 0.0::f32);
     p.ch = context.split(ctx, 2);
     context.set_channel(ctx, p.ch, 1);
     ret p;
@@ -1111,13 +1153,14 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
     if (p.open == 0) { ret; }
 
     val f:  *layout.Frame = context.top_layout(ctx);
-    val x0: f32           = f.x0;
-    val y0: f32           = f.y0;
-    val x1: f32           = f.x0 + f.w;
-    val y1: f32           = f.y + pad(ctx);
+    val pd: theme.Edges   = padding(ctx, p.kind);
+    val x0: f32           = f.x0 - pd.l;
+    val y0: f32           = f.y0 - pd.t;
+    val x1: f32           = f.x0 + f.w + pd.r;
+    val y1: f32           = f.y + pd.b;
     context.pop_layout(ctx);
     context.set_channel(ctx, p.ch, 0);
-    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, ctx.theme.window);
+    context.box(ctx, p.kind, theme.NORMAL, x0, y0, x1, y1);
     context.merge(ctx, p.ch);
     context.fill_claim(ctx, p.claim, x0, y0, x1, y1);
     context.pop_id(ctx);
@@ -1160,8 +1203,9 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
         wo = maxf(wo, context.text_width(ctx, options[k]));
         k  = k + 1;
     }
-    val rh: f32          = row_h(ctx);
-    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, label) + wo + pad(ctx) * 3.0::f32, rh);
+    val rh: f32          = row_of(ctx, theme.DROPDOWN);
+    val in: theme.Edges  = inset(ctx, theme.DROPDOWN);
+    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, label) + wo + in.l * 2.0::f32 + in.r, rh);
     val x0: f32          = r.x0;
     val y0: f32          = r.y0;
     val x1: f32          = r.x1;
@@ -1183,20 +1227,23 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
         }
     }
 
-    var bg: draw.Color = tint(ctx, hd, ctx.theme.control, ctx.theme.control_hot, ctx.theme.control_on);
-    if (st.open != 0) { bg = ctx.theme.control_on; }
-    face(ctx, x0, y0, x1, y1, bg);
+    val hs: u8 = state_of(hd, st.open != 0, false);
+    anim.box(ctx, id, theme.DROPDOWN, hs, x0, y0, x1, y1);
 
-    val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
-    label_at(ctx, label, x0 + pad(ctx), ty, ctx.theme.text);
+    val ty: f32        = text_top(ctx, y0, h);
+    val tc: draw.Color = ink(ctx, theme.DROPDOWN, hs).text;
+    label_at(ctx, label, x0 + in.l, ty, tc);
     if (@selected < count) {
         val cur: str = options[@selected];
         val cw:  f32 = context.text_width(ctx, cur);
-        context.text_at(ctx, cur, x1 - pad(ctx) - cw, ty, ctx.theme.text);
+        context.text_at(ctx, cur, x1 - in.r - cw, ty, tc);
     }
 
-    val pop: Popup          = popup_at(ctx, pid, st.open, x0, y1 + gap(ctx), x1 - x0, true);
-    val grp: interact.Group = interact.begin_group(ctx, pid, interact.COLUMN);
+    val below: f32            = context.px(ctx, look(ctx, theme.DROPDOWN).margin.b);
+    val pop:   Popup          = popup_at(ctx, pid, st.open, x0, y1 + below, x1 - x0, true, theme.POPUP);
+    val oh:    f32            = row_of(ctx, theme.OPTION);
+    val oin:   theme.Edges    = inset(ctx, theme.OPTION);
+    val grp:   interact.Group = interact.begin_group(ctx, pid, interact.COLUMN);
 
     var changed: u8    = 0;
     var back:    bool  = false;
@@ -1204,7 +1251,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     for (i < count) {
         val oid: u64 = bid.child_int(pid, i::u64);
         if (pop.open != 0) {
-            val o:   context.Area = place(ctx, wide(), layout.fit(), x1 - x0, rh);
+            val o:   context.Area = place(ctx, wide(), layout.fit(), x1 - x0, oh);
             val ox0: f32          = o.x0;
             val oy0: f32          = o.y0;
             val ox1: f32          = o.x1;
@@ -1224,8 +1271,9 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
                 back    = true;
             }
 
-            face(ctx, ox0, oy0, ox1, oy1, tint(ctx, ho, ctx.theme.track, ctx.theme.control_hot, ctx.theme.control_on));
-            context.text_at(ctx, options[i], ox0 + pad(ctx), oy0 + (oy1 - oy0 - context.line_height(ctx)) / 2.0::f32, ctx.theme.text);
+            val os: u8          = state_of(ho, false, false);
+            val op: theme.Paint = anim.box(ctx, oid, theme.OPTION, os, ox0, oy0, ox1, oy1);
+            context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, oy1 - oy0), op.text);
         }
         i = i + 1;
     }
@@ -1301,8 +1349,10 @@ fun caret_at(ctx: *context.Context, f: *field.Field, x: f32) usize {
 # hint: dim text shown while it is empty and unfocused, nil for none
 # ret:  this frame's outcome bits: field.EDITED, field.ENTERED, field.ESCAPED
 pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) u8 {
-    val nw: f32          = context.text_width(ctx, hint) + pad(ctx) * 2.0::f32 + context.px(ctx, ctx.theme.caret_w);
-    val r:  context.Area = place(ctx, wide(), layout.fit(), nw, row_h(ctx));
+    val in: theme.Edges  = inset(ctx, theme.FIELD);
+    val cw: f32          = context.px(ctx, look(ctx, theme.FIELD_CARET).min_w);
+    val nw: f32          = context.text_width(ctx, hint) + in.l + in.r + cw;
+    val r:  context.Area = place(ctx, wide(), layout.fit(), nw, row_of(ctx, theme.FIELD));
     ret text_field_at(ctx, key, f, hint, r.x0, r.y0, r.x1, r.y1);
 }
 
@@ -1321,10 +1371,12 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
 # y1:   bottom y in pixels
 # ret:  this frame's outcome bits: field.EDITED, field.ENTERED, field.ESCAPED
 pub fun text_field_at(ctx: *context.Context, key: str, f: *field.Field, hint: str, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val id: u64 = context.id_of(ctx, key);
-    val h:  f32 = y1 - y0;
-    val tx: f32 = x0 + pad(ctx);
-    var tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
+    val id: u64         = context.id_of(ctx, key);
+    val in: theme.Edges = inset(ctx, theme.FIELD);
+    val cw: f32         = context.px(ctx, look(ctx, theme.FIELD_CARET).min_w);
+    val h:  f32         = y1 - y0;
+    val tx: f32         = x0 + in.l;
+    var tw: f32         = maxf(x1 - x0 - in.l - in.r, 0.0::f32);
 
     var counted: [42]u8;
     var count:   str = nil;
@@ -1332,7 +1384,7 @@ pub fun text_field_at(ctx: *context.Context, key: str, f: *field.Field, hint: st
     if (field.has(f, field.COUNT)) {
         count   = edit.count_text(f, ?counted[0]);
         count_w = context.text_width(ctx, count);
-        tw      = maxf(tw - count_w - pad(ctx), 0.0::f32);
+        tw      = maxf(tw - count_w - in.r, 0.0::f32);
     }
 
     val hf: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, PRESS | interact.ARROWS | interact.TEXT);
@@ -1351,44 +1403,39 @@ pub fun text_field_at(ctx: *context.Context, key: str, f: *field.Field, hint: st
     val on:    bool = ctx.focus == id;
     val quiet: bool = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
 
-    var bg: draw.Color = ctx.theme.track;
-    if (hf.hot && !on) { bg = ctx.theme.control_hot; }
-    if (on) {
-        val ew: f32 = context.px(ctx, ctx.theme.edge_w);
-        face(ctx, x0, y0, x1, y1, ctx.theme.accent);
-        face(ctx, x0 + ew, y0 + ew, x1 - ew, y1 - ew, bg);
-    }
-    or { face(ctx, x0, y0, x1, y1, bg); }
+    val fs: u8           = state_of(hf, false, on);
+    val fp: *theme.Paint = ink(ctx, theme.FIELD, fs);
+    val cc: draw.Color   = ink(ctx, theme.FIELD_CARET, fs).fill;
+    context.box(ctx, theme.FIELD, fs, x0, y0, x1, y1);
 
     keep_in_view(ctx, f, tw);
     val lh: f32 = context.line_height(ctx);
     val ty: f32 = y0 + (h - lh) / 2.0::f32;
-    if (count != nil) { context.text_at(ctx, count, x1 - pad(ctx) - count_w, ty, ctx.theme.text_faint); }
+    if (count != nil) { context.text_at(ctx, count, x1 - in.r - count_w, ty, fp.mark); }
     context.push_clip(ctx, tx, y0, tx + tw, y1);
-    if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, ctx.theme.text_faint); }
+    if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, fp.mark); }
     if (on && field.selected(f)) {
         var lo: usize = field.sel_lo(f);
         if (lo < f.first) { lo = f.first; }
         val sx0: f32 = tx + span(ctx, f, f.first, lo);
         val sx1: f32 = tx + span(ctx, f, f.first, field.sel_hi(f));
-        context.quad(ctx, sx0, ty, sx1, ty + lh, ctx.theme.select);
+        context.quad(ctx, sx0, ty, sx1, ty + lh, ink(ctx, theme.FIELD_SELECT, fs).fill);
     }
-    val cw:  f32 = context.px(ctx, ctx.theme.caret_w);
     var pre: str = nil;
     if (!quiet) { pre = context.preedit(ctx, id); }
     var cx: f32 = tx + span(ctx, f, f.first, f.caret);
-    if (pre == nil) { edit.draw_text(ctx, f, f.first, f.len, tx, ty, ctx.theme.text); }
+    if (pre == nil) { edit.draw_text(ctx, f, f.first, f.len, tx, ty, fp.text); }
     or {
         val pw: f32 = bytes_width(ctx, pre, 0, str_len(pre));
-        edit.draw_text(ctx, f, f.first, f.caret, tx, ty, ctx.theme.text);
-        context.text_at(ctx, pre, cx, ty, ctx.theme.text);
-        context.quad(ctx, cx, ty + lh - cw, cx + pw, ty + lh, ctx.theme.text);
-        edit.draw_text(ctx, f, f.caret, f.len, cx + pw, ty, ctx.theme.text);
+        edit.draw_text(ctx, f, f.first, f.caret, tx, ty, fp.text);
+        context.text_at(ctx, pre, cx, ty, fp.text);
+        context.quad(ctx, cx, ty + lh - cw, cx + pw, ty + lh, cc);
+        edit.draw_text(ctx, f, f.caret, f.len, cx + pw, ty, fp.text);
         cx = cx + bytes_width(ctx, pre, 0, context.preedit_caret(ctx));
     }
     context.pop_clip(ctx);
     if (on) {
-        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, ty, cx + cw, ty + lh, ctx.theme.text); }
+        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, ty, cx + cw, ty + lh, cc); }
         if (!quiet)                 { context.set_ime_rect(ctx, cx, ty, cx + cw, ty + lh); }
     }
     ret out;
@@ -1752,7 +1799,7 @@ pub fun dock_placed(ctx: *context.Context, dk: *Docked) bool {
 # shown:  1 if the window is drawn this frame, 0 while it is closed
 # body:   1 if its body takes widgets this frame, 0 while closed or collapsed
 # th:     titlebar height, 0 without one
-# ch:     the channels the body's background and children draw in
+# ch:     the channels the shadow and body, the titlebar and the children draw in
 # claim:  the window's reserved claim, beneath everything in it
 # scroll: the scroll region the body is laid out in, unless auto-sized
 # sc:     the body's scroll state
@@ -1994,7 +2041,7 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     if (dk != nil && dk.node != 0) { ret begin_docked(ctx, win, r, dk); }
     r.shown = 1;
 
-    var th: f32 = row_h(ctx);
+    var th: f32 = row_of(ctx, theme.WINDOW_TITLE);
     if ((win.flags & WINDOW_NO_TITLE) != 0) { th = 0.0::f32; }
     r.th = th;
     val min_w: f32 = maxf(win.min_w, th * 3.0::f32);
@@ -2067,6 +2114,10 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     if ((win.flags & WINDOW_AUTO_SIZE) == 0) { st.h = clampf(st.h, min_h, max_h); }
 
     r.claim = context.reserve_claim(ctx, r.id);
+    # the window's shadow and body draw beneath its titlebar, which draws
+    # beneath its widgets
+    r.ch = context.split(ctx, 3);
+    context.set_channel(ctx, r.ch, 1);
 
     val x0: f32 = st.x;
     val x1: f32 = st.x + st.w;
@@ -2076,7 +2127,8 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         var dx1:   f32 = x1;
         val close: u8  = (win.flags & WINDOW_NO_CLOSE) == 0;
         if (close != 0) { dx1 = x1 - th; }
-        r.need_w = th + pad(ctx) * 2.0::f32 + label_width(ctx, win.title) + (x1 - dx1);
+        val tin: theme.Edges = inset(ctx, theme.WINDOW_TITLE);
+        r.need_w = th + tin.l + tin.r + label_width(ctx, win.title) + (x1 - dx1);
 
         val chrome: interact.Group = interact.begin_group(ctx, bid.child(r.id, "#chrome"), interact.ROW);
         val hc:     interact.Hit   = interact.hit(ctx, col_id, x0, y0, x0 + th, ty1, PRESS);
@@ -2106,35 +2158,38 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
             val dg:  dnd.Drag = dnd.source(ctx, hd, WINDOW_KIND, (?wid)::ptr, $size_of(u64), x0, y0, x1, ty1);
         }
 
-        var tbg: draw.Color = ctx.theme.header;
-        if (hd.hot || hc.hot || hx.hot) { tbg = ctx.theme.header_hot; }
+        val ts:   u8 = theme.pick(hd.hot || hc.hot || hx.hot, hd.active || hc.active || hx.active, false, false);
         var ends: u8 = context.CORNERS_ALL;
         if (st.collapsed == 0) { ends = context.CORNERS_TOP; }
-        context.fill(ctx, x0, y0, x1, ty1, corner(ctx), ends, tbg);
+        context.box_face(ctx, theme.WINDOW_TITLE, ts, x0, y0, x1, ty1, ends, context.SIDES_ALL);
 
-        val gy:  f32 = y0 + (th - context.line_height(ctx)) / 2.0::f32;
-        var gch: u32 = '+';
+        val tp:  *theme.Paint = ink(ctx, theme.WINDOW_TITLE, ts);
+        val gy:  f32          = text_top(ctx, y0, th);
+        var gch: u32          = '+';
         if (st.collapsed == 0) { gch = '-'; }
-        context.glyph(ctx, gch, x0 + pad(ctx), gy, ctx.theme.text_dim);
-        label_at(ctx, win.title, x0 + th + pad(ctx), gy, ctx.theme.text);
+        context.glyph(ctx, gch, x0 + tin.l, gy, tp.mark);
+        label_at(ctx, win.title, x0 + th + tin.l, gy, tp.text);
         if (close != 0) {
-            var xc: draw.Color = ctx.theme.text_dim;
-            if (hx.hot) { xc = ctx.theme.text; }
-            context.glyph(ctx, 'x', dx1 + pad(ctx), gy, xc);
+            var xc: draw.Color = tp.mark;
+            if (hx.hot) { xc = tp.text; }
+            context.glyph(ctx, 'x', dx1 + tin.l, gy, xc);
         }
     }
+    context.set_channel(ctx, r.ch, 2);
     if (st.collapsed != 0 && th > 0.0::f32) { ret r; }
 
     r.body = 1;
-    r.ch   = context.split(ctx, 2);
-    context.set_channel(ctx, r.ch, 1);
+    val p: theme.Edges = padding(ctx, theme.WINDOW);
     if (auto) {
-        open_column(ctx, x0, y0 + th, st.w, 0.0::f32);
+        open_column(ctx, x0 + p.l, y0 + th + p.t, maxf(st.w - p.l - p.r, 0.0::f32), 0.0::f32);
         ret r;
     }
-    val body_id: u64 = bid.child(r.id, "#body");
+    val body_id: u64          = bid.child(r.id, "#body");
+    val inner:   context.Area = context.Area{
+        x0: x0 + p.l, y0: y0 + th + p.t, x1: maxf(x1 - p.r, x0 + p.l), y1: maxf(y0 + st.h - p.b, y0 + th + p.t)
+    };
     r.sc     = state.get[Scroll](ctx, body_id);
-    r.scroll = scroll_in(ctx, body_id, r.sc, context.Area{x0: x0, y0: y0 + th, x1: x1, y1: y0 + st.h}, 0);
+    r.scroll = scroll_in(ctx, body_id, r.sc, inner, 0);
     ret r;
 }
 
@@ -2171,7 +2226,7 @@ fun end_docked(ctx: *context.Context, r: WindowArea) {
     val y0: f32 = r.scroll.y;
     val x1: f32 = r.scroll.x + r.scroll.w;
     val y1: f32 = r.scroll.y + r.scroll.h;
-    if ((r.flags & WINDOW_NO_BACKGROUND) == 0) { context.quad(ctx, x0, y0, x1, y1, ctx.theme.dock); }
+    if ((r.flags & WINDOW_NO_BACKGROUND) == 0) { context.box_face(ctx, theme.DOCK, theme.NORMAL, x0, y0, x1, y1, context.CORNERS_ALL, 0); }
     context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
     context.pop_id(ctx);
@@ -2200,31 +2255,35 @@ pub fun end_window(ctx: *context.Context, r: WindowArea) {
     var y1: f32          = st.y + r.th;
     if (r.body != 0) {
         if ((r.flags & WINDOW_AUTO_SIZE) != 0) {
+            val p: theme.Edges   = padding(ctx, theme.WINDOW);
             val f: *layout.Frame = context.top_layout(ctx);
-            y1   = clampf(f.y + pad(ctx), y0 + r.min_h, y0 + r.max_h);
+            y1   = clampf(f.y + p.b, y0 + r.min_h, y0 + r.max_h);
             st.h = y1 - y0;
-            st.w = clampf(maxf(f.need_w, r.need_w), r.min_w, r.max_w);
+            st.w = clampf(maxf(f.need_w + p.l + p.r, r.need_w), r.min_w, r.max_w);
             context.pop_layout(ctx);
         }
         or {
             end_scroll(ctx, r.sc, r.scroll);
             y1 = y0 + st.h;
         }
-        context.set_channel(ctx, r.ch, 0);
-        if ((r.flags & WINDOW_NO_BACKGROUND) == 0) {
+    }
+    context.set_channel(ctx, r.ch, 0);
+    if ((r.flags & WINDOW_NO_BACKGROUND) == 0) {
+        context.box_shadow(ctx, theme.WINDOW, theme.NORMAL, x0, y0, x1, y1, context.CORNERS_ALL);
+        if (r.body != 0) {
             var ends: u8 = context.CORNERS_BOTTOM;
             if (r.th == 0.0::f32) { ends = context.CORNERS_ALL; }
-            context.fill(ctx, x0, y0 + r.th, x1, y1, corner(ctx), ends, ctx.theme.window);
+            context.box_face(ctx, theme.WINDOW, theme.NORMAL, x0, y0 + r.th, x1, y1, ends, context.SIDES_ALL);
         }
-        context.merge(ctx, r.ch);
     }
+    context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
 
     # the grips run just outside the edges, so they never cover the window's
     # own widgets, and meet in squares at the corners
     if (r.body != 0 && (r.flags & (WINDOW_NO_RESIZE | WINDOW_AUTO_SIZE)) == 0 && st.locked == 0) {
-        val g: f32   = pad(ctx);
-        var k: usize = 0;
+        val gm: theme.Edges = context.px_edges(ctx, look(ctx, theme.WINDOW).margin);
+        var k:  usize       = 0;
         for (k < 8) {
             val m:   u32 = GRIPS[k];
             var gx0: f32 = x0;
@@ -2232,20 +2291,20 @@ pub fun end_window(ctx: *context.Context, r: WindowArea) {
             var gy0: f32 = y0;
             var gy1: f32 = y1;
             if ((m & EDGE_L) != 0) {
-                gx0 = x0 - g;
+                gx0 = x0 - gm.l;
                 gx1 = x0;
             }
             if ((m & EDGE_R) != 0) {
                 gx0 = x1;
-                gx1 = x1 + g;
+                gx1 = x1 + gm.r;
             }
             if ((m & EDGE_T) != 0) {
-                gy0 = y0 - g;
+                gy0 = y0 - gm.t;
                 gy1 = y0;
             }
             if ((m & EDGE_B) != 0) {
                 gy0 = y1;
-                gy1 = y1 + g;
+                gy1 = y1 + gm.b;
             }
             val gid: u64          = grip_id(r.id, m);
             val gh:  interact.Hit = interact.hit(ctx, gid, gx0, gy0, gx1, gy1, input.BUTTON_LEFT);
@@ -2264,6 +2323,13 @@ pub fun end_window(ctx: *context.Context, r: WindowArea) {
     if (r.hidden != 0) { context.pop_measure(ctx); }
     context.pop_id(ctx);
     context.pop_band(ctx);
+}
+
+# the width a scrollbar takes from a region's column: the bar and the margin
+# between it and the content
+fun bar_room(ctx: *context.Context) f32 {
+    val s: *theme.Style = look(ctx, theme.SCROLLBAR);
+    ret context.px(ctx, s.min_w + s.margin.l);
 }
 
 # consumer-owned state of a scroll region, kept across frames
@@ -2331,7 +2397,7 @@ pub fun begin_scroll(ctx: *context.Context, key: str, s: *Scroll, h: f32) Scroll
 
 # begin_scroll for a region whose id is already known
 fun scroll_at(ctx: *context.Context, id: u64, s: *Scroll, h: f32) ScrollArea {
-    val bar: f32          = context.px(ctx, ctx.theme.bar_w) + pad(ctx);
+    val bar: f32          = bar_room(ctx);
     val m:   *Measure     = state.get[Measure](ctx, id);
     val a:   context.Area = place(ctx, wide(), layout.fit(), m.w + bar, maxf(h, 0.0::f32));
     ret scroll_in(ctx, id, s, a, 1);
@@ -2353,7 +2419,7 @@ pub fun begin_scroll_at(ctx: *context.Context, key: str, s: *Scroll, a: context.
 
 # a scroll region over the rect a, whose id is already known
 fun scroll_in(ctx: *context.Context, id: u64, s: *Scroll, a: context.Area, scope: u8) ScrollArea {
-    val bar: f32 = context.px(ctx, ctx.theme.bar_w) + pad(ctx);
+    val bar: f32 = bar_room(ctx);
     var r:   ScrollArea;
     r.id    = id;
     r.scope = scope;
@@ -2425,9 +2491,9 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     if (s.offset != r.top) { context.wake_at(ctx, ctx.in.time); }
 
     if (most > 0.0::f32) {
-        val tx0:     f32   = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
+        val tx0:     f32   = r.x + r.w - context.px(ctx, look(ctx, theme.SCROLLBAR).min_w);
         val tx1:     f32   = r.x + r.w;
-        val thumb_h: f32   = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
+        val thumb_h: f32   = clampf(r.h * r.h / s.content, context.px(ctx, look(ctx, theme.SCROLLBAR_THUMB).min_h), r.h);
         val travel:  f32   = r.h - thumb_h;
         val grab:    *Grab = state.get[Grab](ctx, r.thumb);
         var dx:      f32;
@@ -2442,8 +2508,8 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
         val ht: interact.Hit = interact.hit(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h, input.BUTTON_LEFT);
         if (ht.pressed) { grab.y = s.offset; }
 
-        face(ctx, tx0, r.y, tx1, r.y + r.h, ctx.theme.track);
-        face(ctx, tx0, ty, tx1, ty + thumb_h, tint(ctx, ht, ctx.theme.handle, ctx.theme.handle, ctx.theme.handle_on));
+        context.box(ctx, theme.SCROLLBAR, theme.NORMAL, tx0, r.y, tx1, r.y + r.h);
+        anim.box(ctx, r.thumb, theme.SCROLLBAR_THUMB, state_of(ht, false, false), tx0, ty, tx1, ty + thumb_h);
     }
 }
 
@@ -2466,7 +2532,8 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
 fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     val id: u64          = context.id_of(ctx, title);
     val lh: f32          = context.line_height(ctx);
-    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, title) + lh + pad(ctx) * 3.0::f32, row_h(ctx));
+    val in: theme.Edges  = inset(ctx, theme.SECTION);
+    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, title) + lh + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
     val x0: f32          = r.x0;
     val y0: f32          = r.y0;
     val x1: f32          = r.x1;
@@ -2480,12 +2547,12 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
         or              { @open = 0; }
     }
 
-    val hot: f32 = anim.fade(ctx, bid.child(id, "#hot"), hs.hot, theme.MOTION_HOVER);
-    face(ctx, x0, y0, x1, y1, tint(ctx, hs, ctx.theme.header, ctx.theme.header_hot, ctx.theme.header_hot));
+    val st: u8          = state_of(hs, false, false);
+    val p:  theme.Paint = anim.box(ctx, id, theme.SECTION, st, x0, y0, x1, y1);
 
     val gy: f32 = y0 + (h - lh) / 2.0::f32;
-    caret(ctx, x0 + pad(ctx), gy, lh, @open != 0, anim.mix(ctx.theme.text_dim, ctx.theme.text, hot));
-    label_at(ctx, title, x0 + pad(ctx) * 2.0::f32 + lh, gy, ctx.theme.text);
+    caret(ctx, x0 + in.l, gy, lh, @open != 0, p.mark);
+    label_at(ctx, title, x0 + in.l * 2.0::f32 + lh, gy, p.text);
     ret id;
 }
 
@@ -4204,10 +4271,15 @@ test theme__drives_colors_and_corners {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var t: theme.Theme = theme.default();
+    var t:  theme.Theme;
+    val te: err[allo.Error] = theme.init(?t, ?a);
+    if (sel te.err) { ret 1; }
     t.control = draw.rgba(0.9::f32, 0.1::f32, 0.1::f32, 1.0::f32);
     t.corner  = 4.0::f32;
-    context.set_theme(?ctx, t);
+    theme.derive(?t);
+    val se: err[allo.Error] = context.set_theme(?ctx, ?t);
+    if (sel se.err) { ret 1; }
+    val tf: err[allo.Error] = theme.free(?t);
     if (context.theme_of(?ctx).corner != 4.0::f32) { ret 2; }
 
     # the button's face is rounded in the theme's control color: no solid

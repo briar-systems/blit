@@ -26,6 +26,7 @@ use blit.context;
 use drv: blit.driver;
 use blit.layout;
 use blit.overlay;
+use blit.theme;
 use blit.widget;
 use allo: std.allocator;
 use std.allocator.page;
@@ -172,7 +173,7 @@ fun card(ctx: *context.Context, c: overlay.Chrome, s: str) {
 #
 # the stack grows away from the anchor's edge: up from a bottom anchor, down
 # from any other, the newest nearest the anchor, and the cards line up on the
-# anchor's side. a margin of twice the theme's padding keeps it off the edges.
+# anchor's side. the toast style's margin keeps it off the edges.
 # ---
 # ctx: context
 # key: the overlay's key in the current id scope
@@ -195,10 +196,10 @@ pub fun show(ctx: *context.Context, key: str, t: *Toasts, at: overlay.Anchor) {
     }
     if (t.len == 0) { ret; }
 
-    val m: f32             = context.px(ctx, ctx.theme.pad) * 2.0::f32;
+    val m: theme.Edges     = context.px_edges(ctx, context.look_of(ctx, theme.TOAST).margin);
     var o: overlay.Overlay = overlay.on_surface(at);
-    o.dx = m * (1.0::f32 - 2.0::f32 * at.x);
-    o.dy = m * (1.0::f32 - 2.0::f32 * at.y);
+    o.dx = m.l * (1.0::f32 - at.x) - m.r * at.x;
+    o.dy = m.t * (1.0::f32 - at.y) - m.b * at.y;
     if (at.x > 0.5::f32)  { o.align = layout.Align.end{}; }
     or (at.x == 0.5::f32) { o.align = layout.Align.center{}; }
     val up: bool = at.y > 0.5::f32;

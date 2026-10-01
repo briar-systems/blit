@@ -42,6 +42,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use blit.theme;
 use blit.value;
 use blit.widget;
 
@@ -273,21 +274,24 @@ fun apply(st: *Picker, c: *draw.Color) {
 
 # a two-tone ring marking a point, readable on any colour
 fun dot(ctx: *context.Context, x: f32, y: f32, r: f32) {
-    val w: f32 = context.px(ctx, 1.5::f32);
-    context.stroke_circle(ctx, x, y, r + w, w, ctx.theme.track);
-    context.stroke_circle(ctx, x, y, r, w, ctx.theme.text);
+    val w: f32          = context.px(ctx, 1.5::f32);
+    val p: *theme.Paint = context.paint_of(ctx, theme.PICKER, theme.NORMAL);
+    context.stroke_circle(ctx, x, y, r + w, w, p.border);
+    context.stroke_circle(ctx, x, y, r, w, p.mark);
 }
 
 # a two-tone line across a bar at y, marking its value
 fun notch(ctx: *context.Context, x0: f32, x1: f32, y: f32) {
-    val w: f32 = context.px(ctx, 1.0::f32);
-    context.frame(ctx, x0 - w, y - w * 2.0::f32, x1 + w, y + w * 2.0::f32, w, ctx.theme.track);
-    context.frame(ctx, x0, y - w, x1, y + w, w, ctx.theme.text);
+    val w: f32          = context.px(ctx, 1.0::f32);
+    val p: *theme.Paint = context.paint_of(ctx, theme.PICKER, theme.NORMAL);
+    context.frame(ctx, x0 - w, y - w * 2.0::f32, x1 + w, y + w * 2.0::f32, w, p.border);
+    context.frame(ctx, x0, y - w, x1, y + w, w, p.mark);
 }
 
 # a checkerboard of k pixel cells, what alpha shows through
 fun checker(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, k: f32) {
-    context.quad(ctx, x0, y0, x1, y1, ctx.theme.text_dim);
+    val p: *theme.Paint = context.paint_of(ctx, theme.CHECKER, theme.NORMAL);
+    context.quad(ctx, x0, y0, x1, y1, p.fill);
     if (k <= 0.0::f32) { ret; }
     var j: usize = 0;
     var y: f32   = y0;
@@ -299,7 +303,7 @@ fun checker(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, k: f32) {
             var ye: f32 = y + k;
             if (xe > x1) { xe = x1; }
             if (ye > y1) { ye = y1; }
-            context.quad(ctx, x, y, xe, ye, ctx.theme.control);
+            context.quad(ctx, x, y, xe, ye, p.mark);
             x = x + k * 2.0::f32;
         }
         y = y + k;
@@ -453,7 +457,7 @@ pub fun picker(ctx: *context.Context, label: str, c: *draw.Color, flags: u8) boo
     val ring:  bool    = (flags & RING) != 0;
     val alpha: bool    = (flags & ALPHA) != 0;
     val g:     f32     = widget.row_gap(ctx);
-    val pad:   f32     = context.px(ctx, ctx.theme.pad);
+    val pad:   f32     = context.px(ctx, context.look_of(ctx, theme.PICKER).inset.l);
     val rh:    f32     = row_h(ctx);
     sync(st, @c);
 
@@ -488,7 +492,7 @@ pub fun picker(ctx: *context.Context, label: str, c: *draw.Color, flags: u8) boo
     val sw: f32          = hr.x0 + rh * 2.0::f32;
     checker(ctx, hr.x0, hr.y0, sw, hr.y1, rh / 2.0::f32);
     context.quad(ctx, hr.x0, hr.y0, sw, hr.y1, @c);
-    if (n > 0) { context.text_span(ctx, label, n, sw + g, hr.y0 + (rh - context.line_height(ctx)) / 2.0::f32, ctx.theme.text); }
+    if (n > 0) { context.text_span(ctx, label, n, sw + g, hr.y0 + (rh - context.line_height(ctx)) / 2.0::f32, context.paint_of(ctx, theme.PICKER, theme.NORMAL).text); }
 
     var hex: [HEX_CAP]u8;
     val t:   str = value.entry(ctx, "#hex", hex_text(@c, alpha, ?hex[0]), hex_char, sw + g + lw, hr.y0, hr.x1, hr.y1);

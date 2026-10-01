@@ -14,9 +14,9 @@
 # time starts at its target, a host that never advances its clock gets every
 # value at its target at once, and so does context.set_reduce_motion.
 #
-# how long a kind of motion takes and how it eases are the theme's (see
-# theme.Motion): timing is the one place a widget reads them, so a style
-# system maps them in one spot.
+# how long a kind of motion takes and how it eases are the theme's motion
+# fields (motion.hover_time, motion.hover_ease and so on, see theme.motion):
+# timing is the one place a widget reads them.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -31,7 +31,6 @@ use std.allocator.page;
 use blit.context;
 use blit.draw;
 use blit.ease;
-use bid: blit.id;
 use blit.input;
 use blit.state;
 use blit.store;
@@ -56,19 +55,16 @@ rec Track {
 
 # how a kind of motion moves under the context's theme
 #
-# the one reader of the theme's motion: every animated widget takes its
-# duration and curve from here, and reduced motion (see
+# every animated widget takes its duration and curve from here, the theme's
+# motion fields (see theme.motion), and reduced motion (see
 # context.set_reduce_motion) makes every duration 0.
 # ---
 # ctx:  context
 # kind: a theme.MOTION_* kind
 # ret:  its duration and curve, a zero duration for a kind out of range
 pub fun timing(ctx: *context.Context, kind: usize) th.Motion {
-    var m: th.Motion;
-    m.curve = ease.LINEAR;
-    if (kind >= th.MOTIONS) { ret m; }
-    m = ctx.theme.motion[kind];
-    if (ctx.still != 0 || m.dur < 0.0::f32) { m.dur = 0.0::f32; }
+    var m: th.Motion = th.motion(?ctx.theme, kind);
+    if (ctx.still != 0) { m.dur = 0.0::f32; }
     ret m;
 }
 
@@ -210,24 +206,104 @@ pub fun mix(a: draw.Color, b: draw.Color, t: f32) draw.Color {
     ret draw.rgba(lerp(a.r, b.r, t), lerp(a.g, b.g, t), lerp(a.b, b.b, t), lerp(a.a, b.a, t));
 }
 
-# a control's face easing from rest toward hover while hovered and toward
-# press while pressed, as every built-in control paints its face
-#
-# the two fades keep their state under the control's id with the suffixes
-# "#hot" and "#press", at rest costing nothing (see fade).
+# the paint a box shows while it eases from one state to another
 # ---
-# ctx:    context
-# id:     the control's id
-# hot:    true while the control is hovered
-# active: true while it is pressed
-# rest:   the face at rest
-# hover:  the face hovered
-# press:  the face pressed
-# ret:    the face this frame
-pub fun tint(ctx: *context.Context, id: u64, hot: bool, active: bool, rest: draw.Color, hover: draw.Color, press: draw.Color) draw.Color {
-    val ht: f32 = fade(ctx, bid.child(id, "#hot"), hot, th.MOTION_HOVER);
-    val at: f32 = fade(ctx, bid.child(id, "#press"), active, th.MOTION_HOVER);
-    ret mix(mix(rest, hover, ht), press, at);
+# from:  the paint the run started from, as it showed then
+# to:    the state it is headed for
+# start: the host time the run started at
+# dur:   the run's length in seconds, 0 once settled
+# curve: the run's ease curve
+rec Blend {
+    from:  th.Paint;
+    to:    u8;
+    start: f64;
+    dur:   f32;
+    curve: u8;
+}
+
+# a paint t of the way from a to b, color by color and width by width
+fun mix_paint(a: th.Paint, b: *th.Paint, t: f32) th.Paint {
+    var p: th.Paint;
+    p.fill     = mix(a.fill, b.fill, t);
+    p.fill_to  = mix(a.fill_to, b.fill_to, t);
+    p.text     = mix(a.text, b.text, t);
+    p.mark     = mix(a.mark, b.mark, t);
+    p.border   = mix(a.border, b.border, t);
+    p.border_w = lerp(a.border_w, b.border_w, t);
+    p.shadow   = mix(a.shadow, b.shadow, t);
+    ret p;
+}
+
+# where a blend stands now, settling it once its run ends and asking for the
+# next frame while it runs
+fun blended(ctx: *context.Context, b: *Blend, kind: u32) th.Paint {
+    val to: *th.Paint = context.paint_of(ctx, kind, b.to);
+    if (b.dur <= 0.0::f32) { ret @to; }
+    val now: f64 = ctx.in.time;
+    val p:   f64 = (now - b.start) / b.dur::f64;
+    if (p >= 1.0::f64 || ctx.still != 0 || ctx.clocked == 0) {
+        b.dur = 0.0::f32;
+        ret @to;
+    }
+    context.wake_at(ctx, now);
+    var q: f32 = 0.0::f32;
+    if (p > 0.0::f64) { q = p::f32; }
+    ret mix_paint(b.from, to, ease.at(b.curve, q));
+}
+
+# the paint a box of a kind shows in a state, easing from the state it was
+# in over the theme's hover motion, as every built-in control paints its face
+#
+# a box at rest in the normal state keeps no state, so a control the pointer
+# never visits costs nothing. the blend lives in the store under id, so each
+# box a widget paints takes an id of its own.
+# ---
+# ctx:  context
+# id:   the box's id
+# kind: a registered kind (see theme.register_kind)
+# now:  the state it is in this frame, theme.NORMAL .. theme.FOCUSED
+# ret:  the paint to draw with this frame
+pub fun paint(ctx: *context.Context, id: u64, kind: u32, now: u8) th.Paint {
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(Blend));
+    if (e == nil && now == th.NORMAL) { ret @context.paint_of(ctx, kind, now); }
+    if (e != nil) {
+        val held: *Blend = e.data::*Blend;
+        if (now == th.NORMAL && held.to == th.NORMAL && held.dur <= 0.0::f32) { ret @context.paint_of(ctx, kind, now); }
+    }
+    val b: *Blend = state.get[Blend](ctx, id);
+    if (e == nil) {
+        b.from = @context.paint_of(ctx, kind, th.NORMAL);
+        b.to   = th.NORMAL;
+        b.dur  = 0.0::f32;
+    }
+    if (b.to != now) {
+        val m: th.Motion = timing(ctx, th.MOTION_HOVER);
+        b.from  = blended(ctx, b, kind);
+        b.to    = now;
+        b.start = ctx.in.time;
+        b.dur   = m.dur;
+        b.curve = m.curve;
+        if (ctx.clocked == 0) { b.dur = 0.0::f32; }
+    }
+    ret blended(ctx, b, kind);
+}
+
+# paint a widget kind's box in a state, easing from the state it was in (see
+# paint), and hand back the paint it drew with for its text and marks
+# ---
+# ctx:  context
+# id:   the box's id
+# kind: a registered kind
+# now:  the state it is in this frame
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# ret:  the paint drawn with
+pub fun box(ctx: *context.Context, id: u64, kind: u32, now: u8, x0: f32, y0: f32, x1: f32, y1: f32) th.Paint {
+    val p: th.Paint = paint(ctx, id, kind, now);
+    context.box_painted(ctx, kind, p, x0, y0, x1, y1);
+    ret p;
 }
 
 # one frame at time t, asking for a value of id toward target
@@ -248,7 +324,8 @@ test value__eases_to_its_target_and_then_sleeps {
     var ctx: context.Context;
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
-    ctx.theme.motion[th.MOTION_OPEN] = th.Motion{dur: 0.1::f32, curve: ease.LINEAR};
+    ctx.theme.open_time = 0.1::f32;
+    ctx.theme.open_ease = ease.LINEAR::f32;
 
     # first sight starts at the target, and nothing is pending
     if (frame_value(?ctx, 0.0::f64, 7, 0.0::f32) != 0.0::f32) { ret 2; }

@@ -41,6 +41,7 @@ use blit.draw;
 use blit.input;
 use blit.interact;
 use blit.payload;
+use blit.theme;
 
 # what a source's drag is doing this frame
 # ---
@@ -238,10 +239,9 @@ pub fun target(ctx: *context.Context, h: interact.Hit, kind: str, x0: f32, y0: f
     ret d;
 }
 
-# the accept highlight: the selection tint under an accent outline
+# the accept highlight, in the drop target style
 fun highlight(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32) {
-    context.quad(ctx, x0, y0, x1, y1, ctx.theme.select);
-    context.frame(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.edge_w), ctx.theme.accent);
+    context.box(ctx, theme.DROP_TARGET, theme.HOT, x0, y0, x1, y1);
 }
 
 # the drag in flight, when its type is kind

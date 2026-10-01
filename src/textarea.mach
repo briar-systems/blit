@@ -33,6 +33,7 @@ use blit.font;
 use blit.input;
 use blit.interact;
 use blit.layout;
+use blit.theme;
 use blit.widget;
 
 # rows a TextArea first allocates, doubled whenever they fill
@@ -302,7 +303,7 @@ fun is_vertical(code: u32) bool {
 # ret: this frame's outcome bits: field.EDITED, field.ESCAPED
 pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea, h: f32) u8 {
     val id:     u64          = context.id_of(ctx, key);
-    val p:      f32          = context.px(ctx, ctx.theme.pad);
+    val p:      f32          = context.px(ctx, context.look_of(ctx, theme.FIELD).inset.l);
     val a:      context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), p * 2.0::f32, maxf(h, 0.0::f32));
     val x0:     f32          = a.x0;
     val y0:     f32          = a.y0;
@@ -310,7 +311,7 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     val bh:     f32          = a.y1 - a.y0;
     val lh:     f32          = context.line_height(ctx);
     val wide:   f32          = maxf(w - p * 2.0::f32, 0.0::f32);
-    val narrow: f32          = maxf(w - context.px(ctx, ctx.theme.bar_w) - p * 3.0::f32, 0.0::f32);
+    val narrow: f32          = maxf(w - context.px(ctx, context.look_of(ctx, theme.SCROLLBAR).min_w) - p * 3.0::f32, 0.0::f32);
     var page:   usize        = 1;
     if (bh - p * 2.0::f32 > lh) { page = ((bh - p * 2.0::f32) / lh)::usize; }
 
@@ -348,17 +349,13 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     if (moved || f.rev != rev) { reveal(t, f, lh, p, bh); }
     t.scroll.content = content;
 
-    val on:    bool       = ctx.focus == id;
-    val quiet: bool       = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
-    var bg:    draw.Color = ctx.theme.track;
-    if (ctx.hover == id && !on) { bg = ctx.theme.control_hot; }
-    val corner: f32 = context.px(ctx, ctx.theme.corner);
-    if (on) {
-        val ew: f32 = context.px(ctx, ctx.theme.edge_w);
-        context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, ctx.theme.accent);
-        context.fill(ctx, x0 + ew, y0 + ew, x0 + w - ew, y0 + bh - ew, corner, context.CORNERS_ALL, bg);
-    }
-    or { context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, bg); }
+    val on:    bool         = ctx.focus == id;
+    val quiet: bool         = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
+    val fs:    u8           = theme.pick(ctx.hover == id, false, false, on);
+    val fp:    *theme.Paint = context.paint_of(ctx, theme.FIELD, fs);
+    val cc:    draw.Color   = context.paint_of(ctx, theme.FIELD_CARET, fs).fill;
+    val cw:    f32          = context.px(ctx, context.look_of(ctx, theme.FIELD_CARET).min_w);
+    context.box(ctx, theme.FIELD, fs, x0, y0, x0 + w, y0 + bh);
 
     val keyed: bool = interact.stop(ctx, id, a.x0, a.y0, a.x1, a.y1, interact.ARROWS | interact.TEXT);
     context.push_id(ctx, id);
@@ -402,24 +399,23 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
             if (b > e) { b = e; }
             var x1: f32 = p + edit.width(ctx, f, s, b);
             if (hi > e && e < f.len && f.buf[e] == '\n') { x1 = x1 + context.glyph_advance(ctx, 0, ' '); }
-            context.quad(ctx, p + edit.width(ctx, f, s, a), y, x1, y + lh, ctx.theme.select);
+            context.quad(ctx, p + edit.width(ctx, f, s, a), y, x1, y + lh, context.paint_of(ctx, theme.FIELD_SELECT, fs).fill);
         }
         if (pre != nil && k == cr) {
             val cx: f32 = p + edit.width(ctx, f, s, f.caret);
-            edit.draw_text(ctx, f, s, f.caret, p, y, ctx.theme.text);
-            context.text_at(ctx, pre, cx, y, ctx.theme.text);
-            context.quad(ctx, cx, y + lh - context.px(ctx, ctx.theme.caret_w), cx + pw, y + lh, ctx.theme.text);
-            edit.draw_text(ctx, f, f.caret, e, cx + pw, y, ctx.theme.text);
+            edit.draw_text(ctx, f, s, f.caret, p, y, fp.text);
+            context.text_at(ctx, pre, cx, y, fp.text);
+            context.quad(ctx, cx, y + lh - cw, cx + pw, y + lh, cc);
+            edit.draw_text(ctx, f, f.caret, e, cx + pw, y, fp.text);
         }
-        or { edit.draw_text(ctx, f, s, e, p, y, ctx.theme.text); }
+        or { edit.draw_text(ctx, f, s, e, p, y, fp.text); }
         k = k + 1;
     }
     if (on && t.count > 0) {
-        val cw: f32 = context.px(ctx, ctx.theme.caret_w);
         val y:  f32 = p + cr::f32 * lh;
         var cx: f32 = p + edit.width(ctx, f, t.rows[cr], f.caret);
         if (pre != nil)             { cx = cx + context.text_width_n(ctx, pre, context.preedit_caret(ctx)); }
-        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, y, cx + cw, y + lh, ctx.theme.text); }
+        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, y, cx + cw, y + lh, cc); }
         if (!quiet)                 { context.set_ime_rect(ctx, cx, y, cx + cw, y + lh); }
     }
     widget.space(ctx, content);
@@ -431,7 +427,7 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
         val label:   str          = edit.count_text(f, ?counted[0]);
         val lw:      f32          = context.text_width(ctx, label);
         val row:     context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), lw + p, lh);
-        context.text_at(ctx, label, row.x1 - p - lw, row.y0, ctx.theme.text_faint);
+        context.text_at(ctx, label, row.x1 - p - lw, row.y0, fp.mark);
     }
     ret out;
 }
