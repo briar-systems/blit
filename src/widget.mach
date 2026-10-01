@@ -2383,6 +2383,15 @@ fun scroll_most(content: f32, h: f32) f32 {
     ret maxf(content - h, 0.0::f32);
 }
 
+# whether a region at offset, scrolling at most most, can move by a wheel
+# turned wheel pixels: away from the user towards the top, towards the user
+# towards the bottom
+fun can_wheel(offset: f32, most: f32, wheel: f32) bool {
+    if (wheel > 0.0::f32) { ret offset > 0.0::f32; }
+    if (wheel < 0.0::f32) { ret offset < most; }
+    ret false;
+}
+
 # open a scroll region h tall as the next item of the layout, spanning the column
 #
 # widgets placed until end_scroll lay out in a column inside it, clipped to
@@ -2459,12 +2468,14 @@ fun scroll_in(ctx: *context.Context, id: u64, s: *Scroll, a: context.Area, scope
 # its scrollbar and close its column
 #
 # the wheel goes to the innermost region holding the topmost claim under the
-# cursor within the same band (see context.push_band), so a region under a
-# popup, modal or window does not scroll, even one the popup was opened in,
-# and a region nested in another scrolls before its parent. a region in a
-# disabled scope (see context.begin_disabled) takes no wheel, which goes on to
-# its parent. scrolling applies from the next frame, like all input. a tab
-# stop inside the region that the keyboard moved the focus to this frame is
+# cursor within the same band (see context.push_band) that can move the way
+# the wheel turns, so a region under a popup, modal or window does not
+# scroll, even one the popup was opened in, and a region nested in another
+# scrolls before its parent. a region with no overflow, or at its limit in
+# the wheel's direction, takes no wheel, and neither does a region in a
+# disabled scope (see context.begin_disabled): the wheel goes on to its
+# parent. scrolling applies from the next frame, like all input. a tab stop
+# inside the region that the keyboard moved the focus to this frame is
 # scrolled into view, when it fits.
 # ---
 # ctx: context
@@ -2479,8 +2490,11 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     context.pop_layout(ctx);
     context.end_surface(ctx, r.surf);
 
-    # the hovered widget claimed inside this region, or the region itself
-    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.in.wheel != 0.0::f32 && ctx.hover_seen > r.seen) {
+    val most: f32 = scroll_most(s.content, r.h);
+    s.offset = clampf(s.offset, 0.0::f32, most);
+    # the hovered widget claimed inside this region, or the region itself, and
+    # the region can move the way the wheel turns
+    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.hover_seen > r.seen && can_wheel(s.offset, most, ctx.in.wheel)) {
         s.offset        = s.offset - ctx.in.wheel;
         ctx.wheel_taken = 1;
     }
@@ -2494,7 +2508,6 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
             if (c1 > s.offset + r.h) { s.offset = c1 - r.h; }
         }
     }
-    val most: f32 = scroll_most(s.content, r.h);
     s.offset = clampf(s.offset, 0.0::f32, most);
     # the content shows the new offset from the next frame
     if (s.offset != r.top) { context.wake_at(ctx, ctx.in.time); }
@@ -2537,17 +2550,27 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     ret @open != 0;
 }
 
+# the side of a section's caret: the section style's min_w, or with none the
+# caption's ascent, so it follows the caption's text style and never the line
+fun caret_size(ctx: *context.Context, ascent: f32) f32 {
+    val k: f32 = look(ctx, theme.SECTION).min_w;
+    if (k > 0.0::f32) { ret context.px(ctx, k); }
+    ret ascent;
+}
+
 # a section's heading: the row, its click and its caret, returning its id
 fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
-    val id: u64          = context.id_of(ctx, title);
-    val lh: f32          = context.line_height(ctx);
-    val in: theme.Edges  = inset(ctx, theme.SECTION);
-    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, title) + lh + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
-    val x0: f32          = r.x0;
-    val y0: f32          = r.y0;
-    val x1: f32          = r.x1;
-    val y1: f32          = r.y1;
-    val h:  f32          = y1 - y0;
+    val id: u64             = context.id_of(ctx, title);
+    val lh: f32             = context.line_height(ctx);
+    val m:  gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
+    val k:  f32             = caret_size(ctx, m.ascent);
+    val in: theme.Edges     = inset(ctx, theme.SECTION);
+    val r:  context.Area    = place(ctx, wide(), layout.fit(), label_width(ctx, title) + k + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
+    val x0: f32             = r.x0;
+    val y0: f32             = r.y0;
+    val x1: f32             = r.x1;
+    val y1: f32             = r.y1;
+    val h:  f32             = y1 - y0;
 
     val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, PRESS);
     hand(ctx, hs);
@@ -2559,9 +2582,10 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     val st: u8          = state_of(hs, false, false);
     val p:  theme.Paint = anim.box(ctx, id, theme.SECTION, st, x0, y0, x1, y1);
 
+    # the caret centred on the caption between its line's top and its baseline
     val gy: f32 = y0 + (h - lh) / 2.0::f32;
-    caret(ctx, x0 + in.l, gy, lh, @open != 0, p.mark);
-    label_at(ctx, title, x0 + in.l * 2.0::f32 + lh, gy, p.text);
+    caret(ctx, x0 + in.l, gy + (m.ascent - k) / 2.0::f32, k, @open != 0, p.mark);
+    label_at(ctx, title, x0 + in.l * 2.0::f32 + k, gy, p.text);
     ret id;
 }
 
@@ -3120,6 +3144,64 @@ test section__folds_over_time_then_sleeps {
     driver.click(?d, sec);
     driver.step(?d);
     if (after_y(?d) != shut) { ret 9; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the top and bottom of every vertex drawn in pure red, the caret's ink in
+# section__caret_follows_the_caption_not_the_line
+#[testing]
+fun red_span(d: *driver.Driver, top: *f32, bottom: *f32) {
+    val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    @top    = 1000000.0::f32;
+    @bottom = -1000000.0::f32;
+    var i: usize = 0;
+    for (i < context.draw_count(?d.ctx)) {
+        val v: draw.Vert = vs[i];
+        if (v.r == 1.0::f32 && v.g == 0.0::f32 && v.b == 0.0::f32 && v.a == 1.0::f32) {
+            if (v.y < @top)    { @top = v.y; }
+            if (v.y > @bottom) { @bottom = v.y; }
+        }
+        i = i + 1;
+    }
+}
+
+test section__caret_follows_the_caption_not_the_line {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var open: u8              = 0;
+    var d:    driver.Driver;
+    val e:    err[allo.Error] = driver.init(?d, ?a, 200.0::f32, 200.0::f32, fold_ui, (?open)::ptr);
+    if (sel e.err) { ret 1; }
+    val t:    *theme.Theme    = context.theme_of(?d.ctx);
+    val mark: opt[theme.Path] = theme.path(t, "section.*.mark");
+    val size: opt[theme.Path] = theme.path(t, "section.min_w");
+    if (sel mark.none) { ret 2; }
+    if (sel size.none) { ret 2; }
+    theme.set_path(t, mark.some, theme.of_color(draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32)));
+
+    # a larger body style: the caret spans the caption's line top to its
+    # baseline, never its descent and gap
+    if (!context.set_style(?d.ctx, font.STYLE_BODY, font.Style{source: 0, size: 3.0::f32})) { ret 3; }
+    driver.step(?d);
+    val r: opt[context.Area] = driver.rect(?d, driver.find(?d, "sec"));
+    if (sel r.none) { ret 4; }
+    val m:      gly.LineMetrics = font.line(context.font_of(?d.ctx), font.STYLE_BODY, 1.0::f32);
+    val lh:     f32             = gly.line_height(m);
+    val line:   f32             = r.some.y0 + (r.some.y1 - r.some.y0 - lh) / 2.0::f32;
+    var top:    f32             = 0.0::f32;
+    var bottom: f32             = 0.0::f32;
+    red_span(?d, ?top, ?bottom);
+    if (top != line || bottom != line + m.ascent) { ret 5; }
+
+    # the section style's min_w sizes it whatever the text
+    theme.set_path(t, size.some, theme.of_length(6.0::f32));
+    driver.step(?d);
+    red_span(?d, ?top, ?bottom);
+    if (bottom - top != 6.0::f32) { ret 6; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

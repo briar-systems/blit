@@ -105,7 +105,7 @@ pub val FIELD: u32 = 15;
 pub val FIELD_CARET: u32 = 16;
 # the highlight behind selected text: fill
 pub val FIELD_SELECT: u32 = 17;
-# a collapsible section heading: mark the caret
+# a collapsible section heading: mark the caret, min_w its size, 0 to follow the caption's ascent
 pub val SECTION: u32 = 18;
 # a scrollbar's track: min_w its width, margin.l between it and the content
 pub val SCROLLBAR: u32 = 19;
@@ -512,7 +512,7 @@ val KIND_INFO: [53]Name = [53]Name{
     Name{name: "field", doc: "a text field: mark the hint, focused while it holds the keyboard"},
     Name{name: "field_caret", doc: "a text field's caret and its composition underline: fill, min_w the width"},
     Name{name: "field_select", doc: "the highlight behind selected text: fill"},
-    Name{name: "section", doc: "a collapsible section heading: mark the caret"},
+    Name{name: "section", doc: "a collapsible section heading: mark the caret, min_w its size, 0 to follow the caption's ascent"},
     Name{name: "scrollbar", doc: "a scrollbar's track: min_w its width, margin.l between it and the content"},
     Name{name: "scrollbar_thumb", doc: "a scrollbar's thumb: min_h its least length"},
     Name{name: "list", doc: "a list's body"},

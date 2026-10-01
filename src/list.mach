@@ -42,6 +42,7 @@ use allo: std.allocator;
 use std.allocator.page;
 
 use blit.context;
+use blit.dock;
 use blit.draw;
 use blit.driver;
 use bid: blit.id;
@@ -817,6 +818,76 @@ test list__drawn_rows_keep_hit_selection_and_scrolling {
     if (p.first != 2 || driver.drawn(?d, row_id(?d, 1))) { ret 6; }
     click_row(?d, 3, 0);
     if (p.l.selected != 3 || p.seen != 3) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a probe's list inside a left dock that scrolls over the space below it
+#[testing]
+rec InDock {
+    side: dock.Dock;
+    p:    Probe;
+}
+
+#[testing]
+fun docked_ui(ctx: *context.Context, user: ptr) {
+    val w:  *InDock       = user::*InDock;
+    val dk: dock.DockArea = dock.begin_dock(ctx, "side", ?w.side);
+    show(ctx, "list", ?w.p.l, w.p.r, 100.0::f32);
+    widget.space(ctx, 1000.0::f32);
+    dock.end_dock(ctx, ?w.side, dk);
+}
+
+# turn the wheel over the row showing item i and let the glides settle
+#[testing]
+fun wheel_row(d: *driver.Driver, i: usize, dy: f32) bool {
+    val ok: bool = driver.scroll(d, bid.child_int(driver.find(d, "side/list"), i::u64), 0.0::f32, dy);
+    driver.settle(d);
+    ret ok;
+}
+
+test list__passes_the_wheel_to_the_dock_at_either_end {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var items: [20]str;
+    var k:     usize = 0;
+    for (k < 20) {
+        items[k] = "item";
+        k        = k + 1;
+    }
+    var w: InDock;
+    w.side.side = context.Side.left{};
+    w.side.size = 120.0::f32;
+    w.p.r       = rows(?items[0], 20);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, docked_ui, (?w)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+
+    # the list takes the wheel while it can move, up to its end
+    if (!wheel_row(?d, 1, -30.0::f32))                                        { ret 2; }
+    if (w.p.l.scroll.offset != 30.0::f32 || w.side.scroll.offset != 0.0::f32) { ret 3; }
+    wheel_row(?d, 2, -1000.0::f32);
+    if (w.p.l.scroll.offset != 300.0::f32 || w.side.scroll.offset != 0.0::f32) { ret 4; }
+    # at its end the wheel passes to the dock
+    if (!wheel_row(?d, 18, -30.0::f32))                                         { ret 5; }
+    if (w.p.l.scroll.offset != 300.0::f32 || w.side.scroll.offset != 30.0::f32) { ret 6; }
+
+    # turned back, the list takes it again, up to its start
+    wheel_row(?d, 18, 1000.0::f32);
+    if (w.p.l.scroll.offset != 0.0::f32 || w.side.scroll.offset != 30.0::f32) { ret 7; }
+    # at its start the wheel passes to the dock
+    if (!wheel_row(?d, 3, 30.0::f32))                                        { ret 8; }
+    if (w.p.l.scroll.offset != 0.0::f32 || w.side.scroll.offset != 0.0::f32) { ret 9; }
+
+    # a list with nothing to scroll passes the wheel either way
+    w.p.r = rows(?items[0], 2);
+    driver.steps(?d, 2);
+    if (!wheel_row(?d, 0, -30.0::f32))                                        { ret 10; }
+    if (w.p.l.scroll.offset != 0.0::f32 || w.side.scroll.offset != 30.0::f32) { ret 11; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
