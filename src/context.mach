@@ -46,10 +46,11 @@
 #
 # paint and input share one order. geometry is emitted on a layer, a slot in
 # one of the bands blit.band lists (push_band opens one), and end() composes
-# the draw list by layer, keeping emission order within a layer. interactive widgets claim their rects with the same order as a
-# key (see blit.hit). frame N's input is routed by the claims recorded in frame
-# N-1, hit-tested with frame N's cursor and resolved once in begin(N): only the
-# topmost claimant under the cursor is hovered. a widget therefore becomes
+# the draw list by layer, keeping emission order within a layer. interactive
+# widgets claim their rects with the same order as a key (see blit.hit).
+# frame N's input is routed by the claims recorded in frame N-1, hit-tested
+# with frame N's cursor and resolved once in begin(N): only the topmost
+# claimant under the cursor is hovered. a widget therefore becomes
 # interactive one frame after it first claims. that is a chosen property, since
 # any way around it makes some widgets special.
 #

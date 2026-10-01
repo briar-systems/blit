@@ -284,7 +284,7 @@ fun hand(ctx: *context.Context, h: interact.Hit) {
     if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
 }
 
-# the handle begin_panel and begin_window return for their matching end
+# the handle begin_panel returns for end_panel
 # ---
 # ch:    the channels the body's background and children draw in
 # claim: the container's reserved claim, context.NO_CLAIM when refused
@@ -1296,6 +1296,8 @@ pub fun window(title: str, x: f32, y: f32, w: f32, h: f32) Window {
 # collapsed: 1 if only the titlebar shows, else 0
 # pinned:    1 to keep the window above every unpinned window, else 0
 # locked:    1 to keep the window from moving or resizing, else 0
+# slot:      the slot in the windows band it last drew on, which the claims
+#            routing this frame's input carry
 pub rec WindowState {
     x:         f32;
     y:         f32;
@@ -1307,6 +1309,7 @@ pub rec WindowState {
     collapsed: u8;
     pinned:    u8;
     locked:    u8;
+    slot:      u32;
 }
 
 # the handle begin_window returns for end_window
@@ -1503,12 +1506,14 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     val max_w: f32 = maxf(bound(win.max_w), min_w);
     val max_h: f32 = maxf(bound(win.max_h), min_h);
 
-    # a press on the window's own layer brings it to the front this frame
+    # a press on the layer the window last drew on brings it to the front
+    # this frame
     if (input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != 0
-        && context.hovered_layer(ctx) == band.layer(band.WINDOWS, window_slot(st))) {
+        && context.hovered_layer(ctx) == band.layer(band.WINDOWS, st.slot)) {
         st.z = context.raise(ctx);
     }
-    context.push_band(ctx, band.WINDOWS, window_slot(st));
+    st.slot = window_slot(st);
+    context.push_band(ctx, band.WINDOWS, st.slot);
     context.push_id(ctx, r.id);
 
     val drag_id:  u64 = bid.child(r.id, "#drag");
