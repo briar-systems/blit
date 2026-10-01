@@ -1644,7 +1644,11 @@ fun fold(b: u8) u8 {
 }
 
 # whether s holds query, ignoring ascii case; an empty or nil query matches all
-fun matches(s: str, query: str) bool {
+# ---
+# s:     the text searched, nil holding nothing
+# query: the text looked for
+# ret:   true if s holds query
+pub fun matches(s: str, query: str) bool {
     if (query == nil || query[0] == 0) { ret true; }
     if (s == nil)                      { ret false; }
     var i: usize = 0;
