@@ -1,0 +1,93 @@
+# lists: scrolling lists with a filter, secondary labels, multiple
+# selection and rows the caller draws
+#
+# a list is described each frame by a Rows record: its labels, details, the
+# query and matcher that pick the rows shown, and a drawer for rows of your
+# own. the selection and the scroll are the caller's List.
+
+use std.types.string.str;
+
+use blit;
+
+# what the lists keep
+# ---
+# files:     the filtered list, single selection
+# query:     the filter field
+# query_buf: its text
+# many:      the list with marks, multiple selection
+# marks:     one byte per item, nonzero while selected
+# swatches:  the list whose rows are drawn by hand
+pub rec State {
+    files:     blit.list.List;
+    query:     blit.field.Field;
+    query_buf: [32]u8;
+    many:      blit.list.List;
+    marks:     [8]u8;
+    swatches:  blit.list.List;
+}
+
+pub fun init(s: *State) {
+    s.files.selected = 8;
+    blit.field.init(?s.query, ?s.query_buf[0], 32, 0, nil);
+    s.many.marks        = ?s.marks[0];
+    s.many.selected     = 8;
+    s.marks[1]          = 1;
+    s.marks[2]          = 1;
+    s.swatches.selected = 1;
+}
+
+# the items every list shows
+fun names(out: *str) {
+    out[0] = "glider gun";
+    out[1] = "pulsar";
+    out[2] = "acorn";
+    out[3] = "r-pentomino";
+    out[4] = "garden of eden";
+    out[5] = "spaceship";
+    out[6] = "diehard";
+    out[7] = "beacon";
+}
+
+# a row drawn by hand: a swatch of a series colour, then the label
+fun swatch_row(ctx: *blit.context.Context, user: ptr, row: blit.list.Row) {
+    val labels: *str              = user::*str;
+    val t:      *blit.theme.Theme = blit.context.theme_of(ctx);
+    val h:      f32               = row.y1 - row.y0;
+    val pad:    f32               = blit.context.px(ctx, 4.0::f32);
+    blit.context.rounded_rect(ctx, row.x0 + pad, row.y0 + pad, row.x0 + h - pad, row.y1 - pad, blit.draw.radii(pad), t.series[row.index % 8]);
+    blit.context.text_at(ctx, labels[row.index], row.x0 + h + pad, row.y0 + (h - blit.context.line_height(ctx)) / 2.0::f32, row.ink);
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s:     *State = user::*State;
+    var items: [8]str;
+    names(?items[0]);
+    var sizes: [8]str;
+    sizes[0] = "36 KiB";
+    sizes[1] = "2 KiB";
+    sizes[2] = "1 KiB";
+    sizes[3] = "1 KiB";
+    sizes[4] = "9 KiB";
+    sizes[5] = "4 KiB";
+    sizes[6] = "1 KiB";
+    sizes[7] = "1 KiB";
+
+    # the rows shown are the labels holding the query, ignoring case
+    blit.controls.separator_label(ctx, "Filtered, with details");
+    blit.widget.text_field(ctx, "query", ?s.query, "filter");
+    var r: blit.list.Rows = blit.list.rows(?items[0], 8);
+    r.details = ?sizes[0];
+    r.query   = blit.field.text(?s.query);
+    blit.list.show(ctx, "files", ?s.files, r, blit.context.px(ctx, 120.0::f32));
+
+    # ctrl or command toggles a row, shift selects a run
+    blit.controls.separator_label(ctx, "Multiple selection");
+    blit.list.show(ctx, "many", ?s.many, blit.list.rows(?items[0], 8), blit.context.px(ctx, 100.0::f32));
+
+    # the list still claims, selects and scrolls the rows it hands the drawer
+    blit.controls.separator_label(ctx, "Rows drawn by hand");
+    var d: blit.list.Rows = blit.list.rows(?items[0], 8);
+    d.draw = swatch_row;
+    d.user = (?items[0])::ptr;
+    blit.list.show(ctx, "swatches", ?s.swatches, d, blit.context.px(ctx, 100.0::f32));
+}

@@ -1,0 +1,103 @@
+# text: fields, a text area, styles and truncation
+#
+# a text field edits utf-8 in a buffer the caller owns, with a caret, a
+# selection, undo in a second buffer, the clipboard hand-off and the IME's
+# composition. flags make it a password, read-only, counted or multi-line.
+# a text area edits one over many wrapped lines, drawing only the rows in
+# view however long the text.
+
+use allo: std.allocator;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.string.str;
+
+use blit;
+
+# what the fields edit
+# ---
+# name:      a plain field with undo
+# name_buf:  its text
+# hist:      its undo history
+# pass:      a password
+# pass_buf:  its text
+# tag:       a field counting its characters against a maximum
+# tag_buf:   its text
+# fixed:     a read-only field
+# fixed_buf: its text
+# notes:     the text area's field
+# notes_buf: its text
+# view:      the text area's wrapped rows and scroll
+# heading:   the larger text style, made the first time it is drawn
+pub rec State {
+    name:      blit.field.Field;
+    name_buf:  [64]u8;
+    hist:      [1024]u8;
+    pass:      blit.field.Field;
+    pass_buf:  [32]u8;
+    tag:       blit.field.Field;
+    tag_buf:   [64]u8;
+    fixed:     blit.field.Field;
+    fixed_buf: [64]u8;
+    notes:     blit.field.Field;
+    notes_buf: [2048]u8;
+    view:      blit.textarea.TextArea;
+    heading:   u32;
+}
+
+pub fun init(s: *State, a: *allo.Allocator) {
+    blit.field.init(?s.name, ?s.name_buf[0], 64, 24, nil);
+    blit.field.keep_history(?s.name, ?s.hist[0], 1024);
+    blit.field.init(?s.pass, ?s.pass_buf[0], 32, 0, nil);
+    s.pass.flags = blit.field.MASKED;
+    blit.field.set(?s.pass, "hunter2");
+    blit.field.init(?s.tag, ?s.tag_buf[0], 64, 12, nil);
+    s.tag.flags = blit.field.COUNT;
+    blit.field.init(?s.fixed, ?s.fixed_buf[0], 64, 0, nil);
+    blit.field.set(?s.fixed, "select and copy, never edit");
+    s.fixed.flags = blit.field.READ_ONLY;
+    blit.field.init(?s.notes, ?s.notes_buf[0], 2048, 0, nil);
+    s.notes.flags = blit.field.LINES;
+    blit.field.set(?s.notes, "A text area wraps its text at word boundaries.\nUp and down move by wrapped rows, page up and page down by a box of rows, and the box scrolls to keep the caret in view.");
+    blit.textarea.init(?s.view, a);
+}
+
+pub fun free(s: *State) bool {
+    val e: err[allo.Error] = blit.textarea.free(?s.view);
+    ret !sel e.err;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    blit.controls.separator_label(ctx, "Fields");
+    blit.widget.text_field(ctx, "name", ?s.name, "a name, with undo");
+    blit.widget.text_field(ctx, "password", ?s.pass, "password");
+    blit.widget.text_field(ctx, "tag", ?s.tag, "twelve at most");
+    blit.widget.text_field(ctx, "fixed", ?s.fixed, nil);
+
+    blit.controls.separator_label(ctx, "Text area");
+    blit.textarea.text_area(ctx, "notes", ?s.notes, ?s.view, blit.context.px(ctx, 96.0::f32));
+
+    # a style is a glyph source at a size, registered once
+    blit.controls.separator_label(ctx, "Styles and truncation");
+    if (s.heading == 0) {
+        val st: opt[u32] = blit.context.add_style(ctx, blit.font.Style{source: 0, size: 2.0::f32});
+        if (sel st.some) { s.heading = st.some; }
+    }
+    blit.context.push_style(ctx, s.heading);
+    blit.widget.text(ctx, "Heading");
+    blit.context.pop_style(ctx);
+
+    # one line cut to a width with an ellipsis at its end, start or middle
+    val t:    *blit.theme.Theme = blit.context.theme_of(ctx);
+    val lh:   f32               = blit.context.line_height(ctx);
+    val w:    f32               = blit.context.px(ctx, 160.0::f32);
+    val long: str               = "/home/user/projects/blit/demo/gallery/src/sections/text.mach";
+    var mode: u8                = blit.text.CUT_END;
+    for (mode <= blit.text.CUT_MIDDLE) {
+        val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fixed(w), blit.layout.fixed(lh), w, lh);
+        blit.text.fit_at(ctx, long, r.x0, r.y0, w, mode, t.text_dim);
+        mode = mode + 1;
+    }
+}

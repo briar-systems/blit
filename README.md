@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.ease`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.anim`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.ease`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.anim`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`, `blit.inspect`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -1885,6 +1885,46 @@ claims (`blit.context.rect_of`, `widget_at`, `widget_in`) and, while
 `set_trace(?ctx, 1)` is on, every drawn line of text (`traced_count`,
 `traced_at`), off by default so an app's frames pay nothing for it.
 
+## Inspector
+
+`blit.inspect` is an interface inspector built with blit, for debugging the
+interfaces built with it: a window over the frame showing what the context
+keeps, as a tree whose sections open to their entries.
+
+```mach
+var insp: blit.inspect.Inspector;
+blit.inspect.init(?insp, ?a);          # once, closed
+# per frame, after every other widget:
+blit.inspect.show(?ctx, ?insp);
+# bound to a key or a button:
+blit.inspect.toggle(?insp);
+# at shutdown: blit.inspect.free(?insp)
+```
+
+- **What it shows.** The frame: the screen, scale and dt, and the hovered,
+  hot, active and focused ids (whether the focus wears the ring and takes
+  typed keys). The focus order: every tab stop in the order tab moves
+  through them, with its layer, group and the keys it takes. Layers and
+  claims: each band with its rule and its claims and runs, and each claim's
+  id, layer and rect. Collisions: every id claimed twice. The draw list: its
+  vertex, index and run counts and each run's layer, texture, triangles and
+  clip. Windows: each window's rect, z and flags. Dock spaces: each space's
+  tree of splits and leaves and the windows docked in them. The state store:
+  every entry's id, kind (a registered kind's name, or its type), size, age
+  and pin.
+- **Outlines.** Hovering an entry outlines its rect on the surface, in the
+  tooltips band above everything but a drag, in the `inspect_outline` kind
+  (`blit.inspect.register_kinds` registers it, as `show` does the first time
+  it draws): a claim's rect, a widget's, a window's, a dock node's, a tab
+  stop's, a run's clip.
+- **Costing nothing when off.** It records nothing: everything it shows is
+  what the context already keeps for routing, drawing and its store, read
+  where it stands. The `Inspector` is the caller's, and while closed `show`
+  returns at once. Called last, it reads the app's whole frame before
+  drawing itself, and while open it copies what it lists into storage it
+  owns, so drawing itself never moves what it reads. Closing its window
+  closes it.
+
 ## Build & test
 
 ```
@@ -1913,6 +1953,24 @@ changing blit, since a demo builds against its pulled copy:
 ```
 mach test demo/panel
 demo/panel/out/linux-x86_64/debug/bin/panel --snapshot > demo/panel/src/bin/panel.snap
+```
+
+`demo/gallery/` is the reference people learn blit from, as Dear ImGui's demo
+window is: one window covering every widget and module, each section beside
+the code that builds it. The screen is a dock space with the gallery docked
+in it, a list of sections on the left, the chosen section's widgets in the
+middle and its source on the right. Each section is a file of its own under
+`demo/gallery/src/sections/`, embedded, so the code shown is the code that
+runs, and a new section is one file and one row of the table in
+`demo/gallery/src/app.mach`. A host with a window and a renderer makes a
+`Gallery` and runs `gallery.app.ui` each frame. Its test visits every
+section headless, checking each frame is whole with no id collisions, and
+compares the last frame with `demo/gallery/src/bin/gallery.snap`:
+
+```
+mach dep pull demo/gallery
+mach test demo/gallery
+demo/gallery/out/linux-x86_64/debug/bin/gallery --snapshot > demo/gallery/src/bin/gallery.snap
 ```
 
 ## Benchmark
