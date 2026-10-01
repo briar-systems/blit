@@ -5,20 +5,31 @@
 # store. build one in code with root, split and add, or drag a window's
 # titlebar over a space and drop it on a zone. drag a tab out to float it
 # again. the windows here are drawn by the section's root hook every frame.
+#
+# a space's central node stays open for what the app draws beneath it: while
+# it holds no window it paints nothing and takes no input, so the stage's
+# scene shows through it and keeps the pointer there.
 
+use std.types.option.opt;
 use std.types.string.str;
 
 use blit;
 
 # the sample windows and what was asked of them
 # ---
-# open: the sample windows are drawn
-# ask:  1 to dock them beside the gallery, 2 to float them, 0 for nothing
-# was:  whether each window was open last frame
+# open:  the sample windows are drawn
+# ask:   1 to dock them beside the gallery, 2 to float them, 0 for nothing
+# was:   whether each window was open last frame
+# stage: the stage, a space with a see-through centre, is drawn
+# built: the stage's panel was docked beside its centre
+# hits:  clicks the stage's scene took
 pub rec State {
-    open: u8;
-    ask:  u8;
-    was:  [2]u8;
+    open:  u8;
+    ask:   u8;
+    was:   [2]u8;
+    stage: u8;
+    built: u8;
+    hits:  u64;
 }
 
 pub fun init(s: *State) {}
@@ -30,6 +41,50 @@ pub fun show(ctx: *blit.context.Context, user: ptr) {
     if (blit.widget.button(ctx, "Float them"))                          { s.ask = 2; }
     blit.widget.toggle(ctx, "Show them", ?s.open);
     blit.widget.note(ctx, "Drag a floating window's titlebar over the desk to see its drop zones: the centre docks it as a tab, an edge splits the leaf beneath. Hold shift to drop it without docking.");
+    blit.widget.toggle(ctx, "A stage with a see-through centre", ?s.stage);
+    blit.widget.note(ctx, "The stage is a dock space whose central node is empty: the scene drawn beneath it shows through and takes the clicks there, beside a docked panel.");
+}
+
+# the stage: a scene the app draws and claims, then a dock space over it with
+# a panel docked left of its empty central node
+fun stage(ctx: *blit.context.Context, s: *State) {
+    val a: blit.context.Area = blit.context.Area{x0: 700.0::f32, y0: 360.0::f32, x1: 1240.0::f32, y1: 760.0::f32};
+
+    # the scene, beneath the space: drawn and claimed first, in the same band
+    blit.context.push_band(ctx, blit.band.DOCKED, 0);
+    blit.context.quad(ctx, a.x0, a.y0, a.x1, a.y1, blit.draw.rgba(0.08::f32, 0.1::f32, 0.16::f32, 1.0::f32));
+    var y: f32 = a.y0 + 20.0::f32;
+    for (y < a.y1) {
+        blit.context.quad(ctx, a.x0, y, a.x1, y + 1.0::f32, blit.draw.rgba(0.2::f32, 0.26::f32, 0.4::f32, 1.0::f32));
+        y = y + 20.0::f32;
+    }
+    val h: blit.interact.Hit = blit.interact.hit(ctx, blit.context.id_of(ctx, "scene"), a.x0, a.y0, a.x1, a.y1, blit.input.BUTTON_LEFT);
+    if (h.clicked) { s.hits = s.hits + 1; }
+    blit.context.pop_band(ctx);
+
+    val sid: u64 = blit.context.id_of(ctx, "stage");
+    val mid: u64 = blit.dock.central(ctx, sid);
+    if (s.built == 0 && mid != 0) {
+        blit.dock.add(ctx, blit.dock.split(ctx, mid, blit.context.Side.left{}, 0.3::f32), blit.context.id_of(ctx, "Outliner"));
+        s.built = 1;
+    }
+    blit.dock.space(ctx, "stage", a);
+    val c: opt[blit.context.Area] = blit.dock.central_area(ctx, sid);
+    if (sel c.some) {
+        var say: str = "the scene";
+        if (h.hot) { say = "the scene has the pointer"; }
+        blit.context.push_band(ctx, blit.band.DOCKED, 0);
+        blit.context.text_at(ctx, say, c.some.x0 + 12.0::f32, c.some.y0 + 12.0::f32, blit.draw.rgba(0.8::f32, 0.85::f32, 1.0::f32, 1.0::f32));
+        blit.context.pop_band(ctx);
+    }
+
+    val o: blit.widget.WindowArea = blit.widget.begin_window(ctx, blit.widget.window("Outliner", 720.0::f32, 380.0::f32, 160.0::f32, 200.0::f32));
+    if (o.body != 0) {
+        blit.widget.text(ctx, "camera");
+        blit.widget.text(ctx, "light");
+        blit.widget.text(ctx, "ground");
+    }
+    blit.widget.end_window(ctx, o);
 }
 
 # open or close a window by its state: a window that was open and is now
@@ -77,4 +132,6 @@ pub fun root(ctx: *blit.context.Context, user: ptr) {
     val b: blit.widget.WindowArea = blit.widget.begin_window(ctx, blit.widget.window("Properties", 300.0::f32, 120.0::f32, 220.0::f32, 160.0::f32));
     if (b.body != 0) { blit.widget.note(ctx, "Its content and ids are the same docked or floating."); }
     blit.widget.end_window(ctx, b);
+
+    if (s.stage != 0) { stage(ctx, s); }
 }
