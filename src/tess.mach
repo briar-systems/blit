@@ -34,6 +34,7 @@ use blit.draw;
 use blit.path;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.sort;
 use vec: std.collections.vector;
 use std.math.float.acos_f32;
 use std.math.float.cos_f32;
@@ -171,21 +172,32 @@ rec Section {
     fade: u8;
 }
 
-# an edge of a filled contour, top to bottom, with the winding it adds
+# an edge of a filled contour, top to bottom, with the winding it adds and
+# the order it was made in
 rec Edge {
     x0: f32;
     y0: f32;
     x1: f32;
     y1: f32;
     w:  i32;
+    id: usize;
 }
 
-# where an edge crosses a band: at its top, bottom and middle
+# an active edge where it crosses a band: at its top, bottom and middle
+# ---
+# xa: x at the band's top
+# xb: x at the band's bottom
+# xm: x at the band's middle
+# w:  winding the edge adds
+# e:  the edge's index in the sorted edges
+# id: the order the edge was made in, which breaks ties
 rec Cross {
     xa: f32;
     xb: f32;
     xm: f32;
     w:  i32;
+    e:  usize;
+    id: usize;
 }
 
 # a filled trapezoid between two band heights
@@ -207,9 +219,10 @@ rec Trap {
 # sects: a stroke's cross-sections
 # ring:  each fill point inset by half the feather
 # aux:   each fill point outset by half the feather
-# edges: a fill's edges
-# ys:    a fill's band heights
-# act:   the edges crossing one band
+# edges: a fill's edges, sorted by their tops while it sweeps
+# ys:    the heights of a fill's points
+# act:   the edges the sweep's current band crosses, in order across it
+# cuts:  the heights inside the current band where its edges cross
 # traps: a fill's trapezoids
 # bad:   1 once a buffer could not grow since begin, else 0
 pub rec Scratch {
@@ -223,6 +236,7 @@ pub rec Scratch {
     edges: vec.Vector[Edge];
     ys:    vec.Vector[f32];
     act:   vec.Vector[Cross];
+    cuts:  vec.Vector[f32];
     traps: vec.Vector[Trap];
     bad:   u8;
 }
@@ -236,7 +250,7 @@ pub fun init(a: *allo.Allocator) Scratch {
         pts:  vec.init[draw.Point](a), marks: vec.init[usize](a), shut: vec.init[u8](a),
         line: vec.init[draw.Point](a), sects: vec.init[Section](a), ring: vec.init[draw.Point](a),
         aux:  vec.init[draw.Point](a), edges: vec.init[Edge](a), ys: vec.init[f32](a),
-        act:  vec.init[Cross](a), traps: vec.init[Trap](a), bad: 0
+        act:  vec.init[Cross](a), cuts: vec.init[f32](a), traps: vec.init[Trap](a), bad: 0
     };
 }
 
@@ -265,6 +279,8 @@ pub fun free(sc: *Scratch) err[allo.Error] {
     if (sel e8.err) { ret e8; }
     val e9: err[allo.Error] = vec.dnit[Cross](?sc.act);
     if (sel e9.err) { ret e9; }
+    val e10: err[allo.Error] = vec.dnit[f32](?sc.cuts);
+    if (sel e10.err) { ret e10; }
     ret vec.dnit[Trap](?sc.traps);
 }
 
@@ -832,8 +848,9 @@ fun pushed(r: res[usize, allo.Error], sc: *Scratch) {
 #
 # the contours are inset by half the feather, cut into trapezoids between the
 # heights where their edges start, end or cross, and ringed by the feather.
-# cost grows with the square of the edge count, which suits icons and small
-# shapes.
+# a sweep down the edges, sorted once, keeps only those crossing the current
+# band, so e edges cost e log e plus the edges each band holds and the
+# crossings, where comparing every pair would cost e squared.
 # ---
 # dl:  draw list
 # sc:  scratch holding the contours
@@ -884,15 +901,15 @@ pub fun fill(dl: *draw.DrawList, sc: *Scratch, b: *Brush) err[allo.Error] {
             val a: draw.Point = sc.ring.data[first + i];
             val z: draw.Point = sc.ring.data[first + (i + 1) % m];
             pushed(vec.push[f32](?sc.ys, a.y), sc);
-            if (a.y < z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: a.x, y0: a.y, x1: z.x, y1: z.y, w: 1}), sc); }
-            or (a.y > z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: z.x, y0: z.y, x1: a.x, y1: a.y, w: -1}), sc); }
+            val id: usize = sc.edges.len;
+            if (a.y < z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: a.x, y0: a.y, x1: z.x, y1: z.y, w: 1, id: id}), sc); }
+            or (a.y > z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: z.x, y0: z.y, x1: a.x, y1: a.y, w: -1, id: id}), sc); }
             i = i + 1;
         }
         ringed = ringed + m;
         c      = c + 1;
     }
     if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
-    crossings(sc);
     trapezoids(sc);
     if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
 
@@ -937,99 +954,177 @@ fun edge_x(e: Edge, y: f32) f32 {
     ret e.x0 + (e.x1 - e.x0) * (y - e.y0) / (e.y1 - e.y0);
 }
 
-# add the heights where two edges cross, then sort the band heights
-fun crossings(sc: *Scratch) {
-    val n: usize = sc.edges.len;
-    var i: usize = 0;
-    for (i < n) {
-        val a: Edge  = sc.edges.data[i];
-        var j: usize = i + 1;
-        for (j < n) {
-            val z:  Edge = sc.edges.data[j];
-            var lo: f32  = a.y0;
-            if (z.y0 > lo) { lo = z.y0; }
-            var hi: f32 = a.y1;
-            if (z.y1 < hi) { hi = z.y1; }
-            if (hi > lo) {
-                val sa: f32 = (a.x1 - a.x0) / (a.y1 - a.y0);
-                val sz: f32 = (z.x1 - z.x0) / (z.y1 - z.y0);
-                val ds: f32 = sa - sz;
-                if (ds > 0.000001::f32 || ds < -0.000001::f32) {
-                    val y: f32 = (z.x0 - a.x0 + a.y0 * sa - z.y0 * sz) / ds;
-                    if (y > lo && y < hi) { pushed(vec.push[f32](?sc.ys, y), sc); }
-                }
-            }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-    # insertion sort: the heights arrive in contour order, mostly runs
-    val ys: *f32  = sc.ys.data;
-    var k:  usize = 1;
-    for (k < sc.ys.len) {
-        val y: f32   = ys[k];
+# order edges by their tops, then by the order they were made
+fun by_top(a: *Edge, b: *Edge) i64 {
+    if (a.y0 < b.y0) { ret -1; }
+    if (a.y0 > b.y0) { ret 1; }
+    if (a.id < b.id) { ret -1; }
+    if (a.id > b.id) { ret 1; }
+    ret 0;
+}
+
+# where edges a and z cross, a made first; false when they run parallel
+fun meet(a: Edge, z: Edge, y: *f32) bool {
+    val sa: f32 = (a.x1 - a.x0) / (a.y1 - a.y0);
+    val sz: f32 = (z.x1 - z.x0) / (z.y1 - z.y0);
+    val ds: f32 = sa - sz;
+    if (ds <= 0.000001::f32 && ds >= -0.000001::f32) { ret false; }
+    @y = (z.x0 - a.x0 + a.y0 * sa - z.y0 * sz) / ds;
+    ret true;
+}
+
+# whether p goes after q across a band's top: by x there, then by x at its
+# bottom, then by the order made
+fun after_top(p: *Cross, q: *Cross) bool {
+    if (p.xa != q.xa) { ret p.xa > q.xa; }
+    if (p.xb != q.xb) { ret p.xb > q.xb; }
+    ret p.id > q.id;
+}
+
+# whether p goes after q across a band's middle, then by the order made
+fun after_mid(p: *Cross, q: *Cross) bool {
+    if (p.xm != q.xm) { ret p.xm > q.xm; }
+    ret p.id > q.id;
+}
+
+# insertion sort the active edges across a band's top or middle, nearly in
+# order from the band before
+fun settle(act: *Cross, n: usize, mid: bool) {
+    var k: usize = 1;
+    for (k < n) {
+        var x: Cross = act[k];
         var m: usize = k;
-        for (m > 0 && ys[m - 1] > y) {
-            ys[m] = ys[m - 1];
-            m     = m - 1;
+        for (m > 0 && ((mid && after_mid(?act[m - 1], ?x)) || (!mid && after_top(?act[m - 1], ?x)))) {
+            act[m] = act[m - 1];
+            m      = m - 1;
         }
-        ys[m] = y;
-        k     = k + 1;
+        act[m] = x;
+        k      = k + 1;
     }
 }
 
-# cut the filled region between consecutive band heights into trapezoids
+# reorder the active edges, in order across the band's top, by x at its
+# bottom, adding to cuts the height of each crossing strictly inside the band
+#
+# a pair that crosses inside the band changes order across it, and insertion
+# sort swaps each such pair exactly once, so the cost is the crossings.
+fun cross(sc: *Scratch, act: *Cross, n: usize, ya: f32, yb: f32) {
+    val es: *Edge = sc.edges.data;
+    var k:  usize = 1;
+    for (k < n) {
+        var x: Cross = act[k];
+        var m: usize = k;
+        for (m > 0 && act[m - 1].xb > x.xb) {
+            var lo: Edge = es[act[m - 1].e];
+            var hi: Edge = es[x.e];
+            if (hi.id < lo.id) {
+                lo = es[x.e];
+                hi = es[act[m - 1].e];
+            }
+            var y: f32 = 0.0::f32;
+            if (meet(lo, hi, ?y) && y > ya && y < yb) { pushed(vec.push[f32](?sc.cuts, y), sc); }
+            act[m] = act[m - 1];
+            m      = m - 1;
+        }
+        act[m] = x;
+        k      = k + 1;
+    }
+}
+
+# put the trapezoids the nonzero rule fills between heights ya and yb, across
+# which the active edges keep their order
+fun band(sc: *Scratch, act: *Cross, n: usize, ya: f32, yb: f32) {
+    if (yb - ya < 0.00001::f32) { ret; }
+    val es: *Edge = sc.edges.data;
+    val ym: f32   = (ya + yb) * 0.5::f32;
+    var i:  usize = 0;
+    for (i < n) {
+        val e: Edge = es[act[i].e];
+        act[i].xa = edge_x(e, ya);
+        act[i].xb = edge_x(e, yb);
+        act[i].xm = edge_x(e, ym);
+        i         = i + 1;
+    }
+    settle(act, n, true);
+    var wind: i32   = 0;
+    var from: usize = 0;
+    var k:    usize = 0;
+    for (k < n) {
+        val prev: i32 = wind;
+        wind = wind + act[k].w;
+        if (prev == 0 && wind != 0) { from = k; }
+        or (prev != 0 && wind == 0) {
+            val t: Trap = Trap{ya: ya, yb: yb, xla: act[from].xa, xlb: act[from].xb, xra: act[k].xa, xrb: act[k].xb};
+            pushed(vec.push[Trap](?sc.traps, t), sc);
+        }
+        k = k + 1;
+    }
+}
+
+# cut the filled region into trapezoids by a sweep down the edges
+#
+# the edges are sorted by their tops once, and the sweep keeps those crossing
+# the band between two consecutive point heights: an edge enters at the first
+# band below its top and leaves at the first below its bottom. a band is cut
+# again where its edges cross, so each piece holds its edges in one order.
 fun trapezoids(sc: *Scratch) {
     vec.clear[Trap](?sc.traps);
-    var b: usize = 1;
+    vec.clear[Cross](?sc.act);
+    sort.sort[f32](sc.ys.data, sc.ys.len);
+    sort.sort_by[Edge](sc.edges.data, sc.edges.len, by_top);
+    val es:   *Edge = sc.edges.data;
+    var next: usize = 0;
+    var b:    usize = 1;
     for (b < sc.ys.len) {
         val ya: f32 = sc.ys.data[b - 1];
         val yb: f32 = sc.ys.data[b];
         b = b + 1;
         if (yb - ya < 0.00001::f32) { cnt; }
-        val ym: f32 = (ya + yb) * 0.5::f32;
-        vec.clear[Cross](?sc.act);
-        var i: usize = 0;
-        for (i < sc.edges.len) {
-            val e: Edge = sc.edges.data[i];
+        # every edge's ends are point heights, so the middle decides which
+        # edges cross the band
+        val ym:   f32   = (ya + yb) * 0.5::f32;
+        var keep: usize = 0;
+        var i:    usize = 0;
+        for (i < sc.act.len) {
+            val x: Cross = sc.act.data[i];
+            if (es[x.e].y1 > ym) {
+                sc.act.data[keep] = x;
+                keep              = keep + 1;
+            }
             i = i + 1;
-            if (e.y0 >= ym || e.y1 <= ym) { cnt; }
-            val x:  Cross                  = Cross{xa: edge_x(e, ya), xb: edge_x(e, yb), xm: edge_x(e, ym), w: e.w};
-            val ra: res[usize, allo.Error] = vec.push[Cross](?sc.act, x);
-            if (sel ra.err) {
-                sc.bad = 1;
-                ret;
-            }
         }
+        sc.act.len = keep;
+        for (next < sc.edges.len && es[next].y0 < ym) {
+            if (es[next].y1 > ym) {
+                val x: Cross = Cross{xa: 0.0::f32, xb: 0.0::f32, xm: 0.0::f32, w: es[next].w, e: next, id: es[next].id};
+                pushed(vec.push[Cross](?sc.act, x), sc);
+            }
+            next = next + 1;
+        }
+        if (sc.bad != 0) { ret; }
+
         val act: *Cross = sc.act.data;
-        var k:   usize  = 1;
-        for (k < sc.act.len) {
-            val x: Cross = act[k];
-            var m: usize = k;
-            for (m > 0 && act[m - 1].xm > x.xm) {
-                act[m] = act[m - 1];
-                m      = m - 1;
-            }
-            act[m] = x;
-            k      = k + 1;
+        val n:   usize  = sc.act.len;
+        i = 0;
+        for (i < n) {
+            act[i].xa = edge_x(es[act[i].e], ya);
+            act[i].xb = edge_x(es[act[i].e], yb);
+            i         = i + 1;
         }
-        var wind: i32   = 0;
-        var from: usize = 0;
-        k = 0;
-        for (k < sc.act.len) {
-            val prev: i32 = wind;
-            wind = wind + act[k].w;
-            if (prev == 0 && wind != 0) { from = k; }
-            or (prev != 0 && wind == 0) {
-                val t:  Trap                   = Trap{ya: ya, yb: yb, xla: act[from].xa, xlb: act[from].xb, xra: act[k].xa, xrb: act[k].xb};
-                val rt: res[usize, allo.Error] = vec.push[Trap](?sc.traps, t);
-                if (sel rt.err) {
-                    sc.bad = 1;
-                    ret;
-                }
-            }
-            k = k + 1;
+        settle(act, n, false);
+        vec.clear[f32](?sc.cuts);
+        cross(sc, act, n, ya, yb);
+        if (sc.bad != 0) { ret; }
+        sort.sort[f32](sc.cuts.data, sc.cuts.len);
+        var top: f32 = ya;
+        i = 0;
+        for (i < sc.cuts.len) {
+            band(sc, act, n, top, sc.cuts.data[i]);
+            top = sc.cuts.data[i];
+            i   = i + 1;
         }
+        band(sc, act, n, top, yb);
+        if (sc.bad != 0) { ret; }
     }
 }
 

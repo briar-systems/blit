@@ -13,7 +13,7 @@
 # [<name>.<id>] table per entry, and load reads one back through std.data.toml.
 #
 # the store is one owner among several: a widget taking a caller-owned record
-# (Window, Scroll, List, Field) keeps it, so an app can still own its state.
+# (Scroll, List, Field) keeps it, so an app can still own its state.
 
 use std.types.bool.bool;
 use std.types.error.err;
@@ -81,6 +81,18 @@ pub fun pin[T](ctx: *context.Context, id: u64, on: u8) {
 # frames: the age, 0 to keep every entry until the context is freed
 pub fun set_max_age(ctx: *context.Context, frames: u64) {
     ctx.store.max_age = frames;
+}
+
+# hand every T the store keeps, under any id, to f
+#
+# for state that is ordered or counted across ids, such as the windows' stack
+# order. f must not reach for other state while it walks.
+# ---
+# ctx:  context
+# f:    called with each entry and user
+# user: passed through to f
+pub fun each[T](ctx: *context.Context, f: fun(*T, ptr), user: ptr) {
+    store.walk(?ctx.store, $type_id(T), f:~fun(ptr, ptr), user);
 }
 
 # register T for persistence under a name

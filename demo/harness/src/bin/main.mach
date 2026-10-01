@@ -43,12 +43,9 @@ fun main(argc: i64, argv: **u8) i64 {
     opts[1] = "sub";
     opts[2] = "mul";
 
-    var win: blit.widget.Window;
-    win.x     = 380.0::f32;
-    win.y     = 8.0::f32;
-    win.w     = 180.0::f32;
-    win.open  = 1;
-    win.title = "tools";
+    # a window that opens at (380, 8), sized to its content
+    var win: blit.widget.Window = blit.widget.window("tools", 380.0::f32, 8.0::f32, 180.0::f32, 0.0::f32);
+    win.flags = blit.widget.WINDOW_AUTO_SIZE;
 
     var side: blit.widget.Dock;
     side.side = blit.context.Side.right{};
@@ -132,11 +129,13 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.widget.grid(?ctx, heat, 96.0::f32, 48.0::f32);
     blit.widget.end_panel(?ctx, p2);
 
-    # a draggable, collapsible window with a couple of widgets
-    val wh: blit.widget.Block = blit.widget.begin_window(?ctx, ?win);
-    blit.widget.text(?ctx, "drag me");
-    blit.widget.button(?ctx, "go");
-    blit.widget.end_window(?ctx, ?win, wh);
+    # a window that drags, resizes, collapses and closes, with a couple of widgets
+    val wh: blit.widget.WindowArea = blit.widget.begin_window(?ctx, win);
+    if (wh.body != 0) {
+        blit.widget.text(?ctx, "drag me");
+        blit.widget.button(?ctx, "go");
+    }
+    blit.widget.end_window(?ctx, wh);
 
     # charts from plain arrays: two series with the area under one filled, bars
     # either side of zero, and a sparkline for a row
