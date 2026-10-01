@@ -13,7 +13,7 @@
 # [<name>.<id>] table per entry, and load reads one back through std.data.toml.
 #
 # the store is one owner among several: a widget taking a caller-owned record
-# (Window, Scroll, List, Field) keeps it, so an app can still own its state.
+# (Scroll, List, Field) keeps it, so an app can still own its state.
 
 use std.types.bool.bool;
 use std.types.error.err;
