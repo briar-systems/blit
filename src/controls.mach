@@ -21,6 +21,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use blit.anim;
 use blit.context;
@@ -32,6 +33,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 use allo: std.allocator;
@@ -171,8 +173,10 @@ fun bar_at(ctx: *context.Context, s: str) context.Area {
 # text centred over a progress bar from x0 to x1, h tall at y0
 fun bar_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, h: f32) {
     if (s == nil) { ret; }
-    val tw: f32 = context.text_width(ctx, s);
-    context.text_at(ctx, s, x0 + (x1 - x0 - tw) / 2.0::f32, text_top(ctx, y0, h), ink(ctx, theme.PROGRESS, theme.NORMAL).text);
+    val tw: f32          = context.text_width(ctx, s);
+    val in: theme.Edges  = inset(ctx, theme.PROGRESS);
+    val b:  context.Area = context.Area{x0: x0 + in.l, y0: y0, x1: x1 - in.r, y1: y0 + h};
+    rich_text.fit_box(ctx, theme.PROGRESS, s, str_len(s), x0 + (x1 - x0 - tw) / 2.0::f32, text_top(ctx, y0, h), b, ink(ctx, theme.PROGRESS, theme.NORMAL).text);
 }
 
 # a progress bar across the column filled to frac of its width
@@ -384,12 +388,10 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
     val hs:  u8          = theme.pick(hd.hot, hd.active, st.open != 0, false);
     val oin: theme.Edges = inset(ctx, theme.LIST_ITEM);
     anim.box(ctx, id, theme.DROPDOWN, hs, x0, y0, x1, y0 + h);
-    val ty: f32 = text_top(ctx, y0, h);
-    context.text_span(ctx, label, bid.shown(label), x0 + in.l, ty, ink(ctx, theme.DROPDOWN, hs).text);
-    if (@selected < count) {
-        val cur: str = options[@selected];
-        context.text_at(ctx, cur, x1 - in.r - context.text_width(ctx, cur), ty, ink(ctx, theme.DROPDOWN, hs).text);
-    }
+    val tc:  draw.Color = ink(ctx, theme.DROPDOWN, hs).text;
+    var cur: str        = nil;
+    if (@selected < count) { cur = options[@selected]; }
+    rich_text.fit_pair(ctx, theme.DROPDOWN, label, bid.shown(label), tc, cur, tc, in.l, text_top(ctx, y0, h), context.Area{x0: x0 + in.l, y0: y0, x1: x1 - in.r, y1: y0 + h});
 
     context.push_id(ctx, id);
     val pop:     widget.Popup = widget.begin_popup(ctx, "popup", st.open, x0, y0 + h + widget.row_gap(ctx), x1 - x0);
@@ -451,7 +453,8 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
 
                         val os: u8 = theme.pick(i == st.hi, ho.active, i == @selected, false);
                         context.box(ctx, theme.LIST_ITEM, os, ox0, oy0, ox1, oy1);
-                        context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, h), ink(ctx, theme.LIST_ITEM, os).text);
+                        val ob: context.Area = context.Area{x0: ox0 + oin.l, y0: oy0, x1: ox1 - oin.r, y1: oy1};
+                        rich_text.fit_box(ctx, theme.LIST_ITEM, options[i], str_len(options[i]), ox0 + oin.l, text_top(ctx, oy0, h), ob, ink(ctx, theme.LIST_ITEM, os).text);
                     }
                 }
                 i = i + 1;

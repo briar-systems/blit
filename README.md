@@ -353,6 +353,7 @@ shows.
 | `<kind>.shadow_x` | length | shadow offset right |
 | `<kind>.shadow_y` | length | shadow offset down |
 | `<kind>.shadow_blur` | length | how far the shadow fades out, 0 for a hard edge |
+| `<kind>.overflow` | factor | how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end |
 | `<kind>.<state>.fill` | color | the face, at its top when it is a gradient |
 | `<kind>.<state>.fill_to` | color | the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat |
 | `<kind>.<state>.text` | color | text drawn on the face |

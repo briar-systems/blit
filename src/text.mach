@@ -5,7 +5,9 @@
 # an ellipsis where it cut. the cut is a pair of byte offsets into the
 # caller's string, so nothing is copied: the text drawn is the bytes before
 # the head, the ellipsis, then the bytes from the tail. the ellipsis is U+2026
-# when the style's glyph source has it, else three full stops.
+# when the style's glyph source has it, else three full stops. fit_box and
+# fit_pair fit a label into the box a widget draws it in, clipped or cut as
+# the widget's style chooses (see theme.Style.overflow).
 #
 # a rich line is a run of spans, each with its own text style and color, laid
 # out left to right on one shared baseline, for labels like `gen 13  pop 9,252`
@@ -141,7 +143,12 @@ fun keep_tail(ctx: *context.Context, s: str, n: usize, m: usize, from: usize, w:
 # ret:  the cut
 pub fun fit(ctx: *context.Context, s: str, w: f32, mode: u8) Fit {
     var n: usize = 0;
-    if (s != nil)                                       { n = str_len(s); }
+    if (s != nil) { n = str_len(s); }
+    ret cut(ctx, s, n, w, mode);
+}
+
+# fit for the first n bytes of s
+fun cut(ctx: *context.Context, s: str, n: usize, w: f32, mode: u8) Fit {
     if (n == 0 || context.text_width_n(ctx, s, n) <= w) { ret Fit{head: n, tail: n, cut: false}; }
     val room: f32   = w - context.text_width(ctx, ellipsis(ctx));
     val m:    usize = count(s, n);
@@ -170,9 +177,13 @@ pub fun fit(ctx: *context.Context, s: str, w: f32, mode: u8) Fit {
 # ret:  the width drawn, at most w unless the ellipsis alone is wider
 pub fun fit_at(ctx: *context.Context, s: str, x: f32, y: f32, w: f32, mode: u8, c: draw.Color) f32 {
     if (s == nil) { ret 0.0::f32; }
-    val n:  usize = str_len(s);
-    val ft: Fit   = fit(ctx, s, w, mode);
-    var px: f32   = x;
+    ret cut_at(ctx, s, str_len(s), x, y, w, mode, c);
+}
+
+# fit_at for the first n bytes of s
+fun cut_at(ctx: *context.Context, s: str, n: usize, x: f32, y: f32, w: f32, mode: u8, c: draw.Color) f32 {
+    val ft: Fit = cut(ctx, s, n, w, mode);
+    var px: f32 = x;
     context.text_span(ctx, s, ft.head, px, y, c);
     px = px + context.text_width_n(ctx, s, ft.head);
     if (ft.cut) {
@@ -185,6 +196,84 @@ pub fun fit_at(ctx: *context.Context, s: str, x: f32, y: f32, w: f32, mode: u8, 
         px = px + context.text_width_n(ctx, ?s[ft.tail], n - ft.tail);
     }
     ret px - x;
+}
+
+# draw the first n bytes of a line of text with its line box's top-left at
+# (x, y), as it is when it fits the box's span, else as the kind's overflow
+# says: clipped to the box, or cut with an ellipsis at its end to fit the
+# span from its left
+#
+# a widget draws every label it holds inside a box through this, so a label
+# too wide for its box never spills over its neighbours. an ellipsis wider
+# than the span is clipped.
+# ---
+# ctx:  context
+# kind: the style whose overflow decides
+# s:    utf-8 text, one line
+# n:    bytes of s drawn, such as id.shown(label)
+# x:    left x in pixels where it is drawn when it fits
+# y:    top y in pixels
+# b:    the box: x0 to x1 the span the text may take, y0 to y1 its height
+# c:    tint color
+pub fun fit_box(ctx: *context.Context, kind: u32, s: str, n: usize, x: f32, y: f32, b: context.Area, c: draw.Color) {
+    if (s == nil || n == 0) { ret; }
+    val w: f32 = maxf(b.x1 - b.x0, 0.0::f32);
+    if (context.text_width_n(ctx, s, n) <= w) {
+        context.text_span(ctx, s, n, x, y, c);
+        ret;
+    }
+    if (context.look_of(ctx, kind).overflow >= 0.5::f32 && context.text_width(ctx, ellipsis(ctx)) <= w) {
+        cut_at(ctx, s, n, b.x0, y, w, CUT_END, c);
+        ret;
+    }
+    context.push_clip(ctx, b.x0, b.y0, b.x0 + w, b.y1);
+    context.text_span(ctx, s, n, b.x0, y, c);
+    context.pop_clip(ctx);
+}
+
+# draw a label at the left of a box's span and a value at its right, as they
+# are when both fit with gap between them, else each fit to its share as
+# fit_box fits it
+#
+# the value's share is its width or half the room, whichever is less, unless
+# the label leaves it more, and the label takes the rest.
+# ---
+# ctx:   context
+# kind:  the style whose overflow decides
+# label: utf-8 text, one line
+# ln:    bytes of label drawn, such as id.shown(label)
+# lc:    the label's tint
+# value: utf-8 text, one line, nil for none
+# vc:    the value's tint
+# gap:   least space between them, in pixels
+# y:     top y in pixels
+# b:     the box: x0 to x1 the span they share, y0 to y1 its height
+pub fun fit_pair(ctx: *context.Context, kind: u32, label: str, ln: usize, lc: draw.Color, value: str, vc: draw.Color, gap: f32, y: f32, b: context.Area) {
+    var room:  f32 = b.x1 - b.x0;
+    var vw:    f32 = 0.0::f32;
+    var share: f32 = 0.0::f32;
+    if (value != nil) {
+        vw = context.text_width(ctx, value);
+        val avail: f32 = maxf(room - gap, 0.0::f32);
+        var lw:    f32 = 0.0::f32;
+        if (label != nil) { lw = context.text_width_n(ctx, label, ln); }
+        share = minf(vw, maxf(avail - lw, avail / 2.0::f32));
+        room  = avail - share;
+    }
+    fit_box(ctx, kind, label, ln, b.x0, y, context.Area{x0: b.x0, y0: b.y0, x1: b.x0 + room, y1: b.y1}, lc);
+    if (value != nil) { fit_box(ctx, kind, value, str_len(value), b.x1 - vw, y, context.Area{x0: b.x1 - share, y0: b.y0, x1: b.x1, y1: b.y1}, vc); }
+}
+
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# the smaller of two f32 values
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
 }
 
 # the line metrics a run of spans shares: the largest ascent, descent and gap

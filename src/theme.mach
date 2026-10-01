@@ -287,6 +287,8 @@ pub rec Paint {
 # shadow_x:    shadow offset right
 # shadow_y:    shadow offset down
 # shadow_blur: how far the shadow fades out
+# overflow:    how a label too wide for its box fits: below 0.5 clipped at the
+#              box, else cut with an ellipsis at its end
 # states:      the paint for each state, indexed by NORMAL .. FOCUSED
 pub rec Style {
     radius:      draw.Radii;
@@ -298,6 +300,7 @@ pub rec Style {
     shadow_x:    f32;
     shadow_y:    f32;
     shadow_blur: f32;
+    overflow:    f32;
     states:      [6]Paint;
 }
 
@@ -424,11 +427,11 @@ pub rec Field {
 }
 
 # how many rows FIELDS has
-pub val FIELD_COUNT: usize = 58;
+pub val FIELD_COUNT: usize = 59;
 
 # every field of a theme: the one table TOML, overrides, classes, the editor
 # and the README's field table are built from
-pub val FIELDS: [58]Field = [58]Field{
+pub val FIELDS: [59]Field = [59]Field{
     Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background, opaque in the built-in themes"},
     Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip, toast and modal background, opaque in the built-in themes"},
     Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
@@ -480,6 +483,7 @@ pub val FIELDS: [58]Field = [58]Field{
     Field{group: GROUP_STYLE, name: "shadow_x", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_x), count: 1, doc: "shadow offset right"},
     Field{group: GROUP_STYLE, name: "shadow_y", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_y), count: 1, doc: "shadow offset down"},
     Field{group: GROUP_STYLE, name: "shadow_blur", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_blur), count: 1, doc: "how far the shadow fades out, 0 for a hard edge"},
+    Field{group: GROUP_STYLE, name: "overflow", unit: UNIT_FACTOR, off: $offset_of(Style, overflow), count: 1, doc: "how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end"},
     Field{group: GROUP_PAINT, name: "fill", unit: UNIT_COLOR, off: $offset_of(Paint, fill), count: 1, doc: "the face, at its top when it is a gradient"},
     Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, doc: "the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat"},
     Field{group: GROUP_PAINT, name: "text", unit: UNIT_COLOR, off: $offset_of(Paint, text), count: 1, doc: "text drawn on the face"},
@@ -1170,7 +1174,8 @@ pub fun outline_all(s: *Style, c: draw.Color, w: f32) {
 }
 
 # the style every kind starts from: the theme's corner, pad, inset and gap,
-# its row height, transparent fills and its text inks, disabled text faint
+# its row height, transparent fills and its text inks, disabled text faint,
+# and labels too wide for their box cut with an ellipsis
 #
 # a kind's derive is handed this, built from the theme's tokens, to adjust.
 # ---
@@ -1187,6 +1192,7 @@ pub fun base(t: *Theme) Style {
     s.shadow_x    = 0.0::f32;
     s.shadow_y    = 0.0::f32;
     s.shadow_blur = 0.0::f32;
+    s.overflow    = 1.0::f32;
     var i: usize = 0;
     for (i < STATES::usize) {
         s.states[i] = paint(t, clear());

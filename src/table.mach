@@ -67,6 +67,7 @@ use blit.interact;
 use blit.layout;
 use blit.menu;
 use blit.state;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 
@@ -634,11 +635,13 @@ fun head_face(ctx: *context.Context, t: *Table, c: *Column, ci: usize, x0: f32, 
     context.box(ctx, theme.TABLE_HEADER, st, x0, y0, x1, y1);
     val lh: f32 = context.line_height(ctx);
     val ty: f32 = y0 + (y1 - y0 - lh) / 2.0::f32;
-    context.text_span(ctx, c.label, bid.shown(c.label), x0 + p, ty, hp.text);
-    if (t.sort != ci) { ret; }
-    # a triangle half a line wide at the right, up for ascending
+    # a sorted column's triangle, half a line wide at the right, up for ascending
     val s:  f32 = lh / 2.0::f32;
     val ax: f32 = x1 - p * 3.0::f32 - s;
+    var lx: f32 = x1 - p;
+    if (t.sort == ci) { lx = ax; }
+    rich_text.fit_box(ctx, theme.TABLE_HEADER, c.label, bid.shown(c.label), x0 + p, ty, context.Area{x0: x0 + p, y0: y0, x1: lx, y1: y1}, hp.text);
+    if (t.sort != ci) { ret; }
     val ay: f32 = y0 + (y1 - y0 - s / 2.0::f32) / 2.0::f32;
     if (t.dir == SORT_ASC) {
         context.tri(ctx, ax, ay + s / 2.0::f32, ax + s, ay + s / 2.0::f32, ax + s / 2.0::f32, ay, hp.mark);
