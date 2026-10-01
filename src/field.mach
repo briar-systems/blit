@@ -561,7 +561,8 @@ fun coalesces(f: *Field, kind: usize, lo: usize, hi: usize, cp: u32) bool {
     if (kind == KIND_TYPE) {
         if (lo != hi || top.at + top.new_n != lo || top.new_n == 0) { ret false; }
         # a word starts a new step
-        ret !(blank(h.buf[data + top.old_n + top.new_n - 1]) && !blank(cp::u8) && cp < 0x80);
+        val word: bool = cp >= 0x80 || !blank(cp::u8);
+        ret !(blank(h.buf[data + top.old_n + top.new_n - 1]) && word);
     }
     if (hi - lo > 4 || top.new_n != 0 || top.old_n == 0) { ret false; }
     if (kind == KIND_BACK) {
