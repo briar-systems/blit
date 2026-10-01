@@ -778,6 +778,104 @@ blit.menu.end_menu(?ctx, ?cm);
 - **Ids.** A bar's key, then each header and submenu label, then the item's
   label: `driver.find(?d, "main/File/Recent/notes.txt")`.
 
+## Overlays, toasts & tooltips
+
+`blit.overlay` places widgets that float above the interface without being
+windows: a HUD readout, a help button, the cursor's coordinates. An overlay is
+placed by an anchor, not by the layout, and sizes to its content:
+
+```mach
+# a readout in the top right corner of the surface
+var hud: blit.overlay.Overlay = blit.overlay.on_surface(blit.overlay.TOP_RIGHT);
+hud.dx = -8.0::f32;
+hud.dy = 8.0::f32;
+val s: blit.overlay.Shown = blit.overlay.begin(?ctx, "hud", hud);
+blit.widget.text(?ctx, "fps 60");
+blit.overlay.end(?ctx, s);
+
+# a note just below a rect, flipped above it and clamped where it would run off
+var o: blit.overlay.Overlay = blit.overlay.on_rect(r, blit.overlay.BOTTOM_LEFT, blit.overlay.TOP_LEFT);
+o.keep = 1;
+```
+
+- **Anchors.** An `Anchor` is a point of a rect as fractions of its size:
+  `TOP_LEFT`, `TOP`, `TOP_RIGHT`, `LEFT`, `CENTER`, `RIGHT`, `BOTTOM_LEFT`,
+  `BOTTOM` and `BOTTOM_RIGHT`, or any other. `at` is the point of the target
+  (the surface, or `target` in the caller's local pixels with `to_rect` 1),
+  `pivot` the point of the overlay put there, and `dx`/`dy` an offset in
+  pixels. `on_surface(a)` puts the overlay's own `a` at the surface's, so a
+  corner anchor sits in that corner. `keep` keeps it on the surface: an
+  overlay running off an edge flips to the far side of its anchor on that
+  axis, then is clamped.
+- **Size.** Its widgets lay out down a column it fits to them, measured into
+  the state store under its id. A placement that reads the size (any pivot
+  but the top left, or `keep`) uses last frame's measure, and an overlay never
+  measured spends its first frame hidden, only measuring, and asks for the
+  next at once, as a fitted stack does.
+- **No chrome, no claim.** A bare overlay draws no title, frame or
+  background, and claims nothing itself: input stops only where its widgets
+  claim, so the world under its empty space and its text stays interactive.
+- **Order.** Overlays paint and take input in the overlays band, above docks
+  and windows and beneath popups, menus and modals. `order` places one among
+  the others, higher above, and call order breaks a tie.
+- **Fade.** `fade` (a `Fade` of `dist`, `near` and `far`) runs the overlay's
+  opacity from `near`, with the pointer on it, to `far`, with the pointer
+  `dist` pixels away or more or off the surface: near 0.2 and far 1 lets a
+  HUD get out of the way, near 1 and far 0 shows it only as the pointer
+  nears. It fades everything it holds through `blit.context.push_alpha(?ctx,
+  a)`/`pop_alpha`, an opacity scope every color the painter emits passes
+  through, which nests by multiplying. A consumer span is drawn by the
+  consumer and is not faded.
+
+`blit.toast` stacks timed notifications at an anchor of the surface:
+
+```mach
+var toasts: blit.toast.Toasts;
+blit.toast.init(?toasts, ?a);                     # once
+val posted: err[allo.Error] = blit.toast.post(?toasts, "saved", 0.0); # anywhere: 0 for SECONDS
+blit.toast.show(?ctx, "toasts", ?toasts, blit.overlay.BOTTOM_RIGHT); # per frame
+```
+
+- **Life.** A toast's clock starts the first frame `show` draws it. It fades
+  in over its first `FADE` seconds and out over its last, and is dropped once
+  its time is up. `post` copies the text into storage the `Toasts` owns, and
+  `free` releases it.
+- **Stack.** The cards stack away from the anchor's edge, up from a bottom
+  anchor and down from any other, the newest nearest the anchor, lined up on
+  its side and kept off the edges by twice the theme's padding.
+- **Frames.** `show` asks for frames only while a toast fades, and otherwise
+  for the moment the next one starts to fade out, so once they are gone
+  `next_frame` is `none` again.
+
+`blit.tooltip` shows an overlay over a widget once the pointer has rested on
+it, named by id after the widget is drawn:
+
+```mach
+blit.widget.button(?ctx, "Save");
+blit.tooltip.text(?ctx, blit.context.id_of(?ctx, "Save"), "write the file");
+
+var t: blit.tooltip.Tip = blit.tooltip.tip();
+t.follow = 0;                                     # below the widget, not the pointer
+val tip: blit.tooltip.Shown = blit.tooltip.begin(?ctx, id, t);
+if (tip.open != 0) { blit.widget.text(?ctx, "any widgets"); }
+blit.tooltip.end(?ctx, tip);
+```
+
+- **Delay.** It shows once the widget has been the hovered claimant for
+  `delay` seconds (`DELAY`, 0.5 s), asking for that frame through `wake_at`
+  while it waits and for nothing once shown. A held button hides it and
+  starts the delay over.
+- **Placement.** Below and right of the pointer, clear of the cursor by
+  `CURSOR_GAP`, or below the widget with `follow` 0, in the tooltips band
+  above everything but a drag preview, and always kept on the surface.
+- **Pass-through.** A tooltip claims nothing, so the widget under it keeps the
+  pointer. Its content is for reading: a widget in it that claims would take
+  the hover from the widget it describes.
+
+Toasts and tooltips draw their cards with the window surface, the edge line,
+the text colour, the padding and the corner radius of the theme, read through
+`blit.overlay.chrome(?ctx, kind)`.
+
 ## Charts
 
 `blit.chart` plots plain arrays into a rect you give it, in the current local
@@ -835,8 +933,8 @@ click is always the one visibly on top.
   on a layer of band `b`, in screen coordinates with the clip reset to the
   screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
   band shares one slot, a nesting band (popups, modals) stacks a child one
-  slot above a parent of the same band, and an ordered band (windows) takes
-  the slot given, a window's z. `end()` composes the draw list by layer,
+  slot above a parent of the same band, and an ordered band (windows,
+  overlays) takes the slot given, a window's z or an overlay's order. `end()` composes the draw list by layer,
   keeping call order within a layer, so a popup opened early in the frame
   still paints over a window called after it, and sibling popups share a
   layer. `run_at` reports each run's `layer`. `push_layer` and `pop_layer`
