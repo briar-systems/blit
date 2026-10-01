@@ -1930,24 +1930,24 @@ mach build demo/bench -p release
 demo/bench/out/linux-x86_64/release/bin/bench
 ```
 
-Baseline on dev ahead of 0.10.0 (after #81), on an AMD Ryzen 7 5800X3D, to
+Baseline on dev ahead of 0.10.0 (after #152), on an AMD Ryzen 7 5800X3D, to
 compare later work against. Run it on an idle machine and pinned to one core
 (`taskset -c 15`): other load shows up as a large spread, and a run whose
 spread is large is not worth comparing. Two consecutive runs recorded this way
-agreed within 1.5% on every scene.
+agreed within 0.5% on every scene.
 
 ```
 scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
-dense panel    off        495.7     0.3%      3532     3       2
-dense panel    on         501.1     0.4%      3532     3       2   +1.1%
-10k row list   off       5557.5     1.2%      1136     3       0
-10k row list   on        5555.7     1.0%      1136     3       0   +0.0%
-100k chart     off       1816.3     3.4%     10492     3       0
-100k chart     on        1854.3     4.9%     10492     3       0   +2.0%
-windows        off        424.7     1.6%      3672    18       0
-windows        on         430.0     2.7%      3672    18       0   +1.2%
-10k-edge fill  off      14532.5     0.7%    231520     1       0
-10k-edge fill  on       14539.1     2.3%    231520     1       0   +0.0%
+dense panel    off        264.8     0.3%      3532     3       2
+dense panel    on         270.1     0.2%      3532     3       2   +1.9%
+10k row list   off         57.9     0.4%      1136     3       0
+10k row list   on          58.4     0.4%      1136     3       0   +0.9%
+100k chart     off       1679.1     0.3%     10492     3       0
+100k chart     on        1731.0     0.3%     10492     3       0   +3.0%
+windows        off        242.7     2.0%      3672    18       0
+windows        on         247.6     1.2%      3672    18       0   +2.0%
+10k-edge fill  off      14454.7     0.2%    231520     1       0
+10k-edge fill  on       14453.1     0.3%    231520     1       0   +0.0%
 ```
 
 ## Conventions
