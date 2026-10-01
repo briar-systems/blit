@@ -9,7 +9,6 @@ out     = "out/{target.name}/{profile.name}"
 isa     = "x86_64"
 os      = "linux"
 abi     = "sysv64"
-default = true
 
 [target.windows-x86_64]
 isa = "x86_64"
