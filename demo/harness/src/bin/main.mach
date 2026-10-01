@@ -32,6 +32,7 @@ fun main(argc: i64, argv: **u8) i64 {
     # a rounder look at 150%: every theme metric and all text scale with it
     var look: blit.theme.Theme = blit.theme.default();
     look.corner = 3.0::f32;
+    blit.theme.derive(?look);
     blit.context.set_theme(?ctx, look);
     blit.context.set_scale(?ctx, 1.5::f32);
 
