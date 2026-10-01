@@ -96,7 +96,7 @@ rec State {
     checks:  [8]u8;
     values:  [8]f32;
     choices: [8]usize;
-    list:    blit.widget.List;
+    list:    blit.list.List;
     rows:    *str;
     samples: *f32;
     wins:    [6]blit.widget.Window;
@@ -148,7 +148,7 @@ fun dense(ctx: *blit.context.Context, s: *State) {
 # a panel holding a list of ROWS items
 fun rows(ctx: *blit.context.Context, s: *State) {
     val b: blit.widget.Block = blit.widget.begin_panel(ctx, 8.0::f32, 8.0::f32, 400.0::f32);
-    blit.widget.list(ctx, "rows", ?s.list, s.rows, ROWS, nil, 700.0::f32);
+    blit.list.show(ctx, "rows", ?s.list, blit.list.rows(s.rows, ROWS), 700.0::f32);
     blit.widget.end_panel(ctx, b);
 }
 

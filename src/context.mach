@@ -112,6 +112,7 @@ use bid: blit.id;
 use blit.input;
 use blit.layout;
 use blit.path;
+use blit.payload;
 use blit.store;
 use blit.tess;
 use th:   blit.theme;
@@ -365,6 +366,7 @@ pub rec TextLine {
 # clip_on:      1 if the frame copied text into clip, else 0
 # paste_wanted: 1 if a widget asked for the clipboard's text this frame, else 0
 # timed:        1 once a frame has carried the host's clock, else 0
+# clocked:      1 once time has advanced between frames, so the host supplies a clock
 # delta:        seconds since the previous frame, 0 on the first
 # wake:         the earliest time a widget asked for a frame by this frame
 # wake_on:      1 if a widget asked for a frame this frame, else 0
@@ -386,6 +388,7 @@ pub rec TextLine {
 # collided_len: repeat claims recorded in collided
 # z_top:        the highest window z handed out or noted, 0 before any
 # store:        state kept by widget id across frames (see blit.state)
+# drag:         the drag and drop in flight and how the last one ended (see blit.dnd)
 # backlog:      button events held back for the frames after, in arrival order
 # backlog_cap:  events allocated for backlog
 # backlog_len:  events held in backlog
@@ -468,6 +471,7 @@ pub rec Context {
     clip_on:      u8;
     paste_wanted: u8;
     timed:        u8;
+    clocked:      u8;
     delta:        f64;
     wake:         f64;
     wake_on:      u8;
@@ -489,6 +493,7 @@ pub rec Context {
     collided_len: usize;
     z_top:        u64;
     store:        store.Store;
+    drag:         payload.Session;
     backlog:      *input.Event;
     backlog_cap:  usize;
     backlog_len:  usize;
@@ -603,6 +608,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_on      = 0;
     ctx.paste_wanted = 0;
     ctx.timed        = 0;
+    ctx.clocked      = 0;
     ctx.delta        = 0.0::f64;
     ctx.wake         = 0.0::f64;
     ctx.wake_on      = 0;
@@ -628,6 +634,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.backlog_len  = 0;
     ctx.lag          = 0;
     store.init(?ctx.store, a);
+    payload.init(?ctx.drag, a);
     ctx.trace_on    = 0;
     ctx.traced      = nil;
     ctx.traced_cap  = 0;
@@ -639,13 +646,16 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, held-back button events, state, id bookkeeping and text trace
+# composition, held-back button events, state, drag payload, id bookkeeping
+# and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    val ex: err[allo.Error] = payload.free(?ctx.drag);
+    if (sel ex.err) { ret ex; }
     if (ctx.backlog != nil) {
         val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
         if (sel eh.err) { ret eh; }
@@ -757,7 +767,10 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.in           = in;
     ctx.in.prev_down = prev;
     ctx.delta        = 0.0::f64;
-    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
+    if (ctx.timed != 0 && in.time > then) {
+        ctx.delta   = in.time - then;
+        ctx.clocked = 1;
+    }
     ctx.timed = 1;
 
     ctx.sw       = sw;
@@ -832,7 +845,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 
 # finish a frame: close the last run, compose the runs by layer, drop the
 # active widget once its button is released, drop the focus when its
-# holder was not drawn, and age out the state no widget reached
+# holder was not drawn, age out the state no widget reached, and settle the
+# drag and drop in flight (see blit.payload.settle)
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
@@ -841,6 +855,7 @@ pub fun end(ctx: *Context) {
     if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
     if (ctx.focus_drawn == 0)                    { ctx.focus = 0; }
     if (store.sweep(?ctx.store) != 0)            { ctx.oom = 1; }
+    payload.settle(?ctx.drag, ctx.in);
 }
 
 # set how close in time and space a press must follow the previous press on
@@ -1111,7 +1126,7 @@ pub fun preedit_caret(ctx: *Context) usize {
 
 # record each button pressed this frame as its last press, extending the run
 # of clicks when it lands on the claimant the one before did, soon and near
-# enough
+# enough. without a host clock no press is soon, so every one is single
 fun take_presses(ctx: *Context) {
     val near: f32   = px(ctx, ctx.dbl_dist);
     var b:    usize = 0;
@@ -1121,7 +1136,7 @@ fun take_presses(ctx: *Context) {
             val dx:  f32    = ctx.in.mx - p.x;
             val dy:  f32    = ctx.in.my - p.y;
             var run: u32    = 1;
-            if (p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
+            if (ctx.clocked != 0 && p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
                 run = p.clicks + 1;
             }
             @p = Press{time: ctx.in.time, x: ctx.in.mx, y: ctx.in.my, id: ctx.hover, clicks: run};
