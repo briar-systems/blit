@@ -446,6 +446,21 @@ fun len2(x: f32, y: f32) f32 {
     ret sqrt_f32(x * x + y * y);
 }
 
+# where flattening stands between commands
+# ---
+# cx:   current point x, in path units
+# cy:   current point y, in path units
+# sx:   x the open contour started at
+# sy:   y the open contour started at
+# live: 1 while a contour is open
+rec Pen {
+    cx:   f32;
+    cy:   f32;
+    sx:   f32;
+    sy:   f32;
+    live: u8;
+}
+
 # append a path's contours, each point at (ox + x * s, oy + y * s)
 #
 # a contour ends at the next move or at close. a command after close and
@@ -457,77 +472,101 @@ fun len2(x: f32, y: f32) f32 {
 # oy: y offset in screen pixels
 # s:  scale from path units to pixels
 pub fun flatten(sc: *Scratch, p: *path.Path, ox: f32, oy: f32, s: f32) {
-    var cx:   f32   = 0.0::f32;
-    var cy:   f32   = 0.0::f32;
-    var sx:   f32   = 0.0::f32;
-    var sy:   f32   = 0.0::f32;
-    var live: u8    = 0;
-    var i:    usize = 0;
+    var pen: Pen;
+    var i:   usize = 0;
     for (i < path.len(p)) {
-        val o: path.Op = path.at(p, i);
+        step(sc, ?pen, path.at(p, i), ox, oy, s);
         i = i + 1;
-        if (o.verb == path.MOVE) {
-            contour(sc, 0);
-            point(sc, ox + o.x * s, oy + o.y * s);
-            cx   = o.x;
-            cy   = o.y;
-            sx   = o.x;
-            sy   = o.y;
-            live = 1;
-            cnt;
-        }
-        if (o.verb == path.CLOSE) {
-            if (live != 0) { shut(sc); }
-            cx   = sx;
-            cy   = sy;
-            live = 0;
-            cnt;
-        }
-        if (live == 0) {
-            contour(sc, 0);
-            point(sc, ox + cx * s, oy + cy * s);
-            sx   = cx;
-            sy   = cy;
-            live = 1;
-        }
-        if (o.verb == path.QUAD) {
-            val mx: f32   = (cx - 2.0::f32 * o.cx0 + o.x) * s;
-            val my: f32   = (cy - 2.0::f32 * o.cy0 + o.y) * s;
-            val n:  usize = curve_segments(len2(mx, my), 0.25::f32);
-            var k:  usize = 1;
-            for (k <= n) {
-                val t: f32 = k::f32 / n::f32;
-                val u: f32 = 1.0::f32 - t;
-                val x: f32 = u * u * cx + 2.0::f32 * u * t * o.cx0 + t * t * o.x;
-                val y: f32 = u * u * cy + 2.0::f32 * u * t * o.cy0 + t * t * o.y;
-                point(sc, ox + x * s, oy + y * s);
-                k = k + 1;
-            }
-        }
-        or (o.verb == path.CUBIC) {
-            val ax: f32 = (cx - 2.0::f32 * o.cx0 + o.cx1) * s;
-            val ay: f32 = (cy - 2.0::f32 * o.cy0 + o.cy1) * s;
-            val bx: f32 = (o.cx0 - 2.0::f32 * o.cx1 + o.x) * s;
-            val by: f32 = (o.cy0 - 2.0::f32 * o.cy1 + o.y) * s;
-            var m:  f32 = len2(ax, ay);
-            if (len2(bx, by) > m) { m = len2(bx, by); }
-            val n: usize = curve_segments(m, 0.75::f32);
-            var k: usize = 1;
-            for (k <= n) {
-                val t: f32 = k::f32 / n::f32;
-                val u: f32 = 1.0::f32 - t;
-                val x: f32 = u * u * u * cx + 3.0::f32 * u * u * t * o.cx0 + 3.0::f32 * u * t * t * o.cx1 + t * t * t * o.x;
-                val y: f32 = u * u * u * cy + 3.0::f32 * u * u * t * o.cy0 + 3.0::f32 * u * t * t * o.cy1 + t * t * t * o.y;
-                point(sc, ox + x * s, oy + y * s);
-                k = k + 1;
-            }
-        }
-        or {
-            point(sc, ox + o.x * s, oy + o.y * s);
-        }
-        cx = o.x;
-        cy = o.y;
     }
+}
+
+# append the contours of path data (see blit.path), as flatten does a path's
+#
+# the stream is read up to its end or the first malformed command.
+# ---
+# sc:   scratch
+# data: the stream
+# n:    floats in the stream
+# ox:   x offset in screen pixels
+# oy:   y offset in screen pixels
+# s:    scale from path units to pixels
+pub fun flatten_data(sc: *Scratch, data: *f32, n: usize, ox: f32, oy: f32, s: f32) {
+    var pen: Pen;
+    var i:   usize = 0;
+    for (i < n) {
+        var o:    path.Op;
+        val took: usize = path.decode(data, n, i, ?o);
+        if (took == 0) { ret; }
+        step(sc, ?pen, o, ox, oy, s);
+        i = i + took;
+    }
+}
+
+# append one path command
+fun step(sc: *Scratch, pen: *Pen, o: path.Op, ox: f32, oy: f32, s: f32) {
+    if (o.verb == path.MOVE) {
+        contour(sc, 0);
+        point(sc, ox + o.x * s, oy + o.y * s);
+        pen.cx   = o.x;
+        pen.cy   = o.y;
+        pen.sx   = o.x;
+        pen.sy   = o.y;
+        pen.live = 1;
+        ret;
+    }
+    if (o.verb == path.CLOSE) {
+        if (pen.live != 0) { shut(sc); }
+        pen.cx   = pen.sx;
+        pen.cy   = pen.sy;
+        pen.live = 0;
+        ret;
+    }
+    val cx: f32 = pen.cx;
+    val cy: f32 = pen.cy;
+    if (pen.live == 0) {
+        contour(sc, 0);
+        point(sc, ox + cx * s, oy + cy * s);
+        pen.sx   = cx;
+        pen.sy   = cy;
+        pen.live = 1;
+    }
+    if (o.verb == path.QUAD) {
+        val mx: f32   = (cx - 2.0::f32 * o.cx0 + o.x) * s;
+        val my: f32   = (cy - 2.0::f32 * o.cy0 + o.y) * s;
+        val n:  usize = curve_segments(len2(mx, my), 0.25::f32);
+        var k:  usize = 1;
+        for (k <= n) {
+            val t: f32 = k::f32 / n::f32;
+            val u: f32 = 1.0::f32 - t;
+            val x: f32 = u * u * cx + 2.0::f32 * u * t * o.cx0 + t * t * o.x;
+            val y: f32 = u * u * cy + 2.0::f32 * u * t * o.cy0 + t * t * o.y;
+            point(sc, ox + x * s, oy + y * s);
+            k = k + 1;
+        }
+    }
+    or (o.verb == path.CUBIC) {
+        val ax: f32 = (cx - 2.0::f32 * o.cx0 + o.cx1) * s;
+        val ay: f32 = (cy - 2.0::f32 * o.cy0 + o.cy1) * s;
+        val bx: f32 = (o.cx0 - 2.0::f32 * o.cx1 + o.x) * s;
+        val by: f32 = (o.cy0 - 2.0::f32 * o.cy1 + o.y) * s;
+        var m:  f32 = len2(ax, ay);
+        if (len2(bx, by) > m) { m = len2(bx, by); }
+        val n: usize = curve_segments(m, 0.75::f32);
+        var k: usize = 1;
+        for (k <= n) {
+            val t: f32 = k::f32 / n::f32;
+            val u: f32 = 1.0::f32 - t;
+            val x: f32 = u * u * u * cx + 3.0::f32 * u * u * t * o.cx0 + 3.0::f32 * u * t * t * o.cx1 + t * t * t * o.x;
+            val y: f32 = u * u * u * cy + 3.0::f32 * u * u * t * o.cy0 + 3.0::f32 * u * t * t * o.cy1 + t * t * t * o.y;
+            point(sc, ox + x * s, oy + y * s);
+            k = k + 1;
+        }
+    }
+    or {
+        point(sc, ox + o.x * s, oy + o.y * s);
+    }
+    pen.cx = o.x;
+    pen.cy = o.y;
 }
 
 # the bounding box of every point built since begin, false when there is none
