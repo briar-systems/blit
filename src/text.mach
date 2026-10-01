@@ -198,6 +198,11 @@ fun cut_at(ctx: *context.Context, s: str, n: usize, x: f32, y: f32, w: f32, mode
     ret px - x;
 }
 
+# how far a label may overrun its box and still count as fitting: a box sized to
+# its label is built from absolute coordinates, whose rounding far from the left
+# edge leaves it a hair short, and a sixty-fourth of a pixel never shows
+val FIT_SLACK: f32 = 0.015625;
+
 # draw the first n bytes of a line of text with its line box's top-left at
 # (x, y), as it is when it fits the box's span, else as the kind's overflow
 # says: clipped to the box, or cut with an ellipsis at its end to fit the
@@ -218,7 +223,7 @@ fun cut_at(ctx: *context.Context, s: str, n: usize, x: f32, y: f32, w: f32, mode
 pub fun fit_box(ctx: *context.Context, kind: u32, s: str, n: usize, x: f32, y: f32, b: context.Area, c: draw.Color) {
     if (s == nil || n == 0) { ret; }
     val w: f32 = maxf(b.x1 - b.x0, 0.0::f32);
-    if (context.text_width_n(ctx, s, n) <= w) {
+    if (context.text_width_n(ctx, s, n) <= w + FIT_SLACK) {
         context.text_span(ctx, s, n, x, y, c);
         ret;
     }
@@ -336,6 +341,45 @@ pub fun spans_at(ctx: *context.Context, sp: *Span, n: usize, x: f32, y: f32) f32
         i = i + 1;
     }
     ret px - x;
+}
+
+test text__a_label_sized_to_its_box_is_whole_anywhere {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var in: input.Input;
+    context.begin(?ctx, in, 6000.0::f32, 100.0::f32);
+    val s:     str        = "Behavior";
+    val n:     usize      = str_len(s);
+    val lw:    f32        = context.text_width(?ctx, s);
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    # boxes sized to the label as a tab or button builds them, from absolute
+    # coordinates far from the left edge with paddings off the pixel grid; each
+    # must draw the same glyphs as the label drawn whole
+    var k: u32 = 0;
+    for (k < 600) {
+        val x:   f32          = 900.0::f32 + k::f32 * 7.31::f32;
+        val pad: f32          = 1.0::f32 + (k % 37)::f32 * 0.173::f32;
+        val b:   context.Area = context.Area{x0: x + pad, y0: 0.0::f32, x1: (x + (pad * 2.0::f32 + lw)) - pad, y1: 20.0::f32};
+        val ref: usize        = context.draw_count(?ctx);
+        context.text_span(?ctx, s, n, x + pad, 0.0::f32, white);
+        val at: usize = context.draw_count(?ctx);
+        fit_box(?ctx, 0, s, n, x + pad, 0.0::f32, b, white);
+        if (context.draw_count(?ctx) - at != at - ref) { ret 2; }
+        val p: *draw.Vert = context.draw_verts(?ctx);
+        var i: usize      = 0;
+        for (i < at - ref) {
+            if (p[at + i].u != p[ref + i].u || p[at + i].v != p[ref + i].v) { ret 3; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
 }
 
 test text__cuts_and_spans {
