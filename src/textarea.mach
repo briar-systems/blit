@@ -32,6 +32,7 @@ use blit.field;
 use blit.font;
 use blit.input;
 use blit.interact;
+use blit.layout;
 use blit.widget;
 
 # rows a TextArea first allocates, doubled whenever they fill
@@ -300,16 +301,17 @@ fun is_vertical(code: u32) bool {
 # h:   the area's height in pixels
 # ret: this frame's outcome bits: field.EDITED, field.ESCAPED
 pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea, h: f32) u8 {
-    val id:     u64   = context.id_of(ctx, key);
-    val x0:     f32   = ctx.cx;
-    val y0:     f32   = ctx.cy;
-    val w:      f32   = ctx.pw;
-    val bh:     f32   = maxf(h, 0.0::f32);
-    val p:      f32   = context.px(ctx, ctx.theme.pad);
-    val lh:     f32   = context.line_height(ctx);
-    val wide:   f32   = maxf(w - p * 2.0::f32, 0.0::f32);
-    val narrow: f32   = maxf(w - context.px(ctx, ctx.theme.bar_w) - p * 3.0::f32, 0.0::f32);
-    var page:   usize = 1;
+    val id:     u64          = context.id_of(ctx, key);
+    val p:      f32          = context.px(ctx, ctx.theme.pad);
+    val a:      context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), p * 2.0::f32, maxf(h, 0.0::f32));
+    val x0:     f32          = a.x0;
+    val y0:     f32          = a.y0;
+    val w:      f32          = a.x1 - a.x0;
+    val bh:     f32          = a.y1 - a.y0;
+    val lh:     f32          = context.line_height(ctx);
+    val wide:   f32          = maxf(w - p * 2.0::f32, 0.0::f32);
+    val narrow: f32          = maxf(w - context.px(ctx, ctx.theme.bar_w) - p * 3.0::f32, 0.0::f32);
+    var page:   usize        = 1;
     if (bh - p * 2.0::f32 > lh) { page = ((bh - p * 2.0::f32) / lh)::usize; }
 
     f.flags = f.flags | field.LINES;
@@ -359,8 +361,8 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     or { context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, bg); }
 
     context.push_id(ctx, id);
-    val r:  widget.ScrollArea = widget.begin_scroll(ctx, "#scroll", ?t.scroll, bh);
-    val hf: interact.Hit      = interact.hit(ctx, id, 0.0::f32, 0.0::f32, ctx.pw, maxf(content, bh), input.BUTTON_LEFT);
+    val r:  widget.ScrollArea = widget.begin_scroll_at(ctx, "#scroll", ?t.scroll, a);
+    val hf: interact.Hit      = interact.hit(ctx, id, 0.0::f32, 0.0::f32, widget.avail(ctx).x1, maxf(content, bh), input.BUTTON_LEFT);
     if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
     if (hf.pressed || (hf.held && ctx.focus == id)) {
         var pr: usize = 0;
@@ -419,15 +421,16 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
         if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, y, cx + cw, y + lh, ctx.theme.text); }
         if (!quiet)                 { context.set_ime_rect(ctx, cx, y, cx + cw, y + lh); }
     }
-    ctx.cy = content;
+    widget.space(ctx, content);
     widget.end_scroll(ctx, ?t.scroll, r);
     context.pop_id(ctx);
 
     if (field.has(f, field.COUNT)) {
         var counted: [42]u8;
-        val label:   str = edit.count_text(f, ?counted[0]);
-        context.text_at(ctx, label, x0 + w - p - context.text_width(ctx, label), ctx.cy, ctx.theme.text_faint);
-        widget.advance(ctx, lh);
+        val label:   str          = edit.count_text(f, ?counted[0]);
+        val lw:      f32          = context.text_width(ctx, label);
+        val row:     context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), lw + p, lh);
+        context.text_at(ctx, label, row.x1 - p - lw, row.y0, ctx.theme.text_faint);
     }
     ret out;
 }
@@ -438,7 +441,7 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
 fun frame_area(ctx: *context.Context, in: input.Input, f: *field.Field, t: *TextArea, h: f32, top: *f32) u8 {
     context.begin(ctx, in, 200.0::f32, 400.0::f32);
     val p: widget.Block = widget.begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    @top = ctx.cy;
+    @top = widget.avail(ctx).y0;
     val out: u8 = text_area(ctx, "notes", f, t, h);
     widget.end_panel(ctx, p);
     context.end(ctx);
