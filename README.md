@@ -242,43 +242,68 @@ rect for consumer-drawn affordances.
 
 ## Charts
 
-`blit.chart` plots plain arrays into a rect you give it, in the current local
-space, and returns a `Hover` for the value under the cursor:
+`blit.chart` plots columns of values into a rect you give it, in the current
+local space, and returns a `Hover` for the value under the cursor:
 
 ```mach
 var energy: [64]f32;   # filled by you, oldest first
 var income: [64]f32;
 var series: [2]blit.chart.Series;
-series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
-series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, 64, blit.chart.options());
-if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
+series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 64);
+series[0].fill = 1;
+series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 64);
+val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, blit.chart.options());
+if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.x, hov.value
 
-blit.chart.bars(?ctx, x, y, w, h, ?net[0], count, blit.chart.options());
-blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
+# profiler samples: u64 timestamps at uneven spacing, a counter that holds between them
+var t:     [256]u64;
+var bytes: [256]u64;
+var heap:  blit.chart.Series = blit.chart.series(blit.chart.u64s(?bytes[0]), n);
+heap.x     = blit.chart.u64s(?t[0]);
+heap.shape = blit.chart.STEP;
+
+blit.chart.bars(?ctx, x, y, w, h, blit.chart.f32s(?net[0]), count, blit.chart.options());
+blit.chart.sparkline(?ctx, x, y, w, h, series[0]);
 ```
 
-- **Line.** One or more series share x: sample `i` of every series sits at the
-  same x, the first at the plot's left edge and the last at its right. A series
-  with `fill` set fills the area between its line and zero.
+- **Columns.** A `Column` is values of `F32`, `F64` or `U64` at `data + i *
+  stride`, so packed arrays (`f32s`, `f64s`, `u64s`) and fields of an array of
+  records (a stride of the record's size) plot alike, without copying.
+- **Line.** Each series has its own `count` and, optionally, an `x` column of
+  ascending positions, so spacing may be uneven and series need not share
+  samples. Without `x`, sample `i` sits at `x = i`. `shape = STEP` holds each
+  value until the next sample. A series with `fill` set fills the area between
+  its line and zero.
 - **Bars.** One bar per value in equal slots, up from zero when positive and
-  down when negative.
-- **Sparkline.** A compact line fitted to its values, with no axes, for a row or
-  a cell.
-- **Axes.** `Options.y` is the value range, fixed when `lo < hi` and otherwise
-  fitted to the values and widened to whole ticks (bars always hold zero).
-  `Options.x` is what the first and last sample stand for, labelling x, and the
-  sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
-  labels come from the glyph source, with k, M, G or T for large steps.
-  `Options.axes = 0` gives the whole rect to the plot.
+  down when negative. `Options.flush = 1` draws them with no gap.
+- **Sparkline.** A compact series fitted to its values, with no axes, for a row
+  or a cell. It keeps the series' x, shape and fill.
+- **Exact values.** `Num` holds one exact value, `Num.f{f64}` or `Num.u{u64}`.
+  An axis whose values are all u64 keeps an exact origin and steps its ticks in
+  whole numbers, so timestamps and counters past 2^53 label and read out to the
+  last digit. Hovers report `x` and `value` as `Num`.
+- **Axes.** `Options.y` and `Options.x` are `Axis` records: fixed with
+  `blit.chart.fixed(lo, hi)`, else fitted to the values. A fitted y axis is
+  widened to whole ticks (linear bars always hold zero), a fitted x axis spans
+  the samples edge to edge. `log = 1` spaces either axis by powers of ten, with
+  a tick per decade or per few; values at or below zero sit at its floor. Bars
+  label their first and last bar with a fixed `Options.x`, their index
+  otherwise. Ticks step by 1, 2 or 5 times a power of ten and labels come from
+  the glyph source, with k, M, G or T for large steps. `Options.axes = 0` gives
+  the whole rect to the plot.
 - **Hover.** A chart takes one id in call order and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
-  widget. A line reports the sample nearest the cursor and the series nearest it
-  there, bars report the slot under the cursor, and both draw a read-out of the
-  value inside the plot. A sparkline reports and marks its sample.
+  widget. A line reads, in each series, the sample nearest the cursor (for a
+  step series the one whose value holds there) and reports the series nearest
+  the cursor, bars report the slot under the cursor, and both draw a read-out
+  of the value inside the plot. A sparkline reports and marks its sample.
+- **Caller's cursor.** While a line chart is not hovered, `Options.cursor`
+  places its vertical guide, marker and read-out at `cursor.x` on
+  `cursor.series`. Feeding one chart's `Hover` (`x` and `series`) to the others
+  keeps a cursor in step across charts, and a playhead is the same call.
 - **Crisp at any scale.** A line is one quad per screen pixel column, the
-  polyline swept by a square brush of `line_w`, so no sample is ever skipped
-  when samples outnumber pixels. Columns, rules, bars and labels land on whole
+  path swept by a square brush of `line_w`, so no sample is ever skipped when
+  samples outnumber pixels. Columns, rules, bars and labels land on whole
   screen pixels, and every length is a theme metric at the context's scale.
 - **Plain quads.** Charts emit through the painter like every widget, clipped to
   their rect and to any clip or sub-surface they sit in, and allocate nothing
