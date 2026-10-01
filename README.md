@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -148,8 +148,9 @@ blit.context.set_scale(?ctx, 2.0::f32);
   interface, layout and hit rects included, for a HiDPI display or a user's
   choice. Lengths you pass (panel and window widths, dock sizes, your own
   geometry) stay in pixels. `blit.context.px(?ctx, v)` scales them to match.
-  `blit.widget.row_gap(?ctx)`, `text_row_height` and `control_row_height`
-  report the spacing at the current theme and scale.
+  `blit.widget.row_gap(?ctx)`, `text_row_height`, `control_row_height` and
+  `control_height` (a control row without its gap) report the spacing at the
+  current theme and scale.
 - **Rows fit their text.** A control row is `row` tall, or a line of text plus
   `pad` above and below if that is taller, so a larger glyph source never
   overflows its rows.
@@ -166,7 +167,7 @@ and `blit.context.free_area` reports what they leave for the rest of the screen,
 such as a world view. Call docks at the root.
 
 A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
-open one at the layout cursor on its own: its column is clipped and scrolls by the
+open one as the next item of the layout on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
@@ -203,7 +204,9 @@ blit.context.end(?ctx);
 
 - **Time.** `in.time` is the host's monotonic clock in seconds, and
   `blit.context.dt(?ctx)` is the time since the previous frame (0 on the
-  first).
+  first). Double clicks, caret blink and every other timed behaviour need it:
+  a host that never advances `in.time` gets single clicks only and a caret
+  that does not blink.
 - **Pointer.** `down` and `prev_down` are bitmasks of `BUTTON_LEFT`,
   `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
   `blit.input.pressed`, `released` and `held` take the button. The context
@@ -271,15 +274,59 @@ blit.context.end(?ctx);
   val did: u8 = blit.widget.text_field(?ctx, "name", ?name, "name");
   if ((did & blit.field.ENTERED) != 0) { ... }
   ```
-  A press on the field focuses it and puts the caret under the cursor. It takes
-  typed text, backspace and delete, left, right, home and end (shift extends
-  the selection), shortcut A to select all, shortcut C, X and V through the
-  clipboard hand-off, and enter or escape, which end the edit and give the
-  keyboard back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
-  While focused it shows the IME's composition inline at the caret, underlined,
-  and places the candidate window at the caret.
-  The edit model in `blit.field` needs no context, so it can be driven
-  directly.
+  A press on the field focuses it and puts the caret under the cursor, or
+  extends the selection to it with shift held. A double click selects a word
+  and a triple click the line, and dragging extends the selection by
+  characters, words or lines to match. Runs of clicks are counted by
+  `blit.interact` (see `blit.context.set_double_click`).
+  The field takes typed text, backspace and delete, left, right, home and end
+  (shift extends the selection), word movement and deletion with
+  `blit.input.MOD_WORD` (option on darwin, ctrl elsewhere) held with the
+  arrows, backspace and delete, shortcut A to select all, shortcut Z to undo
+  and shortcut shift Z or Y to redo, shortcut C, X and V through the clipboard
+  hand-off, and enter or escape, which end the edit and give the keyboard
+  back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
+  While focused the caret blinks every `blit.edit.BLINK` seconds, asking for
+  the frames it needs through `next_frame`, and the field shows the IME's
+  composition inline at the caret, underlined, and places the candidate window
+  at the caret.
+- **Field flags.** `f.flags` shapes a field, 0 after `init`:
+  `blit.field.MASKED` draws `*` for every character, never copies and takes no
+  composition (a password); `READ_ONLY` moves, selects and copies but refuses
+  every edit; `COUNT` shows the length in characters, against `max` when set;
+  `LINES` makes enter type a newline and home and end act on the line.
+- **Undo.** Undo history lives in a second buffer the consumer owns, so a field
+  without one has no undo:
+  ```mach
+  var hist: [4096]u8;
+  blit.field.keep_history(?name, ?hist[0], 4096);
+  ```
+  Typing and single-character deletions coalesce into word-sized steps, any
+  other edit or a caret movement ends a step, and the oldest steps are dropped
+  when the buffer fills. `blit.field.set` clears the history.
+- **Text area.** `blit.textarea.text_area(?ctx, key, ?f, ?view, h)` edits a
+  field over many lines in a box `h` tall across the column. The text wraps at
+  word boundaries, up and down move the caret by wrapped rows toward the column
+  they started in, page up and page down by a box of rows, and the box scrolls
+  by wheel and scrollbar and to keep the caret in view. Clicks, drags, the
+  keyboard, undo, the clipboard, the caret and the composition behave as in
+  the text field, enter types a newline (the area makes its field `LINES`) and
+  escape ends the edit. A `COUNT` field shows its length on a row below.
+  The `blit.textarea.TextArea` view keeps the scroll and the start of every
+  wrapped row, laid out again only when the text, width, style or scale
+  changes, so each frame draws only the rows in view of however long a text:
+  ```mach
+  var view: blit.textarea.TextArea;
+  blit.textarea.init(?view, ?a);               # once
+  blit.textarea.text_area(?ctx, "notes", ?notes, ?view, 200.0);
+  blit.textarea.free(?view);                   # at shutdown
+  ```
+- **The edit model.** `blit.field` needs no context, so a field can be driven
+  directly: `insert`, `paste`, `erase`, `key`, `undo`, `redo`, `select_word`,
+  `select_line`, `word_left`, `word_right`, `place` and `move`.
+  `blit.edit` holds what both text widgets share between the frame's input and
+  a field (event routing, click and drag selection, the caret blink and masked
+  drawing), for a consumer building a text widget of its own.
 
 ## Clipping & sub-surfaces
 
@@ -360,18 +407,126 @@ if (h.held) { drag_by(h.dx, h.dy); }
   text it will not take) calls `focus` with that id to hand the keyboard
   straight back, and `focused(?ctx, id)` says whether it holds it.
 
+## Drag and drop
+
+`blit.dnd` lets any widget be a drag source or a drop target. Both ends take
+the widget's own `blit.interact.Hit`, so a row, a tab or a window's title bar
+becomes a source or a target by passing its hit along.
+
+```mach
+# a source: past a small move threshold its drag starts with a typed payload,
+# a type tag and bytes the context copies
+val h: blit.interact.Hit = blit.interact.hit(?ctx, id, x0, y0, x1, y1, blit.input.BUTTON_LEFT);
+val d: blit.dnd.Drag = blit.dnd.source(?ctx, h, "layer", (?index)::ptr, $size_of(u64), x0, y0, x1, y1);
+if (d.on) {
+    # the source draws its own preview, on a layer above the interface
+    val pv: blit.dnd.Preview = blit.dnd.begin_preview(?ctx);
+    blit.context.quad(?ctx, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control_on);
+    blit.dnd.end_preview(?ctx, pv);
+}
+if (d.missed) { float_off(); }
+
+# a target: after drawing the widget, name the type it accepts over its rect
+val t: blit.dnd.Drop = blit.dnd.target(?ctx, h, "layer", x0, y0, x1, y1);
+if (t.dropped) { move_layer(@(t.data::*u64), here); }
+```
+
+- **Source.** `source` is called every frame with the widget's hit. Once the
+  widget holds the pointer and has moved `payload.THRESHOLD` (4 unscaled
+  pixels, `set_threshold` changes it) from the press, the drag starts. The
+  payload is copied into storage the context owns, again every frame the drag
+  is on, so a source can hand over a record on its stack, and the rect given
+  is what the preview follows. `Drag.on` is true while its drag is in flight,
+  and through the frame after it ends exactly one of `dropped` (a target took
+  it), `missed` (released over no target) or `cancelled` (Escape) is set, so a
+  dragged tab can become a window when no tab bar took it.
+- **Target.** `target` reports a drag of its type over it when its hit is
+  hot, the topmost claimant under the pointer, and draws the theme's accept
+  highlight (the `select` tint under an `accent` outline) over the rect.
+  `Drop.dropped` is the frame the button comes up over it, with the payload
+  in `data` and `n` and the starting widget in `source`. A target accepting
+  several types calls `target` once per type with the same hit. A target with
+  nothing else to do claims its rect with `interact.hit` and no buttons.
+- **Preview.** `begin_preview` opens a layer above the interface and returns
+  the source's rect in screen pixels, kept under the pointer where the press
+  grabbed it. The source draws anything there, and the layer claims nothing,
+  so targets beneath still see the pointer.
+- **Cancel.** Escape ends a drag at once, and the source cannot start another
+  until its button comes up. A release over no target ends it as missed.
+- **Anywhere.** The drag belongs to the context (`blit.payload`), not to its
+  source, so it outlives the source's frames and reaches targets in any
+  window, dock, popup or surface: the claim order that routes every hover
+  decides which target is under the pointer. `carried(?ctx, kind)` peeks at a
+  drag in flight, for a widget that shows where a drag would land before it
+  is over a target.
+
 ## Widgets & layout
 
-Every widget places itself at the layout cursor, spans the column, advances
-the cursor and draws through the painter, so each one clips and scrolls like
-any geometry and works inside surfaces, docks and windows alike.
+Every widget asks the layout for its rect, draws through the painter in it,
+and moves the layout on, so each one clips and scrolls like any geometry and
+works inside surfaces, docks and windows alike.
 
-- **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
-  `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
+- **A stack of frames.** Layout is a stack of frames on the context
+  (`blit.layout.Frame`): a content box, a pen, the axis items advance along,
+  the gap between them and how they align across it. Every container (panel,
+  window, popup, dock, scroll region, columns, stack) pushes its frame at its
+  begin and pops it at its end, so a panel opened inside a window leaves the
+  window's layout where it was. Outside any container, widgets lay out down a
+  column over the screen.
+- **Stacks.** `begin_stack(?ctx, key, s)`/`end_stack` open a horizontal or
+  vertical stack as the next item of the current frame, and stacks nest.
+  `blit.widget.stack(?ctx, axis)` gives the options at the theme's gap: adjust
+  `gap`, `align` (`start`, `center`, `end` or `stretch`, across the axis), the
+  stack's own `w` and `h` in its parent, and `item_w`/`item_h`, the rules its
+  items take unless they set one.
+  ```mach
+  var bar: blit.layout.Stack = blit.widget.stack(?ctx, blit.layout.Axis.horizontal{});
+  bar.align  = blit.layout.Align.center{};
+  bar.item_w = blit.layout.fit();
+  blit.widget.begin_stack(?ctx, "tools", bar);
+  blit.widget.button(?ctx, "Open");
+  blit.widget.button(?ctx, "Save");
+  blit.widget.size_next(?ctx, blit.layout.fill(1.0::f32), blit.layout.auto());
+  blit.widget.text_field(?ctx, "find", ?find, "find");
+  blit.widget.end_stack(?ctx);
+  ```
+- **Sizing.** Each side of an item is `blit.layout.fixed(px)`, `fit()` (what its
+  content needs), `fill(weight)` (a share of the space the other items leave)
+  or `frac(f)` (a fraction of the space left), and `limit(s, min, max)` clamps
+  any of them. `size_next(?ctx, w, h)` sizes the next item, `auto()` leaving a
+  side to the item. Widgets that spanned the column (buttons, sliders,
+  toggles, fields, dropdowns, sections, scroll regions) fill the width by
+  default, and text, checkboxes, images and grids fit their content.
+- **A hidden first frame.** A single pass cannot know a container's content
+  before placing it, so a stack fitted to its content, a stack centered or
+  end-aligned in its parent, and fill shares along a stack read what the
+  stack measured last frame, kept in the state store under its id. A stack
+  that would place anything by such a measure before it has one lays out its
+  first frame only to measure: its geometry and claims, and its children's,
+  are dropped (`blit.context.push_measure`/`pop_measure`), and it asks for
+  the next frame at once, so `next_frame` is `some(0)`. A guess is never seen
+  or clicked, as with Dear ImGui's hidden first frame for auto-fit windows.
+  After that, a change of content settles one frame late.
+- **Same line.** `same_line(?ctx)` puts the next item beside the last one in a
+  column, for quick inline rows. The line is as tall as its tallest item.
+- **By hand.** `place(?ctx, w, h, nat_w, nat_h)` places a control built
+  outside blit as the next item, with its own rules and natural size, and
+  returns its rect, and `begin_scroll_at` opens a scroll region over such a
+  rect. `avail(?ctx)` is the space the next item may take, from the pen to the
+  frame's far edges. `advance(?ctx, h)` moves past a row placed by hand
+  and `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
   column into n equal cells, gaps between, for widgets that take a rect, such
   as `button_at(?ctx, label, x0, y0, x1, y1, on)`. `begin_columns(?ctx, n)`,
   `next_column` and `end_columns` lay whole widgets side by side and resume
   below the tallest column.
+- **Style.** The gaps between items and the padding containers keep come from
+  the theme (`gap`, `pad`) at the context's scale.
+
+This is a breaking change from the loose layout fields: `Context.ox`, `oy`,
+`cx`, `cy` and `pw` are gone (read `avail` instead), as are the saved-layout
+fields of `Popup`, `ScrollArea` and `DockArea`, and `Columns` holds its row
+instead of `ox` and `pw`.
+
 - **Sections.** `section(?ctx, title, ?open)` is a heading with a caret,
   pointing right when closed and down when open, that returns whether to place
   the rows beneath it.
@@ -386,10 +541,26 @@ any geometry and works inside surfaces, docks and windows alike.
   same without one.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
-- **Lists.** `list(?ctx, key, ?l, ?items[0], count, query, h)` is a scrolling list
-  `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
-  none), and only the items holding `query`, ignoring ASCII case, are shown,
-  so a search box the caller keeps narrows it.
+- **Lists.** `blit.list.show(?ctx, key, ?l, rows, h)` is a scrolling list `h`
+  pixels tall, described each frame by a `blit.list.Rows`:
+  `blit.list.rows(?labels[0], count)` fills one with labels alone, and its
+  fields add the rest. `details` holds a secondary label per row, drawn
+  right-aligned in the dim text color, with the label clipped short of it.
+  `match(user, index, query)` decides which items are shown, defaulting to the
+  items whose label holds `query`, ignoring ASCII case (`blit.widget.matches`,
+  for a matcher to build on). `draw(ctx, user, row)` paints a row's content in
+  place of the labels: the list still claims the row, paints its hover and
+  selection face beneath and scrolls it, so a drawn row keeps hit, selection
+  and scrolling, and anything the drawer claims sits above the row. The
+  `blit.list.Row` it receives carries the item, the row's id and `Hit` (where
+  a drag source or drop target for reordering attaches), its rect, whether it
+  is selected and the text colors for that. `row_h` sets a row height other
+  than the theme's. Clicking a row selects its item (`List.selected`, the
+  count for none). With `List.marks` pointing at one byte per item the list is
+  a multiple selection: a click selects an item alone, ctrl (command on
+  darwin) toggles it, and shift selects the shown items from the last one
+  clicked. A row's id is its item index under the list's, so it keeps its hit
+  identity as the query or matcher changes.
 
 `demo/panel/` builds a docked application panel from these widgets alone, in
 the shape of an application's side panel (a header, then run, view and files
@@ -403,6 +574,35 @@ x, y, w)`/`end_popup` opens an overlay column, and
 `blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` is a left click on an
 arbitrary rect for consumer-drawn affordances, the simplest use of
 `blit.interact.hit`.
+
+## Small controls
+
+`blit.controls` holds the small controls a tool expects, each placed at the
+layout cursor across the column like `blit.widget`'s:
+
+- **Radio buttons.** `radio(?ctx, label, ?choice, value)` is a circle beside
+  its label that sets `@choice` to `value` when clicked, filled in the accent
+  while chosen, so buttons sharing one choice make a group.
+  `radios(?ctx, ?labels[0], n, ?choice)` stacks n of them, button i standing
+  for i.
+- **Progress bars.** `progress(?ctx, frac, text)` fills to `frac` of the
+  column, and `progress_busy(?ctx, text)` sweeps a segment across it every
+  `BUSY_PERIOD` seconds of `in.time` for work of unknown length. A busy bar
+  asks for the frame its segment next moves a pixel in through `wake_at`, so
+  it animates while drawn and an interface without one still reports `none`
+  from `next_frame`. Either takes text to centre over the bar, nil for none.
+- **Separators.** `separator(?ctx)` is a rule across the column in the
+  theme's `edge` color, `edge_w` thick, and `separator_label(?ctx, label)` runs
+  the rule on from a dim label.
+- **Combo.** `combo(?ctx, label, ?selected, ?options[0], count)` is a select
+  whose popup holds a filter field that takes the keyboard when it opens.
+  Typing narrows the options to those holding the text, ignoring ASCII case,
+  up and down move the highlight among them, and enter or a click picks one.
+  Escape or a press outside closes it without a pick. `COMBO_ROWS` options
+  show at once and the rest scroll. Its open state, filter, highlight and
+  scroll live in the state store under its id, and its parts are reached by
+  path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
+  each option an index under it.
 
 ## Widget ids
 
@@ -444,7 +644,7 @@ were. 0 is never an id: it means "no widget".
 
 This is a breaking change from call-order ids: `blit.context.next_id` and
 `Context.seq` are gone, and `begin_popup`, `begin_scroll`, `begin_dock`,
-`list`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
+`blit.list.show`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
 `sparkline` take a key argument after the context.
 
 ## State store
@@ -573,7 +773,7 @@ handle through to the draw list's runs. `0` is reserved for the atlas.
   texels, `whole(tex, filter)` covers the texture.
 - **Drawing.** `blit.context.image_at(?ctx, img, x0, y0, x1, y1, tint)` stretches
   the region into a rect, clipped like any geometry by its run's scissor.
-  `blit.widget.image(?ctx, img, w, h)` places it at the layout cursor.
+  `blit.widget.image(?ctx, img, w, h)` places it in the layout.
 - **Grids.** `blit.widget.Grid` is a row-major field of cells, each colored by
   the consumer (`colors`) or by mapping `values` through a `Palette` of equal
   steps from `lo` to `hi`. `grid_at` fills a rect with it and `grid` places it
@@ -617,8 +817,9 @@ segment count follows their size on screen and the interface scale.
   A fill takes the nonzero rule, so a hole is a contour wound against its
   outline and crossing contours fill their union. Contours that overlap still
   show the faint feathers of the edges they hide, so icons are cleanest drawn
-  as contours that meet without overlapping. Filling costs the square of the
-  edge count, which suits icons and small shapes.
+  as contours that meet without overlapping. A fill sweeps its edges once,
+  sorted, so a large path such as a chart area or a text outline costs
+  e log e in its edge count rather than e squared.
 - **Gradients.** `blit.draw.gradient(x0, y0, c0, x1, y1, c1)` is a linear
   gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
   `rounded_rect_gradient` and `fill_path_gradient`.

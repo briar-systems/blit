@@ -1,0 +1,427 @@
+# drag and drop: any widget can be a source or a target of a typed payload
+#
+# both ends work on the widget's own blit.interact.Hit, so a widget that
+# already takes the pointer becomes a source or a target by passing its hit
+# along. a source pressed and moved past a small threshold (set_threshold)
+# starts a drag and hands the context a payload: a type tag naming what is
+# dragged, such as "list-item" or "window", and bytes the context copies, such
+# as an index or a window's id. the drag belongs to the context from then on
+# (see blit.payload), so it outlives its source and reaches targets in other
+# windows, docks, popups and surfaces alike.
+#
+# a target names the type it accepts over its rect. while a drag of that
+# type is over it, the topmost claimant under the pointer as for any hover, it
+# draws the theme's accept highlight and reports the payload, and on release
+# it takes the drop. a target accepting several types asks once per type with
+# the same hit. Escape cancels a drag, and so does a release over no target.
+#
+# the source draws the preview: begin_preview opens a layer above the
+# interface and hands back the rect the source grabbed, following the
+# pointer, and the source paints whatever it wants there before end_preview.
+# the preview claims nothing, so targets beneath it still see the pointer.
+#
+# a source learns how its drag ended in the frames after: dropped on a target,
+# missed (released over none) or cancelled, so a dragged tab can float off as
+# a window when no tab bar took it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.context;
+use blit.draw;
+use blit.driver;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.payload;
+use blit_widget: blit.widget;
+
+# what a source's drag is doing this frame
+# ---
+# on:        true while its drag is in flight
+# dropped:   true through the frame after a target took its drag
+# missed:    true through the frame after its drag was released over no target
+# cancelled: true through the frame after Escape cancelled its drag
+pub rec Drag {
+    on:        bool;
+    dropped:   bool;
+    missed:    bool;
+    cancelled: bool;
+}
+
+# a drag over a target this frame
+# ---
+# over:    true while a drag of the accepted type is over the target
+# dropped: true on the frame it was released over the target, which takes it
+# source:  the id of the widget the drag started on
+# data:    the payload bytes, valid until the next drag starts
+# n:       payload byte count
+# mx:      pointer x in the target's local space
+# my:      pointer y in the target's local space
+pub rec Drop {
+    over:    bool;
+    dropped: bool;
+    source:  u64;
+    data:    *u8;
+    n:       usize;
+    mx:      f32;
+    my:      f32;
+}
+
+# the drag in flight
+# ---
+# kind:   its type tag
+# source: the id of the widget it started on
+# data:   the payload bytes, valid until the next drag starts
+# n:      payload byte count
+pub rec Payload {
+    kind:   str;
+    source: u64;
+    data:   *u8;
+    n:      usize;
+}
+
+# where the preview draws, in screen pixels on the preview layer
+# ---
+# on: true when a drag is in flight and the preview layer is open
+# x0: left edge of the grabbed rect, following the pointer
+# y0: top edge
+# x1: right edge
+# y1: bottom edge
+pub rec Preview {
+    on: bool;
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+}
+
+# the context's drag, with an Escape this frame already applied
+fun session(ctx: *context.Context) *payload.Session {
+    payload.check_escape(?ctx.drag, ctx.in);
+    ret ?ctx.drag;
+}
+
+# make a widget a drag source
+#
+# call it every frame with the widget's hit. once the widget holds the pointer
+# and has moved past the threshold, the drag starts with the payload given,
+# which is copied in again each frame the drag is on, so it can change while
+# it is dragged. the rect is the widget's, in the current local space: the
+# preview follows the pointer at the place in it the press grabbed.
+# ---
+# ctx:  context
+# h:    the widget's hit this frame (see blit.interact.hit)
+# kind: the payload's type tag
+# data: the payload bytes, copied; nil when n is 0
+# n:    payload byte count
+# x0:   the widget's left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# ret:  what its drag is doing
+pub fun source(ctx: *context.Context, h: interact.Hit, kind: str, data: ptr, n: usize, x0: f32, y0: f32, x1: f32, y1: f32) Drag {
+    var d: Drag;
+    if (h.id == 0) { ret d; }
+    val s: *payload.Session = session(ctx);
+    if (s.ended != payload.ENDED_NONE && s.ended_src == h.id) {
+        d.dropped   = s.ended == payload.ENDED_DROPPED;
+        d.missed    = s.ended == payload.ENDED_MISSED;
+        d.cancelled = s.ended == payload.ENDED_CANCELLED;
+    }
+    if (s.live != 0 && s.source == h.id) {
+        val e: err[allo.Error] = payload.put(s, kind, data, n);
+        if (sel e.err) { ctx.oom = 1; }
+        d.on = true;
+        ret d;
+    }
+    if (s.live != 0 || !h.held || s.spent == h.id) { ret d; }
+    val t: f32 = context.px(ctx, s.threshold);
+    if (h.dx * h.dx + h.dy * h.dy < t * t) { ret d; }
+
+    val e: err[allo.Error] = payload.put(s, kind, data, n);
+    if (sel e.err) {
+        ctx.oom = 1;
+        ret d;
+    }
+    s.live      = 1;
+    s.source    = h.id;
+    s.button    = h.button;
+    s.delivered = 0;
+    s.gx        = h.mx - h.dx - x0;
+    s.gy        = h.my - h.dy - y0;
+    s.w         = x1 - x0;
+    s.h         = y1 - y0;
+    d.on        = true;
+    d.dropped   = false;
+    d.missed    = false;
+    d.cancelled = false;
+    ret d;
+}
+
+# the layer the preview draws on, above the interface
+#
+# the one place the preview's layer is chosen: the window layer bands (#82)
+# redirect it to their drag preview band, above every other band.
+fun open_layer(ctx: *context.Context) {
+    context.push_layer(ctx);
+}
+
+# close the layer open_layer opened
+fun close_layer(ctx: *context.Context) {
+    context.pop_layer(ctx);
+}
+
+# open the drag preview, when a drag is in flight
+#
+# the source calls it while its drag is on and draws the preview in the rect
+# it hands back, in screen pixels: the rect the source grabbed, kept under
+# the pointer where the press caught it. the layer claims nothing.
+# ---
+# ctx: context
+# ret: the preview's rect, on when the layer is open and end_preview must close it
+pub fun begin_preview(ctx: *context.Context) Preview {
+    var p: Preview;
+    val s: *payload.Session = session(ctx);
+    if (s.live == 0) { ret p; }
+    open_layer(ctx);
+    p.on = true;
+    p.x0 = ctx.in.mx - s.gx;
+    p.y0 = ctx.in.my - s.gy;
+    p.x1 = p.x0 + s.w;
+    p.y1 = p.y0 + s.h;
+    ret p;
+}
+
+# close the drag preview begin_preview opened
+# ---
+# ctx: context
+# p:   the value begin_preview returned
+pub fun end_preview(ctx: *context.Context, p: Preview) {
+    if (p.on) { close_layer(ctx); }
+}
+
+# make a widget a drop target for one type of payload
+#
+# call it with the widget's hit after drawing the widget, so the accept
+# highlight lies over it. a target with no other interaction claims its rect
+# with interact.hit and no buttons.
+# ---
+# ctx:  context
+# h:    the widget's hit this frame
+# kind: the type tag it accepts
+# x0:   left x of the highlight in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# ret:  the drag over it, if any
+pub fun target(ctx: *context.Context, h: interact.Hit, kind: str, x0: f32, y0: f32, x1: f32, y1: f32) Drop {
+    var d: Drop;
+    val s: *payload.Session = session(ctx);
+    if (!h.hot || !payload.is_kind(s, kind)) { ret d; }
+    d.over   = true;
+    d.source = s.source;
+    d.data   = payload.data(s);
+    d.n      = s.n;
+    d.mx     = h.mx;
+    d.my     = h.my;
+    highlight(ctx, x0, y0, x1, y1);
+    if (input.held(ctx.in, s.button) == 0) {
+        d.dropped   = true;
+        s.delivered = 1;
+    }
+    ret d;
+}
+
+# the accept highlight: the selection tint under an accent outline
+fun highlight(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32) {
+    context.quad(ctx, x0, y0, x1, y1, ctx.theme.select);
+    context.frame(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.edge_w), ctx.theme.accent);
+}
+
+# the drag in flight, when its type is kind
+#
+# for widgets that react to a drag anywhere, such as a dock showing where a
+# dragged window would land.
+# ---
+# ctx:  context
+# kind: the type tag asked about
+# ret:  the payload, or none when no drag of that type is in flight
+pub fun carried(ctx: *context.Context, kind: str) opt[Payload] {
+    val s: *payload.Session = session(ctx);
+    if (!payload.is_kind(s, kind)) { ret opt[Payload].none{}; }
+    ret opt[Payload].some{Payload{kind: payload.kind(s), source: s.source, data: payload.data(s), n: s.n}};
+}
+
+# set how far the pointer moves from a press on a source before a drag starts
+# ---
+# ctx:  context
+# dist: unscaled pixels, multiplied by the interface scale, payload.THRESHOLD by default
+pub fun set_threshold(ctx: *context.Context, dist: f32) {
+    ctx.drag.threshold = dist;
+}
+
+# two windows side by side: a source row in the left, two target rows in the
+# right, one accepting the source's type and one another type
+# ---
+# left:    the "From" window
+# right:   the "To" window
+# value:   the payload the source drags
+# drag:    what the source's drag did this frame
+# ons:     frames the source's drag was on
+# got:     the payload the accepting row last took, 0 before any
+# drops:   drops the accepting row took
+# overs:   frames a drag was over the accepting row
+# others:  frames a drag was over the row accepting another type
+# preview: the last preview rect opened
+# px:      the pointer x the last preview opened at
+# py:      the pointer y the last preview opened at
+#[testing]
+rec Pair {
+    left:    blit_widget.Window;
+    right:   blit_widget.Window;
+    value:   u64;
+    drag:    Drag;
+    ons:     usize;
+    got:     u64;
+    drops:   usize;
+    overs:   usize;
+    others:  usize;
+    preview: Preview;
+    px:      f32;
+    py:      f32;
+}
+
+# a row in the current window, claimed for the left button
+#[testing]
+fun row(ctx: *context.Context, key: str, x0: *f32, y0: *f32, x1: *f32, y1: *f32) interact.Hit {
+    val r: context.Area = blit_widget.place(ctx, layout.fill(1.0::f32), layout.fixed(20.0::f32), 0.0::f32, 20.0::f32);
+    @x0 = r.x0;
+    @y0 = r.y0;
+    @x1 = r.x1;
+    @y1 = r.y1;
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, key), @x0, @y0, @x1, @y1, input.BUTTON_LEFT);
+    ret h;
+}
+
+#[testing]
+fun pair_ui(ctx: *context.Context, user: ptr) {
+    val p:  *Pair = user::*Pair;
+    var x0: f32;
+    var y0: f32;
+    var x1: f32;
+    var y1: f32;
+
+    val bl: blit_widget.Block = blit_widget.begin_window(ctx, ?p.left);
+    val hs: interact.Hit      = row(ctx, "item", ?x0, ?y0, ?x1, ?y1);
+    p.drag = source(ctx, hs, "item", (?p.value)::ptr, $size_of(u64), x0, y0, x1, y1);
+    if (p.drag.on) {
+        p.ons = p.ons + 1;
+        val pv: Preview = begin_preview(ctx);
+        p.preview = pv;
+        p.px      = ctx.in.mx;
+        p.py      = ctx.in.my;
+        context.quad(ctx, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control);
+        end_preview(ctx, pv);
+    }
+    blit_widget.end_window(ctx, ?p.left, bl);
+
+    val br: blit_widget.Block = blit_widget.begin_window(ctx, ?p.right);
+    val ht: interact.Hit      = row(ctx, "slot", ?x0, ?y0, ?x1, ?y1);
+    val d:  Drop              = target(ctx, ht, "item", x0, y0, x1, y1);
+    if (d.over) { p.overs = p.overs + 1; }
+    if (d.dropped && d.n == $size_of(u64)) {
+        p.got   = @(d.data::*u64);
+        p.drops = p.drops + 1;
+    }
+    val ho: interact.Hit = row(ctx, "other", ?x0, ?y0, ?x1, ?y1);
+    if (target(ctx, ho, "file", x0, y0, x1, y1).over) { p.others = p.others + 1; }
+    blit_widget.end_window(ctx, ?p.right, br);
+}
+
+#[testing]
+fun pair(d: *driver.Driver, a: *allo.Allocator, p: *Pair) bool {
+    p.left  = blit_widget.Window{x: 10.0::f32, y: 10.0::f32, w: 120.0::f32, open: 1, title: "From"};
+    p.right = blit_widget.Window{x: 200.0::f32, y: 10.0::f32, w: 120.0::f32, open: 1, title: "To"};
+    p.value = 42;
+    val e: err[allo.Error] = driver.init(d, a, 400.0::f32, 200.0::f32, pair_ui, p::ptr);
+    if (sel e.err) { ret false; }
+    driver.step(d);
+    ret true;
+}
+
+test dnd__drops_across_windows_and_cancels {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Pair;
+    var d: driver.Driver;
+    if (!pair(?d, ?a, ?p)) { ret 1; }
+    val item:  u64 = driver.find(?d, "From/item");
+    val slot:  u64 = driver.find(?d, "To/slot");
+    val other: u64 = driver.find(?d, "To/other");
+    if (!driver.drawn(?d, item) || !driver.drawn(?d, slot)) { ret 2; }
+
+    # a drag from one window onto a target in the other delivers the payload,
+    # and the source learns it was dropped in the frame after
+    if (!driver.drag_onto(?d, item, slot))         { ret 3; }
+    if (p.drops != 1 || p.got != 42 || p.ons == 0) { ret 4; }
+    if (p.overs == 0 || p.others != 0)             { ret 5; }
+    driver.step(?d);
+    if (!p.drag.dropped || p.drag.on) { ret 6; }
+    driver.step(?d);
+    if (p.drag.dropped) { ret 7; }
+
+    # the preview keeps the grabbed point under the pointer
+    if (!p.preview.on)                               { ret 8; }
+    if (p.preview.x1 - p.preview.x0 != 120.0::f32)   { ret 9; }
+    if (p.px < p.preview.x0 || p.px >= p.preview.x1) { ret 10; }
+    if (p.py < p.preview.y0 || p.py >= p.preview.y1) { ret 11; }
+
+    # the other type's target never sees it, and a release over it misses
+    p.value = 7;
+    if (!driver.drag_onto(?d, item, other)) { ret 12; }
+    if (p.others != 0 || p.drops != 1)      { ret 13; }
+    driver.step(?d);
+    if (!p.drag.missed) { ret 14; }
+
+    # released over no target at all misses too
+    if (!driver.drag(?d, item, 380.0::f32, 190.0::f32)) { ret 15; }
+    driver.step(?d);
+    if (!p.drag.missed || p.drops != 1) { ret 16; }
+
+    # Escape cancels, and the same press does not start it again over a target
+    val r: opt[context.Area] = driver.rect(?d, slot);
+    if (sel r.none) { ret 17; }
+    driver.hover(?d, item);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, 150.0::f32, 40.0::f32);
+    if (!p.drag.on) { ret 18; }
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (!p.drag.cancelled || p.drag.on) { ret 19; }
+    driver.move(?d, (r.some.x0 + r.some.x1) / 2.0::f32, (r.some.y0 + r.some.y1) / 2.0::f32);
+    driver.move(?d, (r.some.x0 + r.some.x1) / 2.0::f32 + 1.0::f32, (r.some.y0 + r.some.y1) / 2.0::f32);
+    if (p.drag.on) { ret 20; }
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.drops != 1) { ret 21; }
+
+    # a press that moves less than the threshold is no drag
+    val ons: usize = p.ons;
+    driver.hover(?d, item);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, d.in.mx + 2.0::f32, d.in.my);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.ons != ons) { ret 22; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

@@ -16,18 +16,26 @@ fwd blit.path;
 fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;
+fwd blit.layout;
 fwd blit.hit;
 fwd blit.interact;
 fwd blit.id;
 fwd blit.field;
 fwd blit.writer;
+fwd blit.edit;
 fwd blit.theme;
 fwd blit.style;
 fwd blit.context;
 fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
+fwd blit.tree;
+fwd blit.textarea;
+fwd blit.list;
 fwd blit.chart;
+fwd blit.controls;
+fwd blit.payload;
+fwd blit.dnd;
 fwd blit.driver;
 
 # blit library version
