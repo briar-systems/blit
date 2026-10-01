@@ -1009,6 +1009,13 @@ instead of `ox` and `pw`.
   home and end move it a row at a time, right opens a node or steps into it,
   left closes one or steps out to its parent, enter activates the node as a
   double click does and space selects it.
+  A list lays out and draws only the rows in view, passing over the rest in
+  blocks, so it costs its visible rows and, with a query or a matcher, one
+  test per item. Its natural width, which a container sized to its content
+  takes, is the widest row it has laid out so far (`List.width`): it grows as
+  wider rows scroll into view and never shrinks while scrolling. It resets
+  when the list has no items, and a caller whose labels change sets it to 0
+  to measure afresh.
 
 `demo/panel/` builds a docked application panel from these widgets alone, in
 the shape of an application's side panel (a header, then run, view and files
@@ -1984,24 +1991,24 @@ mach build demo/bench -p release
 demo/bench/out/linux-x86_64/release/bin/bench
 ```
 
-Baseline on dev ahead of 0.10.0 (after #81), on an AMD Ryzen 7 5800X3D, to
+Baseline on dev ahead of 0.10.0 (after #152), on an AMD Ryzen 7 5800X3D, to
 compare later work against. Run it on an idle machine and pinned to one core
 (`taskset -c 15`): other load shows up as a large spread, and a run whose
 spread is large is not worth comparing. Two consecutive runs recorded this way
-agreed within 1.5% on every scene.
+agreed within 2% on every scene.
 
 ```
 scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
-dense panel    off        495.7     0.3%      3532     3       2
-dense panel    on         501.1     0.4%      3532     3       2   +1.1%
-10k row list   off       5557.5     1.2%      1136     3       0
-10k row list   on        5555.7     1.0%      1136     3       0   +0.0%
-100k chart     off       1816.3     3.4%     10492     3       0
-100k chart     on        1854.3     4.9%     10492     3       0   +2.0%
-windows        off        424.7     1.6%      3672    18       0
-windows        on         430.0     2.7%      3672    18       0   +1.2%
-10k-edge fill  off      14532.5     0.7%    231520     1       0
-10k-edge fill  on       14539.1     2.3%    231520     1       0   +0.0%
+dense panel    off        253.4     3.4%      3532     3       0
+dense panel    on         258.0     0.4%      3532     3       0   +1.8%
+10k row list   off         60.4     2.3%      1136     3       0
+10k row list   on          60.7     0.4%      1136     3       0   +0.5%
+100k chart     off       1697.3     4.4%     10492     3       0
+100k chart     on        1756.1     0.7%     10492     3       0   +3.4%
+windows        off        241.5     3.9%      3672    18       0
+windows        on         246.4     0.6%      3672    18       0   +2.0%
+10k-edge fill  off      14413.6     1.5%    231520     1       0
+10k-edge fill  on       14404.5     0.9%    231520     1       0   +0.0%
 ```
 
 ## Conventions

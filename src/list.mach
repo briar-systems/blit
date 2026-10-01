@@ -13,8 +13,11 @@
 # claims each shown row through interact.hit and paints its hover, press and
 # selection face before the row's content, so a row drawn by the caller keeps
 # hit, selection and scrolling. anything the drawer claims sits above the row
-# and takes its own input. rows scrolled out of view are skipped rather than
-# emitted.
+# and takes its own input. rows scrolled out of view are passed over in blocks
+# rather than laid out one by one, so a list costs the rows in view and, with
+# a query or a matcher, one test per item. the list's natural width is the
+# widest row it has laid out so far (List.width), so a container sized to its
+# content settles as rows scroll into view and never narrows while scrolling.
 #
 # a row's id and hit are passed to its drawer, which is where a drag source or
 # a drop target for reordering rows attaches.
@@ -63,11 +66,15 @@ pub def Drawer: fun(*context.Context, ptr, Row);
 #           it is selected, which makes the list a multiple selection
 # cursor:   with marks, the item the keyboard last moved to or a click
 #           landed on, where the arrows move from
+# width:    the widest row the list has laid out, its natural width, which
+#           only grows while it scrolls. 0 when the list has no items, and
+#           set to 0 by the caller when its labels change to measure afresh
 pub rec List {
     selected: usize;
     scroll:   widget.Scroll;
     marks:    *u8;
     cursor:   usize;
+    width:    f32;
 }
 
 # what a list shows this frame
@@ -140,6 +147,20 @@ fun shown(r: *Rows, i: usize) bool {
     if (r.match != nil)  { ret r.match(r.user, i, r.query); }
     if (r.labels == nil) { ret true; }
     ret widget.matches(r.labels[i], r.query);
+}
+
+# whether every item is shown, so rows can be counted without testing them
+fun shows_all(r: *Rows) bool {
+    if (r.match != nil)  { ret false; }
+    if (r.labels == nil) { ret true; }
+    ret r.query == nil || r.query[0] == 0;
+}
+
+# pass n rows h tall over in the list's column as one block, measured as if
+# each were placed but adding no width
+fun pass(f: *layout.Frame, n: usize, h: f32) {
+    if (n == 0) { ret; }
+    layout.skip(f, n::f32 * h + (n - 1)::f32 * f.gap, true);
 }
 
 # whether item i is selected
@@ -224,8 +245,9 @@ fun natural_w(ctx: *context.Context, r: *Rows, i: usize) f32 {
 
 # a scrolling list of rows, h pixels tall, whose items can be selected
 #
-# the list holds the keyboard as described above. only the items the matcher shows are laid out. clicking a shown row selects
-# its item: with l.marks nil it becomes the one selected item, else the click
+# the list holds the keyboard as described above. only the items the matcher
+# shows take rows, and only the rows in view are laid out and drawn, the rest
+# passed over in blocks. clicking a shown row selects its item: with l.marks nil it becomes the one selected item, else the click
 # edits the multiple selection (a plain click selects it alone, ctrl or
 # command toggles it, shift selects the shown items from the anchor to it).
 # selected rows are drawn in the accent. the list scrolls by the wheel and a
@@ -243,6 +265,7 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
     var changed: bool              = false;
     if (rh <= 0.0::f32) { rh = widget.control_height(ctx); }
     val top: f32 = area.top;
+    if (r.count == 0) { l.width = 0.0::f32; }
 
     # the list's own stop, over the region it scrolls in
     val view:  context.Area = context.Area{x0: 0.0::f32, y0: area.top, x1: area.w, y1: area.top + area.h};
@@ -251,61 +274,104 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
     if (keyed) { aim = aimed(ctx, l, ?r, h, rh); }
     var pressed: bool = false;
 
-    var i: usize = 0;
+    # rows wholly above the view but for the last of them, which is laid out
+    # so rounding never hides a row in view
+    val f:     *layout.Frame = context.top_layout(ctx);
+    val all:   bool          = shows_all(?r);
+    var above: usize         = 0;
+    val past:  f32           = top - f.y - rh;
+    if (past > 0.0::f32) { above = (past / (rh + f.gap))::usize; }
+
+    # i is the item, j the shown rows before it, held the shown rows passed
+    # over since the last one laid out, and below set once a row falls past
+    # the view. the aimed row is laid out wherever it is, to scroll it in
+    var j:     usize = 0;
+    var held:  usize = 0;
+    var below: bool  = false;
+    var i:     usize = 0;
     for (i < r.count) {
-        if (shown(?r, i)) {
-            val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), natural_w(ctx, ?r, i), rh);
-            if (i == aim) {
+        if (all) {
+            # every item is a row, so a run passed over is jumped
+            var to: usize = r.count;
+            if (!below)               { to = above; }
+            if (aim >= i && aim < to) { to = aim; }
+            if (to > i) {
+                held = held + to - i;
+                j    = to;
+                i    = to;
+                cnt;
+            }
+        }
+        or {
+            if (!shown(?r, i)) {
+                i = i + 1;
+                cnt;
+            }
+            if ((below || j < above) && i != aim) {
+                held = held + 1;
+                j    = j + 1;
+                i    = i + 1;
+                cnt;
+            }
+        }
+        pass(f, held, rh);
+        held = 0;
+        j    = j + 1;
+        val nw: f32 = natural_w(ctx, ?r, i);
+        if (nw > l.width) { l.width = nw; }
+        val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), l.width, rh);
+        if (i == aim) {
+            if (l.marks != nil) {
+                var mods: u8 = 0;
+                if ((ctx.in.mods & input.MOD_SHIFT) != 0) { mods = input.MOD_SHIFT; }
+                if (click_many(l, ?r, i, mods))           { changed = true; }
+                l.cursor = i;
+            }
+            or (l.selected != i) {
+                l.selected = i;
+                changed    = true;
+            }
+            if (a.y0 < l.scroll.offset)     { l.scroll.offset = a.y0; }
+            if (a.y1 > l.scroll.offset + h) { l.scroll.offset = a.y1 - h; }
+        }
+        if (a.y0 >= top + area.h) { below = true; }
+        or (a.y1 > top) {
+            var row: Row;
+            row.index = i;
+            row.id    = bid.child_int(area.id, i::u64);
+            row.x0    = a.x0;
+            row.y0    = a.y0;
+            row.x1    = a.x1;
+            row.y1    = a.y1;
+            row.hit   = interact.hit(ctx, row.id, row.x0, row.y0, row.x1, row.y1, input.BUTTON_LEFT);
+            if (row.hit.pressed) { pressed = true; }
+            if (row.hit.clicked) {
+                l.cursor = i;
                 if (l.marks != nil) {
-                    var mods: u8 = 0;
-                    if ((ctx.in.mods & input.MOD_SHIFT) != 0) { mods = input.MOD_SHIFT; }
-                    if (click_many(l, ?r, i, mods))           { changed = true; }
-                    l.cursor = i;
+                    if (click_many(l, ?r, i, ctx.in.mods)) { changed = true; }
                 }
                 or (l.selected != i) {
                     l.selected = i;
                     changed    = true;
                 }
-                if (a.y0 < l.scroll.offset)     { l.scroll.offset = a.y0; }
-                if (a.y1 > l.scroll.offset + h) { l.scroll.offset = a.y1 - h; }
             }
-            if (a.y1 > top && a.y0 < top + area.h) {
-                var row: Row;
-                row.index = i;
-                row.id    = bid.child_int(area.id, i::u64);
-                row.x0    = a.x0;
-                row.y0    = a.y0;
-                row.x1    = a.x1;
-                row.y1    = a.y1;
-                row.hit   = interact.hit(ctx, row.id, row.x0, row.y0, row.x1, row.y1, input.BUTTON_LEFT);
-                if (row.hit.pressed) { pressed = true; }
-                if (row.hit.clicked) {
-                    l.cursor = i;
-                    if (l.marks != nil) {
-                        if (click_many(l, ?r, i, ctx.in.mods)) { changed = true; }
-                    }
-                    or (l.selected != i) {
-                        l.selected = i;
-                        changed    = true;
-                    }
-                }
 
-                row.selected = is_selected(l, i);
-                val st: u8           = theme.pick(row.hit.hot, row.hit.active, row.selected, false);
-                val p:  *theme.Paint = context.paint_of(ctx, theme.LIST_ITEM, st);
-                row.ink = p.text;
-                row.dim = p.mark;
-                context.box(ctx, theme.LIST_ITEM, st, row.x0, row.y0, row.x1, row.y1);
+            row.selected = is_selected(l, i);
+            val st: u8           = theme.pick(row.hit.hot, row.hit.active, row.selected, false);
+            val p:  *theme.Paint = context.paint_of(ctx, theme.LIST_ITEM, st);
+            row.ink = p.text;
+            row.dim = p.mark;
+            context.box(ctx, theme.LIST_ITEM, st, row.x0, row.y0, row.x1, row.y1);
 
-                if (r.draw != nil) { r.draw(ctx, r.user, row); }
-                or                 { draw_labels(ctx, ?r, row); }
-                if (keyed && i == cursor_of(l) && context.focus_visible(ctx)) {
-                    context.box(ctx, theme.FOCUS_RING, theme.NORMAL, row.x0, row.y0, row.x1, row.y1);
-                }
+            if (r.draw != nil) { r.draw(ctx, r.user, row); }
+            or                 { draw_labels(ctx, ?r, row); }
+            if (keyed && i == cursor_of(l) && context.focus_visible(ctx)) {
+                context.box(ctx, theme.FOCUS_RING, theme.NORMAL, row.x0, row.y0, row.x1, row.y1);
             }
         }
         i = i + 1;
     }
+    pass(f, held, rh);
     widget.end_scroll(ctx, ?l.scroll, area);
     if (pressed && !keyed) { context.focus(ctx, area.id); }
     ret changed;
@@ -458,6 +524,8 @@ test list__selects_scrolls_and_searches {
     driver.scroll(?d, row_id(?d, 1), 0.0::f32, -40.0::f32);
     driver.settle(?d);
     if (p.l.scroll.offset != 40.0::f32 || driver.drawn(?d, row_id(?d, 0))) { ret 6; }
+    # rows passed over out of view still take their room
+    if (p.l.scroll.content != 400.0::f32) { ret 6; }
     click_row(?d, 2, 0);
     if (p.l.selected != 2) { ret 7; }
 
@@ -472,6 +540,73 @@ test list__selects_scrolls_and_searches {
     if (p.l.selected != 3) { ret 10; }
 
     val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# one frame of a list in a window sized to its content, scrolled to offset,
+# returning the window's width
+#[testing]
+fun auto_frame(ctx: *context.Context, l: *List, r: Rows, offset: f32) f32 {
+    var win: widget.Window = widget.window("w", 0.0::f32, 0.0::f32, 40.0::f32, 0.0::f32);
+    win.min_w = 40.0::f32;
+    win.flags = widget.WINDOW_AUTO_SIZE;
+    var in: input.Input;
+    in.mx           = -1.0::f32;
+    in.my           = -1.0::f32;
+    l.scroll.offset = offset;
+    context.begin(ctx, in, 600.0::f32, 400.0::f32);
+    val b: widget.WindowArea = widget.begin_window(ctx, win);
+    show(ctx, "list", l, r, 60.0::f32);
+    widget.end_window(ctx, b);
+    context.end(ctx);
+    ret widget.window_state(ctx, "w").w;
+}
+
+test list__natural_width_never_shrinks_while_scrolling {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var labels: [20]str;
+    var k:      usize = 0;
+    for (k < 20) {
+        labels[k] = "a";
+        k         = k + 1;
+    }
+    labels[15] = "a label far wider than the rest";
+    var l: List;
+    l.selected = 20;
+
+    # down to the wide row and back up, the window never narrowing, and wider
+    # once the wide row was seen
+    var offs: [3]f32;
+    offs[0] = 0.0::f32;
+    offs[1] = 300.0::f32;
+    offs[2] = 0.0::f32;
+    var last:  f32   = 0.0::f32;
+    var first: f32   = 0.0::f32;
+    var s:     usize = 0;
+    for (s < 3) {
+        var n: usize = 0;
+        for (n < 30) {
+            val w: f32 = auto_frame(?ctx, ?l, rows(?labels[0], 20), offs[s]);
+            if (w < last) { ret 2; }
+            last = w;
+            n    = n + 1;
+        }
+        if (s == 0) { first = last; }
+        s = s + 1;
+    }
+    if (last <= first) { ret 3; }
+
+    # a list emptied measures afresh
+    auto_frame(?ctx, ?l, rows(?labels[0], 0), 0.0::f32);
+    if (l.width != 0.0::f32) { ret 4; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
 }

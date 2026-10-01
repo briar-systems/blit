@@ -621,16 +621,11 @@ fun members(ctx: *context.Context, p: *Pass) bool {
     state.each[widget.Docked](ctx, gather_one, (?g)::ptr);
     p.n = g.n;
     if (g.n == 0) { ret true; }
-    val got: res[*Member, allo.Error] = allo.allocate[Member](ctx.a, g.n);
-    if (sel got.err) { ret false; }
-    val tb: res[*tabs.Tab, allo.Error] = allo.allocate[tabs.Tab](ctx.a, g.n);
-    if (sel tb.err) {
-        val f: err[allo.Error] = allo.deallocate[Member](ctx.a, got.ok, g.n);
-        ret false;
-    }
-    p.m     = got.ok;
-    p.tabs  = tb.ok;
-    g.items = got.ok;
+    # scratch for this frame alone, so a steady frame allocates nothing
+    p.m    = context.frame_alloc[Member](ctx, g.n);
+    p.tabs = context.frame_alloc[tabs.Tab](ctx, g.n);
+    if (p.m == nil || p.tabs == nil) { ret false; }
+    g.items = p.m;
     g.n     = 0;
     state.each[widget.Docked](ctx, gather_one, (?g)::ptr);
     var i: usize = 0;
@@ -650,15 +645,6 @@ fun members(ctx: *context.Context, p: *Pass) bool {
         i      = i + 1;
     }
     ret true;
-}
-
-# release the pass's scratch
-fun release(ctx: *context.Context, p: *Pass) {
-    if (p.m == nil) { ret; }
-    val a: err[allo.Error] = allo.deallocate[Member](ctx.a, p.m, p.n);
-    val b: err[allo.Error] = allo.deallocate[tabs.Tab](ctx.a, p.tabs, p.n);
-    if ((sel a.err) || (sel b.err)) { ctx.oom = 1; }
-    p.m = nil;
 }
 
 # the first member docked in a leaf, n when none is
@@ -1129,7 +1115,6 @@ fun draw_space(ctx: *context.Context, sid: u64, a: context.Area) {
     measure(ctx, ?p, rid);
     lay(ctx, ?p, rid, a.x0, a.y0, a.x1, a.y1);
     zones(ctx, ?p, rid);
-    release(ctx, ?p);
     context.pop_band(ctx);
     apply(ctx, ?p);
 }
