@@ -240,6 +240,7 @@ fun offset_in(ctx: *context.Context, t: *TextArea, f: *field.Field, r: usize, x:
 # move the caret by rows, toward the goal column, as up, down, page up and
 # page down do
 fun vertical(ctx: *context.Context, t: *TextArea, f: *field.Field, k: input.Key, page: usize, lh: f32) {
+    if (t.count == 0) { ret; }
     val shift: bool  = (k.mods & input.MOD_SHIFT) != 0;
     val r:     usize = row_of(t, f.caret);
     if (t.aiming == 0) {
