@@ -102,6 +102,7 @@ use blit.hit;
 use bid: blit.id;
 use blit.input;
 use blit.path;
+use blit.sheet;
 use blit.store;
 use blit.tess;
 use th:   blit.theme;
@@ -368,6 +369,7 @@ pub rec TextLine {
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
+# sheet:        the theme's open overrides and its classes (see blit.style)
 # backlog:      button events held back for the frames after, in arrival order
 # backlog_cap:  events allocated for backlog
 # backlog_len:  events held in backlog
@@ -469,6 +471,7 @@ pub rec Context {
     collided_cap: usize;
     collided_len: usize;
     store:        store.Store;
+    sheet:        sheet.Sheet;
     backlog:      *input.Event;
     backlog_cap:  usize;
     backlog_len:  usize;
@@ -607,6 +610,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.backlog_len  = 0;
     ctx.lag          = 0;
     store.init(?ctx.store, a);
+    sheet.init(?ctx.sheet, a);
     ctx.trace_on    = 0;
     ctx.traced      = nil;
     ctx.traced_cap  = 0;
@@ -625,6 +629,9 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
+    val esh: err[allo.Error] = sheet.free(?ctx.sheet);
+    if (sel esh.err) { ret esh; }
     if (ctx.backlog != nil) {
         val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
         if (sel eh.err) { ret eh; }
@@ -734,6 +741,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.delta        = 0.0::f64;
     if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
     ctx.timed = 1;
+
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
 
     ctx.sw  = sw;
     ctx.sh  = sh;
@@ -2207,6 +2216,7 @@ pub fun glyph_advance(ctx: *Context, left: u32, cp: u32) f32 {
 # ctx: context
 # t:   the theme, copied into the context
 pub fun set_theme(ctx: *Context, t: th.Theme) {
+    sheet.forget(?ctx.sheet);
     ctx.theme = t;
 }
 
@@ -2289,6 +2299,144 @@ pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners:
         rr.bl = r;
     }
     rounded_rect(ctx, x0, y0, x1, y1, rr, c);
+}
+
+# the style a widget kind draws with, overrides included
+# ---
+# ctx:  context
+# kind: theme.LABEL .. theme.SCRIM
+# ret:  the style, in the context's theme
+pub fun look_of(ctx: *Context, kind: u32) *th.Style {
+    ret ?ctx.theme.styles[kind];
+}
+
+# how a widget kind draws in a state
+# ---
+# ctx:   context
+# kind:  theme.LABEL .. theme.SCRIM
+# state: theme.NORMAL .. theme.FOCUSED
+# ret:   the paint, in the context's theme
+pub fun paint_of(ctx: *Context, kind: u32, state: u8) *th.Paint {
+    ret ?ctx.theme.styles[kind].states[state];
+}
+
+# unscaled edges, in pixels at the context's scale
+# ---
+# ctx: context
+# e:   edges authored at scale 1.0
+# ret: the scaled edges
+pub fun px_edges(ctx: *Context, e: th.Edges) th.Edges {
+    ret th.Edges{l: e.l * ctx.scale, t: e.t * ctx.scale, r: e.r * ctx.scale, b: e.b * ctx.scale};
+}
+
+# which sides of a box are outlined, combined with |
+pub val SIDES_LEFT:   u8 = 1;
+pub val SIDES_TOP:    u8 = 2;
+pub val SIDES_RIGHT:  u8 = 4;
+pub val SIDES_BOTTOM: u8 = 8;
+pub val SIDES_ALL:    u8 = 15;
+
+# a soft shadow: a rounded rect whose edge fades out over blur pixels,
+# centered on the rect's edge
+#
+# the fade is drawn as stacked rounded rects, each a share of the color's
+# alpha, so it needs nothing of the renderer. a blur of zero is one hard
+# rounded rect.
+# ---
+# ctx:  context
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# r:    the corner radii in pixels
+# blur: the width the edge fades over, in pixels
+# c:    the shadow's color at full strength
+pub fun shadow(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, blur: f32, c: draw.Color) {
+    if (c.a <= 0.0::f32) { ret; }
+    if (blur <= 0.0::f32) {
+        rounded_rect(ctx, x0, y0, x1, y1, r, c);
+        ret;
+    }
+    var n: usize = (blur / 2.0::f32)::usize + 1;
+    if (n > 8) { n = 8; }
+    var layer: draw.Color = c;
+    layer.a = c.a / n::f32;
+    var k: usize = 0;
+    for (k < n) {
+        val g: f32        = blur * (k + 1)::f32 / n::f32 - blur / 2.0::f32;
+        val e: draw.Radii = draw.Radii{
+            tl: maxf(r.tl + g, 0.0::f32), tr: maxf(r.tr + g, 0.0::f32), br: maxf(r.br + g, 0.0::f32),
+            bl: maxf(r.bl + g, 0.0::f32)
+        };
+        rounded_rect(ctx, x0 - g, y0 - g, x1 + g, y1 + g, e, layer);
+        k = k + 1;
+    }
+}
+
+# whether two colors are the same
+fun same_color(a: draw.Color, b: draw.Color) bool {
+    ret a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+
+# paint a widget kind's box in a state: its shadow, its flat or gradient
+# face and its outline, with its radii, at the context's scale
+# ---
+# ctx:   context
+# kind:  theme.LABEL .. theme.SCRIM
+# state: theme.NORMAL .. theme.FOCUSED
+# x0:    left x in pixels
+# y0:    top y in pixels
+# x1:    right x in pixels
+# y1:    bottom y in pixels
+pub fun box(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32) {
+    box_part(ctx, kind, state, x0, y0, x1, y1, CORNERS_ALL, SIDES_ALL);
+}
+
+# paint part of a widget kind's box: box with only some corners rounded and
+# some sides outlined, for a box drawn in pieces, such as a window's titlebar
+# above its body or a dock's inner edge
+# ---
+# ctx:     context
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+# sides:   which sides are outlined, SIDES_* combined with |
+pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
+    val s: *th.Style  = ?ctx.theme.styles[kind];
+    val p: *th.Paint  = ?s.states[state];
+    var r: draw.Radii = draw.radii(0.0::f32);
+    if ((corners & CORNERS_TOP) != 0) {
+        r.tl = s.radius.tl * ctx.scale;
+        r.tr = s.radius.tr * ctx.scale;
+    }
+    if ((corners & CORNERS_BOTTOM) != 0) {
+        r.br = s.radius.br * ctx.scale;
+        r.bl = s.radius.bl * ctx.scale;
+    }
+    if (p.shadow.a > 0.0::f32) {
+        val dx: f32 = s.shadow_x * ctx.scale;
+        val dy: f32 = s.shadow_y * ctx.scale;
+        shadow(ctx, x0 + dx, y0 + dy, x1 + dx, y1 + dy, r, s.shadow_blur * ctx.scale, p.shadow);
+    }
+    if (same_color(p.fill, p.fill_to)) {
+        if (p.fill.a > 0.0::f32) { rounded_rect(ctx, x0, y0, x1, y1, r, p.fill); }
+    }
+    or { rounded_rect_gradient(ctx, x0, y0, x1, y1, r, draw.gradient(x0, y0, p.fill, x0, y1, p.fill_to)); }
+    val bw: f32 = p.border_w * ctx.scale;
+    if (bw <= 0.0::f32 || p.border.a <= 0.0::f32 || sides == 0) { ret; }
+    if (sides == SIDES_ALL) {
+        if (square(r)) { frame(ctx, x0, y0, x1, y1, bw, p.border); }
+        or             { stroke_rounded_rect(ctx, x0, y0, x1, y1, r, bw, p.border); }
+        ret;
+    }
+    if ((sides & SIDES_LEFT) != 0)   { quad(ctx, x0, y0, x0 + bw, y1, p.border); }
+    if ((sides & SIDES_RIGHT) != 0)  { quad(ctx, x1 - bw, y0, x1, y1, p.border); }
+    if ((sides & SIDES_TOP) != 0)    { quad(ctx, x0, y0, x1, y0 + bw, p.border); }
+    if ((sides & SIDES_BOTTOM) != 0) { quad(ctx, x0, y1 - bw, x1, y1, p.border); }
 }
 
 # a brush of one color, as emitted, on the atlas white block

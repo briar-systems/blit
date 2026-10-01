@@ -22,6 +22,7 @@ fwd blit.id;
 fwd blit.field;
 fwd blit.writer;
 fwd blit.theme;
+fwd blit.style;
 fwd blit.context;
 fwd blit.state;
 fwd blit.text;

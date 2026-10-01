@@ -1,0 +1,395 @@
+# the live side of a theme: a stack of field overrides and named classes
+#
+# a sheet belongs to a context (see blit.style for the calls on one) and
+# works on the context's theme, but holds nothing of the context itself.
+#
+# an override writes a field of the theme and keeps the value it replaced, so
+# popping it restores the theme exactly. one push writes every field its path
+# names, so "*.hot.fill" is one push and one pop. a class is a named list of
+# path and value settings, and pushing it is one push of all of them in
+# order, so a later setting wins over an earlier one for the same field.
+# classes are allocator-backed and a sheet grows them; a push the allocator
+# refuses writes nothing and reports it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use blit.draw;
+use th:   blit.theme;
+use tw:   blit.writer;
+use allo: std.allocator;
+use std.allocator.page;
+use vec: std.collections.vector;
+use std.data.toml;
+use std.memory;
+
+# a field's value saved by an override, restored by its pop
+# ---
+# r:   the field
+# old: the value the override replaced
+rec Saved {
+    r:   th.Ref;
+    old: th.Value;
+}
+
+# one setting of a class: a path and the value its fields take
+# ---
+# p: the path, naming one field or, through wildcards, several
+# v: the value
+pub rec Setting {
+    p: th.Path;
+    v: th.Value;
+}
+
+# a named list of settings
+# ---
+# name: the class's name, NUL-terminated, owned
+# cap:  bytes allocated at name
+# sets: the settings, in the order they apply
+pub rec Class {
+    name: *u8;
+    cap:  usize;
+    sets: vec.Vector[Setting];
+}
+
+# the override stack and the classes of one context
+# ---
+# a:       allocator backing the stacks, the classes and the text
+# saved:   values the open overrides replaced, oldest first
+# marks:   where in saved each open push starts
+# classes: the classes, by id
+# out:     the text the last save wrote
+pub rec Sheet {
+    a:       *allo.Allocator;
+    saved:   vec.Vector[Saved];
+    marks:   vec.Vector[usize];
+    classes: vec.Vector[Class];
+    out:     tw.Writer;
+}
+
+# set a sheet up empty; it allocates on first use, so this cannot fail
+# ---
+# s: sheet to initialize
+# a: allocator to back it
+pub fun init(s: *Sheet, a: *allo.Allocator) {
+    s.a       = a;
+    s.saved   = vec.init[Saved](a);
+    s.marks   = vec.init[usize](a);
+    s.classes = vec.init[Class](a);
+    tw.init(?s.out, a);
+}
+
+# keep the first refusal a release walk meets
+fun keep_first(first: *err[allo.Error], next: err[allo.Error]) {
+    if (sel first.ok && sel next.err) { @first = next; }
+}
+
+# release the stacks, every class and the text
+# ---
+# s:   sheet to free
+# ret: ok, or the first refusal; the sheet is empty either way
+pub fun free(s: *Sheet) err[allo.Error] {
+    var first: err[allo.Error] = err[allo.Error].ok{};
+    var i:     usize           = 0;
+    for (i < s.classes.len) {
+        val c: *Class = ?s.classes.data[i];
+        keep_first(?first, allo.deallocate[u8](s.a, c.name, c.cap));
+        keep_first(?first, vec.dnit[Setting](?c.sets));
+        i = i + 1;
+    }
+    keep_first(?first, vec.dnit[Class](?s.classes));
+    keep_first(?first, vec.dnit[Saved](?s.saved));
+    keep_first(?first, vec.dnit[usize](?s.marks));
+    keep_first(?first, tw.free(?s.out));
+    ret first;
+}
+
+# write every field a path names and save what it replaced, without a mark
+fun write(s: *Sheet, t: *th.Theme, p: th.Path, v: th.Value) bool {
+    val n:    usize                  = th.span(p);
+    val room: res[usize, allo.Error] = vec.reserve[Saved](?s.saved, n);
+    if (sel room.err) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: th.Ref = th.ref_at(p, i);
+        s.saved.data[s.saved.len] = Saved{r: r, old: th.get(t, r)};
+        s.saved.len               = s.saved.len + 1;
+        th.put(t, r, v);
+        i = i + 1;
+    }
+    ret true;
+}
+
+# open a push: one mark the next pop returns to
+fun open(s: *Sheet) bool {
+    val pushed: res[usize, allo.Error] = vec.push[usize](?s.marks, s.saved.len);
+    ret sel pushed.ok;
+}
+
+# override every field a path names until the matching pop
+#
+# fields are written as they are: a token pushed this way changes the
+# palette a consumer reads, not the styles built from it.
+# ---
+# s:   sheet
+# t:   the theme it overrides
+# p:   the path
+# v:   the value
+# ret: true, or false when the allocator refused and nothing was written
+pub fun push(s: *Sheet, t: *th.Theme, p: th.Path, v: th.Value) bool {
+    if (!open(s)) { ret false; }
+    if (!write(s, t, p, v)) {
+        val m: opt[usize] = vec.pop[usize](?s.marks);
+        ret false;
+    }
+    ret true;
+}
+
+# open a push that writes nothing, so a refused push still pairs with its pop
+# ---
+# s:   sheet
+# ret: true, or false when the allocator refused
+pub fun push_none(s: *Sheet) bool {
+    ret open(s);
+}
+
+# write the values every open push replaced into a theme, newest first,
+# leaving the pushes open: the theme as it stands without them
+# ---
+# s: sheet
+# t: a copy of the theme the pushes are open on
+pub fun restored(s: *Sheet, t: *th.Theme) {
+    var i: usize = s.saved.len;
+    for (i > 0) {
+        i = i - 1;
+        th.put(t, s.saved.data[i].r, s.saved.data[i].old);
+    }
+}
+
+# undo the latest push, restoring every field it wrote; nothing when none is open
+# ---
+# s: sheet
+# t: the theme it overrides
+pub fun pop(s: *Sheet, t: *th.Theme) {
+    val m: opt[usize] = vec.pop[usize](?s.marks);
+    if (sel m.none) { ret; }
+    for (s.saved.len > m.some) {
+        s.saved.len = s.saved.len - 1;
+        val e: Saved = s.saved.data[s.saved.len];
+        th.put(t, e.r, e.old);
+    }
+}
+
+# how many pushes are open
+# ---
+# s:   sheet
+# ret: the depth of the override stack
+pub fun depth(s: *Sheet) usize {
+    ret s.marks.len;
+}
+
+# undo every open push, restoring the theme
+# ---
+# s: sheet
+# t: the theme it overrides
+pub fun unwind(s: *Sheet, t: *th.Theme) {
+    for (s.marks.len > 0) { pop(s, t); }
+}
+
+# drop every open push without restoring, for a theme replaced whole
+# ---
+# s: sheet
+pub fun forget(s: *Sheet) {
+    s.marks.len = 0;
+    s.saved.len = 0;
+}
+
+# the class a name names
+# ---
+# s:    sheet
+# name: the class's name
+# ret:  its id, or none
+pub fun class_of(s: *Sheet, name: str) opt[u32] {
+    if (name == nil) { ret opt[u32].none{}; }
+    var i: usize = 0;
+    for (i < s.classes.len) {
+        if (str_equals(s.classes.data[i].name::str, name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# a class by name, made empty the first time it is named
+# ---
+# s:    sheet
+# name: the class's name, copied
+# ret:  its id, or the allocator's refusal
+pub fun add_class(s: *Sheet, name: str) res[u32, allo.Error] {
+    val have: opt[u32] = class_of(s, name);
+    if (sel have.some) { ret res[u32, allo.Error].ok{have.some}; }
+    var n: usize = 1;
+    if (name != nil) { n = str_len(name) + 1; }
+    val b: res[*u8, allo.Error] = allo.allocate[u8](s.a, n);
+    if (sel b.err) { ret res[u32, allo.Error].err{b.err}; }
+    b.ok[0] = 0;
+    if (name != nil) { memory.raw_copy(b.ok::ptr, name::ptr, n); }
+    var c: Class;
+    c.name = b.ok;
+    c.cap  = n;
+    c.sets = vec.init[Setting](s.a);
+    val pushed: res[usize, allo.Error] = vec.push[Class](?s.classes, c);
+    if (sel pushed.err) {
+        val d: err[allo.Error] = allo.deallocate[u8](s.a, b.ok, n);
+        ret res[u32, allo.Error].err{pushed.err};
+    }
+    ret res[u32, allo.Error].ok{(s.classes.len - 1)::u32};
+}
+
+# how many classes a sheet holds
+pub fun class_count(s: *Sheet) usize {
+    ret s.classes.len;
+}
+
+# a class's name
+# ---
+# s:   sheet
+# id:  the class
+# ret: its name, nil for no class
+pub fun class_name(s: *Sheet, id: u32) str {
+    if (id::usize >= s.classes.len) { ret nil; }
+    ret s.classes.data[id].name::str;
+}
+
+# whether two paths name the same fields
+fun same_path(a: th.Path, b: th.Path) bool {
+    ret a.field == b.field && a.kind == b.kind && a.state == b.state && a.elem == b.elem;
+}
+
+# set a class's value for a path, replacing its earlier value for that path
+# ---
+# s:   sheet
+# id:  the class
+# p:   the path
+# v:   the value
+# ret: ok, also for no class, which is left alone, or the allocator's refusal
+pub fun class_set(s: *Sheet, id: u32, p: th.Path, v: th.Value) err[allo.Error] {
+    if (id::usize >= s.classes.len) { ret err[allo.Error].ok{}; }
+    val c: *Class = ?s.classes.data[id];
+    var i: usize  = 0;
+    for (i < c.sets.len) {
+        if (same_path(c.sets.data[i].p, p)) {
+            c.sets.data[i].v = v;
+            ret err[allo.Error].ok{};
+        }
+        i = i + 1;
+    }
+    val pushed: res[usize, allo.Error] = vec.push[Setting](?c.sets, Setting{p: p, v: v});
+    if (sel pushed.err) { ret err[allo.Error].err{pushed.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# drop every setting of a class
+# ---
+# s:  sheet
+# id: the class
+pub fun class_clear(s: *Sheet, id: u32) {
+    if (id::usize >= s.classes.len) { ret; }
+    s.classes.data[id].sets.len = 0;
+}
+
+# override a class's settings, in order, until the matching pop
+# ---
+# s:   sheet
+# t:   the theme it overrides
+# id:  the class
+# ret: true, or false for no class or a refused allocation, with nothing written
+pub fun push_class(s: *Sheet, t: *th.Theme, id: u32) bool {
+    if (id::usize >= s.classes.len) { ret false; }
+    if (!open(s))                   { ret false; }
+    val c: *Class = ?s.classes.data[id];
+    var i: usize  = 0;
+    for (i < c.sets.len) {
+        if (!write(s, t, c.sets.data[i].p, c.sets.data[i].v)) {
+            pop(s, t);
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# read the [class.<name>] tables of a theme document into classes, each
+# table's keys paths and its values theirs; a class named again is replaced
+# ---
+# s:    sheet
+# root: the parsed document
+# ret:  ok, or why a class was refused, with the classes before it read
+pub fun read_classes(s: *Sheet, root: *toml.Table) err[th.LoadError] {
+    val co: opt[*toml.Value] = toml.get(root, "class");
+    if (sel co.none) { ret err[th.LoadError].ok{}; }
+    val cv: *toml.Value = co.some;
+    if (cv.tag != toml.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.unknown{cv.key.at}}; }
+    var i: usize = 0;
+    for (i < toml.table_len(?cv.data.table)) {
+        val ko: opt[str]         = toml.table_key(?cv.data.table, i);
+        val vo: opt[*toml.Value] = toml.table_value(?cv.data.table, i);
+        if (sel ko.none) { brk; }
+        if (sel vo.none) { brk; }
+        val v: *toml.Value = vo.some;
+        if (v.tag != toml.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.value{v.span.at}}; }
+        val id: res[u32, allo.Error] = add_class(s, ko.some);
+        if (sel id.err) { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{id.err}}}; }
+        class_clear(s, id.ok);
+        var j: usize = 0;
+        for (j < toml.table_len(?v.data.table)) {
+            val k2: opt[str]         = toml.table_key(?v.data.table, j);
+            val v2: opt[*toml.Value] = toml.table_value(?v.data.table, j);
+            if (sel k2.none) { brk; }
+            if (sel v2.none) { brk; }
+            val p: opt[th.Path] = th.path(k2.some);
+            if (sel p.none) { ret err[th.LoadError].err{th.LoadError.unknown{v2.some.key.at}}; }
+            val x: opt[th.Value] = th.read_value(th.FIELDS[p.some.field].unit, v2.some);
+            if (sel x.none) { ret err[th.LoadError].err{th.LoadError.value{v2.some.span.at}}; }
+            val set: err[allo.Error] = class_set(s, id.ok, p.some, x.some);
+            if (sel set.err) { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{set.err}}}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[th.LoadError].ok{};
+}
+
+# write every class as a [class.<name>] table of "path" = value
+# ---
+# s: sheet
+# w: writer, past reset; the tables are appended
+pub fun save_classes(s: *Sheet, w: *tw.Writer) {
+    var keys: [2]str;
+    keys[0] = "class";
+    var i: usize = 0;
+    for (i < s.classes.len) {
+        val c: *Class = ?s.classes.data[i];
+        keys[1] = c.name::str;
+        tw.put_table(w, ?keys[0], 2);
+        var j: usize = 0;
+        for (j < c.sets.len) {
+            var buf: [64]u8;
+            val set: Setting = c.sets.data[j];
+            th.path_text(set.p, ?buf[0], 64);
+            tw.put_assign(w, ?buf[0]);
+            th.write_value(w, th.FIELDS[set.p.field].unit, set.v);
+            tw.end_line(w);
+            j = j + 1;
+        }
+        tw.end_line(w);
+        i = i + 1;
+    }
+}
