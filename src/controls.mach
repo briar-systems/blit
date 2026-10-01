@@ -1,8 +1,9 @@
 # the small controls: radio buttons, progress bars, separators and a combo box
 #
-# each places itself at the layout cursor, spans the column and advances the
-# cursor like blit.widget's widgets, draws through the painter and claims
-# through interact.hit, with every color and length from the theme.
+# each places itself in the current layout frame like blit.widget's widgets
+# (see widget.place), the bars, separators and combo filling the width and a
+# radio button fitting its label, draws through the painter and claims through
+# interact.hit, with every color and length from the theme.
 #
 # a radio button sets a shared choice to its own value. a progress bar fills to
 # a fraction, or sweeps a segment across while the amount of work is unknown,
@@ -28,6 +29,7 @@ use blit.field;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
+use blit.layout;
 use blit.state;
 use blit.widget;
 use allo: std.allocator;
@@ -79,6 +81,12 @@ fun clampf(v: f32, lo: f32, hi: f32) f32 {
     ret v;
 }
 
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
 # a radio button beside its label that sets @choice to value when clicked
 #
 # the circle is filled with the accent while @choice is value. buttons sharing
@@ -91,11 +99,13 @@ fun clampf(v: f32, lo: f32, hi: f32) f32 {
 # ret:    true if the choice changed this frame
 pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) bool {
     val id:  u64          = context.id_of(ctx, label);
-    val x0:  f32          = ctx.cx;
-    val y0:  f32          = ctx.cy;
     val box: f32          = row_h(ctx);
+    val tw:  f32          = context.text_width_n(ctx, label, bid.shown(label));
+    val at:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), box + pad(ctx) + tw, box);
+    val x0:  f32          = at.x0;
+    val y0:  f32          = at.y0;
     val tx:  f32          = x0 + box + pad(ctx);
-    val x1:  f32          = tx + context.text_width_n(ctx, label, bid.shown(label));
+    val x1:  f32          = tx + tw;
     val hr:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + box, input.BUTTON_LEFT);
     hand(ctx, hr);
 
@@ -114,7 +124,6 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
     if (@choice == value) { context.circle(ctx, cx, cy, r - pad(ctx), ctx.theme.accent); }
 
     context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ctx.theme.text);
-    widget.advance(ctx, box);
     ret changed;
 }
 
@@ -135,6 +144,13 @@ pub fun radios(ctx: *context.Context, labels: *str, n: usize, choice: *usize) bo
     ret changed;
 }
 
+# place a progress bar filling the width, fitting the text s over it
+fun bar_at(ctx: *context.Context, s: str) context.Area {
+    var tw: f32 = 0.0::f32;
+    if (s != nil) { tw = context.text_width(ctx, s); }
+    ret widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx) * 2.0::f32, row_h(ctx));
+}
+
 # text centred over a progress bar from x0 to x1, h tall at y0
 fun bar_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, h: f32) {
     if (s == nil) { ret; }
@@ -148,15 +164,15 @@ fun bar_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, h: f32) {
 # frac: the fraction done, clamped to [0, 1]
 # s:    text centred over the bar, such as a percentage, nil for none
 pub fun progress(ctx: *context.Context, frac: f32, s: str) {
-    val x0: f32 = ctx.cx;
-    val y0: f32 = ctx.cy;
-    val h:  f32 = row_h(ctx);
-    val x1: f32 = ctx.cx + ctx.pw;
+    val at: context.Area = bar_at(ctx, s);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val h:  f32          = at.y1 - at.y0;
+    val x1: f32          = at.x1;
     face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
     val fx: f32 = x0 + (x1 - x0) * clampf(frac, 0.0::f32, 1.0::f32);
     if (fx > x0) { face(ctx, x0, y0, fx, y0 + h, ctx.theme.accent); }
     bar_text(ctx, s, x0, y0, x1, h);
-    widget.advance(ctx, h);
 }
 
 # an indeterminate progress bar across the column, a third of its width
@@ -170,11 +186,12 @@ pub fun progress(ctx: *context.Context, frac: f32, s: str) {
 # ctx: context
 # s:   text centred over the bar, nil for none
 pub fun progress_busy(ctx: *context.Context, s: str) {
-    val x0: f32 = ctx.cx;
-    val y0: f32 = ctx.cy;
-    val h:  f32 = row_h(ctx);
-    val x1: f32 = ctx.cx + ctx.pw;
-    val w:  f32 = x1 - x0;
+    val at: context.Area = bar_at(ctx, s);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val h:  f32          = at.y1 - at.y0;
+    val x1: f32          = at.x1;
+    val w:  f32          = x1 - x0;
     face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
 
     # the segment enters from the left and leaves at the right, travelling w + seg
@@ -190,16 +207,15 @@ pub fun progress_busy(ctx: *context.Context, s: str) {
         context.wake_at(ctx, ctx.in.time + BUSY_PERIOD / travel::f64);
     }
     bar_text(ctx, s, x0, y0, x1, h);
-    widget.advance(ctx, h);
 }
 
 # a rule across the column in the theme's edge color, edge_w thick
 # ---
 # ctx: context
 pub fun separator(ctx: *context.Context) {
-    val ew: f32 = context.px(ctx, ctx.theme.edge_w);
-    context.quad(ctx, ctx.cx, ctx.cy, ctx.cx + ctx.pw, ctx.cy + ew, ctx.theme.edge);
-    widget.advance(ctx, ew);
+    val ew: f32          = context.px(ctx, ctx.theme.edge_w);
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), 0.0::f32, ew);
+    context.quad(ctx, at.x0, at.y0, at.x1, at.y1, ctx.theme.edge);
 }
 
 # a labelled rule: dim text on the left and the rule running on from it to
@@ -208,19 +224,20 @@ pub fun separator(ctx: *context.Context) {
 # ctx:   context
 # label: text drawn on the left; text after "##" is not drawn
 pub fun separator_label(ctx: *context.Context, label: str) {
-    val x0: f32   = ctx.cx;
-    val y0: f32   = ctx.cy;
-    val x1: f32   = ctx.cx + ctx.pw;
-    val lh: f32   = context.line_height(ctx);
-    val n:  usize = bid.shown(label);
+    val lh: f32          = context.line_height(ctx);
+    val n:  usize        = bid.shown(label);
+    val tw: f32          = context.text_width_n(ctx, label, n);
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx), lh);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val x1: f32          = at.x1;
     context.text_span(ctx, label, n, x0, y0, ctx.theme.text_dim);
 
     var rx: f32 = x0;
-    if (n > 0) { rx = x0 + context.text_width_n(ctx, label, n) + pad(ctx); }
+    if (n > 0) { rx = x0 + tw + pad(ctx); }
     val ew: f32 = context.px(ctx, ctx.theme.edge_w);
     val ry: f32 = y0 + (lh - ew) / 2.0::f32;
     if (rx < x1) { context.quad(ctx, rx, ry, x1, ry + ew, ctx.theme.edge); }
-    widget.advance(ctx, lh);
 }
 
 # the state a combo keeps in the context's store under its header's id
@@ -317,10 +334,18 @@ fun combo_close(ctx: *context.Context, st: *ComboState, fid: u64) {
 pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str, count: usize) u8 {
     val id: u64         = context.id_of(ctx, label);
     val st: *ComboState = state.get[ComboState](ctx, id);
-    val x0: f32         = ctx.cx;
-    val y0: f32         = ctx.cy;
-    val h:  f32         = row_h(ctx);
-    val x1: f32         = ctx.cx + ctx.pw;
+    var wo: f32         = 0.0::f32;
+    var k:  usize       = 0;
+    for (k < count) {
+        wo = maxf(wo, context.text_width(ctx, options[k]));
+        k  = k + 1;
+    }
+    val h:  f32          = row_h(ctx);
+    val nw: f32          = context.text_width_n(ctx, label, bid.shown(label)) + wo + pad(ctx) * 3.0::f32;
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nw, h);
+    val x0: f32          = at.x0;
+    val y0: f32          = at.y0;
+    val x1: f32          = at.x1;
 
     var opening: bool         = false;
     val hd:      interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + h, input.BUTTON_LEFT);
@@ -345,10 +370,9 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
         val cur: str = options[@selected];
         context.text_at(ctx, cur, x1 - pad(ctx) - context.text_width(ctx, cur), ty, ctx.theme.text);
     }
-    widget.advance(ctx, h);
 
     context.push_id(ctx, id);
-    val pop:     widget.Popup = widget.begin_popup(ctx, "popup", st.open, ctx.cx, ctx.cy, ctx.pw);
+    val pop:     widget.Popup = widget.begin_popup(ctx, "popup", st.open, x0, y0 + h + widget.row_gap(ctx), x1 - x0);
     var fid:     u64          = 0;
     var changed: u8           = 0;
     if (pop.open != 0) {
@@ -394,11 +418,12 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
             i = 0;
             for (i < count) {
                 if (widget.matches(options[i], field.text(?st.filter))) {
-                    val oy0: f32 = ctx.cy;
-                    val oy1: f32 = oy0 + h;
+                    val row: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), context.text_width(ctx, options[i]) + pad(ctx) * 2.0::f32, h);
+                    val oy0: f32          = row.y0;
+                    val oy1: f32          = row.y1;
                     if (oy1 > top && oy0 < top + r.h) {
-                        val ox0: f32          = ctx.cx;
-                        val ox1: f32          = ctx.cx + ctx.pw;
+                        val ox0: f32          = row.x0;
+                        val ox1: f32          = row.x1;
                         val ho:  interact.Hit = interact.hit(ctx, bid.child_int(r.id, i::u64), ox0, oy0, ox1, oy1, input.BUTTON_LEFT);
                         hand(ctx, ho);
                         if (ho.hot && follow) { st.hi = i; }
@@ -412,7 +437,6 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
                         or (i == st.hi) { face(ctx, ox0, oy0, ox1, oy1, ctx.theme.control_hot); }
                         context.text_at(ctx, options[i], ox0 + pad(ctx), text_top(ctx, oy0, h), ink);
                     }
-                    widget.advance(ctx, h);
                 }
                 i = i + 1;
             }

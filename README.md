@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -166,7 +166,7 @@ and `blit.context.free_area` reports what they leave for the rest of the screen,
 such as a world view. Call docks at the root.
 
 A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
-open one at the layout cursor on its own: its column is clipped and scrolls by the
+open one as the next item of the layout on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
@@ -406,16 +406,71 @@ if (h.held) { drag_by(h.dx, h.dy); }
 
 ## Widgets & layout
 
-Every widget places itself at the layout cursor, spans the column, advances
-the cursor and draws through the painter, so each one clips and scrolls like
-any geometry and works inside surfaces, docks and windows alike.
+Every widget asks the layout for its rect, draws through the painter in it,
+and moves the layout on, so each one clips and scrolls like any geometry and
+works inside surfaces, docks and windows alike.
 
-- **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
-  `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
+- **A stack of frames.** Layout is a stack of frames on the context
+  (`blit.layout.Frame`): a content box, a pen, the axis items advance along,
+  the gap between them and how they align across it. Every container (panel,
+  window, popup, dock, scroll region, columns, stack) pushes its frame at its
+  begin and pops it at its end, so a panel opened inside a window leaves the
+  window's layout where it was. Outside any container, widgets lay out down a
+  column over the screen.
+- **Stacks.** `begin_stack(?ctx, key, s)`/`end_stack` open a horizontal or
+  vertical stack as the next item of the current frame, and stacks nest.
+  `blit.widget.stack(?ctx, axis)` gives the options at the theme's gap: adjust
+  `gap`, `align` (`start`, `center`, `end` or `stretch`, across the axis), the
+  stack's own `w` and `h` in its parent, and `item_w`/`item_h`, the rules its
+  items take unless they set one.
+  ```mach
+  var bar: blit.layout.Stack = blit.widget.stack(?ctx, blit.layout.Axis.horizontal{});
+  bar.align  = blit.layout.Align.center{};
+  bar.item_w = blit.layout.fit();
+  blit.widget.begin_stack(?ctx, "tools", bar);
+  blit.widget.button(?ctx, "Open");
+  blit.widget.button(?ctx, "Save");
+  blit.widget.size_next(?ctx, blit.layout.fill(1.0::f32), blit.layout.auto());
+  blit.widget.text_field(?ctx, "find", ?find, "find");
+  blit.widget.end_stack(?ctx);
+  ```
+- **Sizing.** Each side of an item is `blit.layout.fixed(px)`, `fit()` (what its
+  content needs), `fill(weight)` (a share of the space the other items leave)
+  or `frac(f)` (a fraction of the space left), and `limit(s, min, max)` clamps
+  any of them. `size_next(?ctx, w, h)` sizes the next item, `auto()` leaving a
+  side to the item. Widgets that spanned the column (buttons, sliders,
+  toggles, fields, dropdowns, sections, scroll regions) fill the width by
+  default, and text, checkboxes, images and grids fit their content.
+- **A hidden first frame.** A single pass cannot know a container's content
+  before placing it, so a stack fitted to its content, a stack centered or
+  end-aligned in its parent, and fill shares along a stack read what the
+  stack measured last frame, kept in the state store under its id. A stack
+  that would place anything by such a measure before it has one lays out its
+  first frame only to measure: its geometry and claims, and its children's,
+  are dropped (`blit.context.push_measure`/`pop_measure`), and it asks for
+  the next frame at once, so `next_frame` is `some(0)`. A guess is never seen
+  or clicked, as with Dear ImGui's hidden first frame for auto-fit windows.
+  After that, a change of content settles one frame late.
+- **Same line.** `same_line(?ctx)` puts the next item beside the last one in a
+  column, for quick inline rows. The line is as tall as its tallest item.
+- **By hand.** `place(?ctx, w, h, nat_w, nat_h)` places a control built
+  outside blit as the next item, with its own rules and natural size, and
+  returns its rect, and `begin_scroll_at` opens a scroll region over such a
+  rect. `avail(?ctx)` is the space the next item may take, from the pen to the
+  frame's far edges. `advance(?ctx, h)` moves past a row placed by hand
+  and `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
   column into n equal cells, gaps between, for widgets that take a rect, such
   as `button_at(?ctx, label, x0, y0, x1, y1, on)`. `begin_columns(?ctx, n)`,
   `next_column` and `end_columns` lay whole widgets side by side and resume
   below the tallest column.
+- **Style.** The gaps between items and the padding containers keep come from
+  the theme (`gap`, `pad`) at the context's scale.
+
+This is a breaking change from the loose layout fields: `Context.ox`, `oy`,
+`cx`, `cy` and `pw` are gone (read `avail` instead), as are the saved-layout
+fields of `Popup`, `ScrollArea` and `DockArea`, and `Columns` holds its row
+instead of `ox` and `pw`.
+
 - **Sections.** `section(?ctx, title, ?open)` is a heading with a caret,
   pointing right when closed and down when open, that returns whether to place
   the rows beneath it.
@@ -646,7 +701,7 @@ handle through to the draw list's runs. `0` is reserved for the atlas.
   texels, `whole(tex, filter)` covers the texture.
 - **Drawing.** `blit.context.image_at(?ctx, img, x0, y0, x1, y1, tint)` stretches
   the region into a rect, clipped like any geometry by its run's scissor.
-  `blit.widget.image(?ctx, img, w, h)` places it at the layout cursor.
+  `blit.widget.image(?ctx, img, w, h)` places it in the layout.
 - **Grids.** `blit.widget.Grid` is a row-major field of cells, each colored by
   the consumer (`colors`) or by mapping `values` through a `Palette` of equal
   steps from `lo` to `hi`. `grid_at` fills a rect with it and `grid` places it

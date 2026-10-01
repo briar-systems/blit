@@ -1,0 +1,586 @@
+# stack layout: frames, sizing rules and the arithmetic that places items
+#
+# a frame is one level of layout: a content box, a pen, the axis items advance
+# along, the spacing between them and how they align across the axis. the
+# context keeps a stack of frames (see context.push_layout) that every container
+# pushes and pops, and the widgets place themselves in the top one (see
+# blit.widget). this module is the data and the arithmetic alone, so it knows
+# nothing of the context, the theme or the draw list.
+#
+# an item asks for a rect with a size rule for each side and its natural size,
+# the size its content needs. the rule resolves against the frame:
+#
+# - fixed takes its value.
+# - fit takes the natural size.
+# - fill takes a share, by weight, of the space the frame's other items leave.
+#   along the axis that share is computed from the totals the frame measured
+#   last frame, so it settles one frame after the content changes. across the
+#   axis it is the whole cross extent.
+# - frac takes a fraction of the space left from the pen along the axis, or of
+#   the cross extent across it.
+#
+# min and max then clamp the result. a side whose length is not known yet, the
+# open end of a column that grows with its content or a stack fitted to its
+# content, has nothing to fill, so fill and frac fall back to the natural size
+# there. that keeps a measured stack measuring its content, never its own last
+# size.
+#
+# a frame also measures what it holds: need_w and need_h are the natural size
+# of its content, which a stack fitted to its content takes the next frame.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# need_w and need_h of a frame are its own, not a limit: the side grows with
+# the content, and w or h holds what was measured last frame, 0 when nothing was
+pub val OPEN_W: u8 = 1;
+pub val OPEN_H: u8 = 2;
+
+# the direction a frame's items advance in
+pub tag Axis: u8 {
+    vertical;
+    horizontal;
+}
+
+# where an item sits across a frame's axis
+#
+# stretch makes an item sized to fit take the whole cross extent instead.
+pub tag Align: u8 {
+    start;
+    center;
+    end;
+    stretch;
+}
+
+# how one side of an item is sized
+#
+# auto defers to the frame's item rule, then to the widget's own default.
+pub tag Rule: u8 {
+    auto;
+    fixed;
+    fit;
+    fill;
+    frac;
+}
+
+# a sizing rule for one side of an item
+# ---
+# rule: how the side is sized
+# v:    the pixels of fixed, the weight of fill, the fraction of frac
+# min:  least size in pixels
+# max:  largest size in pixels, 0 for none
+pub rec Size {
+    rule: Rule;
+    v:    f32;
+    min:  f32;
+    max:  f32;
+}
+
+# the options a stack opens with
+# ---
+# axis:   the direction its items advance in
+# align:  where its items sit across the axis
+# gap:    pixels between its items
+# w:      how the stack's own width is sized in its parent, auto for fill
+# h:      how the stack's own height is sized in its parent, auto for fit
+# item_w: the width rule its items take unless they say otherwise, auto for each widget's own
+# item_h: the height rule its items take unless they say otherwise, auto for each widget's own
+pub rec Stack {
+    axis:   Axis;
+    align:  Align;
+    gap:    f32;
+    w:      Size;
+    h:      Size;
+    item_w: Size;
+    item_h: Size;
+}
+
+# one level of layout, in the local pixels of the space it was opened in
+# ---
+# axis:        the direction items advance in
+# align:       where items sit across the axis
+# x0:          content box left
+# y0:          content box top
+# w:           content box width, last frame's measure when OPEN_W
+# h:           content box height, last frame's measure when OPEN_H
+# open:        OPEN_W and OPEN_H bits for the sides that grow with the content
+# gap:         pixels between items
+# x:           pen x, where the next item starts
+# y:           pen y
+# inline:      1 when the next item goes beside the last one (same_line)
+# line_x1:     right edge of the last item
+# line_y0:     top of the current line
+# line_y1:     bottom of the current line's tallest item
+# line_w:      natural width of the current line
+# line_h:      natural height of the current line
+# items:       items placed
+# bare:        1 when the pen has no gap after the last item (skip without one)
+# need_w:      natural width of the content so far
+# need_h:      natural height of the content so far
+# fixed:       pixels along the axis taken by items not filling and the gaps, this frame
+# weight:      fill weight placed along the axis this frame
+# prev_fixed:  fixed as measured last frame
+# prev_weight: weight as measured last frame
+# item_w:      width rule for items that do not set one
+# item_h:      height rule for items that do not set one
+# next_w:      width rule the next item takes, auto for none
+# next_h:      height rule the next item takes, auto for none
+# id:          the stack's id, whose measure the state store keeps, 0 for none
+# slot:        the rect the frame takes in its parent, before it is measured
+# rule_w:      the frame's own width rule in its parent
+# rule_h:      the frame's own height rule in its parent
+# hidden:      1 when the frame lays out only to measure, drawing and claiming nothing
+pub rec Frame {
+    axis:        Axis;
+    align:       Align;
+    x0:          f32;
+    y0:          f32;
+    w:           f32;
+    h:           f32;
+    open:        u8;
+    gap:         f32;
+    x:           f32;
+    y:           f32;
+    inline:      u8;
+    line_x1:     f32;
+    line_y0:     f32;
+    line_y1:     f32;
+    line_w:      f32;
+    line_h:      f32;
+    items:       usize;
+    bare:        u8;
+    need_w:      f32;
+    need_h:      f32;
+    fixed:       f32;
+    weight:      f32;
+    prev_fixed:  f32;
+    prev_weight: f32;
+    item_w:      Size;
+    item_h:      Size;
+    next_w:      Size;
+    next_h:      Size;
+    id:          u64;
+    slot:        Item;
+    rule_w:      Size;
+    rule_h:      Size;
+    hidden:      u8;
+}
+
+# a placed item: its rect and what it adds to its frame's measure
+# ---
+# x:      left in local pixels
+# y:      top in local pixels
+# w:      width in pixels
+# h:      height in pixels
+# nat_w:  natural width, clamped by the rule
+# nat_h:  natural height, clamped by the rule
+# weight: fill weight along the frame's axis, 0 when the item does not fill
+# fit_w:  1 when the width is the natural width because nothing else sized it
+# fit_h:  1 when the height is the natural height because nothing else sized it
+pub rec Item {
+    x:      f32;
+    y:      f32;
+    w:      f32;
+    h:      f32;
+    nat_w:  f32;
+    nat_h:  f32;
+    weight: f32;
+    fit_w:  u8;
+    fit_h:  u8;
+}
+
+# the rule deferring to the frame and the widget
+pub fun auto() Size {
+    var s: Size;
+    ret s;
+}
+
+# exactly v pixels
+pub fun fixed(v: f32) Size {
+    ret Size{rule: Rule.fixed{}, v: v, min: 0.0::f32, max: 0.0::f32};
+}
+
+# the natural size of the content
+pub fun fit() Size {
+    ret Size{rule: Rule.fit{}, v: 0.0::f32, min: 0.0::f32, max: 0.0::f32};
+}
+
+# a share, by weight, of the space the other items leave
+pub fun fill(weight: f32) Size {
+    ret Size{rule: Rule.fill{}, v: weight, min: 0.0::f32, max: 0.0::f32};
+}
+
+# a fraction, from 0 to 1, of the space left
+pub fun frac(f: f32) Size {
+    ret Size{rule: Rule.frac{}, v: f, min: 0.0::f32, max: 0.0::f32};
+}
+
+# s clamped to [lo, hi], hi 0 for no largest size
+pub fun limit(s: Size, lo: f32, hi: f32) Size {
+    var r: Size = s;
+    r.min = lo;
+    r.max = hi;
+    ret r;
+}
+
+# a stack's options: start-aligned, gap pixels apart, filling its parent's
+# width and fitting its content's height
+# ---
+# axis: the direction its items advance in
+# gap:  pixels between its items
+pub fun stack(axis: Axis, gap: f32) Stack {
+    var s: Stack;
+    s.axis = axis;
+    s.gap  = gap;
+    ret s;
+}
+
+# a frame laying items out down a w-wide column from (x, y)
+#
+# h is the column's height, and it is open when h is not positive: the column
+# grows with its content.
+# ---
+# x:   left in local pixels
+# y:   top in local pixels
+# w:   width in pixels
+# h:   height in pixels, not positive for a column that grows
+# gap: pixels between items
+pub fun column(x: f32, y: f32, w: f32, h: f32, gap: f32) Frame {
+    var f: Frame;
+    f.x0 = x;
+    f.y0 = y;
+    f.w  = maxf(w, 0.0::f32);
+    f.h  = maxf(h, 0.0::f32);
+    if (h <= 0.0::f32) { f.open = OPEN_H; }
+    f.gap = gap;
+    f.x   = x;
+    f.y   = y;
+    ret f;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# whether f lays its items along x
+pub fun across(f: *Frame) bool {
+    ret sel f.axis.horizontal;
+}
+
+# s clamped by its min and max, never negative
+fun clamp(s: Size, v: f32) f32 {
+    var r: f32 = v;
+    if (s.max > 0.0::f32 && r > s.max) { r = s.max; }
+    if (r < s.min)                     { r = s.min; }
+    ret maxf(r, 0.0::f32);
+}
+
+# the natural size an item under s adds to its frame's measure
+pub fun natural(s: Size, nat: f32) f32 {
+    if (sel s.rule.fixed) { ret clamp(s, s.v); }
+    ret clamp(s, nat);
+}
+
+# the first rule of a, b and c that is not auto
+pub fun pick(a: Size, b: Size, c: Size) Size {
+    if (!(sel a.rule.auto)) { ret a; }
+    if (!(sel b.rule.auto)) { ret b; }
+    ret c;
+}
+
+# one side's size along the frame's axis
+#
+# len is the axis's length and known whether it is a limit. rem is the space
+# left from the pen. a fill share comes from last frame's totals, or the space
+# left when there are none yet.
+fun along(f: *Frame, s: Size, nat: f32, len: f32, rem: f32, known: bool, fit: *u8) f32 {
+    @fit = 0;
+    if (sel s.rule.fixed) { ret clamp(s, s.v); }
+    if (known && (sel s.rule.fill)) {
+        if (f.prev_weight > 0.0::f32) { ret clamp(s, maxf(len - f.prev_fixed, 0.0::f32) * s.v / f.prev_weight); }
+        ret clamp(s, maxf(rem, 0.0::f32));
+    }
+    if (known && (sel s.rule.frac)) { ret clamp(s, s.v * maxf(rem, 0.0::f32)); }
+    @fit = 1;
+    ret clamp(s, nat);
+}
+
+# one side's size across the frame's axis, len its cross extent
+fun over(f: *Frame, s: Size, nat: f32, len: f32, fit: *u8) f32 {
+    @fit = 0;
+    if (sel s.rule.fixed) { ret clamp(s, s.v); }
+    if (len > 0.0::f32) {
+        if (sel s.rule.fill)                           { ret clamp(s, len); }
+        if (sel s.rule.frac)                           { ret clamp(s, s.v * len); }
+        if ((sel f.align.stretch) && (sel s.rule.fit)) { ret clamp(s, len); }
+    }
+    @fit = 1;
+    ret clamp(s, nat);
+}
+
+# the offset of an item size wide across a cross extent len
+fun offset(f: *Frame, len: f32, size: f32) f32 {
+    if (len <= size)        { ret 0.0::f32; }
+    if (sel f.align.center) { ret (len - size) / 2.0::f32; }
+    if (sel f.align.end)    { ret len - size; }
+    ret 0.0::f32;
+}
+
+# the rect the next item takes in f, without placing it
+#
+# sw and sh are the item's rules with auto already resolved: auto here sizes to
+# fit. nat_w and nat_h are its natural size.
+# ---
+# f:     frame
+# sw:    width rule
+# sh:    height rule
+# nat_w: natural width
+# nat_h: natural height
+# ret:   the item
+pub fun resolve(f: *Frame, sw: Size, sh: Size, nat_w: f32, nat_h: f32) Item {
+    var it: Item;
+    val rw: Size = pick(sw, fit(), fit());
+    val rh: Size = pick(sh, fit(), fit());
+    it.nat_w = natural(rw, nat_w);
+    it.nat_h = natural(rh, nat_h);
+    val x1:   f32  = f.x0 + f.w;
+    val y1:   f32  = f.y0 + f.h;
+    val wide: bool = (f.open & OPEN_W) == 0;
+    val tall: bool = (f.open & OPEN_H) == 0;
+
+    if (across(f)) {
+        it.x = f.x;
+        it.w = along(f, rw, nat_w, f.w, x1 - f.x, wide, ?it.fit_w);
+        it.h = over(f, rh, nat_h, f.h, ?it.fit_h);
+        it.y = f.y0 + offset(f, f.h, it.h);
+        if (sel rw.rule.fill) { it.weight = rw.v; }
+        ret it;
+    }
+    if (f.inline != 0) {
+        # beside the last item: the width is a share of the rest of the line
+        it.x = f.x;
+        it.y = f.line_y0;
+        val rest: f32 = maxf(x1 - f.x, 0.0::f32);
+        if (sel rw.rule.fill) { it.w = clamp(rw, rest); }
+        or                    { it.w = along(f, rw, nat_w, rest, rest, wide, ?it.fit_w); }
+        it.h = along(f, rh, nat_h, f.h, y1 - f.y, tall, ?it.fit_h);
+        ret it;
+    }
+    it.y = f.y;
+    it.h = along(f, rh, nat_h, f.h, y1 - f.y, tall, ?it.fit_h);
+    it.w = over(f, rw, nat_w, f.w, ?it.fit_w);
+    it.x = f.x0 + offset(f, f.w, it.w);
+    if (sel rh.rule.fill) { it.weight = rh.v; }
+    ret it;
+}
+
+# place an item resolve gave, moving the pen past it and adding it to the measure
+# ---
+# f:  frame
+# it: the item
+pub fun commit(f: *Frame, it: Item) {
+    val spaced: bool = f.items > 0 && f.bare == 0;
+    f.bare = 0;
+    if (across(f)) {
+        if (spaced) {
+            f.fixed  = f.fixed + f.gap;
+            f.need_w = f.need_w + f.gap;
+        }
+        f.need_w = f.need_w + it.nat_w;
+        f.need_h = maxf(f.need_h, it.nat_h);
+        if (it.weight > 0.0::f32) { f.weight = f.weight + it.weight; }
+        or                        { f.fixed = f.fixed + it.w; }
+        f.x       = it.x + it.w + f.gap;
+        f.line_x1 = it.x + it.w;
+        f.line_y0 = it.y;
+        f.line_y1 = maxf(f.line_y1, it.y + it.h);
+        f.items   = f.items + 1;
+        ret;
+    }
+    if (f.inline != 0) {
+        f.line_w = f.line_w + f.gap + it.nat_w;
+        f.need_w = maxf(f.need_w, f.line_w);
+        if (it.nat_h > f.line_h) {
+            f.need_h = f.need_h + it.nat_h - f.line_h;
+            f.line_h = it.nat_h;
+        }
+        val bottom: f32 = it.y + it.h;
+        if (bottom > f.line_y1) {
+            f.fixed   = f.fixed + bottom - f.line_y1;
+            f.line_y1 = bottom;
+        }
+        f.inline  = 0;
+        f.line_x1 = it.x + it.w;
+        f.x       = f.x0;
+        f.y       = f.line_y1 + f.gap;
+        f.items   = f.items + 1;
+        ret;
+    }
+    if (spaced) {
+        f.fixed  = f.fixed + f.gap;
+        f.need_h = f.need_h + f.gap;
+    }
+    f.need_h = f.need_h + it.nat_h;
+    f.need_w = maxf(f.need_w, it.nat_w);
+    if (it.weight > 0.0::f32) { f.weight = f.weight + it.weight; }
+    or                        { f.fixed = f.fixed + it.h; }
+    f.line_x1 = it.x + it.w;
+    f.line_y0 = it.y;
+    f.line_y1 = it.y + it.h;
+    f.line_w  = it.nat_w;
+    f.line_h  = it.nat_h;
+    f.x       = f.x0;
+    f.y       = it.y + it.h + f.gap;
+    f.items   = f.items + 1;
+}
+
+# put the next item beside the last one, on the same line
+#
+# a no-op in a frame laid out along x, whose items share a line already, and
+# before the first item.
+# ---
+# f: frame
+pub fun same_line(f: *Frame) {
+    if (across(f) || f.items == 0) { ret; }
+    f.inline = 1;
+    f.x      = f.line_x1 + f.gap;
+}
+
+# move the pen past len pixels along the axis, then the gap when gap is set
+#
+# what is passed over counts as an item filling nothing, so a row placed by
+# hand still adds to the measure.
+# ---
+# f:   frame
+# len: pixels
+# gap: true to leave the gap after it
+pub fun skip(f: *Frame, len: f32, gap: bool) {
+    var it: Item;
+    it.x = f.x;
+    it.y = f.y;
+    if (f.inline != 0 && !across(f)) { it.y = f.line_y0; }
+    if (across(f)) {
+        it.w     = len;
+        it.h     = 0.0::f32;
+        it.nat_w = len;
+    }
+    or {
+        it.x     = f.x0;
+        it.w     = 0.0::f32;
+        it.h     = len;
+        it.nat_h = len;
+        f.inline = 0;
+    }
+    commit(f, it);
+    if (gap) { ret; }
+    f.bare = 1;
+    if (across(f)) { f.x = f.x - f.gap; }
+    or             { f.y = f.y - f.gap; }
+}
+
+test layout__fixed_fit_fill_frac_along_a_row {
+    var f: Frame = column(0.0::f32, 0.0::f32, 100.0::f32, 20.0::f32, 4.0::f32);
+    f.axis = Axis.horizontal{};
+    f.open = 0;
+
+    # fixed 10, fit 6, then a fraction of the 72 left
+    val a: Item = resolve(?f, fixed(10.0::f32), auto(), 0.0::f32, 8.0::f32);
+    if (a.x != 0.0::f32 || a.w != 10.0::f32 || a.h != 8.0::f32) { ret 1; }
+    commit(?f, a);
+    val b: Item = resolve(?f, fit(), auto(), 6.0::f32, 8.0::f32);
+    if (b.x != 14.0::f32 || b.w != 6.0::f32) { ret 2; }
+    commit(?f, b);
+    val c: Item = resolve(?f, frac(0.5::f32), auto(), 0.0::f32, 8.0::f32);
+    if (c.x != 24.0::f32 || c.w != 38.0::f32) { ret 3; }
+
+    # a fill share with no measure yet takes what is left, then settles on
+    # last frame's totals: 100 - 10 - 4 = 86 split 1:3
+    val d: Item = resolve(?f, fill(1.0::f32), auto(), 0.0::f32, 8.0::f32);
+    if (d.w != 76.0::f32) { ret 4; }
+    f.prev_fixed  = 14.0::f32;
+    f.prev_weight = 4.0::f32;
+    val e: Item = resolve(?f, fill(1.0::f32), auto(), 0.0::f32, 8.0::f32);
+    val g: Item = resolve(?f, fill(3.0::f32), auto(), 0.0::f32, 8.0::f32);
+    if (e.w != 21.5::f32 || g.w != 64.5::f32) { ret 5; }
+
+    # min and max clamp whatever the rule gave
+    val h: Item = resolve(?f, limit(fill(3.0::f32), 0.0::f32, 30.0::f32), auto(), 0.0::f32, 8.0::f32);
+    if (h.w != 30.0::f32) { ret 6; }
+    val k: Item = resolve(?f, limit(fixed(2.0::f32), 5.0::f32, 0.0::f32), auto(), 0.0::f32, 8.0::f32);
+    if (k.w != 5.0::f32) { ret 7; }
+
+    # the measure: 10 + 4 + 6, and two items filling nothing
+    if (f.need_w != 20.0::f32 || f.need_h != 8.0::f32) { ret 8; }
+    if (f.fixed != 20.0::f32 || f.weight != 0.0::f32)  { ret 9; }
+    ret 0;
+}
+
+test layout__aligns_across_the_axis {
+    var f: Frame = column(0.0::f32, 0.0::f32, 100.0::f32, 20.0::f32, 4.0::f32);
+    f.axis = Axis.horizontal{};
+    f.open = 0;
+
+    f.align = Align.center{};
+    if (resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32).y != 6.0::f32) { ret 1; }
+    f.align = Align.end{};
+    if (resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32).y != 12.0::f32) { ret 2; }
+    f.align = Align.stretch{};
+    val s: Item = resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32);
+    if (s.y != 0.0::f32 || s.h != 20.0::f32) { ret 3; }
+    # a fixed size is not stretched
+    if (resolve(?f, fit(), fixed(8.0::f32), 10.0::f32, 8.0::f32).h != 8.0::f32) { ret 4; }
+
+    # down a column, x is the cross axis
+    var c: Frame = column(0.0::f32, 0.0::f32, 100.0::f32, 0.0::f32, 4.0::f32);
+    c.align = Align.end{};
+    if (resolve(?c, fit(), fit(), 10.0::f32, 8.0::f32).x != 90.0::f32) { ret 5; }
+    # fill and frac across take the whole or a part of the width
+    if (resolve(?c, fill(1.0::f32), fit(), 10.0::f32, 8.0::f32).w != 100.0::f32) { ret 6; }
+    if (resolve(?c, frac(0.25::f32), fit(), 10.0::f32, 8.0::f32).w != 25.0::f32) { ret 7; }
+    ret 0;
+}
+
+test layout__open_sides_fall_back_to_the_natural_size {
+    # a column growing with its content has no height to fill
+    var c: Frame = column(0.0::f32, 0.0::f32, 100.0::f32, 0.0::f32, 4.0::f32);
+    val a: Item  = resolve(?c, fill(1.0::f32), fill(1.0::f32), 10.0::f32, 8.0::f32);
+    if (a.h != 8.0::f32 || a.fit_h != 1 || a.w != 100.0::f32 || a.fit_w != 0) { ret 1; }
+
+    # a width measured as nothing yet has nothing to stretch over
+    c.open  = OPEN_W | OPEN_H;
+    c.w     = 0.0::f32;
+    c.align = Align.stretch{};
+    val b: Item = resolve(?c, fill(1.0::f32), fit(), 10.0::f32, 8.0::f32);
+    if (b.w != 10.0::f32 || b.fit_w != 1) { ret 2; }
+    ret 0;
+}
+
+test layout__same_line_and_skip {
+    var c: Frame = column(0.0::f32, 0.0::f32, 100.0::f32, 0.0::f32, 4.0::f32);
+    same_line(?c);
+    if (c.inline != 0) { ret 1; }
+
+    commit(?c, resolve(?c, fit(), fit(), 30.0::f32, 10.0::f32));
+    same_line(?c);
+    # beside it, the rest of the line filled
+    val b: Item = resolve(?c, fill(1.0::f32), fit(), 20.0::f32, 16.0::f32);
+    if (b.x != 34.0::f32 || b.y != 0.0::f32 || b.w != 66.0::f32) { ret 2; }
+    commit(?c, b);
+    # the line is as tall as its tallest item
+    if (c.x != 0.0::f32 || c.y != 20.0::f32)            { ret 3; }
+    if (c.need_w != 54.0::f32 || c.need_h != 16.0::f32) { ret 4; }
+
+    # a row by hand, then space without the gap
+    skip(?c, 6.0::f32, true);
+    skip(?c, 10.0::f32, false);
+    if (c.y != 40.0::f32 || c.need_h != 40.0::f32) { ret 5; }
+    ret 0;
+}

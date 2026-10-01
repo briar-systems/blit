@@ -16,6 +16,7 @@ fwd blit.path;
 fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;
+fwd blit.layout;
 fwd blit.hit;
 fwd blit.interact;
 fwd blit.id;
