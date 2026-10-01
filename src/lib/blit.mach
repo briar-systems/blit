@@ -34,6 +34,7 @@ fwd blit.textarea;
 fwd blit.list;
 fwd blit.chart;
 fwd blit.controls;
+fwd blit.table;
 fwd blit.payload;
 fwd blit.dnd;
 fwd blit.tabs;
