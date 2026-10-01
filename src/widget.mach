@@ -1768,6 +1768,60 @@ test button__clicks_on_release_inside_after_press {
     ret 0;
 }
 
+# whether the context asks for a frame now
+#[testing]
+fun asks_now(ctx: *context.Context) bool {
+    val nf: opt[f64] = context.next_frame(ctx);
+    ret sel nf.some && nf.some == 0.0::f64;
+}
+
+test button__clicks_on_presses_and_releases_between_frames {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    val id: u64 = context.id_of(?ctx, "ok");
+
+    var in: input.Input = input_at(10.0::f32, 5.0::f32, 0);
+    input.init(?in, ?a);
+    frame_button(?ctx, in);
+
+    # a press and release on the button, the cursor gone by the frame: a
+    # press, then a release that clicks where it happened
+    in.mx = 500.0::f32;
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.release_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 2; }
+    if (!asks_now(?ctx))                                     { ret 3; }
+    input.clear_keys(?in);
+    if (frame_button(?ctx, in) != true) { ret 4; }
+    if (!asks_now(?ctx))                { ret 5; }
+    frame_button(?ctx, in);
+    if (asks_now(?ctx) || ctx.in.mx != 500.0::f32) { ret 6; }
+
+    # press, release, press: a click, then the button held
+    in.mx = 10.0::f32;
+    frame_button(?ctx, in);
+    in.down = input.BUTTON_LEFT;
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.release_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 7; }
+    input.clear_keys(?in);
+    if (frame_button(?ctx, in) != true)                      { ret 8; }
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 9; }
+    if (input.pressed(ctx.in, input.BUTTON_LEFT) != 1)       { ret 10; }
+    if (asks_now(?ctx))                                      { ret 11; }
+
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # a frame holding one panel with one checkbox
 #[testing]
 fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {

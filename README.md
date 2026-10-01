@@ -189,11 +189,12 @@ in.time    = clock_seconds();       # the host's monotonic clock, as f64
 in.present = 1;                     # 0 while the pointer is off the surface
 in.mx      = x;
 in.my      = y;
-in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held this frame
+in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held after the frame's last event
 in.mods    = blit.input.MOD_SHIFT;   # MOD_* bits held this frame
 in.wheel   = dy_pixels;             # both wheels in pixels
 in.wheel_x = dx_pixels;
-blit.input.type_text(?in, cp);      # then every event, in arrival order
+blit.input.press_button(?in, blit.input.BUTTON_LEFT, bx, by); # then every event, in arrival order
+blit.input.type_text(?in, cp);
 blit.context.begin(?ctx, in, w, h);
 # ... widgets ...
 blit.context.end(?ctx);
@@ -208,6 +209,17 @@ blit.context.end(?ctx);
   `blit.input.pressed`, `released` and `held` take the button. The context
   carries `prev_down` across frames. With `present` 0 nothing is hovered and
   `in_rect` misses. Widgets act on the left button.
+- **Button events.** A host that only samples the buttons sets `down` and
+  nothing more, and a press and release that both land between two frames are
+  then lost. A host that sees each one also adds it as it arrives,
+  `press_button(?in, button, x, y)` and `release_button(?in, button, x, y)`
+  with the cursor where it happened, and still sets `down` to the buttons held
+  after the last of them. `begin` hands them to widgets in order, at most one
+  change of a button per frame, holding the rest back and asking for the next
+  frame through `next_frame`, so a quick click is a press in one frame and a
+  release in the next, and a double click is a click, then a press. A frame
+  that applies one sees the cursor where it happened, so `pressed` and
+  `released` keep their per-frame meaning.
 - **Keyboard events.** `type_text(?in, cp)` for each typed codepoint,
   `press_key(?in, code, mods)` for each key press or repeat,
   `release_key(?in, code, mods)` for each release and `compose(?in, text,
@@ -229,8 +241,8 @@ blit.context.end(?ctx);
   window, in screen pixels, none while nothing takes text.
 - **Scheduling.** Widgets call `blit.context.wake_at(?ctx, t)` for a time they
   need a frame by (a hover delay, an animation, a caret blink). After `end`,
-  `next_frame(?ctx)` is `some(0)` to draw again now, `some(t)` to draw by time
-  `t`, or `none` to draw only on input, so an idle tool can sleep instead of
+  `next_frame(?ctx)` is `some(0)` to draw again now (also while button events
+  are held back), `some(t)` to draw by time `t`, or `none` to draw only on input, so an idle tool can sleep instead of
   redrawing every frame.
 
 ## Keyboard, focus & text fields
@@ -599,11 +611,13 @@ cell. Colors and texels are premultiplied.
 - **Runs.** `run_count` / `run_at` divide the index list into runs, in paint
   order. A `Run` is plain numbers: `kind` (u32), `tex` (u64), `page`, `layer`
   and `filter` (u32), the scissor `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1`
-  (f32) and `start` and `count` (usize, in indices). Every index lies in one
-  run. Draw the runs in order:
-  - **Kind.** `blit.context.RUN_TRIANGLES` (0) is the only kind today: bind,
-    scissor and draw as below. Skip a run of any other kind, so later kinds
-    (such as consumer spans) need no change to a renderer that ignores them.
+  (f32), `start` and `count` (usize, in indices), and for a consumer span
+  `id` and `data` (u64) and its rect `x0`, `y0`, `x1`, `y1` (f32). Every index
+  lies in one run. Draw the runs in order:
+  - **Kind.** `blit.context.RUN_TRIANGLES` (0): bind, scissor and draw as
+    below. `blit.context.RUN_CUSTOM` (1) is a consumer span (see below). Skip a
+    run of any other kind, so later kinds need no change to a renderer that
+    ignores them.
   - **Texture.** When `tex` is `blit.draw.ATLAS` (0), bind atlas page `page`.
     Otherwise `tex` is the consumer's own texture handle, passed through
     untouched, and `filter` asks for `FILTER_NEAREST` (0) or `FILTER_LINEAR` (1)
@@ -617,6 +631,14 @@ cell. Colors and texels are premultiplied.
     with `GL_SCISSOR_TEST` enabled.
   - **Draw.** `glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT,
     start * 4)`: indices are absolute vertex numbers, so no base vertex.
+  - **Consumer spans.** A `RUN_CUSTOM` run holds no indices (`count` 0). Set
+    its scissor, call the app's own drawing for `id` with `data` and the rect
+    (`x0`, `y0`, `x1`, `y1`, screen pixels, y down), then restore blit's state
+    (program, buffers, blend, texture binding) before the next run.
+    `blit.context.custom(?ctx, x0, y0, x1, y1, id, data)` places one: the rect
+    is in local space like every rect, it takes the current clip and layer,
+    and it sorts like any run, so a popup on a higher layer, or anything drawn
+    after it, paints over it. `id` and `data` are passed through untouched.
 - **State.** Blend premultiplied: `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)`.
   Disable face culling (triangles come in either winding) and depth testing.
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
@@ -648,7 +670,7 @@ cell. Colors and texels are premultiplied.
   FragColor   = aColor * texture(atlas, aUV);
   ```
 - **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
-  events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
+  and button events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
   clipboard and answer `wants_paste`, upload the changed atlas pages, the
   vertices and the indices, and draw each run as above.
 - **From 0.9.** A renderer written for the 0.9 contract changes in these
@@ -659,7 +681,8 @@ cell. Colors and texels are premultiplied.
   - apply each run's scissor
   - blend `ONE` / `ONE_MINUS_SRC_ALPHA` where it blended `SRC_ALPHA` /
     `ONE_MINUS_SRC_ALPHA`, and leave face culling off
-  - skip runs whose `kind` is not `RUN_TRIANGLES`
+  - call back into the app for `RUN_CUSTOM` runs, and skip runs of any other
+    kind that is not `RUN_TRIANGLES`
   - upload consumer textures premultiplied
 
 ## Build & test
