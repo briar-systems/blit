@@ -103,9 +103,10 @@ fun header(ctx: *blit.context.Context, p: *Panel) {
 # stepping, speed and randomizing
 fun run(ctx: *blit.context.Context, p: *Panel) {
     if (!blit.widget.section(ctx, "RUN", ?p.open_run)) { ret; }
-    p.step_y = ctx.cy + ctx.ly;
-    p.x0     = ctx.cx + ctx.lx;
-    p.w      = ctx.pw;
+    val at: blit.context.Area = blit.widget.avail(ctx);
+    p.step_y = at.y0 + ctx.ly;
+    p.x0     = at.x0 + ctx.lx;
+    p.w      = at.x1 - at.x0;
     var go: str = "Play";
     if (p.running != 0) { go = "Pause"; }
     var acts: [3]str;
@@ -126,7 +127,7 @@ fun run(ctx: *blit.context.Context, p: *Panel) {
         o = put_str(?rd[0], o, " gen/s");
     }
     rd[o]     = 0;
-    p.speed_y = ctx.cy + ctx.ly;
+    p.speed_y = blit.widget.avail(ctx).y0 + ctx.ly;
     blit.widget.slider(ctx, "Speed", ?rd[0], ?p.speed, 1.0::f32, 120.0::f32);
     blit.widget.toggle(ctx, "Uncapped", ?p.uncapped);
 

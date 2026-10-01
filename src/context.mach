@@ -1,8 +1,9 @@
 # the immediate-mode context: draw list, input, layout, and the
 # painter helpers widgets build on
 #
-# the context owns the per-frame draw list and the current input, tracks a simple
-# top-to-bottom layout cursor, and holds the id stack widget ids are scoped by.
+# the context owns the per-frame draw list and the current input, holds the
+# stack of layout frames containers push and pop (see blit.layout), and holds
+# the id stack widget ids are scoped by.
 # it is also the painter: quad/glyph/text_at emit into the draw list through
 # the font and its atlas so widgets never touch the draw list or font directly. a
 # draw-list growth failure is recorded in `oom` rather than silently dropping
@@ -89,6 +90,7 @@ use gly: blit.glyph;
 use blit.hit;
 use bid: blit.id;
 use blit.input;
+use blit.layout;
 use blit.store;
 use th:   blit.theme;
 use allo: std.allocator;
@@ -97,8 +99,8 @@ use std.collections.set;
 use std.math.float.sqrt_f32;
 use std.text.utf8;
 
-# capacity the clip, origin, layer and id stacks and the collision list start
-# with, doubling from there
+# capacity the clip, origin, layer, layout and id stacks and the collision
+# list start with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
 # capacity the span list starts with, doubling from there
@@ -175,11 +177,6 @@ pub rec Area {
 # in:           input for the current frame
 # sw:           screen width in pixels
 # sh:           screen height in pixels
-# ox:           layout origin x (panel left)
-# oy:           layout origin y (panel top)
-# cx:           layout cursor x
-# cy:           layout cursor y
-# pw:           current panel width
 # hot:          id of the widget hovered this frame (0 = none)
 # active:       id of the widget being interacted with, persists across frames (0 = none)
 # drag_off_x:   cursor-to-origin x offset captured when a drag begins
@@ -214,6 +211,10 @@ pub rec Area {
 # layers:       saved parent layers, grown on demand
 # layers_cap:   layers allocated for layers
 # font:         the glyph sources, the text styles, the glyph cache and the atlas
+# frames:       the open layout frames, innermost last, grown on demand
+# frames_cap:   frames allocated for frames
+# frame_sp:     open layout frames, saved or not
+# spare:        the frame handed out while the stack cannot grow
 # style:        id of the text style text is drawn in
 # style_sp:     text style stack depth
 # style_ids:    saved parent text styles, grown on demand
@@ -257,11 +258,6 @@ pub rec Context {
     in:           input.Input;
     sw:           f32;
     sh:           f32;
-    ox:           f32;
-    oy:           f32;
-    cx:           f32;
-    cy:           f32;
-    pw:           f32;
     hot:          u64;
     active:       u64;
     drag_off_x:   f32;
@@ -296,6 +292,10 @@ pub rec Context {
     layers:       *u32;
     layers_cap:   usize;
     font:         font.Font;
+    frames:       *layout.Frame;
+    frames_cap:   usize;
+    frame_sp:     usize;
+    spare:        layout.Frame;
     style:        u32;
     style_sp:     usize;
     style_ids:    *u32;
@@ -380,11 +380,6 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
 
     ctx.sw           = 0.0::f32;
     ctx.sh           = 0.0::f32;
-    ctx.ox           = 0.0::f32;
-    ctx.oy           = 0.0::f32;
-    ctx.cx           = 0.0::f32;
-    ctx.cy           = 0.0::f32;
-    ctx.pw           = 0.0::f32;
     ctx.hot          = 0;
     ctx.active       = 0;
     ctx.drag_off_x   = 0.0::f32;
@@ -415,6 +410,9 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer_sp     = 0;
     ctx.layers       = nil;
     ctx.layers_cap   = 0;
+    ctx.frames       = nil;
+    ctx.frames_cap   = 0;
+    ctx.frame_sp     = 0;
     ctx.style        = font.STYLE_BODY;
     ctx.style_sp     = 0;
     ctx.style_ids    = nil;
@@ -493,6 +491,10 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel ey.err) { ret ey; }
     ctx.layers     = nil;
     ctx.layers_cap = 0;
+    val ef: err[allo.Error] = allo.deallocate[layout.Frame](ctx.a, ctx.frames, ctx.frames_cap);
+    if (sel ef.err) { ret ef; }
+    ctx.frames     = nil;
+    ctx.frames_cap = 0;
     val et: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.style_ids, ctx.style_cap);
     if (sel et.err) { ret et; }
     ctx.style_ids = nil;
@@ -541,15 +543,11 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
     ctx.timed = 1;
 
-    ctx.sw  = sw;
-    ctx.sh  = sh;
-    ctx.ox  = 0.0::f32;
-    ctx.oy  = 0.0::f32;
-    ctx.cx  = 0.0::f32;
-    ctx.cy  = 0.0::f32;
-    ctx.pw  = 0.0::f32;
-    ctx.hot = 0;
-    ctx.oom = 0;
+    ctx.sw       = sw;
+    ctx.sh       = sh;
+    ctx.frame_sp = 0;
+    ctx.hot      = 0;
+    ctx.oom      = 0;
 
     ctx.lx      = 0.0::f32;
     ctx.ly      = 0.0::f32;
@@ -1334,6 +1332,59 @@ pub fun pop_layer(ctx: *Context) {
     ctx.layer_sp = ctx.layer_sp - 1;
     if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
     or                                 { ctx.layer = ctx.layer - 1; }
+}
+
+# open a layout frame inside the current one (see blit.layout)
+#
+# containers push the frame their content is laid out in and pop it at their
+# end, so the parent's pen is untouched until the container places itself.
+# the stack grows with nesting; if it cannot, oom is set, frame hands out a
+# spare frame until the matching pop and depth still balances.
+# ---
+# ctx: context
+# f:   the new frame
+pub fun push_frame(ctx: *Context, f: layout.Frame) {
+    ctx.frames = room[layout.Frame](ctx, ctx.frames, ?ctx.frames_cap, ctx.frame_sp + 1, CLIP_DEPTH);
+    if (ctx.frame_sp < ctx.frames_cap) { ctx.frames[ctx.frame_sp] = f; }
+    or                                 { ctx.spare = f; }
+    ctx.frame_sp = ctx.frame_sp + 1;
+}
+
+# close the innermost layout frame, back to its parent
+# ---
+# ctx: context
+pub fun pop_frame(ctx: *Context) {
+    if (ctx.frame_sp > 0) { ctx.frame_sp = ctx.frame_sp - 1; }
+}
+
+# the innermost layout frame, nil when none is open
+#
+# the pointer is valid until the next push_frame.
+# ---
+# ctx: context
+# ret: the frame
+pub fun frame(ctx: *Context) *layout.Frame {
+    ret frame_at(ctx, 0);
+}
+
+# the frame depth levels out from the innermost, nil past the root
+# ---
+# ctx:   context
+# depth: 0 for the innermost, 1 for its parent
+# ret:   the frame
+pub fun frame_at(ctx: *Context, depth: usize) *layout.Frame {
+    if (depth >= ctx.frame_sp) { ret nil; }
+    val i: usize = ctx.frame_sp - 1 - depth;
+    if (i < ctx.frames_cap) { ret ?ctx.frames[i]; }
+    ret ?ctx.spare;
+}
+
+# how many layout frames are open
+# ---
+# ctx: context
+# ret: the depth, 0 before the first is pushed
+pub fun frame_depth(ctx: *Context) usize {
+    ret ctx.frame_sp;
 }
 
 # move a local rect into screen space and clip it to the active rect
