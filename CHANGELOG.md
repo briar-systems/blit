@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-01
+
+### Added
+- A wrapping flow layout (#203): `layout.rows` and the `Flow` options place items left to right and start a new row when the next would pass the right edge. A row is as tall as its tallest item, items align against their row (`start`, `center`, `end`, `stretch`), and an item wider than a row gets the row to itself and is cut by its own truncation (`fit_box`, `fit_pair`). `widget.flow` takes its item and row gaps from the `layout` style, and `begin_flow` / `end_flow` size a flow in its parent as `begin_stack` does. A flow sized `limit(fit(), 0, max)` wraps at `max`, which is how one wraps inside an overlay.
+
 ## [0.11.0] - 2026-10-01
 
 ### Added

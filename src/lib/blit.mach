@@ -55,4 +55,4 @@ fwd blit.tooltip;
 fwd blit.inspect;
 
 # blit library version
-pub val VERSION: str = "0.11.0";
+pub val VERSION: str = "0.12.0";
