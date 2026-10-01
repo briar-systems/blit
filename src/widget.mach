@@ -2532,17 +2532,27 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     ret @open != 0;
 }
 
+# the side of a section's caret: the section style's min_w, or with none the
+# caption's ascent, so it follows the caption's text style and never the line
+fun caret_size(ctx: *context.Context, ascent: f32) f32 {
+    val k: f32 = look(ctx, theme.SECTION).min_w;
+    if (k > 0.0::f32) { ret context.px(ctx, k); }
+    ret ascent;
+}
+
 # a section's heading: the row, its click and its caret, returning its id
 fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
-    val id: u64          = context.id_of(ctx, title);
-    val lh: f32          = context.line_height(ctx);
-    val in: theme.Edges  = inset(ctx, theme.SECTION);
-    val r:  context.Area = place(ctx, wide(), layout.fit(), label_width(ctx, title) + lh + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
-    val x0: f32          = r.x0;
-    val y0: f32          = r.y0;
-    val x1: f32          = r.x1;
-    val y1: f32          = r.y1;
-    val h:  f32          = y1 - y0;
+    val id: u64             = context.id_of(ctx, title);
+    val lh: f32             = context.line_height(ctx);
+    val m:  gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
+    val k:  f32             = caret_size(ctx, m.ascent);
+    val in: theme.Edges     = inset(ctx, theme.SECTION);
+    val r:  context.Area    = place(ctx, wide(), layout.fit(), label_width(ctx, title) + k + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
+    val x0: f32             = r.x0;
+    val y0: f32             = r.y0;
+    val x1: f32             = r.x1;
+    val y1: f32             = r.y1;
+    val h:  f32             = y1 - y0;
 
     val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, PRESS);
     hand(ctx, hs);
@@ -2554,9 +2564,10 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     val st: u8          = state_of(hs, false, false);
     val p:  theme.Paint = anim.box(ctx, id, theme.SECTION, st, x0, y0, x1, y1);
 
+    # the caret centred on the caption between its line's top and its baseline
     val gy: f32 = y0 + (h - lh) / 2.0::f32;
-    caret(ctx, x0 + in.l, gy, lh, @open != 0, p.mark);
-    label_at(ctx, title, x0 + in.l * 2.0::f32 + lh, gy, p.text);
+    caret(ctx, x0 + in.l, gy + (m.ascent - k) / 2.0::f32, k, @open != 0, p.mark);
+    label_at(ctx, title, x0 + in.l * 2.0::f32 + k, gy, p.text);
     ret id;
 }
 
