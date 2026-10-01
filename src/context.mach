@@ -19,11 +19,18 @@
 # text is laid out and rasterised at, so a scale of 2.0 doubles the interface
 # without any widget knowing.
 #
-# the painter also carries a CPU clip stack and a local-origin offset. every quad
-# is shifted by the local origin into screen space, then clipped to the active
-# rect; quads fully outside are dropped and partial ones are shrunk with their
-# uvs interpolated, so all clipping stays geometric and backend-agnostic. push a
-# sub-surface (begin_surface) to draw custom content in a scrolled local space.
+# the painter also carries a clip stack and a local-origin offset. every shape
+# is shifted by the local origin into screen space. a shape wholly outside the
+# active clip rect is dropped on the CPU, and the rest is left whole: each run
+# of the draw list carries the clip rect it was drawn under, which the renderer
+# sets as its scissor. push a sub-surface (begin_surface) to draw custom
+# content in a scrolled local space.
+#
+# the draw list is indexed and its colors premultiplied. a run is a span of
+# indices drawn with one texture, one scissor and on one layer. a container
+# that paints its background once its contents are known splits the runs
+# into channels (split, set_channel, merge), so the background it draws last
+# still sorts beneath its children.
 #
 # coordinates compose one way. every rect a caller passes (geometry, claims,
 # clips, surfaces) is in the current local space, which is screen space shifted
@@ -70,19 +77,14 @@ use blit.input;
 use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
+use vec: std.collections.vector;
 use std.math.float.sqrt_f32;
 
 # maximum nesting of pushed clip rects, local origins and layers
 pub val CLIP_DEPTH: usize = 16;
 
-# maximum single-texture spans one frame's draw list may divide into
-pub val RUN_DEPTH: usize = 64;
-
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
-
-# the fill handle reserve_fill returns when the fill could not be emitted whole
-pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
 
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
@@ -90,27 +92,57 @@ pub val CORNERS_TOP:    u8 = 1;
 pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
 
-# one contiguous span of the draw list sampling a single texture on one layer
+# a run of indexed triangles: bind the texture, set the scissor, draw the indices
+pub val RUN_TRIANGLES: u32 = 0;
+
+# one span of the composed index list, drawn with one texture and one scissor
+# on one layer
 #
-# every vertex lies in exactly one span, so a span's tex is the texture handle
-# of each quad in it. a renderer binds atlas page `page` when tex is
-# draw.ATLAS, else the consumer texture tex with the sampling filter names,
-# and draws count vertices from start. the record is plain integers, so a
-# foreign renderer reads it field for field.
+# every index lies in exactly one run. for kind RUN_TRIANGLES a renderer binds
+# atlas page `page` when tex is draw.ATLAS, else the consumer texture tex with
+# the sampling filter it names, sets the scissor to the clip rect, and draws
+# count indices from start as triangles. the record is plain numbers, so a
+# foreign renderer reads it field for field. kind is RUN_TRIANGLES today. it
+# leaves room for runs of other kinds, which a renderer that does not know
+# them skips.
 # ---
-# tex:    consumer texture handle, draw.ATLAS (0) for the font atlas
-# page:   the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
-# layer:  layer the span was drawn on
-# start:  first vertex of the span
-# count:  vertices in the span
-# filter: draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
+# kind:    what the run asks of the renderer, RUN_TRIANGLES
+# tex:     consumer texture handle, draw.ATLAS (0) for the font atlas
+# page:    the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
+# layer:   layer the run was drawn on
+# filter:  draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
+# clip_x0: scissor left in screen pixels
+# clip_y0: scissor top in screen pixels, y down
+# clip_x1: scissor right in screen pixels
+# clip_y1: scissor bottom in screen pixels
+# start:   first index of the run
+# count:   indices in the run, three per triangle
 pub rec Run {
-    tex:    u64;
-    page:   u32;
-    layer:  u32;
-    start:  usize;
-    count:  usize;
-    filter: u32;
+    kind:    u32;
+    tex:     u64;
+    page:    u32;
+    layer:   u32;
+    filter:  u32;
+    clip_x0: f32;
+    clip_y0: f32;
+    clip_x1: f32;
+    clip_y1: f32;
+    start:   usize;
+    count:   usize;
+}
+
+# the channels a container splits its runs into, from split, for set_channel
+# and merge
+# ---
+# base:  the first run drawn after the split
+# floor: the enclosing run floor, restored by merge
+# outer: the enclosing channel, restored by merge
+# count: how many channels the split made
+pub rec Channels {
+    base:  usize;
+    floor: usize;
+    outer: u32;
+    count: u32;
 }
 
 # a screen edge a docked container attaches to
@@ -168,11 +200,14 @@ pub rec Area {
 # tex:           texture handle subsequent geometry samples (draw.ATLAS = font atlas)
 # page:          atlas page subsequent atlas geometry samples
 # filter:        sampling filter subsequent consumer-texture geometry asks for
-# run_start:     first vertex of the span being accumulated
-# runs:          closed single-texture spans, in draw order
-# run_len:       how many spans are closed
+# run_start:     first index of the run being accumulated
+# pend:          the state the run being accumulated was opened with
+# runs:          closed runs, in draw order
+# chans:         the channel each closed run was drawn in, parallel to runs
+# chan:          channel subsequent runs are drawn in
+# run_floor:     runs below this index are sealed and never reopened
 # oom:           1 if an allocation or a claim was refused this frame, else 0
-# out:           scratch draw list end() composes layers into
+# order:         scratch index list end() composes runs into
 # claims:        this frame's claims, which route the next frame
 # prior:         the previous frame's claims, which route this frame
 # hover:         id of the topmost claimant under the cursor, resolved in begin (0 = none)
@@ -227,10 +262,13 @@ pub rec Context {
     page:          u32;
     filter:        u32;
     run_start:     usize;
-    runs:          [64]Run;
-    run_len:       usize;
+    pend:          Run;
+    runs:          vec.Vector[Run];
+    chans:         vec.Vector[u32];
+    chan:          u32;
+    run_floor:     usize;
     oom:           u8;
-    out:           draw.DrawList;
+    order:         vec.Vector[u32];
     claims:        hit.ClaimList;
     prior:         hit.ClaimList;
     hover:         u64;
@@ -270,15 +308,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         val f6: err[allo.Error] = font.free(?ctx.font);
         ret e;
     }
-    val eo: err[allo.Error] = draw.init(?ctx.out, a);
-    if (sel eo.err) {
-        val f0: err[allo.Error] = draw.free(?ctx.dl);
-        val f7: err[allo.Error] = font.free(?ctx.font);
-        ret eo;
-    }
     val ec: err[allo.Error] = hit.init(?ctx.claims, a);
     if (sel ec.err) {
-        val f1: err[allo.Error] = draw.free(?ctx.out);
         val f2: err[allo.Error] = draw.free(?ctx.dl);
         val f8: err[allo.Error] = font.free(?ctx.font);
         ret ec;
@@ -286,11 +317,14 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     val ep: err[allo.Error] = hit.init(?ctx.prior, a);
     if (sel ep.err) {
         val f3: err[allo.Error] = hit.free(?ctx.claims);
-        val f4: err[allo.Error] = draw.free(?ctx.out);
         val f5: err[allo.Error] = draw.free(?ctx.dl);
         val f9: err[allo.Error] = font.free(?ctx.font);
         ret ep;
     }
+    # the run lists own nothing until the first frame grows them
+    ctx.runs  = vec.init[Run](a);
+    ctx.chans = vec.init[u32](a);
+    ctx.order = vec.init[u32](a);
 
     ctx.in.mx        = 0.0::f32;
     ctx.in.my        = 0.0::f32;
@@ -324,7 +358,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.page          = 0;
     ctx.filter        = draw.FILTER_NEAREST;
     ctx.run_start     = 0;
-    ctx.run_len       = 0;
+    ctx.chan          = 0;
+    ctx.run_floor     = 0;
     ctx.oom           = 0;
     ctx.hover         = 0;
     ctx.layer         = 0;
@@ -358,8 +393,12 @@ pub fun free(ctx: *Context) err[allo.Error] {
     }
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
-    val e1: err[allo.Error] = draw.free(?ctx.out);
+    val e1: err[allo.Error] = vec.dnit[Run](?ctx.runs);
     if (sel e1.err) { ret e1; }
+    val e4: err[allo.Error] = vec.dnit[u32](?ctx.chans);
+    if (sel e4.err) { ret e4; }
+    val e5: err[allo.Error] = vec.dnit[u32](?ctx.order);
+    if (sel e5.err) { ret e5; }
     val e2: err[allo.Error] = hit.free(?ctx.claims);
     if (sel e2.err) { ret e2; }
     val e3: err[allo.Error] = hit.free(?ctx.prior);
@@ -408,7 +447,10 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.page      = 0;
     ctx.filter    = draw.FILTER_NEAREST;
     ctx.run_start = 0;
-    ctx.run_len   = 0;
+    ctx.chan      = 0;
+    ctx.run_floor = 0;
+    vec.clear[Run](?ctx.runs);
+    vec.clear[u32](?ctx.chans);
 
     ctx.wheel_taken = 0;
     ctx.free        = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
@@ -430,12 +472,9 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     draw.reset(?ctx.dl);
 }
 
-# finish a frame: close the last texture span, compose the draw list by layer,
-# drop the active widget once the button is released and drop the focus when
-# its holder was not drawn
-#
-# vertex indices taken during the frame (begin_panel's handle) are emission
-# indices and are only valid until end().
+# finish a frame: close the last run, compose the runs by layer, drop the
+# active widget once the button is released and drop the focus when its holder
+# was not drawn
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
@@ -575,12 +614,31 @@ pub fun draw_verts(ctx: *Context) *draw.Vert {
     ret draw.data(?ctx.dl);
 }
 
-# number of vertices to draw this frame
+# number of vertices to upload this frame
 # ---
 # ctx: context
 # ret: vertex count
 pub fun draw_count(ctx: *Context) usize {
     ret draw.count(?ctx.dl);
+}
+
+# pointer to the frame's u32 indices in composed paint order, for the
+# consumer to upload
+#
+# runs name spans of this list (see Run).
+# ---
+# ctx: context
+# ret: pointer to the first index
+pub fun draw_indices(ctx: *Context) *u32 {
+    ret draw.indices(?ctx.dl);
+}
+
+# number of indices this frame, three per triangle
+# ---
+# ctx: context
+# ret: index count
+pub fun index_count(ctx: *Context) usize {
+    ret draw.index_count(?ctx.dl);
 }
 
 # fold a draw-list result into the context's oom flag
@@ -590,121 +648,195 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 
 # sample subsequent geometry from one consumer texture, draw.ATLAS for the atlas
 #
-# a switch with nothing emitted since the last one retargets in place, so
-# alternating between an image and the atlas records spans only where
-# something was drawn. a frame that closes more than RUN_DEPTH spans keeps
-# drawing into the last one, which mistextures (and mislayers) those vertices
-# rather than dropping them; raise RUN_DEPTH before drawing that many spans.
+# a switch with nothing emitted since the last one costs nothing, so
+# alternating between an image and the atlas records runs only where
+# something was drawn.
 # ---
 # ctx:    context
 # tex:    consumer texture handle, draw.ATLAS for the font atlas
 # filter: draw.FILTER_NEAREST or FILTER_LINEAR, ignored for the atlas
 pub fun set_texture(ctx: *Context, tex: u64, filter: u32) {
-    retarget(ctx, tex, ctx.page, filter);
-}
-
-# a texture target, the atlas's page and filter normalised so equal targets
-# compare equal field for field
-fun target(tex: u64, page: u32, filter: u32) Run {
-    if (tex == draw.ATLAS) {
-        ret Run{tex: tex, page: page, layer: 0, start: 0, count: 0, filter: draw.FILTER_NEAREST};
-    }
-    ret Run{tex: tex, page: 0, layer: 0, start: 0, count: 0, filter: filter};
-}
-
-# whether two spans sample the same texels the same way
-fun same_target(a: Run, b: Run) bool {
-    ret a.tex == b.tex && a.page == b.page && a.filter == b.filter;
-}
-
-# the target subsequent geometry samples
-fun current(ctx: *Context) Run {
-    ret target(ctx.tex, ctx.page, ctx.filter);
-}
-
-# sample subsequent geometry from a consumer texture, or from an atlas page
-# when tex is draw.ATLAS
-fun retarget(ctx: *Context, tex: u64, page: u32, filter: u32) {
-    val want: Run = target(tex, page, filter);
-    if (same_target(current(ctx), want)) {
-        ctx.page = page;
-        ret;
-    }
-    # a retarget with nothing drawn since the last span closed reopens that
-    # span when it sampled the same texture, so a row of images through one
-    # sheet costs one span however often the atlas was targeted between them
-    val len: usize = draw.count(?ctx.dl);
-    if (len == ctx.run_start && ctx.run_len > 0
-        && same_target(ctx.runs[ctx.run_len - 1], want)
-        && ctx.runs[ctx.run_len - 1].layer == ctx.layer
-        && ctx.runs[ctx.run_len - 1].start
-        + ctx.runs[ctx.run_len - 1].count == len) {
-        ctx.run_len   = ctx.run_len - 1;
-        ctx.run_start = ctx.runs[ctx.run_len].start;
-        ctx.tex       = tex;
-        ctx.page      = page;
-        ctx.filter    = filter;
-        ret;
-    }
-    flush_run(ctx);
     ctx.tex    = tex;
-    ctx.page   = page;
     ctx.filter = filter;
 }
 
-# number of single-texture spans the frame's draw list divides into
+# the run subsequent geometry lands in, the atlas's page and filter
+# normalised so equal states compare equal field for field
+fun state(ctx: *Context) Run {
+    var r: Run = Run{
+        kind:    RUN_TRIANGLES, tex: ctx.tex, page: 0, layer: ctx.layer, filter: ctx.filter,
+        clip_x0: ctx.clip_x0, clip_y0: ctx.clip_y0, clip_x1: ctx.clip_x1, clip_y1: ctx.clip_y1,
+        start:   0, count: 0
+    };
+    if (ctx.tex == draw.ATLAS) {
+        r.page   = ctx.page;
+        r.filter = draw.FILTER_NEAREST;
+    }
+    ret r;
+}
+
+# whether two runs draw the same way: kind, texture, layer and scissor
+fun same_state(a: Run, b: Run) bool {
+    ret a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
+        && a.layer == b.layer && a.clip_x0 == b.clip_x0 && a.clip_y0 == b.clip_y0
+        && a.clip_x1 == b.clip_x1 && a.clip_y1 == b.clip_y1;
+}
+
+# make the run being accumulated match the current state before a shape's
+# indices are written
 #
-# complete only after end(); the span still accumulating is not counted.
+# a shape drawn under another texture, layer or clip than the pending run
+# closes it. with nothing pending, the last closed run reopens when it draws
+# the same way, ends where the list does and lies above the run floor, so a
+# row of images through one sheet costs one run however often the atlas was
+# targeted between them.
+fun open_run(ctx: *Context) {
+    val want: Run   = state(ctx);
+    val len:  usize = draw.index_count(?ctx.dl);
+    if (len > ctx.run_start) {
+        if (same_state(ctx.pend, want)) { ret; }
+        flush_run(ctx);
+    }
+    val n: usize = ctx.runs.len;
+    if (n > ctx.run_floor) {
+        val last: Run = ctx.runs.data[n - 1];
+        if (same_state(last, want) && last.start + last.count == len) {
+            ctx.runs.len  = n - 1;
+            ctx.chans.len = n - 1;
+            ctx.run_start = last.start;
+        }
+    }
+    ctx.pend = want;
+}
+
+# number of runs the frame's draw list divides into
+#
+# complete only after end(); the run still accumulating is not counted.
 # ---
 # ctx: context
-# ret: span count
+# ret: run count
 pub fun run_count(ctx: *Context) usize {
-    ret ctx.run_len;
+    ret ctx.runs.len;
 }
 
-# one single-texture span of the draw list, in composed paint order
+# one run of the draw list, in composed paint order
 # ---
 # ctx:   context
-# index: span index below run_count()
-# ret:   the span, or an empty one for an index out of range
+# index: run index below run_count()
+# ret:   the run, or an empty one for an index out of range
 pub fun run_at(ctx: *Context, index: usize) Run {
-    if (index >= ctx.run_len) { ret target(draw.ATLAS, 0, draw.FILTER_NEAREST); }
-    ret ctx.runs[index];
+    if (index >= ctx.runs.len) {
+        ret Run{
+            kind:    RUN_TRIANGLES, tex: draw.ATLAS, page: 0, layer: 0, filter: draw.FILTER_NEAREST,
+            clip_x0: 0.0::f32, clip_y0: 0.0::f32, clip_x1: 0.0::f32, clip_y1: 0.0::f32,
+            start:   0, count: 0
+        };
+    }
+    ret ctx.runs.data[index];
 }
 
-# close the span being accumulated, if it holds any vertices
+# close the run being accumulated, if it holds any indices
 #
-# with RUN_DEPTH spans closed, the last span absorbs the vertices instead, so
-# every vertex stays covered by a span.
+# a run list that cannot grow sets oom, and the pending indices are left out
+# of every run, so they are never drawn.
 fun flush_run(ctx: *Context) {
-    val len: usize = draw.count(?ctx.dl);
+    val len: usize = draw.index_count(?ctx.dl);
     if (len == ctx.run_start) { ret; }
-    if (ctx.run_len >= RUN_DEPTH) {
-        val last: usize = RUN_DEPTH - 1;
-        ctx.runs[last].count = len - ctx.runs[last].start;
-        ctx.run_start        = len;
+    var run: Run = ctx.pend;
+    run.start     = ctx.run_start;
+    run.count     = len - ctx.run_start;
+    ctx.run_start = len;
+    val rr: res[usize, allo.Error] = vec.push[Run](?ctx.runs, run);
+    if (sel rr.err) {
+        ctx.oom = 1;
         ret;
     }
-    var run: Run = current(ctx);
-    run.layer             = ctx.layer;
-    run.start             = ctx.run_start;
-    run.count             = len - ctx.run_start;
-    ctx.runs[ctx.run_len] = run;
-    ctx.run_len           = ctx.run_len + 1;
-    ctx.run_start         = len;
+    val rc: res[usize, allo.Error] = vec.push[u32](?ctx.chans, ctx.chan);
+    if (sel rc.err) {
+        ctx.runs.len = ctx.runs.len - 1;
+        ctx.oom      = 1;
+    }
 }
 
-# reorder the draw list so layers paint in ascending order
+# split the runs drawn from here on into n channels, starting in channel 0
 #
-# the sort is stable, so emission order holds within a layer, and spans that
-# end up adjacent on one texture and layer merge. an already ordered frame is
-# left untouched. if the scratch list cannot grow, the frame keeps emission
-# order and oom is set.
+# runs drawn in a lower channel paint beneath those drawn in a higher one,
+# whatever the order they were drawn in, until merge folds them back into the
+# enclosing channel. a container draws its children in channel 1 and its
+# background in channel 0 at its end, once its size is known. splits nest,
+# and every split is paired with a merge on the same layer.
+# ---
+# ctx: context
+# n:   number of channels, at least 1
+# ret: the split, for set_channel and merge
+pub fun split(ctx: *Context, n: u32) Channels {
+    flush_run(ctx);
+    val ch: Channels = Channels{base: ctx.runs.len, floor: ctx.run_floor, outer: ctx.chan, count: n};
+    ctx.chan      = 0;
+    ctx.run_floor = ctx.runs.len;
+    ret ch;
+}
+
+# draw subsequent runs in channel i of a split
+# ---
+# ctx: context
+# ch:  the split from split
+# i:   channel index, clamped below ch.count
+pub fun set_channel(ctx: *Context, ch: Channels, i: u32) {
+    flush_run(ctx);
+    var c: u32 = i;
+    if (c >= ch.count && ch.count > 0) { c = ch.count - 1; }
+    ctx.chan      = c;
+    ctx.run_floor = ctx.runs.len;
+}
+
+# fold a split's channels back into the enclosing channel, lowest first
+#
+# the order within a channel is kept, and the runs of the split then belong
+# to the channel the split was made in.
+# ---
+# ctx: context
+# ch:  the split from split
+pub fun merge(ctx: *Context, ch: Channels) {
+    flush_run(ctx);
+    var i: usize = ch.base + 1;
+    for (i < ctx.runs.len) {
+        val run: Run   = ctx.runs.data[i];
+        val c:   u32   = ctx.chans.data[i];
+        var j:   usize = i;
+        for (j > ch.base && ctx.chans.data[j - 1] > c) {
+            ctx.runs.data[j]  = ctx.runs.data[j - 1];
+            ctx.chans.data[j] = ctx.chans.data[j - 1];
+            j                 = j - 1;
+        }
+        ctx.runs.data[j]  = run;
+        ctx.chans.data[j] = c;
+        i                 = i + 1;
+    }
+    var k: usize = ch.base;
+    for (k < ctx.chans.len) {
+        ctx.chans.data[k] = ch.outer;
+        k                 = k + 1;
+    }
+    ctx.chan      = ch.outer;
+    ctx.run_floor = ch.floor;
+}
+
+# order the runs so layers paint in ascending order and lay their indices out
+# in that order
+#
+# the sort is stable, so draw order holds within a layer, and runs that end
+# up adjacent and draw the same way merge. a frame whose runs already follow
+# their indices in layer order is left untouched. if the scratch list cannot
+# grow, the frame keeps draw order and oom is set.
 fun compose(ctx: *Context) {
+    val n:      usize = ctx.runs.len;
     var i:      usize = 1;
     var sorted: u8    = 1;
-    for (i < ctx.run_len) {
-        if (ctx.runs[i].layer < ctx.runs[i - 1].layer) {
+    for (i < n) {
+        val prev: Run = ctx.runs.data[i - 1];
+        val cur:  Run = ctx.runs.data[i];
+        if (cur.layer < prev.layer || cur.start != prev.start + prev.count) {
             sorted = 0;
             brk;
         }
@@ -712,52 +844,53 @@ fun compose(ctx: *Context) {
     }
     if (sorted != 0) { ret; }
 
-    draw.reset(?ctx.out);
-    val grown: err[allo.Error] = draw.reserve(?ctx.out, draw.count(?ctx.dl));
+    vec.clear[u32](?ctx.order);
+    val grown: res[usize, allo.Error] = vec.reserve[u32](?ctx.order, draw.index_count(?ctx.dl));
     if (sel grown.err) {
         ctx.oom = 1;
         ret;
     }
 
     i = 1;
-    for (i < ctx.run_len) {
-        val cur: Run   = ctx.runs[i];
+    for (i < n) {
+        val cur: Run   = ctx.runs.data[i];
         var j:   usize = i;
-        for (j > 0 && ctx.runs[j - 1].layer > cur.layer) {
-            ctx.runs[j] = ctx.runs[j - 1];
-            j           = j - 1;
+        for (j > 0 && ctx.runs.data[j - 1].layer > cur.layer) {
+            ctx.runs.data[j] = ctx.runs.data[j - 1];
+            j                = j - 1;
         }
-        ctx.runs[j] = cur;
-        i           = i + 1;
+        ctx.runs.data[j] = cur;
+        i                = i + 1;
     }
 
-    val src: *draw.Vert = draw.data(?ctx.dl);
-    var at:  usize      = 0;
-    var n:   usize      = 0;
-    var k:   usize      = 0;
-    for (k < ctx.run_len) {
-        val run: Run   = ctx.runs[k];
+    val src: *u32  = draw.indices(?ctx.dl);
+    var m:   usize = 0;
+    var k:   usize = 0;
+    for (k < n) {
+        val run: Run   = ctx.runs.data[k];
+        val at:  usize = ctx.order.len;
         var v:   usize = 0;
         for (v < run.count) {
-            record(ctx, draw.push_vert(?ctx.out, src[run.start + v]));
-            v = v + 1;
+            ctx.order.data[at + v] = src[run.start + v];
+            v                      = v + 1;
         }
-        if (n > 0 && same_target(ctx.runs[n - 1], run) && ctx.runs[n - 1].layer == run.layer) {
-            ctx.runs[n - 1].count = ctx.runs[n - 1].count + run.count;
+        ctx.order.len = at + run.count;
+        if (m > 0 && same_state(ctx.runs.data[m - 1], run)) {
+            ctx.runs.data[m - 1].count = ctx.runs.data[m - 1].count + run.count;
         }
         or {
-            ctx.runs[n]       = run;
-            ctx.runs[n].start = at;
-            n                 = n + 1;
+            ctx.runs.data[m]       = run;
+            ctx.runs.data[m].start = at;
+            m                      = m + 1;
         }
-        at = at + run.count;
-        k  = k + 1;
+        k = k + 1;
     }
-    ctx.run_len = n;
+    ctx.runs.len  = m;
+    ctx.chans.len = m;
 
-    val emitted: draw.DrawList = ctx.dl;
-    ctx.dl  = ctx.out;
-    ctx.out = emitted;
+    val emitted: vec.Vector[u32] = ctx.dl.idx;
+    ctx.dl.idx = ctx.order;
+    ctx.order  = emitted;
 }
 
 # draw a region of a consumer texture scaled into a rect
@@ -889,7 +1022,6 @@ pub fun input_visible(ctx: *Context, x: f32, y: f32) u8 {
 # ---
 # ctx: context
 pub fun push_layer(ctx: *Context) {
-    flush_run(ctx);
     if (ctx.layer_sp < CLIP_DEPTH) { ctx.layers[ctx.layer_sp] = ctx.layer; }
     ctx.layer_sp = ctx.layer_sp + 1;
     ctx.layer    = ctx.layer + 1;
@@ -909,7 +1041,6 @@ pub fun pop_layer(ctx: *Context) {
     if (ctx.layer_sp == 0) { ret; }
     pop_origin(ctx);
     pop_clip(ctx);
-    flush_run(ctx);
     ctx.layer_sp = ctx.layer_sp - 1;
     if (ctx.layer_sp < CLIP_DEPTH) { ctx.layer = ctx.layers[ctx.layer_sp]; }
     or                             { ctx.layer = ctx.layer - 1; }
@@ -1017,48 +1148,30 @@ pub fun fill_claim(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: 
     ctx.claims.items[handle].y1 = sy1;
 }
 
-# shift a textured quad by the local origin, clip it to the active rect with
-# its uvs interpolated across the surviving fraction, and push it
+# whether a screen-space box lies wholly outside the active clip rect
+fun culled(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    ret x1 <= ctx.clip_x0 || x0 >= ctx.clip_x1 || y1 <= ctx.clip_y0 || y0 >= ctx.clip_y1;
+}
+
+# shift a textured quad by the local origin and push it, unless it lies wholly
+# outside the clip rect
 #
-# quads fully outside the clip are dropped; zero-extent axes keep their uvs
-# unchanged.
+# a quad the clip cuts is pushed whole and its run's scissor cuts it.
 fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
     val sx0: f32 = x0 + ctx.lx;
     val sy0: f32 = y0 + ctx.ly;
     val sx1: f32 = x1 + ctx.lx;
     val sy1: f32 = y1 + ctx.ly;
-
-    if (sx1 <= ctx.clip_x0 || sx0 >= ctx.clip_x1) { ret; }
-    if (sy1 <= ctx.clip_y0 || sy0 >= ctx.clip_y1) { ret; }
-
-    val nx0: f32 = maxf(sx0, ctx.clip_x0);
-    val ny0: f32 = maxf(sy0, ctx.clip_y0);
-    val nx1: f32 = minf(sx1, ctx.clip_x1);
-    val ny1: f32 = minf(sy1, ctx.clip_y1);
-
-    var nu0: f32 = u0;
-    var nu1: f32 = u1;
-    val w:   f32 = sx1 - sx0;
-    if (w > 0.0::f32) {
-        nu0 = u0 + (u1 - u0) * (nx0 - sx0) / w;
-        nu1 = u0 + (u1 - u0) * (nx1 - sx0) / w;
-    }
-
-    var nv0: f32 = v0;
-    var nv1: f32 = v1;
-    val h:   f32 = sy1 - sy0;
-    if (h > 0.0::f32) {
-        nv0 = v0 + (v1 - v0) * (ny0 - sy0) / h;
-        nv1 = v0 + (v1 - v0) * (ny1 - sy0) / h;
-    }
-
-    record(ctx, draw.push_quad(?ctx.dl, nx0, ny0, nx1, ny1, nu0, nv0, nu1, nv1, c));
+    if (culled(ctx, minf(sx0, sx1), minf(sy0, sy1), maxf(sx0, sx1), maxf(sy0, sy1))) { ret; }
+    open_run(ctx);
+    record(ctx, draw.push_quad(?ctx.dl, sx0, sy0, sx1, sy1, u0, v0, u1, v1, c));
 }
 
-# a color as it is emitted: converted to linear light for an sRGB target
+# a color as it is emitted: converted to linear light for an sRGB target,
+# then premultiplied by its alpha
 fun paint(ctx: *Context, c: draw.Color) draw.Color {
-    if (ctx.srgb != 0) { ret draw.linear(c); }
-    ret c;
+    if (ctx.srgb != 0) { ret draw.premultiply(draw.linear(c)); }
+    ret draw.premultiply(c);
 }
 
 # say whether the target encodes sRGB on write
@@ -1182,8 +1295,7 @@ pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
 # how many quads a fill of radius r with these corners is made of
 #
 # one for the body and one per pixel row of each rounded end, so a square fill
-# is a single quad. the count depends on the radius and corners alone, never
-# on the rect, which lets reserve_fill emit a fill before its height is known.
+# is a single quad.
 fun fill_quads(r: f32, corners: u8) usize {
     if (r <= 0.0::f32) { ret 1; }
     var rows: usize = r::usize;
@@ -1256,102 +1368,15 @@ pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners:
     }
 }
 
-# emit a zero-height fill at (x0, y0)-(x1, y0) to give its rect later with
-# grow_fill
-#
-# containers use this: a panel paints its background beneath its widgets
-# before it knows how tall they make it. the placeholder is not clipped until
-# grow_fill gives it its rect. r and corners must match the grow_fill call.
-# ---
-# ctx:     context
-# x0:      left x in pixels
-# y0:      top y in pixels
-# x1:      right x in pixels
-# r:       corner radius in pixels
-# corners: which corners are rounded, CORNERS_* combined with |
-# c:       fill color
-# ret:     a handle for grow_fill, or NO_VERTS if the fill was not emitted whole
-pub fun reserve_fill(ctx: *Context, x0: f32, y0: f32, x1: f32, r: f32, corners: u8, c: draw.Color) usize {
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    var wu: f32;
-    var wv: f32;
-    atlas.white_uv(?wu, ?wv);
-    # the placeholders skip the clip, which would drop a zero-height quad on
-    # its edge, and grow_fill clips them once the rect is known
-    val ink:    draw.Color = paint(ctx, c);
-    val sx0:    f32        = x0 + ctx.lx;
-    val sx1:    f32        = x1 + ctx.lx;
-    val sy:     f32        = y0 + ctx.ly;
-    val n:      usize      = fill_quads(rad, corners);
-    val before: usize      = draw.count(?ctx.dl);
-    var k:      usize      = 0;
-    for (k < n) {
-        record(ctx, draw.push_quad(?ctx.dl, sx0, sy, sx1, sy, wu, wv, wu, wv, ink));
-        k = k + 1;
-    }
-    if (draw.count(?ctx.dl) != before + n * 6) { ret NO_VERTS; }
-    ret before;
-}
-
-# move quad k of a reserved fill onto the local rect q, clipped like emit
-fun place_quad(ctx: *Context, p: *draw.Vert, k: usize, q: Area) {
-    var sx0: f32 = maxf(q.x0 + ctx.lx, ctx.clip_x0);
-    var sy0: f32 = maxf(q.y0 + ctx.ly, ctx.clip_y0);
-    var sx1: f32 = minf(q.x1 + ctx.lx, ctx.clip_x1);
-    var sy1: f32 = minf(q.y1 + ctx.ly, ctx.clip_y1);
-    if (sx1 <= sx0 || sy1 <= sy0) {
-        sx1 = sx0;
-        sy1 = sy0;
-    }
-    p[k + 0].x = sx0;
-    p[k + 0].y = sy0;
-    p[k + 1].x = sx1;
-    p[k + 1].y = sy0;
-    p[k + 2].x = sx1;
-    p[k + 2].y = sy1;
-    p[k + 3].x = sx0;
-    p[k + 3].y = sy0;
-    p[k + 4].x = sx1;
-    p[k + 4].y = sy1;
-    p[k + 5].x = sx0;
-    p[k + 5].y = sy1;
-}
-
-# give a fill reserved by reserve_fill its rect, in local coordinates clipped
-# like geometry
-#
-# a no-op for NO_VERTS. vertex handles are emission indices, valid until end().
-# ---
-# ctx:     context
-# handle:  the value returned by reserve_fill this frame
-# x0:      left x in pixels
-# y0:      top y in pixels
-# x1:      right x in pixels
-# y1:      bottom y in pixels
-# r:       corner radius in pixels, as passed to reserve_fill
-# corners: which corners are rounded, as passed to reserve_fill
-pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8) {
-    if (handle == NO_VERTS) { ret; }
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    val n: usize = fill_quads(rad, corners);
-    if (handle + n * 6 > draw.count(?ctx.dl)) { ret; }
-    val p: *draw.Vert = draw.data(?ctx.dl);
-    var k: usize      = 0;
-    for (k < n) {
-        place_quad(ctx, p, handle + k * 6, fill_part(x0, y0, x1, y1, rad, corners, k));
-        k = k + 1;
-    }
-}
-
 # emit one glyph with its pen at x on the baseline, sampling its atlas page
 # ---
 # ret: the glyph's advance
 fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
     val p: font.Placed = font.place(?ctx.font, cp, ctx.scale);
     if (p.drawn == 0) { ret p.g.advance; }
-    retarget(ctx, draw.ATLAS, p.page, draw.FILTER_NEAREST);
+    ctx.tex    = draw.ATLAS;
+    ctx.page   = p.page;
+    ctx.filter = draw.FILTER_NEAREST;
     emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
     ret p.g.advance;
 }
@@ -1526,43 +1551,91 @@ pub fun end_surface(ctx: *Context, surf: Surface) {
     pop_clip(ctx);
 }
 
-test clip__glyph_uvs_interpolate {
+test clip__runs_carry_their_scissor {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
     val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    start_at(?ctx, 0.0::f32, 0.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    # clip to the left half of an 8px glyph cell
+    # clip to the left half of an 8px glyph cell: the glyph is kept whole
     push_clip(?ctx, 0.0::f32, 0.0::f32, 4.0::f32, 100.0::f32);
     glyph(?ctx, 'A', 0.0::f32, 0.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
-
-    val p: *draw.Vert = draw_verts(?ctx);
-    # right edge clipped from 8 to 4
-    if (p[1].x != 4.0::f32) { ret 1; }
-    # left edge and its u untouched
-    if (p[0].x != 0.0::f32) { ret 1; }
-
+    if (draw_count(?ctx) != 4) { ret 2; }
+    val p: *draw.Vert  = draw_verts(?ctx);
     val g: font.Placed = font.place(?ctx.font, 'A', 1.0::f32);
-    if (p[0].u != g.u0) { ret 1; }
-    # clipped edge u interpolated to the cell midpoint
-    if (p[1].u != (g.u0 + g.u1) / 2.0::f32) { ret 1; }
+    if (p[1].x != 8.0::f32 || p[1].u != g.u1) { ret 3; }
 
-    # a quad fully outside the clip is dropped entirely
+    # a quad wholly outside the clip is dropped
     quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
-
+    if (draw_count(?ctx) != 4) { ret 4; }
     pop_clip(?ctx);
+    # the same quad under the screen's clip lands in a run of its own
+    quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
+    end(?ctx);
+
+    if (run_count(?ctx) != 2 || index_count(?ctx) != 12) { ret 5; }
+    val cut: Run = run_at(?ctx, 0);
+    if (cut.kind != RUN_TRIANGLES || cut.start != 0 || cut.count != 6) { ret 6; }
+    if (cut.clip_x0 != 0.0::f32 || cut.clip_y0 != 0.0::f32)            { ret 7; }
+    if (cut.clip_x1 != 4.0::f32 || cut.clip_y1 != 100.0::f32)          { ret 8; }
+    val full: Run = run_at(?ctx, 1);
+    if (full.start != 6 || full.clip_x1 != 100.0::f32) { ret 9; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test channels__background_drawn_last_paints_first {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
+    # vertices 0..3: drawn before the container
+    quad(?ctx, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    val outer: Channels = split(?ctx, 2);
+    set_channel(?ctx, outer, 1);
+    # 4..7: a child, then 8..11 an image in a nested container's body, and
+    # 12..15 that container's background
+    quad(?ctx, 2.0::f32, 0.0::f32, 3.0::f32, 1.0::f32, white);
+    val inner: Channels = split(?ctx, 2);
+    set_channel(?ctx, inner, 1);
+    image_at(?ctx, sheet, 4.0::f32, 0.0::f32, 5.0::f32, 1.0::f32, white);
+    set_channel(?ctx, inner, 0);
+    quad(?ctx, 6.0::f32, 0.0::f32, 7.0::f32, 1.0::f32, white);
+    merge(?ctx, inner);
+    # 16..19: the outer background, drawn last
+    set_channel(?ctx, outer, 0);
+    quad(?ctx, 8.0::f32, 0.0::f32, 9.0::f32, 1.0::f32, white);
+    merge(?ctx, outer);
+    # 20..23: after the container, joining nothing inside it
+    quad(?ctx, 10.0::f32, 0.0::f32, 11.0::f32, 1.0::f32, white);
+    end(?ctx);
+
+    # paint order: before, outer background, child, inner background, image, after
+    val ix:   *u32   = draw_indices(?ctx);
+    var want: [6]u32 = [6]u32{0, 16, 4, 12, 8, 20};
+    var k:    usize  = 0;
+    for (k < 6) {
+        if (ix[k * 6] != want[k]) { ret 2 + k::i32; }
+        k = k + 1;
+    }
+    # atlas quads on either side of the image share runs, the image binds apart
+    if (run_count(?ctx) != 3)                                      { ret 8; }
+    if (run_at(?ctx, 0).count != 24)                               { ret 9; }
+    if (run_at(?ctx, 1).tex != 7)                                  { ret 10; }
+    if (run_at(?ctx, 2).start != 30 || run_at(?ctx, 2).count != 6) { ret 11; }
+
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
@@ -1592,7 +1665,7 @@ test surface__maps_cursor_and_clips {
 
     # content at local (20,30)-(40,50) lands at screen (60,60)-(80,80), inside the clip
     quad(?ctx, 20.0::f32, 30.0::f32, 40.0::f32, 50.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
+    if (draw_count(?ctx) != 4) { ret 1; }
     val p: *draw.Vert = draw_verts(?ctx);
     if (p[0].x != 60.0::f32) { ret 1; }
     if (p[0].y != 60.0::f32) { ret 1; }
@@ -1601,7 +1674,7 @@ test surface__maps_cursor_and_clips {
 
     # content scrolled past the region is dropped
     quad(?ctx, 200.0::f32, 200.0::f32, 210.0::f32, 210.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
+    if (draw_count(?ctx) != 4) { ret 1; }
 
     end_surface(?ctx, s);
     if (ctx.clip_sp != 0)          { ret 1; }
@@ -1713,11 +1786,12 @@ test layer__ascending_paint_order {
     quad(?ctx, 20.0::f32, 0.0::f32, 25.0::f32, 5.0::f32, white);
     end(?ctx);
 
-    # the layer-0 quads merge into one span ahead of the layer-1 quad
-    val p: *draw.Vert = draw_verts(?ctx);
-    if (draw_count(?ctx) != 18)                                            { ret 2; }
-    if (p[0].x != 0.0::f32 || p[6].x != 20.0::f32 || p[12].x != 10.0::f32) { ret 3; }
-    if (run_count(?ctx) != 2)                                              { ret 4; }
+    # the layer-0 quads merge into one run ahead of the layer-1 quad, and the
+    # vertices stay where they were drawn
+    val ix: *u32 = draw_indices(?ctx);
+    if (draw_count(?ctx) != 12)                  { ret 2; }
+    if (ix[0] != 0 || ix[6] != 8 || ix[12] != 4) { ret 3; }
+    if (run_count(?ctx) != 2)                    { ret 4; }
     val low: Run = run_at(?ctx, 0);
     if (low.layer != 0 || low.start != 0 || low.count != 12) { ret 5; }
     val high: Run = run_at(?ctx, 1);
@@ -1873,7 +1947,7 @@ test surface__nested_placed_relative_to_parent {
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 8; }
+    if (draw_count(?ctx) != 4) { ret 8; }
     val p: *draw.Vert = draw_verts(?ctx);
     if (p[0].x != 60.0::f32 || p[0].y != 60.0::f32 || p[2].x != 65.0::f32 || p[2].y != 65.0::f32) { ret 9; }
 
@@ -1959,18 +2033,19 @@ test srgb__painter_emits_linear_colors {
     quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
     text_at(?ctx, "A", 0.0::f32, 0.0::f32, grey);
 
+    # emitted premultiplied, after conversion
     val p:    *draw.Vert = draw_verts(?ctx);
-    val want: f32        = draw.srgb_to_linear(0.5::f32);
-    if (p[0].r != 0.5::f32)                   { ret 2; }
-    if (p[6].r != want || p[6].a != 0.5::f32) { ret 3; }
-    if (p[12].g != want)                      { ret 4; }
+    val want: f32        = draw.srgb_to_linear(0.5::f32) * 0.5::f32;
+    if (p[0].r != 0.25::f32)                  { ret 2; }
+    if (p[4].r != want || p[4].a != 0.5::f32) { ret 3; }
+    if (p[8].g != want)                       { ret 4; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
 }
 
-test fill__rounds_corners_and_grows_reserved {
+test fill__rounds_corners {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -1982,24 +2057,16 @@ test fill__rounds_corners_and_grows_reserved {
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     # a square fill is one quad
     fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
-    if (draw_count(?ctx) != 6) { ret 2; }
+    if (draw_count(?ctx) != 4) { ret 2; }
 
     # radius 4 on every corner: the body plus four rows at each end
     fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
-    if (draw_count(?ctx) != 60) { ret 3; }
+    if (draw_count(?ctx) != 40) { ret 3; }
     val p: *draw.Vert = draw_verts(?ctx);
-    if (p[6].y != 4.0::f32 || p[8].y != 16.0::f32 || p[6].x != 0.0::f32) { ret 4; }
+    if (p[4].y != 4.0::f32 || p[6].y != 16.0::f32 || p[4].x != 0.0::f32) { ret 4; }
     # the outermost top row is inset from both sides, the innermost barely
-    if (p[12].y != 0.0::f32 || p[12].x <= 1.0::f32 || p[13].x >= 19.0::f32) { ret 5; }
-    if (p[30].y != 3.0::f32 || p[30].x >= 0.5::f32)                         { ret 6; }
-
-    # a reserved fill rounded at the bottom takes its rect when grown
-    val h: usize = reserve_fill(?ctx, 0.0::f32, 30.0::f32, 20.0::f32, 4.0::f32, CORNERS_BOTTOM, white);
-    if (h != 60 || draw_count(?ctx) != 90) { ret 7; }
-    grow_fill(?ctx, h, 0.0::f32, 30.0::f32, 20.0::f32, 50.0::f32, 4.0::f32, CORNERS_BOTTOM);
-    if (p[60].y != 30.0::f32 || p[62].y != 46.0::f32) { ret 8; }
-    if (p[66].y != 49.0::f32 || p[68].y != 50.0::f32) { ret 9; }
-    if (p[66].x <= 1.0::f32)                          { ret 10; }
+    if (p[8].y != 0.0::f32 || p[8].x <= 1.0::f32 || p[9].x >= 19.0::f32) { ret 5; }
+    if (p[20].y != 3.0::f32 || p[20].x >= 0.5::f32)                      { ret 6; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }

@@ -52,9 +52,6 @@ use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
 
-# the vertex handle of a container whose background could not be emitted
-pub val NO_VERTS: usize = context.NO_VERTS;
-
 # the theme's space inside chrome, at the context's scale
 fun pad(ctx: *context.Context) f32 {
     ret context.px(ctx, ctx.theme.pad);
@@ -267,18 +264,19 @@ fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32)
 
 # the handle begin_panel and begin_window return for their matching end
 # ---
-# verts: background vertex handle, NO_VERTS when there is none
+# ch:    the channels the body's background and children draw in
 # claim: the container's reserved claim, context.NO_CLAIM when refused
 pub rec Block {
-    verts: usize;
+    ch:    context.Channels;
     claim: usize;
 }
 
-# start a layout column at (x, y) of width w and emit its background
+# start a layout column at (x, y) of width w
 #
-# the background height is unknown until the panel's widgets are placed, so a
-# zero-height placeholder is emitted now and grown to fit by end_panel, and the
-# panel's claim is reserved now, beneath its widgets, and given its rect then.
+# the background height is unknown until the panel's widgets are placed, so
+# the widgets draw in a channel above the background's, which end_panel paints
+# once it knows the height. the panel's claim is reserved now, beneath its
+# widgets, and given its rect then.
 # ---
 # ctx: context
 # x:   panel left in pixels
@@ -294,12 +292,13 @@ pub fun begin_panel(ctx: *context.Context, x: f32, y: f32, w: f32) Block {
 
     var b: Block;
     b.claim = context.reserve_claim(ctx, 0);
-    b.verts = context.reserve_fill(ctx, x, y, x + w, corner(ctx), context.CORNERS_ALL, ctx.theme.panel);
+    b.ch    = context.split(ctx, 2);
+    context.set_channel(ctx, b.ch, 1);
     ret b;
 }
 
-# grow the panel background and claim to enclose every widget placed since
-# begin_panel
+# paint the panel background beneath, and give the claim the rect of, every
+# widget placed since begin_panel
 # ---
 # ctx: context
 # b:   the value returned by begin_panel
@@ -308,7 +307,9 @@ pub fun end_panel(ctx: *context.Context, b: Block) {
     val y0: f32 = ctx.oy;
     val x1: f32 = ctx.ox + ctx.pw;
     val y1: f32 = ctx.cy + pad(ctx);
-    context.grow_fill(ctx, b.verts, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL);
+    context.set_channel(ctx, b.ch, 0);
+    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, ctx.theme.panel);
+    context.merge(ctx, b.ch);
     context.fill_claim(ctx, b.claim, x0, y0, x1, y1);
 }
 
@@ -673,7 +674,7 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
 # ---
 # open:      1 if the popup is drawn this frame, else 0
 # dismissed: 1 if a press outside the popup dismissed it this frame
-# verts:     background vertex handle, NO_VERTS when there is none
+# ch:        the channels the body's background and children draw in
 # claim:     the popup body's reserved claim
 # ox:        the parent layout's origin x, restored by end_popup
 # oy:        the parent layout's origin y
@@ -683,7 +684,7 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
 pub rec Popup {
     open:      u8;
     dismissed: u8;
-    verts:     usize;
+    ch:        context.Channels;
     claim:     usize;
     ox:        f32;
     oy:        f32;
@@ -713,7 +714,6 @@ pub fun begin_popup(ctx: *context.Context, open: u8, x: f32, y: f32, w: f32) Pop
     val outside: u64 = context.next_id(ctx);
 
     var p: Popup;
-    p.verts = NO_VERTS;
     p.claim = context.NO_CLAIM;
     if (open == 0) { ret p; }
     p.open = 1;
@@ -736,12 +736,14 @@ pub fun begin_popup(ctx: *context.Context, open: u8, x: f32, y: f32, w: f32) Pop
     ctx.cx  = sx;
     ctx.cy  = sy;
     ctx.pw  = w;
-    p.verts = context.reserve_fill(ctx, sx, sy, sx + w, corner(ctx), context.CORNERS_ALL, ctx.theme.window);
+    p.ch    = context.split(ctx, 2);
+    context.set_channel(ctx, p.ch, 1);
     ret p;
 }
 
-# close a popup opened by begin_popup: grow its background and claim over its
-# widgets, leave its layer and restore the parent layout
+# close a popup opened by begin_popup: paint its background beneath its
+# widgets, give its claim their rect, leave its layer and restore the parent
+# layout
 # ---
 # ctx: context
 # p:   the value returned by begin_popup
@@ -752,7 +754,9 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
     val y0: f32 = ctx.oy;
     val x1: f32 = ctx.ox + ctx.pw;
     val y1: f32 = ctx.cy + pad(ctx);
-    context.grow_fill(ctx, p.verts, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL);
+    context.set_channel(ctx, p.ch, 0);
+    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, ctx.theme.window);
+    context.merge(ctx, p.ch);
     context.fill_claim(ctx, p.claim, x0, y0, x1, y1);
     context.pop_layer(ctx);
 
@@ -1146,7 +1150,7 @@ pub rec Window {
 # the titlebar drags the window (press and move updates win.x/win.y) and carries a
 # collapse box on the left that toggles win.open. when open, the layout cursor is
 # placed below the titlebar so the consumer's widgets fill the body, which
-# end_window grows to enclose. windows stack by call order: a later window paints
+# end_window paints beneath it. windows stack by call order: a later window paints
 # over, and takes input from, an earlier one, and its whole rect stops input to
 # what it covers. returns a handle to pass to end_window.
 # ---
@@ -1159,7 +1163,6 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     val col_id:  u64 = context.next_id(ctx);
 
     var b: Block;
-    b.verts = NO_VERTS;
     b.claim = context.reserve_claim(ctx, 0);
 
     # follow a drag before claiming, so the claims match where the window paints
@@ -1205,11 +1208,12 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     ctx.cy = win.y + th;
     ctx.pw = win.w;
 
-    b.verts = context.reserve_fill(ctx, win.x, win.y + th, win.x + win.w, corner(ctx), context.CORNERS_BOTTOM, ctx.theme.window);
+    b.ch = context.split(ctx, 2);
+    context.set_channel(ctx, b.ch, 1);
     ret b;
 }
 
-# grow the window body to enclose its widgets, like end_panel, and give the
+# paint the window body beneath its widgets, like end_panel, and give the
 # window's claim its rect (the titlebar alone when collapsed)
 # ---
 # ctx: context
@@ -1222,7 +1226,9 @@ pub fun end_window(ctx: *context.Context, win: *Window, b: Block) {
     var y1: f32 = win.y + th;
     if (win.open != 0) {
         y1 = ctx.cy + pad(ctx);
-        context.grow_fill(ctx, b.verts, x0, win.y + th, x1, y1, corner(ctx), context.CORNERS_BOTTOM);
+        context.set_channel(ctx, b.ch, 0);
+        context.fill(ctx, x0, win.y + th, x1, y1, corner(ctx), context.CORNERS_BOTTOM, ctx.theme.window);
+        context.merge(ctx, b.ch);
     }
     context.fill_claim(ctx, b.claim, x0, win.y, x1, y1);
 }
@@ -1925,14 +1931,16 @@ fun frame_dropdown_window(ctx: *context.Context, in: input.Input, picked: *usize
     ret changed;
 }
 
-# first composed vertex at exactly (x, y), or the vertex count when none is
+# where in paint order a vertex at exactly (x, y) is first drawn: the first
+# composed index naming one, or the index count when none is drawn
 #[testing]
 fun vert_at(ctx: *context.Context, x: f32, y: f32) usize {
-    val p: *draw.Vert = context.draw_verts(ctx);
-    val n: usize      = context.draw_count(ctx);
-    var i: usize      = 0;
+    val p:  *draw.Vert = context.draw_verts(ctx);
+    val ix: *u32       = context.draw_indices(ctx);
+    val n:  usize      = context.index_count(ctx);
+    var i:  usize      = 0;
     for (i < n) {
-        if (p[i].x == x && p[i].y == y) { ret i; }
+        if (p[ix[i]].x == x && p[ix[i]].y == y) { ret i; }
         i = i + 1;
     }
     ret n;
@@ -1967,7 +1975,7 @@ test routing__open_dropdown_beats_later_window {
 
     # the option rows paint after the window despite being called before it
     if (vert_at(?ctx, 0.0::f32, 30.0::f32) >= vert_at(?ctx, 0.0::f32, 40.0::f32)) { ret 3; }
-    if (vert_at(?ctx, 0.0::f32, 40.0::f32) >= context.draw_count(?ctx))           { ret 4; }
+    if (vert_at(?ctx, 0.0::f32, 40.0::f32) >= context.index_count(?ctx))          { ret 4; }
 
     # hover, press and release where option 1 and the drag region overlap.
     # ids: header 1, popup 2, options 3..5, window drag 6 and collapse 7
@@ -2454,7 +2462,7 @@ test scale__doubles_metrics_text_and_hit_rects {
 
     # the header spans y [0, 32) and its face ends there
     frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 0), ?picked, ?opts[0]);
-    if (vert_at(?ctx, 0.0::f32, 32.0::f32) >= context.draw_count(?ctx)) { ret 7; }
+    if (vert_at(?ctx, 0.0::f32, 32.0::f32) >= context.index_count(?ctx)) { ret 7; }
     frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 1), ?picked, ?opts[0]);
     frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 0), ?picked, ?opts[0]);
     if (ctx.open_dropdown != 1) { ret 8; }
@@ -2495,7 +2503,7 @@ test theme__drives_colors_and_corners {
     }
     if (faced == 0) { ret 3; }
     # the panel's grown background body ends 4 above its bottom at 24
-    if (vert_at(?ctx, 0.0::f32, 20.0::f32) >= n) { ret 4; }
+    if (vert_at(?ctx, 0.0::f32, 20.0::f32) >= context.index_count(?ctx)) { ret 4; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -2666,7 +2674,7 @@ test slider__drags_with_a_reading {
     # the reading is two glyphs more than none
     val shown: usize = context.draw_count(?ctx);
     frame_reading(?ctx, input_at(300.0::f32, 90.0::f32, 0), ?v, nil);
-    if (shown != context.draw_count(?ctx) + 12) { ret 6; }
+    if (shown != context.draw_count(?ctx) + 8) { ret 6; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -2889,21 +2897,22 @@ test image__quads_carry_handle_rect_and_uvs {
     val cells: context.Run = context.run_at(?ctx, 2);
     if (cells.tex != draw.ATLAS || cells.start != 12 || cells.count != 24) { ret 6; }
 
-    # clipped at x 50, half the width survives and half the u range with it
+    # the clip at x 50 is the cropped image's scissor, and its quad stays whole
+    if (near.clip_x1 != 50.0::f32 || lin.clip_x1 != 200.0::f32) { ret 7; }
     val p: *draw.Vert = context.draw_verts(?ctx);
-    if (p[0].x != 20.0::f32 || p[0].y != 10.0::f32) { ret 7; }
-    if (p[0].u != 0.25::f32 || p[0].v != 0.25::f32) { ret 8; }
-    if (p[2].x != 50.0::f32 || p[2].y != 40.0::f32) { ret 9; }
-    if (p[2].u != 0.5::f32 || p[2].v != 0.75::f32)  { ret 10; }
+    if (p[0].x != 20.0::f32 || p[0].y != 10.0::f32) { ret 8; }
+    if (p[0].u != 0.25::f32 || p[0].v != 0.25::f32) { ret 9; }
+    if (p[2].x != 80.0::f32 || p[2].y != 40.0::f32) { ret 10; }
+    if (p[2].u != 0.75::f32 || p[2].v != 0.75::f32) { ret 11; }
     # the flow image fills its rect at the cursor with the whole texture
-    if (p[6].x != 0.0::f32 || p[6].y != 50.0::f32)  { ret 11; }
-    if (p[8].x != 16.0::f32 || p[8].y != 58.0::f32) { ret 12; }
-    if (p[8].u != 1.0::f32 || p[8].v != 1.0::f32)   { ret 13; }
+    if (p[4].x != 0.0::f32 || p[4].y != 50.0::f32)  { ret 12; }
+    if (p[6].x != 16.0::f32 || p[6].y != 58.0::f32) { ret 13; }
+    if (p[6].u != 1.0::f32 || p[6].v != 1.0::f32)   { ret 14; }
     # cells tile row-major from the top left in their palette steps
-    if (p[12].x != 0.0::f32 || p[14].x != 10.0::f32)  { ret 14; }
-    if (p[12].b != 1.0::f32 || p[18].r != 1.0::f32)   { ret 15; }
-    if (p[24].y != 110.0::f32 || p[24].r != 1.0::f32) { ret 16; }
-    if (p[30].b != 1.0::f32)                          { ret 17; }
+    if (p[8].x != 0.0::f32 || p[10].x != 10.0::f32)   { ret 15; }
+    if (p[8].b != 1.0::f32 || p[12].r != 1.0::f32)    { ret 16; }
+    if (p[16].y != 110.0::f32 || p[16].r != 1.0::f32) { ret 17; }
+    if (p[20].b != 1.0::f32)                          { ret 18; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }

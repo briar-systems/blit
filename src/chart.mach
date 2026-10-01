@@ -850,14 +850,34 @@ fun frame_line(ctx: *context.Context, in: input.Input, series: *Series, opt: Opt
     ret h;
 }
 
-# every vertex lies in [x0, x1] x [y0, y1]
+# everything drawn shows within [x0, x1] x [y0, y1]: each run's geometry, cut
+# by the scissor that run carries, stays inside the rect
 #[testing]
 fun inside(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val p: *draw.Vert = context.draw_verts(ctx);
-    var i: usize      = 0;
-    for (i < context.draw_count(ctx)) {
-        if (p[i].x < x0 || p[i].x > x1 || p[i].y < y0 || p[i].y > y1) { ret 0; }
-        i = i + 1;
+    val p:  *draw.Vert = context.draw_verts(ctx);
+    val ix: *u32       = context.draw_indices(ctx);
+    var r:  usize      = 0;
+    for (r < context.run_count(ctx)) {
+        val run: context.Run = context.run_at(ctx, r);
+        var bx0: f32         = 100000.0::f32;
+        var by0: f32         = 100000.0::f32;
+        var bx1: f32         = -100000.0::f32;
+        var by1: f32         = -100000.0::f32;
+        var i:   usize       = run.start;
+        for (i < run.start + run.count) {
+            val v: draw.Vert = p[ix[i]];
+            bx0 = minf(bx0, v.x);
+            by0 = minf(by0, v.y);
+            bx1 = maxf(bx1, v.x);
+            by1 = maxf(by1, v.y);
+            i   = i + 1;
+        }
+        bx0 = maxf(bx0, run.clip_x0);
+        by0 = maxf(by0, run.clip_y0);
+        bx1 = minf(bx1, run.clip_x1);
+        by1 = minf(by1, run.clip_y1);
+        if (bx1 > bx0 && by1 > by0 && (bx0 < x0 || by0 < y0 || bx1 > x1 || by1 > y1)) { ret 0; }
+        r = r + 1;
     }
     ret 1;
 }
@@ -1042,7 +1062,8 @@ test theme__drives_series_colors_and_area {
     var i:    usize      = 0;
     for (i < context.draw_count(?ctx)) {
         if (p[i].r == 0.11::f32 && p[i].b == 0.33::f32 && p[i].a == 1.0::f32) { line = 1; }
-        if (p[i].r == 0.11::f32 && p[i].b == 0.33::f32 && p[i].a == 0.5::f32) { fill = 1; }
+        # premultiplied by the area's alpha
+        if (p[i].r == 0.055::f32 && p[i].b == 0.165::f32 && p[i].a == 0.5::f32) { fill = 1; }
         i = i + 1;
     }
     if (line == 0 || fill == 0) { ret 2; }
