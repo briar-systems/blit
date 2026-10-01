@@ -67,6 +67,7 @@ use blit.font;
 use gly: blit.glyph;
 use blit.hit;
 use blit.input;
+use blit.store;
 use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
@@ -136,121 +137,121 @@ pub rec Area {
 
 # immediate-mode UI state for one consumer
 # ---
-# dl:            draw list accumulated each frame
-# in:            input for the current frame
-# sw:            screen width in pixels
-# sh:            screen height in pixels
-# ox:            layout origin x (panel left)
-# oy:            layout origin y (panel top)
-# cx:            layout cursor x
-# cy:            layout cursor y
-# pw:            current panel width
-# seq:           widget id counter, reset each frame
-# hot:           id of the widget hovered this frame (0 = none)
-# active:        id of the widget being interacted with, persists across frames (0 = none)
-# open_dropdown: id of the currently open dropdown, persists across frames (0 = none)
-# drag_off_x:    cursor-to-origin x offset captured when a drag begins
-# drag_off_y:    cursor-to-origin y offset captured when a drag begins
-# lx:            local origin x added to emitted positions before clipping
-# ly:            local origin y added to emitted positions before clipping
-# clip_x0:       active clip rect left in screen pixels
-# clip_y0:       active clip rect top in screen pixels
-# clip_x1:       active clip rect right in screen pixels
-# clip_y1:       active clip rect bottom in screen pixels
-# clip_sp:       clip stack depth (number of pushed parent rects)
-# clip_x0s:      saved parent clip lefts
-# clip_y0s:      saved parent clip tops
-# clip_x1s:      saved parent clip rights
-# clip_y1s:      saved parent clip bottoms
-# org_sp:        local-origin stack depth
-# org_xs:        saved parent local-origin xs
-# org_ys:        saved parent local-origin ys
-# tex:           texture handle subsequent geometry samples (draw.ATLAS = font atlas)
-# page:          atlas page subsequent atlas geometry samples
-# filter:        sampling filter subsequent consumer-texture geometry asks for
-# run_start:     first vertex of the span being accumulated
-# runs:          closed single-texture spans, in draw order
-# run_len:       how many spans are closed
-# oom:           1 if an allocation or a claim was refused this frame, else 0
-# out:           scratch draw list end() composes layers into
-# claims:        this frame's claims, which route the next frame
-# prior:         the previous frame's claims, which route this frame
-# hover:         id of the topmost claimant under the cursor, resolved in begin (0 = none)
-# layer:         layer subsequent geometry and claims land on
-# ordinal:       claims made so far this frame
-# layer_sp:      layer stack depth
-# layers:        saved parent layers
-# font:          the glyph source, its glyph cache and its atlas
-# scale:         interface scale theme metrics and text are sized at, 1.0 by default
-# theme:         the colors and unscaled metrics widgets draw with
-# srgb:          1 if colors are converted to linear light for an sRGB target, else 0
-# wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
-# free:          the screen area docked containers have not taken this frame
-# focus:         id of the widget holding the keyboard, persists across frames (0 = none)
-# focus_drawn:   1 once the focus holder was drawn this frame, else 0
-# a:             allocator backing the clipboard text
-# clip:          text the frame copies to the clipboard, NUL-terminated, nil before the first copy
-# clip_cap:      bytes allocated for clip
-# clip_on:       1 if the frame copied text into clip, else 0
-# paste_wanted:  1 if a widget asked for the clipboard's text this frame, else 0
+# dl:           draw list accumulated each frame
+# in:           input for the current frame
+# sw:           screen width in pixels
+# sh:           screen height in pixels
+# ox:           layout origin x (panel left)
+# oy:           layout origin y (panel top)
+# cx:           layout cursor x
+# cy:           layout cursor y
+# pw:           current panel width
+# seq:          widget id counter, reset each frame
+# hot:          id of the widget hovered this frame (0 = none)
+# active:       id of the widget being interacted with, persists across frames (0 = none)
+# drag_off_x:   cursor-to-origin x offset captured when a drag begins
+# drag_off_y:   cursor-to-origin y offset captured when a drag begins
+# lx:           local origin x added to emitted positions before clipping
+# ly:           local origin y added to emitted positions before clipping
+# clip_x0:      active clip rect left in screen pixels
+# clip_y0:      active clip rect top in screen pixels
+# clip_x1:      active clip rect right in screen pixels
+# clip_y1:      active clip rect bottom in screen pixels
+# clip_sp:      clip stack depth (number of pushed parent rects)
+# clip_x0s:     saved parent clip lefts
+# clip_y0s:     saved parent clip tops
+# clip_x1s:     saved parent clip rights
+# clip_y1s:     saved parent clip bottoms
+# org_sp:       local-origin stack depth
+# org_xs:       saved parent local-origin xs
+# org_ys:       saved parent local-origin ys
+# tex:          texture handle subsequent geometry samples (draw.ATLAS = font atlas)
+# page:         atlas page subsequent atlas geometry samples
+# filter:       sampling filter subsequent consumer-texture geometry asks for
+# run_start:    first vertex of the span being accumulated
+# runs:         closed single-texture spans, in draw order
+# run_len:      how many spans are closed
+# oom:          1 if an allocation or a claim was refused this frame, else 0
+# out:          scratch draw list end() composes layers into
+# claims:       this frame's claims, which route the next frame
+# prior:        the previous frame's claims, which route this frame
+# hover:        id of the topmost claimant under the cursor, resolved in begin (0 = none)
+# layer:        layer subsequent geometry and claims land on
+# ordinal:      claims made so far this frame
+# layer_sp:     layer stack depth
+# layers:       saved parent layers
+# font:         the glyph source, its glyph cache and its atlas
+# scale:        interface scale theme metrics and text are sized at, 1.0 by default
+# theme:        the colors and unscaled metrics widgets draw with
+# srgb:         1 if colors are converted to linear light for an sRGB target, else 0
+# wheel_taken:  1 once a scroll region consumed this frame's wheel, else 0
+# free:         the screen area docked containers have not taken this frame
+# focus:        id of the widget holding the keyboard, persists across frames (0 = none)
+# focus_drawn:  1 once the focus holder was drawn this frame, else 0
+# a:            allocator backing the clipboard text
+# clip:         text the frame copies to the clipboard, NUL-terminated, nil before the first copy
+# clip_cap:     bytes allocated for clip
+# clip_on:      1 if the frame copied text into clip, else 0
+# paste_wanted: 1 if a widget asked for the clipboard's text this frame, else 0
+# store:        state kept by widget id across frames (see blit.state)
 pub rec Context {
-    dl:            draw.DrawList;
-    in:            input.Input;
-    sw:            f32;
-    sh:            f32;
-    ox:            f32;
-    oy:            f32;
-    cx:            f32;
-    cy:            f32;
-    pw:            f32;
-    seq:           u64;
-    hot:           u64;
-    active:        u64;
-    open_dropdown: u64;
-    drag_off_x:    f32;
-    drag_off_y:    f32;
-    lx:            f32;
-    ly:            f32;
-    clip_x0:       f32;
-    clip_y0:       f32;
-    clip_x1:       f32;
-    clip_y1:       f32;
-    clip_sp:       usize;
-    clip_x0s:      [16]f32;
-    clip_y0s:      [16]f32;
-    clip_x1s:      [16]f32;
-    clip_y1s:      [16]f32;
-    org_sp:        usize;
-    org_xs:        [16]f32;
-    org_ys:        [16]f32;
-    tex:           u64;
-    page:          u32;
-    filter:        u32;
-    run_start:     usize;
-    runs:          [64]Run;
-    run_len:       usize;
-    oom:           u8;
-    out:           draw.DrawList;
-    claims:        hit.ClaimList;
-    prior:         hit.ClaimList;
-    hover:         u64;
-    layer:         u32;
-    ordinal:       u64;
-    layer_sp:      usize;
-    layers:        [16]u32;
-    font:          font.Font;
-    scale:         f32;
-    theme:         th.Theme;
-    srgb:          u8;
-    wheel_taken:   u8;
-    free:          Area;
-    focus:         u64;
-    focus_drawn:   u8;
-    a:             *allo.Allocator;
-    clip:          *u8;
-    clip_cap:      usize;
-    clip_on:       u8;
-    paste_wanted:  u8;
+    dl:           draw.DrawList;
+    in:           input.Input;
+    sw:           f32;
+    sh:           f32;
+    ox:           f32;
+    oy:           f32;
+    cx:           f32;
+    cy:           f32;
+    pw:           f32;
+    seq:          u64;
+    hot:          u64;
+    active:       u64;
+    drag_off_x:   f32;
+    drag_off_y:   f32;
+    lx:           f32;
+    ly:           f32;
+    clip_x0:      f32;
+    clip_y0:      f32;
+    clip_x1:      f32;
+    clip_y1:      f32;
+    clip_sp:      usize;
+    clip_x0s:     [16]f32;
+    clip_y0s:     [16]f32;
+    clip_x1s:     [16]f32;
+    clip_y1s:     [16]f32;
+    org_sp:       usize;
+    org_xs:       [16]f32;
+    org_ys:       [16]f32;
+    tex:          u64;
+    page:         u32;
+    filter:       u32;
+    run_start:    usize;
+    runs:         [64]Run;
+    run_len:      usize;
+    oom:          u8;
+    out:          draw.DrawList;
+    claims:       hit.ClaimList;
+    prior:        hit.ClaimList;
+    hover:        u64;
+    layer:        u32;
+    ordinal:      u64;
+    layer_sp:     usize;
+    layers:       [16]u32;
+    font:         font.Font;
+    scale:        f32;
+    theme:        th.Theme;
+    srgb:         u8;
+    wheel_taken:  u8;
+    free:         Area;
+    focus:        u64;
+    focus_drawn:  u8;
+    a:            *allo.Allocator;
+    clip:         *u8;
+    clip_cap:     usize;
+    clip_on:      u8;
+    paste_wanted: u8;
+    store:        store.Store;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -299,57 +300,59 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.in.wheel     = 0.0::f32;
     input.clear_keys(?ctx.in);
 
-    ctx.sw            = 0.0::f32;
-    ctx.sh            = 0.0::f32;
-    ctx.ox            = 0.0::f32;
-    ctx.oy            = 0.0::f32;
-    ctx.cx            = 0.0::f32;
-    ctx.cy            = 0.0::f32;
-    ctx.pw            = 0.0::f32;
-    ctx.seq           = 0;
-    ctx.hot           = 0;
-    ctx.active        = 0;
-    ctx.open_dropdown = 0;
-    ctx.drag_off_x    = 0.0::f32;
-    ctx.drag_off_y    = 0.0::f32;
-    ctx.lx            = 0.0::f32;
-    ctx.ly            = 0.0::f32;
-    ctx.clip_x0       = 0.0::f32;
-    ctx.clip_y0       = 0.0::f32;
-    ctx.clip_x1       = 0.0::f32;
-    ctx.clip_y1       = 0.0::f32;
-    ctx.clip_sp       = 0;
-    ctx.org_sp        = 0;
-    ctx.tex           = draw.ATLAS;
-    ctx.page          = 0;
-    ctx.filter        = draw.FILTER_NEAREST;
-    ctx.run_start     = 0;
-    ctx.run_len       = 0;
-    ctx.oom           = 0;
-    ctx.hover         = 0;
-    ctx.layer         = 0;
-    ctx.ordinal       = 0;
-    ctx.layer_sp      = 0;
-    ctx.scale         = 1.0::f32;
-    ctx.theme         = th.default();
-    ctx.srgb          = 0;
-    ctx.wheel_taken   = 0;
-    ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
-    ctx.focus         = 0;
-    ctx.focus_drawn   = 0;
-    ctx.a             = a;
-    ctx.clip          = nil;
-    ctx.clip_cap      = 0;
-    ctx.clip_on       = 0;
-    ctx.paste_wanted  = 0;
+    ctx.sw           = 0.0::f32;
+    ctx.sh           = 0.0::f32;
+    ctx.ox           = 0.0::f32;
+    ctx.oy           = 0.0::f32;
+    ctx.cx           = 0.0::f32;
+    ctx.cy           = 0.0::f32;
+    ctx.pw           = 0.0::f32;
+    ctx.seq          = 0;
+    ctx.hot          = 0;
+    ctx.active       = 0;
+    ctx.drag_off_x   = 0.0::f32;
+    ctx.drag_off_y   = 0.0::f32;
+    ctx.lx           = 0.0::f32;
+    ctx.ly           = 0.0::f32;
+    ctx.clip_x0      = 0.0::f32;
+    ctx.clip_y0      = 0.0::f32;
+    ctx.clip_x1      = 0.0::f32;
+    ctx.clip_y1      = 0.0::f32;
+    ctx.clip_sp      = 0;
+    ctx.org_sp       = 0;
+    ctx.tex          = draw.ATLAS;
+    ctx.page         = 0;
+    ctx.filter       = draw.FILTER_NEAREST;
+    ctx.run_start    = 0;
+    ctx.run_len      = 0;
+    ctx.oom          = 0;
+    ctx.hover        = 0;
+    ctx.layer        = 0;
+    ctx.ordinal      = 0;
+    ctx.layer_sp     = 0;
+    ctx.scale        = 1.0::f32;
+    ctx.theme        = th.default();
+    ctx.srgb         = 0;
+    ctx.wheel_taken  = 0;
+    ctx.free         = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
+    ctx.focus        = 0;
+    ctx.focus_drawn  = 0;
+    ctx.a            = a;
+    ctx.clip         = nil;
+    ctx.clip_cap     = 0;
+    ctx.clip_on      = 0;
+    ctx.paste_wanted = 0;
+    store.init(?ctx.store, a);
     ret err[allo.Error].ok{};
 }
 
-# release the context's draw lists, claim lists, font and clipboard text
+# release the context's draw lists, claim lists, font, clipboard text and state
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
+    val es: err[allo.Error] = store.free(?ctx.store);
+    if (sel es.err) { ret es; }
     if (ctx.clip != nil) {
         val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
         if (sel ec.err) { ret ec; }
@@ -431,8 +434,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 }
 
 # finish a frame: close the last texture span, compose the draw list by layer,
-# drop the active widget once the button is released and drop the focus when
-# its holder was not drawn
+# drop the active widget once the button is released, drop the focus when
+# its holder was not drawn, and age out the state no widget reached
 #
 # vertex indices taken during the frame (begin_panel's handle) are emission
 # indices and are only valid until end().
@@ -441,8 +444,9 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (ctx.in.down == 0)     { ctx.active = 0; }
-    if (ctx.focus_drawn == 0) { ctx.focus = 0; }
+    if (ctx.in.down == 0)             { ctx.active = 0; }
+    if (ctx.focus_drawn == 0)         { ctx.focus = 0; }
+    if (store.sweep(?ctx.store) != 0) { ctx.oom = 1; }
 }
 
 # give a widget the keyboard
