@@ -1009,6 +1009,10 @@ instead of `ox` and `pw`.
   home and end move it a row at a time, right opens a node or steps into it,
   left closes one or steps out to its parent, enter activates the node as a
   double click does and space selects it.
+  A list lays out and draws only the rows in view, passing over the rest in
+  blocks, so it costs its visible rows and, with a query or a matcher, one
+  test per item. Its natural width, which a container sized to its content
+  takes, is that of the widest row in view.
 
 `demo/panel/` builds a docked application panel from these widgets alone, in
 the shape of an application's side panel (a header, then run, view and files
