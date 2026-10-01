@@ -1,0 +1,650 @@
+# a colour picker: a hue ring or a hue bar around a saturation and value
+# square, an alpha bar and hex entry
+#
+# the picker edits a straight draw.Color in hue, saturation and value. the
+# square picks saturation across and value up, and hue is picked on a bar
+# beside it or, with RING, on a ring around it. with ALPHA an alpha bar
+# beside them picks the opacity over a checkerboard, and the hex text has
+# eight digits instead of six. the row beneath holds a swatch of the colour,
+# the label and the colour's hex text, typed in as a value editor's text is
+# (see value.entry): enter or a press elsewhere commits it, and escape leaves
+# the colour as it was.
+#
+# the picker keeps its hue, saturation and value under its id, so dragging
+# to black or grey and back keeps the hue (and through black, the
+# saturation) instead of snapping to red. a colour changed from outside is
+# read back the next frame. hex text is each channel as its nearest byte, so
+# hex text read back and shown again is the same text, and a dragged colour
+# typed back as its hex lands on the colour that text names.
+#
+# the picker's parts are keyed in its id scope: "#sv" the square, "#hue" the
+# bar, "#wheel" the ring and the square inside it, "#alpha" the alpha bar and
+# "#hex" the hex text.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.math.float;
+
+use blit.context;
+use blit.draw;
+use drv: blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.value;
+use blit.widget;
+
+# flag: show and edit alpha, with eight hex digits
+pub val ALPHA: u8 = 1;
+
+# flag: pick hue on a ring around the square instead of a bar beside it
+pub val RING: u8 = 2;
+
+# bytes hex text takes, the terminator included
+pub val HEX_CAP: usize = 10;
+
+# the largest side of the square or ring, unscaled
+val SIDE_MAX: f32 = 192.0;
+
+# arcs the hue ring is drawn in
+val RING_ARCS: usize = 96;
+
+val PI: f32 = 3.1415927;
+
+# a colour as hue, saturation and value, each in [0, 1]
+# ---
+# h: hue, 0 red, 1/3 green, 2/3 blue, 1 red again
+# s: saturation
+# v: value
+pub rec Hsv {
+    h: f32;
+    s: f32;
+    v: f32;
+}
+
+fun clamp01(x: f32) f32 {
+    if (x < 0.0::f32) { ret 0.0::f32; }
+    if (x > 1.0::f32) { ret 1.0::f32; }
+    ret x;
+}
+
+fun max3(a: f32, b: f32, c: f32) f32 {
+    var m: f32 = a;
+    if (b > m) { m = b; }
+    if (c > m) { m = c; }
+    ret m;
+}
+
+fun min3(a: f32, b: f32, c: f32) f32 {
+    var m: f32 = a;
+    if (b < m) { m = b; }
+    if (c < m) { m = c; }
+    ret m;
+}
+
+# a colour's hue, saturation and value
+#
+# a grey has hue 0, and black saturation 0 too.
+# ---
+# c:   the colour, straight
+# ret: its hue, saturation and value
+pub fun to_hsv(c: draw.Color) Hsv {
+    val r:  f32 = clamp01(c.r);
+    val g:  f32 = clamp01(c.g);
+    val b:  f32 = clamp01(c.b);
+    val mx: f32 = max3(r, g, b);
+    val d:  f32 = mx - min3(r, g, b);
+    var o:  Hsv = Hsv{h: 0.0::f32, s: 0.0::f32, v: mx};
+    if (mx > 0.0::f32) { o.s = d / mx; }
+    if (d <= 0.0::f32) { ret o; }
+    var h: f32 = 0.0::f32;
+    if (mx == r) { h = (g - b) / d; }
+    or (mx == g) { h = (b - r) / d + 2.0::f32; }
+    or           { h = (r - g) / d + 4.0::f32; }
+    h = h / 6.0::f32;
+    if (h < 0.0::f32) { h = h + 1.0::f32; }
+    o.h = h;
+    ret o;
+}
+
+# the colour of a hue, saturation and value, with an alpha
+# ---
+# x:   hue, saturation and value, hue 1 taken as 0
+# a:   alpha
+# ret: the colour, straight
+pub fun from_hsv(x: Hsv, a: f32) draw.Color {
+    val s: f32 = clamp01(x.s);
+    val v: f32 = clamp01(x.v);
+    var h: f32 = clamp01(x.h) * 6.0::f32;
+    if (h >= 6.0::f32) { h = 0.0::f32; }
+    val i: u32 = h::u32;
+    val f: f32 = h - i::f32;
+    val p: f32 = v * (1.0::f32 - s);
+    val q: f32 = v * (1.0::f32 - s * f);
+    val t: f32 = v * (1.0::f32 - s * (1.0::f32 - f));
+    if (i == 0) { ret draw.rgba(v, t, p, a); }
+    if (i == 1) { ret draw.rgba(q, v, p, a); }
+    if (i == 2) { ret draw.rgba(p, v, t, a); }
+    if (i == 3) { ret draw.rgba(p, q, v, a); }
+    if (i == 4) { ret draw.rgba(t, p, v, a); }
+    ret draw.rgba(v, p, q, a);
+}
+
+# a channel as its nearest byte
+fun byte(c: f32) u32 {
+    ret (clamp01(c) * 255.0::f32 + 0.5::f32)::u32;
+}
+
+# a colour as hex text: "#RRGGBB", or "#RRGGBBAA" with alpha
+# ---
+# c:     the colour, straight
+# alpha: true for the alpha digits
+# out:   HEX_CAP bytes for the text
+# ret:   the text, in out
+pub fun hex_text(c: draw.Color, alpha: bool, out: *u8) str {
+    val digits: str    = "0123456789ABCDEF";
+    var ch:     [4]u32 = [4]u32{byte(c.r), byte(c.g), byte(c.b), byte(c.a)};
+    var n:      usize  = 3;
+    if (alpha) { n = 4; }
+    out[0] = '#';
+    var i: usize = 0;
+    for (i < n) {
+        out[1 + i * 2] = digits[(ch[i] >> 4) & 0xF];
+        out[2 + i * 2] = digits[ch[i] & 0xF];
+        i              = i + 1;
+    }
+    out[1 + n * 2] = 0;
+    ret out;
+}
+
+# a hex digit's value, 16 when it is none
+fun nibble(b: u8) u32 {
+    if (b >= '0' && b <= '9') { ret (b - '0')::u32; }
+    if (b >= 'a' && b <= 'f') { ret (b - 'a')::u32 + 10; }
+    if (b >= 'A' && b <= 'F') { ret (b - 'A')::u32 + 10; }
+    ret 16;
+}
+
+# read hex text as a colour
+#
+# six digits set red, green and blue and keep c's alpha, eight set alpha too.
+# a leading "#" and spaces around the digits are ignored.
+# ---
+# s:   the text
+# c:   the colour it edits
+# ret: the colour, none when the text is not six or eight hex digits
+pub fun parse_hex(s: str, c: draw.Color) opt[draw.Color] {
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    if (s[i] == '#') { i = i + 1; }
+    var ch: [4]u32;
+    var n:  usize = 0;
+    for (n < 8 && nibble(s[i]) < 16) {
+        val k: usize = n / 2;
+        ch[k] = ch[k] * 16 + nibble(s[i]);
+        n     = n + 1;
+        i     = i + 1;
+    }
+    for (s[i] == ' ') { i = i + 1; }
+    if (s[i] != 0 || (n != 6 && n != 8)) { ret opt[draw.Color].none{}; }
+    var o: draw.Color = draw.rgba(ch[0]::f32 / 255.0::f32, ch[1]::f32 / 255.0::f32, ch[2]::f32 / 255.0::f32, c.a);
+    if (n == 8) { o.a = ch[3]::f32 / 255.0::f32; }
+    ret opt[draw.Color].some{o};
+}
+
+# whether a typed codepoint may be part of hex text
+# ---
+# cp:  the codepoint
+# ret: true for a hex digit or "#"
+pub fun hex_char(cp: u32) bool {
+    ret cp == '#' || (cp < 0x80 && nibble(cp::u8) < 16);
+}
+
+# the angle of (x, y) from +x in radians, in (-pi, pi], within 1e-5
+fun atan2(y: f32, x: f32) f32 {
+    val ax: f32 = float.sqrt_f32(x * x);
+    val ay: f32 = float.sqrt_f32(y * y);
+    if (ax == 0.0::f32 && ay == 0.0::f32) { ret 0.0::f32; }
+    var a: f32 = ay / ax;
+    if (ay > ax) { a = ax / ay; }
+    val s: f32 = a * a;
+    var r: f32 = ((-0.0464964749::f32 * s + 0.15931422::f32) * s - 0.327622764::f32) * s * a + a;
+    if (ay > ax)      { r = PI / 2.0::f32 - r; }
+    if (x < 0.0::f32) { r = PI - r; }
+    if (y < 0.0::f32) { r = 0.0::f32 - r; }
+    ret r;
+}
+
+# what a picker keeps under its id
+# ---
+# hsv:  the hue, saturation and value it edits
+# r:    red of the colour hsv was taken from or gave, to notice a change from outside
+# g:    green of that colour
+# b:    blue of that colour
+# seen: 1 once hsv holds a colour
+# grab: on a ring, what the press grabbed: 0 nothing, 1 the square, 2 the ring
+rec Picker {
+    hsv:  Hsv;
+    r:    f32;
+    g:    f32;
+    b:    f32;
+    seen: u8;
+    grab: u8;
+}
+
+# take a colour into a picker's hue, saturation and value when it is not the
+# one they hold, keeping the hue of a grey and the saturation of black
+fun sync(st: *Picker, c: draw.Color) {
+    if (st.seen != 0 && c.r == st.r && c.g == st.g && c.b == st.b) { ret; }
+    var n: Hsv = to_hsv(c);
+    if (st.seen != 0) {
+        if (n.v <= 0.0::f32) {
+            n.h = st.hsv.h;
+            n.s = st.hsv.s;
+        }
+        or (n.s <= 0.0::f32) { n.h = st.hsv.h; }
+    }
+    st.hsv  = n;
+    st.r    = c.r;
+    st.g    = c.g;
+    st.b    = c.b;
+    st.seen = 1;
+}
+
+# set a colour from a picker's hue, saturation and value, keeping its alpha
+fun apply(st: *Picker, c: *draw.Color) {
+    val n: draw.Color = from_hsv(st.hsv, c.a);
+    @c   = n;
+    st.r = n.r;
+    st.g = n.g;
+    st.b = n.b;
+}
+
+# a two-tone ring marking a point, readable on any colour
+fun dot(ctx: *context.Context, x: f32, y: f32, r: f32) {
+    val w: f32 = context.px(ctx, 1.5::f32);
+    context.stroke_circle(ctx, x, y, r + w, w, ctx.theme.track);
+    context.stroke_circle(ctx, x, y, r, w, ctx.theme.text);
+}
+
+# a two-tone line across a bar at y, marking its value
+fun notch(ctx: *context.Context, x0: f32, x1: f32, y: f32) {
+    val w: f32 = context.px(ctx, 1.0::f32);
+    context.frame(ctx, x0 - w, y - w * 2.0::f32, x1 + w, y + w * 2.0::f32, w, ctx.theme.track);
+    context.frame(ctx, x0, y - w, x1, y + w, w, ctx.theme.text);
+}
+
+# a checkerboard of k pixel cells, what alpha shows through
+fun checker(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, k: f32) {
+    context.quad(ctx, x0, y0, x1, y1, ctx.theme.text_dim);
+    if (k <= 0.0::f32) { ret; }
+    var j: usize = 0;
+    var y: f32   = y0;
+    for (y < y1) {
+        var i: usize = j % 2;
+        var x: f32   = x0 + i::f32 * k;
+        for (x < x1) {
+            var xe: f32 = x + k;
+            var ye: f32 = y + k;
+            if (xe > x1) { xe = x1; }
+            if (ye > y1) { ye = y1; }
+            context.quad(ctx, x, y, xe, ye, ctx.theme.control);
+            x = x + k * 2.0::f32;
+        }
+        y = y + k;
+        j = j + 1;
+    }
+}
+
+# the saturation and value square at a hue
+fun paint_square(ctx: *context.Context, x: Hsv, x0: f32, y0: f32, x1: f32, y1: f32) {
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val clear: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 0.0::f32);
+    val black: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val none:  draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
+    context.quad(ctx, x0, y0, x1, y1, from_hsv(Hsv{h: x.h, s: 1.0::f32, v: 1.0::f32}, 1.0::f32));
+    context.quad_gradient(ctx, x0, y0, x1, y1, draw.gradient(x0, y0, white, x1, y0, clear));
+    context.quad_gradient(ctx, x0, y0, x1, y1, draw.gradient(x0, y0, none, x0, y1, black));
+    dot(ctx, x0 + clamp01(x.s) * (x1 - x0), y0 + (1.0::f32 - clamp01(x.v)) * (y1 - y0), context.px(ctx, 4.0::f32));
+}
+
+# saturation and value at a point in the square
+fun pick_square(st: *Picker, mx: f32, my: f32, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    var s: f32 = 0.0::f32;
+    var v: f32 = 0.0::f32;
+    if (x1 > x0)                        { s = clamp01((mx - x0) / (x1 - x0)); }
+    if (y1 > y0)                        { v = 1.0::f32 - clamp01((my - y0) / (y1 - y0)); }
+    if (s == st.hsv.s && v == st.hsv.v) { ret false; }
+    st.hsv.s = s;
+    st.hsv.v = v;
+    ret true;
+}
+
+# a hue
+fun set_hue(st: *Picker, h: f32) bool {
+    if (h == st.hsv.h) { ret false; }
+    st.hsv.h = h;
+    ret true;
+}
+
+# the square, picking saturation and value
+fun square(ctx: *context.Context, st: *Picker, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    val h:       interact.Hit = interact.hit(ctx, context.id_of(ctx, "#sv"), x0, y0, x1, y1, input.BUTTON_LEFT);
+    var changed: bool         = false;
+    if (h.held) { changed = pick_square(st, h.mx, h.my, x0, y0, x1, y1); }
+    paint_square(ctx, st.hsv, x0, y0, x1, y1);
+    ret changed;
+}
+
+# the hue bar, red at the top through the hues and back to red at the bottom
+fun hue_bar(ctx: *context.Context, st: *Picker, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    val h:       interact.Hit = interact.hit(ctx, context.id_of(ctx, "#hue"), x0, y0, x1, y1, input.BUTTON_LEFT);
+    var changed: bool         = false;
+    if (h.held && y1 > y0) { changed = set_hue(st, clamp01((h.my - y0) / (y1 - y0))); }
+    val k: f32   = (y1 - y0) / 6.0::f32;
+    var i: usize = 0;
+    for (i < 6) {
+        val c0: draw.Color = from_hsv(Hsv{h: i::f32 / 6.0::f32, s: 1.0::f32, v: 1.0::f32}, 1.0::f32);
+        val c1: draw.Color = from_hsv(Hsv{h: (i + 1)::f32 / 6.0::f32, s: 1.0::f32, v: 1.0::f32}, 1.0::f32);
+        val ya: f32        = y0 + i::f32 * k;
+        context.quad_gradient(ctx, x0, ya, x1, ya + k, draw.gradient(x0, ya, c0, x0, ya + k, c1));
+        i = i + 1;
+    }
+    notch(ctx, x0, x1, y0 + clamp01(st.hsv.h) * (y1 - y0));
+    ret changed;
+}
+
+# the hue ring of outer radius r and width w round (cx, cy), with the square
+# inside it
+fun wheel(ctx: *context.Context, st: *Picker, x0: f32, y0: f32, side: f32, w: f32) bool {
+    val r:  f32 = side / 2.0::f32;
+    val cx: f32 = x0 + r;
+    val cy: f32 = y0 + r;
+    var rw: f32 = w;
+    if (rw > r / 2.0::f32) { rw = r / 2.0::f32; }
+    val ri:  f32 = r - rw;
+    val mid: f32 = r - rw / 2.0::f32;
+    val hs:  f32 = ri * 0.7071::f32 - context.px(ctx, 2.0::f32);
+    val sx0: f32 = cx - hs;
+    val sy0: f32 = cy - hs;
+    val sx1: f32 = cx + hs;
+    val sy1: f32 = cy + hs;
+
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, "#wheel"), x0, y0, x0 + side, y0 + side, input.BUTTON_LEFT);
+    if (h.pressed) {
+        val dx: f32 = h.mx - cx;
+        val dy: f32 = h.my - cy;
+        val d:  f32 = float.sqrt_f32(dx * dx + dy * dy);
+        st.grab = 0;
+        if (d >= ri && d <= r)                                        { st.grab = 2; }
+        or (h.mx >= sx0 && h.mx <= sx1 && h.my >= sy0 && h.my <= sy1) { st.grab = 1; }
+    }
+    var changed: bool = false;
+    if (h.held && st.grab == 1) { changed = pick_square(st, h.mx, h.my, sx0, sy0, sx1, sy1); }
+    or (h.held && st.grab == 2) {
+        var t: f32 = atan2(h.my - cy, h.mx - cx) / (PI * 2.0::f32);
+        if (t < 0.0::f32) { t = t + 1.0::f32; }
+        changed = set_hue(st, clamp01(t));
+    }
+
+    val step: f32   = PI * 2.0::f32 / RING_ARCS::f32;
+    var i:    usize = 0;
+    for (i < RING_ARCS) {
+        val a0: f32        = i::f32 * step;
+        val c:  draw.Color = from_hsv(Hsv{h: (i::f32 + 0.5::f32) / RING_ARCS::f32, s: 1.0::f32, v: 1.0::f32}, 1.0::f32);
+        context.arc(ctx, cx, cy, mid, a0, a0 + step * 1.25::f32, rw, c);
+        i = i + 1;
+    }
+    val a: f32 = clamp01(st.hsv.h) * PI * 2.0::f32;
+    dot(ctx, cx + float.cos_f32(a) * mid, cy + float.sin_f32(a) * mid, rw / 2.0::f32);
+    paint_square(ctx, st.hsv, sx0, sy0, sx1, sy1);
+    ret changed;
+}
+
+# the alpha bar, opaque at the top and clear at the bottom, over a checkerboard
+fun alpha_bar(ctx: *context.Context, c: *draw.Color, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    val h:       interact.Hit = interact.hit(ctx, context.id_of(ctx, "#alpha"), x0, y0, x1, y1, input.BUTTON_LEFT);
+    var changed: bool         = false;
+    if (h.held && y1 > y0) {
+        val a: f32 = 1.0::f32 - clamp01((h.my - y0) / (y1 - y0));
+        if (a != c.a) {
+            c.a     = a;
+            changed = true;
+        }
+    }
+    checker(ctx, x0, y0, x1, y1, (x1 - x0) / 2.0::f32);
+    val top: draw.Color = draw.rgba(c.r, c.g, c.b, 1.0::f32);
+    val bot: draw.Color = draw.rgba(c.r, c.g, c.b, 0.0::f32);
+    context.quad_gradient(ctx, x0, y0, x1, y1, draw.gradient(x0, y0, top, x0, y1, bot));
+    notch(ctx, x0, x1, y0 + (1.0::f32 - clamp01(c.a)) * (y1 - y0));
+    ret changed;
+}
+
+# height of a control row, without the gap below it
+fun row_h(ctx: *context.Context) f32 {
+    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+}
+
+# a colour picker editing @c
+#
+# a square of saturation and value with hue on a bar beside it, or on a ring
+# around it with RING, an alpha bar with ALPHA, and beneath them a swatch,
+# the label and the hex text.
+# ---
+# ctx:   context
+# label: the picker's text, drawn beside its hex text, and its key
+# c:     the colour, straight, edited in place
+# flags: ALPHA and RING, combined with |
+# ret:   true if the colour changed this frame
+pub fun picker(ctx: *context.Context, label: str, c: *draw.Color, flags: u8) bool {
+    val id:    u64     = context.id_of(ctx, label);
+    val st:    *Picker = state.get[Picker](ctx, id);
+    val ring:  bool    = (flags & RING) != 0;
+    val alpha: bool    = (flags & ALPHA) != 0;
+    val g:     f32     = widget.row_gap(ctx);
+    val pad:   f32     = context.px(ctx, ctx.theme.pad);
+    val rh:    f32     = row_h(ctx);
+    sync(st, @c);
+
+    var bars: f32 = 0.0::f32;
+    if (!ring) { bars = bars + rh + g; }
+    if (alpha) { bars = bars + rh + g; }
+    val av:   context.Area = widget.avail(ctx);
+    var side: f32          = av.x1 - av.x0 - bars;
+    if (side > context.px(ctx, SIDE_MAX)) { side = context.px(ctx, SIDE_MAX); }
+    if (side < rh * 2.0::f32)             { side = rh * 2.0::f32; }
+    val r: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), side + bars, side);
+    if (side > r.x1 - r.x0 - bars) { side = r.x1 - r.x0 - bars; }
+    if (side < 0.0::f32)           { side = 0.0::f32; }
+
+    context.push_id(ctx, id);
+    var hsv: bool = false;
+    var x:   f32  = r.x0 + side + g;
+    if (ring) { hsv = wheel(ctx, st, r.x0, r.y0, side, rh); }
+    or {
+        hsv = square(ctx, st, r.x0, r.y0, r.x0 + side, r.y0 + side);
+        if (hue_bar(ctx, st, x, r.y0, x + rh, r.y0 + side)) { hsv = true; }
+        x = x + rh + g;
+    }
+    if (hsv) { apply(st, c); }
+    var changed: bool = hsv;
+    if (alpha && alpha_bar(ctx, c, x, r.y0, x + rh, r.y0 + side)) { changed = true; }
+
+    val n:  usize = bid.shown(label);
+    var lw: f32   = 0.0::f32;
+    if (n > 0) { lw = context.text_width_n(ctx, label, n) + pad; }
+    val hr: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), rh * 2.0::f32 + g + lw + context.px(ctx, 80.0::f32), rh);
+    val sw: f32          = hr.x0 + rh * 2.0::f32;
+    checker(ctx, hr.x0, hr.y0, sw, hr.y1, rh / 2.0::f32);
+    context.quad(ctx, hr.x0, hr.y0, sw, hr.y1, @c);
+    if (n > 0) { context.text_span(ctx, label, n, sw + g, hr.y0 + (rh - context.line_height(ctx)) / 2.0::f32, ctx.theme.text); }
+
+    var hex: [HEX_CAP]u8;
+    val t:   str = value.entry(ctx, "#hex", hex_text(@c, alpha, ?hex[0]), hex_char, sw + g + lw, hr.y0, hr.x1, hr.y1);
+    if (t != nil) {
+        val p: opt[draw.Color] = parse_hex(t, @c);
+        if (sel p.some) {
+            val n: draw.Color = p.some;
+            if (n.r != c.r || n.g != c.g || n.b != c.b || n.a != c.a) {
+                @c      = n;
+                changed = true;
+                sync(st, n);
+            }
+        }
+    }
+    context.pop_id(ctx);
+    ret changed;
+}
+
+# whether two colours have the same hex text
+#[testing]
+fun same_hex(a: draw.Color, b: draw.Color) bool {
+    var x: [HEX_CAP]u8;
+    var y: [HEX_CAP]u8;
+    ret str_equals(hex_text(a, true, ?x[0]), hex_text(b, true, ?y[0]));
+}
+
+#[testing]
+fun hex_is(c: draw.Color, alpha: bool, want: str) bool {
+    var x: [HEX_CAP]u8;
+    ret str_equals(hex_text(c, alpha, ?x[0]), want);
+}
+
+test hex__round_trips_through_text_and_hsv {
+    val c: draw.Color = draw.hex(0x3A7FC0, 128.0::f32 / 255.0::f32);
+    if (!hex_is(c, false, "#3A7FC0") || !hex_is(c, true, "#3A7FC080")) { ret 1; }
+    val p: opt[draw.Color] = parse_hex(" #3a7fc0 ", draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.25::f32));
+    if (sel p.none)                                            { ret 2; }
+    if (p.some.r != c.r || p.some.g != c.g || p.some.b != c.b) { ret 3; }
+    if (p.some.a != 0.25::f32)                                 { ret 4; }
+    val q: opt[draw.Color] = parse_hex("3A7FC080", draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 1.0::f32));
+    if (sel q.none)      { ret 5; }
+    if (q.some.a != c.a) { ret 5; }
+    val bad: [4]str = [4]str{"", "#12345", "#1234567", "#12345G"};
+    var i:   usize  = 0;
+    for (i < 4) {
+        val b: opt[draw.Color] = parse_hex(bad[i], c);
+        if (sel b.some) { ret 6; }
+        i = i + 1;
+    }
+
+    # every byte colour on a grid survives hsv and back as the same hex
+    var r: u32 = 0;
+    for (r < 256) {
+        var gg: u32 = 0;
+        for (gg < 256) {
+            var b: u32 = 0;
+            for (b < 256) {
+                val x: draw.Color = draw.hex((r << 16) | (gg << 8) | b, 1.0::f32);
+                if (!same_hex(x, from_hsv(to_hsv(x), 1.0::f32))) { ret 7; }
+                b = b + 17;
+            }
+            gg = gg + 17;
+        }
+        r = r + 17;
+    }
+    if (!hex_is(from_hsv(Hsv{h: 1.0::f32, s: 1.0::f32, v: 1.0::f32}, 1.0::f32), false, "#FF0000")) { ret 8; }
+    ret 0;
+}
+
+# the colours the test interface edits
+rec Colors {
+    sq:   draw.Color;
+    ring: draw.Color;
+}
+
+#[testing]
+fun colors_ui(ctx: *context.Context, user: ptr) {
+    val s: *Colors = user::*Colors;
+    picker(ctx, "pick", ?s.sq, ALPHA);
+    picker(ctx, "ring", ?s.ring, RING);
+}
+
+# drag one of a picker's parts from its centre to a fraction of its rect
+#[testing]
+fun drag_to(d: *drv.Driver, path: str, fx: f32, fy: f32) bool {
+    val id: u64               = drv.find(d, path);
+    val r:  opt[context.Area] = drv.rect(d, id);
+    if (sel r.none) { ret false; }
+    d.time = d.time + 1.0;
+    ret drv.drag(d, id, r.some.x0 + (r.some.x1 - r.some.x0) * fx, r.some.y0 + (r.some.y1 - r.some.y0) * fy);
+}
+
+# type hex text into a picker and commit it with enter
+#[testing]
+fun type_hex(d: *drv.Driver, path: str, s: str) bool {
+    val id: u64 = drv.find(d, path);
+    d.time = d.time + 1.0;
+    if (!drv.click(d, id) || !drv.focused(d, id)) { ret false; }
+    drv.key(d, 'A', input.MOD_CTRL);
+    drv.type_text(d, s);
+    drv.key(d, input.KEY_ENTER, 0);
+    ret !drv.focused(d, id);
+}
+
+test picker__round_trips_hex_and_drag_edits {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s: Colors;
+    s.sq   = draw.hex(0xFF0000, 1.0::f32);
+    s.ring = draw.hex(0xFF0000, 1.0::f32);
+    var d: drv.Driver;
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 600.0::f32, colors_ui, (?s)::ptr);
+    if (sel e.err) { ret 1; }
+    drv.step(?d);
+
+    # typed hex lands on its bytes and shows as typed
+    if (!type_hex(?d, "pick/#hex", "#3A7FC080"))                              { ret 2; }
+    if (!same_hex(s.sq, draw.hex(0x3A7FC0, 128.0::f32 / 255.0::f32)))         { ret 3; }
+    if (!str_equals(drv.text_of(?d, drv.find(?d, "pick/#hex")), "#3A7FC080")) { ret 4; }
+
+    # the hue bar a third of the way down is green, and the hue outlives a
+    # drag through black
+    if (!drag_to(?d, "pick/#sv", 1.5::f32, -0.5::f32))            { ret 5; }
+    if (!drag_to(?d, "pick/#hue", 0.5::f32, 1.0::f32 / 3.0::f32)) { ret 6; }
+    if (!hex_is(s.sq, true, "#00FF0080"))                         { ret 7; }
+    if (!drag_to(?d, "pick/#sv", -0.5::f32, 1.5::f32))            { ret 8; }
+    if (!hex_is(s.sq, true, "#00000080"))                         { ret 9; }
+    if (!drag_to(?d, "pick/#sv", 1.5::f32, -0.5::f32))            { ret 10; }
+    if (!hex_is(s.sq, true, "#00FF0080"))                         { ret 11; }
+    if (!drag_to(?d, "pick/#alpha", 0.5::f32, 1.5::f32))          { ret 12; }
+    if (!hex_is(s.sq, true, "#00FF0000"))                         { ret 13; }
+
+    # a dragged colour typed back as its hex keeps that hex
+    if (!drag_to(?d, "pick/#sv", 0.37::f32, 0.61::f32)) { ret 14; }
+    var shown: [HEX_CAP]u8;
+    val t:     str = hex_text(s.sq, true, ?shown[0]);
+    if (!type_hex(?d, "pick/#hex", t))                              { ret 15; }
+    if (!hex_is(s.sq, true, t))                                     { ret 16; }
+    if (!str_equals(drv.text_of(?d, drv.find(?d, "pick/#hex")), t)) { ret 17; }
+
+    # on the ring, a press on the ring turns the hue: half way round is cyan
+    val w: opt[context.Area] = drv.rect(?d, drv.find(?d, "ring/#wheel"));
+    if (sel w.none) { ret 18; }
+    val cx:  f32 = (w.some.x0 + w.some.x1) / 2.0::f32;
+    val cy:  f32 = (w.some.y0 + w.some.y1) / 2.0::f32;
+    val mid: f32 = (w.some.x1 - w.some.x0) / 2.0::f32 - 4.0::f32;
+    d.time = d.time + 1.0;
+    drv.move(?d, cx + mid, cy);
+    drv.press(?d, input.BUTTON_LEFT);
+    drv.move(?d, cx, cy + mid);
+    drv.move(?d, cx - mid, cy);
+    drv.release(?d, input.BUTTON_LEFT);
+    if (!hex_is(s.ring, false, "#00FFFF")) { ret 19; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
