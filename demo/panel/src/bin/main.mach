@@ -1,7 +1,8 @@
 # drives a docked application panel built only from blit's widgets, laid out
-# like cellar's side panel: a header, then run, view and files sections. it
-# runs headless frames through blit.driver that click a button and drag a
-# slider, then prints what the panel did and the vertex count. with
+# like cellar's side panel: a header, then run, view, files and layers
+# sections. it runs headless frames through blit.driver that click a button,
+# drag a slider and drag one layer onto another to reorder them, then prints
+# what the panel did and the vertex count. with
 # --snapshot it prints the frame's snapshot instead, which is how panel.snap,
 # the golden the panel's test compares against, is made
 
@@ -38,6 +39,8 @@ use blit;
 # help:       the help button is on
 # files:      the saved files list
 # query:      the text the files list is searched by
+# open_order: the layers section is open
+# order:      the layers, top first, reordered by dragging them
 rec Panel {
     side:       blit.widget.Dock;
     open_run:   u8;
@@ -55,6 +58,8 @@ rec Panel {
     help:       u8;
     files:      blit.widget.List;
     query:      str;
+    open_order: u8;
+    order:      [4]str;
 }
 
 # write n in decimal into buf at o; ret the offset after it
@@ -189,6 +194,55 @@ fun files(ctx: *blit.context.Context, p: *Panel) {
     blit.widget.button(ctx, "Screenshot");
 }
 
+# move the layer at from to stand at to, shifting the ones between
+fun reorder(p: *Panel, from: usize, to: usize) {
+    if (from >= 4 || to >= 4) { ret; }
+    val moved: str   = p.order[from];
+    var i:     usize = from;
+    for (i < to) {
+        p.order[i] = p.order[i + 1];
+        i          = i + 1;
+    }
+    for (i > to) {
+        p.order[i] = p.order[i - 1];
+        i          = i - 1;
+    }
+    p.order[to] = moved;
+}
+
+# the layers, a list reordered by dragging a row onto another: each row is a
+# drag source carrying its index and a drop target for the others
+fun layers(ctx: *blit.context.Context, p: *Panel) {
+    if (!blit.widget.section(ctx, "LAYERS", ?p.open_order)) { ret; }
+    val h:  f32 = blit.widget.control_row_height(ctx) - blit.widget.row_gap(ctx);
+    val ty: f32 = (h - blit.context.line_height(ctx)) / 2.0::f32;
+    var i:  u64 = 0;
+    for (i < 4) {
+        val name: str               = p.order[i];
+        val r:    blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+        val x0:   f32               = r.x0;
+        val y0:   f32               = r.y0;
+        val x1:   f32               = r.x1;
+        val y1:   f32               = r.y1;
+        val hit:  blit.interact.Hit = blit.interact.hit(ctx, blit.context.id_of(ctx, name), x0, y0, x1, y1, blit.input.BUTTON_LEFT);
+        var bg:   blit.draw.Color   = ctx.theme.control;
+        if (hit.hot) { bg = ctx.theme.control_hot; }
+        blit.context.quad(ctx, x0, y0, x1, y1, bg);
+        blit.context.text_at(ctx, name, x0 + blit.context.px(ctx, 4.0::f32), y0 + ty, ctx.theme.text);
+
+        val drag: blit.dnd.Drag = blit.dnd.source(ctx, hit, "layer", (?i)::ptr, $size_of(u64), x0, y0, x1, y1);
+        if (drag.on) {
+            val pv: blit.dnd.Preview = blit.dnd.begin_preview(ctx);
+            blit.context.quad(ctx, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control_on);
+            blit.context.text_at(ctx, name, pv.x0 + blit.context.px(ctx, 4.0::f32), pv.y0 + ty, ctx.theme.text_dim);
+            blit.dnd.end_preview(ctx, pv);
+        }
+        val drop: blit.dnd.Drop = blit.dnd.target(ctx, hit, "layer", x0, y0, x1, y1);
+        if (drop.dropped && drop.n == $size_of(u64)) { reorder(p, (@(drop.data::*u64))::usize, i::usize); }
+        i = i + 1;
+    }
+}
+
 # one frame of the panel, docked to the right of the screen
 fun ui(ctx: *blit.context.Context, user: ptr) {
     val p:    *Panel               = user::*Panel;
@@ -197,6 +251,7 @@ fun ui(ctx: *blit.context.Context, user: ptr) {
     run(ctx, p);
     view(ctx, p);
     files(ctx, p);
+    layers(ctx, p);
     blit.widget.end_dock(ctx, ?p.side, dock);
 }
 
@@ -212,11 +267,17 @@ fun fresh() Panel {
     p.area           = 2;
     p.files.selected = 6;
     p.query          = "an";
+    p.open_order     = 1;
+    p.order[0]       = "cells";
+    p.order[1]       = "grid";
+    p.order[2]       = "trails";
+    p.order[3]       = "selection";
     ret p;
 }
 
-# lay the panel out on an 800 by 600 screen, click step, and drag the speed
-# slider from its left end three quarters across
+# lay the panel out on an 800 by 600 screen, click step, drag the speed
+# slider from its left end three quarters across, and drag the top layer onto
+# the third
 fun script(d: *blit.driver.Driver) bool {
     blit.driver.step(d);
     if (!blit.driver.click(d, blit.driver.find(d, "panel/Step"))) { ret false; }
@@ -228,7 +289,12 @@ fun script(d: *blit.driver.Driver) bool {
     blit.driver.press(d, blit.input.BUTTON_LEFT);
     blit.driver.move(d, r.some.x0 + (r.some.x1 - r.some.x0) * 0.75::f32, y);
     blit.driver.release(d, blit.input.BUTTON_LEFT);
-    ret true;
+    ret blit.driver.drag_onto(d, blit.driver.find(d, "panel/cells"), blit.driver.find(d, "panel/trails"));
+}
+
+# whether the scripted drag moved the top layer to third
+fun reordered(p: *Panel) bool {
+    ret str_equals(p.order[0], "grid") && str_equals(p.order[2], "cells");
 }
 
 # the golden snapshot of the scripted panel's last frame
@@ -242,9 +308,10 @@ test panel__matches_its_golden_snapshot {
     var p:  Panel           = fresh();
     var d:  blit.driver.Driver;
     val ie: err[allo.Error] = blit.driver.init(?d, ?a, 800.0::f32, 600.0::f32, ui, (?p)::ptr);
-    if (sel ie.err)   { ret 1; }
-    if (!script(?d))  { ret 2; }
-    if (p.steps != 1) { ret 3; }
+    if (sel ie.err)     { ret 1; }
+    if (!script(?d))    { ret 2; }
+    if (p.steps != 1)   { ret 3; }
+    if (!reordered(?p)) { ret 6; }
     val snap: str   = blit.driver.snapshot(?d);
     val n:    usize = $length_of(GOLDEN);
     var k:    usize = 0;
@@ -282,11 +349,12 @@ fun main(argc: i64, argv: **u8) i64 {
 
     if (argc > 1 && str_equals(argv[1], "--snapshot")) { print.print(blit.driver.snapshot(?d)); }
     or {
-        print.printf("blit {} panel: steps={} speed={} area={} {} vertices, ok={}\n",
+        print.printf("blit {} panel: steps={} speed={} area={} top layer={} {} vertices, ok={}\n",
             blit.VERSION,
             p.steps,
             (p.speed + 0.5::f32)::u64,
             p.area,
+            p.order[0],
             blit.context.draw_count(?d.ctx),
             blit.context.ok(?d.ctx)::u64);
     }
@@ -296,6 +364,7 @@ fun main(argc: i64, argv: **u8) i64 {
         print.println("driver free failed");
         ret 1;
     }
-    if (p.steps != 1) { ret 2; }
+    if (p.steps != 1)   { ret 2; }
+    if (!reordered(?p)) { ret 3; }
     ret 0;
 }

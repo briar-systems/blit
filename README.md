@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -203,7 +203,9 @@ blit.context.end(?ctx);
 
 - **Time.** `in.time` is the host's monotonic clock in seconds, and
   `blit.context.dt(?ctx)` is the time since the previous frame (0 on the
-  first).
+  first). Double clicks, caret blink and every other timed behaviour need it:
+  a host that never advances `in.time` gets single clicks only and a caret
+  that does not blink.
 - **Pointer.** `down` and `prev_down` are bitmasks of `BUTTON_LEFT`,
   `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
   `blit.input.pressed`, `released` and `held` take the button. The context
@@ -403,6 +405,59 @@ if (h.held) { drag_by(h.dx, h.dy); }
   was drawn in, so a caller that refuses a text field's entry (`ENTERED` with
   text it will not take) calls `focus` with that id to hand the keyboard
   straight back, and `focused(?ctx, id)` says whether it holds it.
+
+## Drag and drop
+
+`blit.dnd` lets any widget be a drag source or a drop target. Both ends take
+the widget's own `blit.interact.Hit`, so a row, a tab or a window's title bar
+becomes a source or a target by passing its hit along.
+
+```mach
+# a source: past a small move threshold its drag starts with a typed payload,
+# a type tag and bytes the context copies
+val h: blit.interact.Hit = blit.interact.hit(?ctx, id, x0, y0, x1, y1, blit.input.BUTTON_LEFT);
+val d: blit.dnd.Drag = blit.dnd.source(?ctx, h, "layer", (?index)::ptr, $size_of(u64), x0, y0, x1, y1);
+if (d.on) {
+    # the source draws its own preview, on a layer above the interface
+    val pv: blit.dnd.Preview = blit.dnd.begin_preview(?ctx);
+    blit.context.quad(?ctx, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control_on);
+    blit.dnd.end_preview(?ctx, pv);
+}
+if (d.missed) { float_off(); }
+
+# a target: after drawing the widget, name the type it accepts over its rect
+val t: blit.dnd.Drop = blit.dnd.target(?ctx, h, "layer", x0, y0, x1, y1);
+if (t.dropped) { move_layer(@(t.data::*u64), here); }
+```
+
+- **Source.** `source` is called every frame with the widget's hit. Once the
+  widget holds the pointer and has moved `payload.THRESHOLD` (4 unscaled
+  pixels, `set_threshold` changes it) from the press, the drag starts. The
+  payload is copied into storage the context owns, again every frame the drag
+  is on, so a source can hand over a record on its stack, and the rect given
+  is what the preview follows. `Drag.on` is true while its drag is in flight,
+  and through the frame after it ends exactly one of `dropped` (a target took
+  it), `missed` (released over no target) or `cancelled` (Escape) is set, so a
+  dragged tab can become a window when no tab bar took it.
+- **Target.** `target` reports a drag of its type over it when its hit is
+  hot, the topmost claimant under the pointer, and draws the theme's accept
+  highlight (the `select` tint under an `accent` outline) over the rect.
+  `Drop.dropped` is the frame the button comes up over it, with the payload
+  in `data` and `n` and the starting widget in `source`. A target accepting
+  several types calls `target` once per type with the same hit. A target with
+  nothing else to do claims its rect with `interact.hit` and no buttons.
+- **Preview.** `begin_preview` opens a layer above the interface and returns
+  the source's rect in screen pixels, kept under the pointer where the press
+  grabbed it. The source draws anything there, and the layer claims nothing,
+  so targets beneath still see the pointer.
+- **Cancel.** Escape ends a drag at once, and the source cannot start another
+  until its button comes up. A release over no target ends it as missed.
+- **Anywhere.** The drag belongs to the context (`blit.payload`), not to its
+  source, so it outlives the source's frames and reaches targets in any
+  window, dock, popup or surface: the claim order that routes every hover
+  decides which target is under the pointer. `carried(?ctx, kind)` peeks at a
+  drag in flight, for a widget that shows where a drag would land before it
+  is over a target.
 
 ## Widgets & layout
 
