@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-01
+
+### Added
+- A passthrough central node in a dock space (#168): `dock.central` keeps one leaf open for what the app draws beneath the space, such as a 3D scene. It holds its share of the space while empty, never collapses, paints no background and takes no input there, so the app's own pixels and claims show through. `dock.central_area` says where it lies this frame, and a saved layout keeps it.
+- A main menu bar (#196) that takes its row from the top of the free area, so a dock space placed from `free_area` begins below it.
+- Keyed, replaceable toasts anchored to any rect (#165): `toast.post_keyed` replaces a toast in place by key, `toast.withdraw` takes one down before its time, and `toast.show_in` draws the stack inside any rect.
+- Placing a window at a position in a leaf's tab stack and choosing the front tab (#175): `dock.insert` and `dock.select`, so a default layout never writes dock tree fields.
+- A slider value fill (#167): the new `slider_fill` style kind fills the track up to the value per state, and a zero handle width gives a fill-only slider. It is transparent in the built-in themes.
+- An `overflow` style field (#177): a label too wide for its box is cut with an ellipsis (the default) or clipped, for buttons, button groups, segmented controls, toggles, sliders, dropdowns and combos, tabs, window and modal titles, section headings, table headers, progress text and list rows.
+- Factor fields state their own range in the theme field table (#192), and the theme editor's sliders use it.
+- `Context.hwheel_taken` (#178), the horizontal counterpart of `wheel_taken`, so taking one wheel axis never blocks the other.
+
+### Changed
+- A scroll region (#164) and a table (#178) take the wheel only when they can move the way it turns, per axis, passing it to the enclosing region at their limits or with nothing to scroll.
+- A docked window's body is padded from the `window` style exactly as a floating one's is (#174), so its content code is the same docked or floating.
+- Section (#166) and tree row (#179) carets are sized by their style's `min_w`, defaulting to the caption's ascent, instead of the line height.
+- Setting or pushing a paint's `fill` alone now gives a solid face: `fill_to` follows `fill` unless it is set too (#180), through pushes and pops, classes, `set`, `set_path`, TOML loading and saving.
+- `dock.add` appends a window as the last tab in the order it was added, before and after the first draw, and moves a window already in the leaf to the end (#190).
+
+### Fixed
+- A tab's label is no longer cut with an ellipsis when the bar has room: tabs are laid out with their separator and take exactly their natural width, and a label within a sixty-fourth of a pixel of its box counts as fitting (#194, #198).
+- Stale kind-range docs, and the deprecated `default = true` target key in every manifest (#181).
+- The gallery's golden snapshot, after the slider fill and with its title tab whole.
+
 ## [0.10.1] - 2026-10-01
 
 ### Fixed
