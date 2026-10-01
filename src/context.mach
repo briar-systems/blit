@@ -2035,8 +2035,9 @@ pub fun input_visible(ctx: *Context, x: f32, y: f32) u8 {
 # over, everything on lower layers, whatever the call order. the clip resets
 # to the whole screen and the local origin to zero, so coordinates inside a
 # band are screen pixels. the band is a root for wheel routing: claims made
-# in it never count as inside a scroll region opened outside it. the stack grows with nesting; if it cannot, oom is
-# set, the parent is not saved and depth still balances.
+# in it never count as inside a scroll region opened outside it. the stack
+# grows with nesting; if it cannot, oom is set, the parent is not saved and
+# depth still balances.
 # ---
 # ctx:  context
 # b:    the band's index, such as band.POPUPS
