@@ -1859,8 +1859,8 @@ test space__central_node_lets_the_app_beneath_show_through {
     driver.steps(?d, 2);
     val whole: opt[context.Area] = hp.area;
     if (sel whole.none)                                           { ret 21; }
-    if (whole.some.x0 != 0.0::f32 || whole.some.x1 != 400.0::f32) { ret 21; }
-    if (docked_paint_at(?d, 50.0::f32, 150.0::f32))               { ret 22; }
+    if (whole.some.x0 != 0.0::f32 || whole.some.x1 != 400.0::f32) { ret 22; }
+    if (docked_paint_at(?d, 50.0::f32, 150.0::f32))               { ret 23; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
