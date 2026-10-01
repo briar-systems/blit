@@ -762,7 +762,8 @@ blit.menu.end_menu(?ctx, ?cm);
   `open_context`.
 - **Items.** An `Item` carries a label, a `Shortcut` shown at its right, a
   check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
-  drawn before the label (text, nil for none) and a disabled flag.
+  drawn before the label (text, such as a `blit.icon.STR_*` icon, nil for
+  none) and a disabled flag.
 - **Shortcuts.** An item fires when its key is pressed with exactly its
   modifiers, open or closed, and stays quiet while another widget holds the
   keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
