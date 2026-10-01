@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -586,6 +586,68 @@ layout cursor across the column like `blit.widget`'s:
   scroll live in the state store under its id, and its parts are reached by
   path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
   each option an index under it.
+
+## Tables
+
+`blit.table` lays rows of any widgets out under columns the user can resize,
+reorder, sort and hide, with frozen leading columns and rows, and draws only
+the rows in view, so a table of a million rows costs what one of a screenful
+does. The caller describes its columns and runs its rows:
+
+```mach
+var cols: [3]blit.table.Column;
+cols[0] = blit.table.Column{label: "Name", width: 160.0::f32};
+cols[1] = blit.table.Column{label: "Size", width: 60.0::f32};
+cols[2] = blit.table.Column{label: "Done", flags: blit.table.NO_SORT};
+
+# per frame:
+var o: blit.table.Options = blit.table.options(count, 300.0::f32);
+o.freeze_cols = 1;
+var t: blit.table.Table = blit.table.begin(?ctx, "files", ?cols[0], 3, o);
+if (t.sorted) { order_rows(t.sort, t.dir); }
+for (blit.table.next_row(?ctx, ?t)) {
+    val f: *File = ?files[order[t.row]];
+    if (blit.table.cell(?ctx, ?t, 0)) { blit.widget.text(?ctx, f.name); }
+    if (blit.table.cell(?ctx, ?t, 1)) { blit.widget.text(?ctx, f.size_text); }
+    if (blit.table.cell(?ctx, ?t, 2)) { blit.widget.checkbox(?ctx, "done", ?f.done); }
+}
+blit.table.end(?ctx, ?t);
+```
+
+- **Rows in view.** `next_row` yields the frozen rows, then only the rows the
+  view shows, setting `t.row`. Rows are one height (`Options.row_h`, a control
+  row by default), so the first row in view is found by arithmetic and a frame
+  never walks the rows above it.
+- **Cells.** `cell(?ctx, ?t, c)` opens column `c`'s cell in the current row
+  and returns false for a hidden column or one scrolled out of view. A cell
+  is a horizontal stack across the column, its widgets centred down the row
+  and clipped to the cell.
+- **Ids.** A row is an id scope keyed by its key under the table's id, its
+  index unless `Options.key` maps it (a caller that sorts keys rows by their
+  data), and a cell a scope keyed by its column's label under the row. A
+  widget in a cell keeps its id and its state however the rows scroll.
+  `cell_id(?t, key, c)` is a cell's scope, the parent of its widgets' ids.
+- **The header.** Dragging the grip at a header cell's right edge resizes the
+  column. A click sorts by the column, ascending and then descending, and the
+  table reports it as `t.sort` (the column's index, the column count for
+  none) and `t.dir`, with `t.sorted` set on the frame it changed: the table
+  never sorts, the caller orders its rows. Dragging a header drops the column
+  on another's place through `blit.dnd`, and a right click opens a popup that
+  shows and hides columns. `NO_RESIZE`, `NO_REORDER`, `NO_HIDE` and `NO_SORT`
+  turn each off per column and `HIDDEN` starts a column hidden.
+- **Frozen columns and rows.** The header, the first `freeze_cols` shown
+  columns and the first `freeze_rows` rows stay put while the rest scrolls,
+  by the wheels and by scrollbars that appear when the content outgrows the
+  table. Frozen and scrolled parts are clipped to rects that do not overlap.
+- **Column state.** Each column's width, place and visibility live in the
+  state store under the column's id (its label under the table's id), and
+  the sort and scroll under the table's. A change the user makes pins them,
+  so a table not drawn for a while keeps its layout.
+  `blit.table.register(?ctx)` makes the layout and sort persist through
+  `blit.state.save` and `load`, as `table_column` and `table` tables.
+- **Where things went.** `begin` fills each `Column`'s `id`, `shown`,
+  `frozen`, `pos` (its place in the display order), `x` and `w`, and `order`,
+  the index of the column shown at that record's own place.
 
 ## Widget ids
 
