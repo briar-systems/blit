@@ -1941,16 +1941,16 @@ agreed within 0.5% on every scene.
 
 ```
 scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
-dense panel    off        264.8     0.3%      3532     3       2
-dense panel    on         270.1     0.2%      3532     3       2   +1.9%
-10k row list   off         57.9     0.4%      1136     3       0
-10k row list   on          58.4     0.4%      1136     3       0   +0.9%
-100k chart     off       1679.1     0.3%     10492     3       0
-100k chart     on        1731.0     0.3%     10492     3       0   +3.0%
-windows        off        242.7     2.0%      3672    18       0
-windows        on         247.6     1.2%      3672    18       0   +2.0%
-10k-edge fill  off      14454.7     0.2%    231520     1       0
-10k-edge fill  on       14453.1     0.3%    231520     1       0   +0.0%
+dense panel    off        252.2     0.4%      3532     3       0
+dense panel    on         257.3     0.3%      3532     3       0   +2.0%
+10k row list   off         58.9     0.6%      1136     3       0
+10k row list   on          59.1     0.4%      1136     3       0   +0.3%
+100k chart     off       1700.5     0.3%     10492     3       0
+100k chart     on        1750.8     0.3%     10492     3       0   +2.9%
+windows        off        240.3     0.3%      3672    18       0
+windows        on         245.7     0.4%      3672    18       0   +2.2%
+10k-edge fill  off      14351.6     0.3%    231520     1       0
+10k-edge fill  on       14351.0     0.4%    231520     1       0   +0.0%
 ```
 
 ## Conventions
