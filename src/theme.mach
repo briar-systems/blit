@@ -416,6 +416,8 @@ pub val GROUP_MOTION: u8 = 5;
 # unit:  UNIT_*
 # off:   byte offset in Theme (palette, metrics, plot), Style or Paint
 # count: elements, 1 except for an array such as plot.series
+# lo:    least value of a UNIT_FACTOR field, 0 for the other units
+# hi:    greatest value of a UNIT_FACTOR field, 0 for the other units
 # doc:   what the field means
 pub rec Field {
     group: u8;
@@ -423,6 +425,8 @@ pub rec Field {
     unit:  u8;
     off:   usize;
     count: usize;
+    lo:    f32;
+    hi:    f32;
     doc:   str;
 }
 
@@ -432,65 +436,65 @@ pub val FIELD_COUNT: usize = 59;
 # every field of a theme: the one table TOML, overrides, classes, the editor
 # and the README's field table are built from
 pub val FIELDS: [59]Field = [59]Field{
-    Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background, opaque in the built-in themes"},
-    Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip, toast and modal background, opaque in the built-in themes"},
-    Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
-    Field{group: GROUP_PALETTE, name: "header", unit: UNIT_COLOR, off: $offset_of(Theme, header), count: 1, doc: "window titlebar and section heading"},
-    Field{group: GROUP_PALETTE, name: "header_hot", unit: UNIT_COLOR, off: $offset_of(Theme, header_hot), count: 1, doc: "a titlebar or heading under the cursor"},
-    Field{group: GROUP_PALETTE, name: "edge", unit: UNIT_COLOR, off: $offset_of(Theme, edge), count: 1, doc: "a dock's inner edge and a separator's rule"},
-    Field{group: GROUP_PALETTE, name: "text", unit: UNIT_COLOR, off: $offset_of(Theme, text), count: 1, doc: "text"},
-    Field{group: GROUP_PALETTE, name: "text_dim", unit: UNIT_COLOR, off: $offset_of(Theme, text_dim), count: 1, doc: "secondary text and glyphs: notes, readings, carets, axis labels"},
-    Field{group: GROUP_PALETTE, name: "text_faint", unit: UNIT_COLOR, off: $offset_of(Theme, text_faint), count: 1, doc: "the faintest text: hints, placeholders and disabled text"},
-    Field{group: GROUP_PALETTE, name: "accent", unit: UNIT_COLOR, off: $offset_of(Theme, accent), count: 1, doc: "a mark that is on (a checked box, a chosen button, a selected row) and a focused field's outline"},
-    Field{group: GROUP_PALETTE, name: "accent_text", unit: UNIT_COLOR, off: $offset_of(Theme, accent_text), count: 1, doc: "text and marks drawn on an accent fill"},
-    Field{group: GROUP_PALETTE, name: "warn", unit: UNIT_COLOR, off: $offset_of(Theme, warn), count: 1, doc: "warnings, for consumers drawing their own content; no widget uses it"},
-    Field{group: GROUP_PALETTE, name: "control", unit: UNIT_COLOR, off: $offset_of(Theme, control), count: 1, doc: "a control's face at rest"},
-    Field{group: GROUP_PALETTE, name: "control_hot", unit: UNIT_COLOR, off: $offset_of(Theme, control_hot), count: 1, doc: "a control under the cursor"},
-    Field{group: GROUP_PALETTE, name: "control_on", unit: UNIT_COLOR, off: $offset_of(Theme, control_on), count: 1, doc: "a control pressed, a dropdown open or a menu's header open"},
-    Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, doc: "a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face"},
-    Field{group: GROUP_PALETTE, name: "handle", unit: UNIT_COLOR, off: $offset_of(Theme, handle), count: 1, doc: "a slider handle, toggle knob or scrollbar thumb at rest"},
-    Field{group: GROUP_PALETTE, name: "handle_on", unit: UNIT_COLOR, off: $offset_of(Theme, handle_on), count: 1, doc: "a handle, knob or thumb being dragged or hovered"},
-    Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, doc: "the highlight behind selected text, translucent in the built-in themes"},
-    Field{group: GROUP_PALETTE, name: "grid", unit: UNIT_COLOR, off: $offset_of(Theme, grid), count: 1, doc: "chart grid lines"},
-    Field{group: GROUP_METRICS, name: "row", unit: UNIT_LENGTH, off: $offset_of(Theme, row), count: 1, doc: "least height of a control row, which grows to fit a line of text and its inset"},
-    Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows, cells and buttons in a row"},
-    Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, doc: "container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content"},
-    Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, doc: "control inset: between a control's edge and its text, and between a box and its label"},
-    Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, doc: "slider handle width, 0 for none"},
-    Field{group: GROUP_METRICS, name: "bar_w", unit: UNIT_LENGTH, off: $offset_of(Theme, bar_w), count: 1, doc: "scrollbar width"},
-    Field{group: GROUP_METRICS, name: "thumb_min", unit: UNIT_LENGTH, off: $offset_of(Theme, thumb_min), count: 1, doc: "shortest scrollbar thumb"},
-    Field{group: GROUP_METRICS, name: "corner", unit: UNIT_LENGTH, off: $offset_of(Theme, corner), count: 1, doc: "corner radius of controls and containers, 0 for square"},
-    Field{group: GROUP_METRICS, name: "edge_w", unit: UNIT_LENGTH, off: $offset_of(Theme, edge_w), count: 1, doc: "width of an edge line: a dock's inner side, a chart's rules and a focused field's outline"},
-    Field{group: GROUP_METRICS, name: "caret_w", unit: UNIT_LENGTH, off: $offset_of(Theme, caret_w), count: 1, doc: "width of a text field's caret"},
-    Field{group: GROUP_PALETTE, name: "focus", unit: UNIT_COLOR, off: $offset_of(Theme, focus), count: 1, doc: "the ring around the control the keyboard reached"},
-    Field{group: GROUP_METRICS, name: "focus_w", unit: UNIT_LENGTH, off: $offset_of(Theme, focus_w), count: 1, doc: "width of the focus ring"},
-    Field{group: GROUP_PLOT, name: "series", unit: UNIT_COLOR, off: $offset_of(Theme, series), count: 8, doc: "chart series colors, series k drawing in series[k % 8]"},
-    Field{group: GROUP_PLOT, name: "line_w", unit: UNIT_LENGTH, off: $offset_of(Theme, line_w), count: 1, doc: "width of a chart line"},
-    Field{group: GROUP_PLOT, name: "tick", unit: UNIT_LENGTH, off: $offset_of(Theme, tick), count: 1, doc: "length of a chart axis tick"},
-    Field{group: GROUP_PLOT, name: "area", unit: UNIT_FACTOR, off: $offset_of(Theme, area), count: 1, doc: "alpha factor of the area filled under a chart line, in [0, 1]"},
-    Field{group: GROUP_MOTION, name: "hover_time", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_time), count: 1, doc: "seconds a control's face takes to follow hover and press, 0 for at once"},
-    Field{group: GROUP_MOTION, name: "hover_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_ease), count: 1, doc: "the curve a hover or press transition eases by: 0 linear, 1 out, 2 in and out"},
-    Field{group: GROUP_MOTION, name: "open_time", unit: UNIT_FACTOR, off: $offset_of(Theme, open_time), count: 1, doc: "seconds a section takes to unfold or fold, 0 for at once"},
-    Field{group: GROUP_MOTION, name: "open_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, open_ease), count: 1, doc: "the curve a section folds by: 0 linear, 1 out, 2 in and out"},
-    Field{group: GROUP_MOTION, name: "scroll_time", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_time), count: 1, doc: "seconds a scroll region takes to glide to a new offset, 0 for at once"},
-    Field{group: GROUP_MOTION, name: "scroll_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_ease), count: 1, doc: "the curve a scroll glide eases by: 0 linear, 1 out, 2 in and out"},
-    Field{group: GROUP_STYLE, name: "radius", unit: UNIT_QUAD, off: $offset_of(Style, radius), count: 1, doc: "corner radii: top-left, top-right, bottom-right, bottom-left"},
-    Field{group: GROUP_STYLE, name: "pad", unit: UNIT_QUAD, off: $offset_of(Style, pad), count: 1, doc: "container padding between its edges and its content: left, top, right, bottom"},
-    Field{group: GROUP_STYLE, name: "inset", unit: UNIT_QUAD, off: $offset_of(Style, inset), count: 1, doc: "control inset between its edges and its text: left, top, right, bottom"},
-    Field{group: GROUP_STYLE, name: "margin", unit: UNIT_QUAD, off: $offset_of(Style, margin), count: 1, doc: "space around the widget: left, top, right (between cells), bottom (between rows)"},
-    Field{group: GROUP_STYLE, name: "min_w", unit: UNIT_LENGTH, off: $offset_of(Style, min_w), count: 1, doc: "least width"},
-    Field{group: GROUP_STYLE, name: "min_h", unit: UNIT_LENGTH, off: $offset_of(Style, min_h), count: 1, doc: "least height, a control's row height before it grows to fit its text"},
-    Field{group: GROUP_STYLE, name: "shadow_x", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_x), count: 1, doc: "shadow offset right"},
-    Field{group: GROUP_STYLE, name: "shadow_y", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_y), count: 1, doc: "shadow offset down"},
-    Field{group: GROUP_STYLE, name: "shadow_blur", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_blur), count: 1, doc: "how far the shadow fades out, 0 for a hard edge"},
-    Field{group: GROUP_STYLE, name: "overflow", unit: UNIT_FACTOR, off: $offset_of(Style, overflow), count: 1, doc: "how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end"},
-    Field{group: GROUP_PAINT, name: "fill", unit: UNIT_COLOR, off: $offset_of(Paint, fill), count: 1, doc: "the face, at its top when it is a gradient"},
-    Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, doc: "the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat"},
-    Field{group: GROUP_PAINT, name: "text", unit: UNIT_COLOR, off: $offset_of(Paint, text), count: 1, doc: "text drawn on the face"},
-    Field{group: GROUP_PAINT, name: "mark", unit: UNIT_COLOR, off: $offset_of(Paint, mark), count: 1, doc: "secondary ink: a glyph, a caret, a reading or a hint"},
-    Field{group: GROUP_PAINT, name: "border", unit: UNIT_COLOR, off: $offset_of(Paint, border), count: 1, doc: "the outline, transparent for none"},
-    Field{group: GROUP_PAINT, name: "border_w", unit: UNIT_LENGTH, off: $offset_of(Paint, border_w), count: 1, doc: "the outline's width"},
-    Field{group: GROUP_PAINT, name: "shadow", unit: UNIT_COLOR, off: $offset_of(Paint, shadow), count: 1, doc: "the shadow's color, transparent for none"}
+    Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, lo: 0.0, hi: 0.0, doc: "panel background, opaque in the built-in themes"},
+    Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, lo: 0.0, hi: 0.0, doc: "window, popup, menu, tooltip, toast and modal background, opaque in the built-in themes"},
+    Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, lo: 0.0, hi: 0.0, doc: "docked container background"},
+    Field{group: GROUP_PALETTE, name: "header", unit: UNIT_COLOR, off: $offset_of(Theme, header), count: 1, lo: 0.0, hi: 0.0, doc: "window titlebar and section heading"},
+    Field{group: GROUP_PALETTE, name: "header_hot", unit: UNIT_COLOR, off: $offset_of(Theme, header_hot), count: 1, lo: 0.0, hi: 0.0, doc: "a titlebar or heading under the cursor"},
+    Field{group: GROUP_PALETTE, name: "edge", unit: UNIT_COLOR, off: $offset_of(Theme, edge), count: 1, lo: 0.0, hi: 0.0, doc: "a dock's inner edge and a separator's rule"},
+    Field{group: GROUP_PALETTE, name: "text", unit: UNIT_COLOR, off: $offset_of(Theme, text), count: 1, lo: 0.0, hi: 0.0, doc: "text"},
+    Field{group: GROUP_PALETTE, name: "text_dim", unit: UNIT_COLOR, off: $offset_of(Theme, text_dim), count: 1, lo: 0.0, hi: 0.0, doc: "secondary text and glyphs: notes, readings, carets, axis labels"},
+    Field{group: GROUP_PALETTE, name: "text_faint", unit: UNIT_COLOR, off: $offset_of(Theme, text_faint), count: 1, lo: 0.0, hi: 0.0, doc: "the faintest text: hints, placeholders and disabled text"},
+    Field{group: GROUP_PALETTE, name: "accent", unit: UNIT_COLOR, off: $offset_of(Theme, accent), count: 1, lo: 0.0, hi: 0.0, doc: "a mark that is on (a checked box, a chosen button, a selected row) and a focused field's outline"},
+    Field{group: GROUP_PALETTE, name: "accent_text", unit: UNIT_COLOR, off: $offset_of(Theme, accent_text), count: 1, lo: 0.0, hi: 0.0, doc: "text and marks drawn on an accent fill"},
+    Field{group: GROUP_PALETTE, name: "warn", unit: UNIT_COLOR, off: $offset_of(Theme, warn), count: 1, lo: 0.0, hi: 0.0, doc: "warnings, for consumers drawing their own content; no widget uses it"},
+    Field{group: GROUP_PALETTE, name: "control", unit: UNIT_COLOR, off: $offset_of(Theme, control), count: 1, lo: 0.0, hi: 0.0, doc: "a control's face at rest"},
+    Field{group: GROUP_PALETTE, name: "control_hot", unit: UNIT_COLOR, off: $offset_of(Theme, control_hot), count: 1, lo: 0.0, hi: 0.0, doc: "a control under the cursor"},
+    Field{group: GROUP_PALETTE, name: "control_on", unit: UNIT_COLOR, off: $offset_of(Theme, control_on), count: 1, lo: 0.0, hi: 0.0, doc: "a control pressed, a dropdown open or a menu's header open"},
+    Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, lo: 0.0, hi: 0.0, doc: "a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face"},
+    Field{group: GROUP_PALETTE, name: "handle", unit: UNIT_COLOR, off: $offset_of(Theme, handle), count: 1, lo: 0.0, hi: 0.0, doc: "a slider handle, toggle knob or scrollbar thumb at rest"},
+    Field{group: GROUP_PALETTE, name: "handle_on", unit: UNIT_COLOR, off: $offset_of(Theme, handle_on), count: 1, lo: 0.0, hi: 0.0, doc: "a handle, knob or thumb being dragged or hovered"},
+    Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, lo: 0.0, hi: 0.0, doc: "the highlight behind selected text, translucent in the built-in themes"},
+    Field{group: GROUP_PALETTE, name: "grid", unit: UNIT_COLOR, off: $offset_of(Theme, grid), count: 1, lo: 0.0, hi: 0.0, doc: "chart grid lines"},
+    Field{group: GROUP_METRICS, name: "row", unit: UNIT_LENGTH, off: $offset_of(Theme, row), count: 1, lo: 0.0, hi: 0.0, doc: "least height of a control row, which grows to fit a line of text and its inset"},
+    Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, lo: 0.0, hi: 0.0, doc: "space between layout rows, cells and buttons in a row"},
+    Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, lo: 0.0, hi: 0.0, doc: "container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content"},
+    Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, lo: 0.0, hi: 0.0, doc: "control inset: between a control's edge and its text, and between a box and its label"},
+    Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, lo: 0.0, hi: 0.0, doc: "slider handle width, 0 for none"},
+    Field{group: GROUP_METRICS, name: "bar_w", unit: UNIT_LENGTH, off: $offset_of(Theme, bar_w), count: 1, lo: 0.0, hi: 0.0, doc: "scrollbar width"},
+    Field{group: GROUP_METRICS, name: "thumb_min", unit: UNIT_LENGTH, off: $offset_of(Theme, thumb_min), count: 1, lo: 0.0, hi: 0.0, doc: "shortest scrollbar thumb"},
+    Field{group: GROUP_METRICS, name: "corner", unit: UNIT_LENGTH, off: $offset_of(Theme, corner), count: 1, lo: 0.0, hi: 0.0, doc: "corner radius of controls and containers, 0 for square"},
+    Field{group: GROUP_METRICS, name: "edge_w", unit: UNIT_LENGTH, off: $offset_of(Theme, edge_w), count: 1, lo: 0.0, hi: 0.0, doc: "width of an edge line: a dock's inner side, a chart's rules and a focused field's outline"},
+    Field{group: GROUP_METRICS, name: "caret_w", unit: UNIT_LENGTH, off: $offset_of(Theme, caret_w), count: 1, lo: 0.0, hi: 0.0, doc: "width of a text field's caret"},
+    Field{group: GROUP_PALETTE, name: "focus", unit: UNIT_COLOR, off: $offset_of(Theme, focus), count: 1, lo: 0.0, hi: 0.0, doc: "the ring around the control the keyboard reached"},
+    Field{group: GROUP_METRICS, name: "focus_w", unit: UNIT_LENGTH, off: $offset_of(Theme, focus_w), count: 1, lo: 0.0, hi: 0.0, doc: "width of the focus ring"},
+    Field{group: GROUP_PLOT, name: "series", unit: UNIT_COLOR, off: $offset_of(Theme, series), count: 8, lo: 0.0, hi: 0.0, doc: "chart series colors, series k drawing in series[k % 8]"},
+    Field{group: GROUP_PLOT, name: "line_w", unit: UNIT_LENGTH, off: $offset_of(Theme, line_w), count: 1, lo: 0.0, hi: 0.0, doc: "width of a chart line"},
+    Field{group: GROUP_PLOT, name: "tick", unit: UNIT_LENGTH, off: $offset_of(Theme, tick), count: 1, lo: 0.0, hi: 0.0, doc: "length of a chart axis tick"},
+    Field{group: GROUP_PLOT, name: "area", unit: UNIT_FACTOR, off: $offset_of(Theme, area), count: 1, lo: 0.0, hi: 1.0, doc: "alpha factor of the area filled under a chart line, in [0, 1]"},
+    Field{group: GROUP_MOTION, name: "hover_time", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_time), count: 1, lo: 0.0, hi: 2.0, doc: "seconds a control's face takes to follow hover and press, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "hover_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_ease), count: 1, lo: 0.0, hi: 2.0, doc: "the curve a hover or press transition eases by: 0 linear, 1 out, 2 in and out"},
+    Field{group: GROUP_MOTION, name: "open_time", unit: UNIT_FACTOR, off: $offset_of(Theme, open_time), count: 1, lo: 0.0, hi: 2.0, doc: "seconds a section takes to unfold or fold, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "open_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, open_ease), count: 1, lo: 0.0, hi: 2.0, doc: "the curve a section folds by: 0 linear, 1 out, 2 in and out"},
+    Field{group: GROUP_MOTION, name: "scroll_time", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_time), count: 1, lo: 0.0, hi: 2.0, doc: "seconds a scroll region takes to glide to a new offset, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "scroll_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_ease), count: 1, lo: 0.0, hi: 2.0, doc: "the curve a scroll glide eases by: 0 linear, 1 out, 2 in and out"},
+    Field{group: GROUP_STYLE, name: "radius", unit: UNIT_QUAD, off: $offset_of(Style, radius), count: 1, lo: 0.0, hi: 0.0, doc: "corner radii: top-left, top-right, bottom-right, bottom-left"},
+    Field{group: GROUP_STYLE, name: "pad", unit: UNIT_QUAD, off: $offset_of(Style, pad), count: 1, lo: 0.0, hi: 0.0, doc: "container padding between its edges and its content: left, top, right, bottom"},
+    Field{group: GROUP_STYLE, name: "inset", unit: UNIT_QUAD, off: $offset_of(Style, inset), count: 1, lo: 0.0, hi: 0.0, doc: "control inset between its edges and its text: left, top, right, bottom"},
+    Field{group: GROUP_STYLE, name: "margin", unit: UNIT_QUAD, off: $offset_of(Style, margin), count: 1, lo: 0.0, hi: 0.0, doc: "space around the widget: left, top, right (between cells), bottom (between rows)"},
+    Field{group: GROUP_STYLE, name: "min_w", unit: UNIT_LENGTH, off: $offset_of(Style, min_w), count: 1, lo: 0.0, hi: 0.0, doc: "least width"},
+    Field{group: GROUP_STYLE, name: "min_h", unit: UNIT_LENGTH, off: $offset_of(Style, min_h), count: 1, lo: 0.0, hi: 0.0, doc: "least height, a control's row height before it grows to fit its text"},
+    Field{group: GROUP_STYLE, name: "shadow_x", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_x), count: 1, lo: 0.0, hi: 0.0, doc: "shadow offset right"},
+    Field{group: GROUP_STYLE, name: "shadow_y", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_y), count: 1, lo: 0.0, hi: 0.0, doc: "shadow offset down"},
+    Field{group: GROUP_STYLE, name: "shadow_blur", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_blur), count: 1, lo: 0.0, hi: 0.0, doc: "how far the shadow fades out, 0 for a hard edge"},
+    Field{group: GROUP_STYLE, name: "overflow", unit: UNIT_FACTOR, off: $offset_of(Style, overflow), count: 1, lo: 0.0, hi: 1.0, doc: "how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end"},
+    Field{group: GROUP_PAINT, name: "fill", unit: UNIT_COLOR, off: $offset_of(Paint, fill), count: 1, lo: 0.0, hi: 0.0, doc: "the face, at its top when it is a gradient"},
+    Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, lo: 0.0, hi: 0.0, doc: "the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat"},
+    Field{group: GROUP_PAINT, name: "text", unit: UNIT_COLOR, off: $offset_of(Paint, text), count: 1, lo: 0.0, hi: 0.0, doc: "text drawn on the face"},
+    Field{group: GROUP_PAINT, name: "mark", unit: UNIT_COLOR, off: $offset_of(Paint, mark), count: 1, lo: 0.0, hi: 0.0, doc: "secondary ink: a glyph, a caret, a reading or a hint"},
+    Field{group: GROUP_PAINT, name: "border", unit: UNIT_COLOR, off: $offset_of(Paint, border), count: 1, lo: 0.0, hi: 0.0, doc: "the outline, transparent for none"},
+    Field{group: GROUP_PAINT, name: "border_w", unit: UNIT_LENGTH, off: $offset_of(Paint, border_w), count: 1, lo: 0.0, hi: 0.0, doc: "the outline's width"},
+    Field{group: GROUP_PAINT, name: "shadow", unit: UNIT_COLOR, off: $offset_of(Paint, shadow), count: 1, lo: 0.0, hi: 0.0, doc: "the shadow's color, transparent for none"}
 };
 
 # a name and what it means, for kinds and states
@@ -2466,6 +2470,17 @@ test table__names_every_field_of_every_record {
     }
     if (bad != 0)            { ret bad::i32 + 1; }
     if (rows != FIELD_COUNT) { ret 6; }
+    ret 0;
+}
+
+test table__factors_state_a_range_and_others_none {
+    var i: usize = 0;
+    for (i < FIELD_COUNT) {
+        val f: Field = FIELDS[i];
+        if (f.unit == UNIT_FACTOR && !(f.lo < f.hi))                         { ret 1; }
+        if (f.unit != UNIT_FACTOR && (f.lo != 0.0::f32 || f.hi != 0.0::f32)) { ret 2; }
+        i = i + 1;
+    }
     ret 0;
 }
 
