@@ -209,9 +209,10 @@ fun frame(ctx: *blit.context.Context, p: *Panel, in: blit.input.Input) {
 # a frame's input with the cursor at (x, y) and the button in state down
 fun at(x: f32, y: f32, down: u8) blit.input.Input {
     var in: blit.input.Input;
-    in.mx   = x;
-    in.my   = y;
-    in.down = down;
+    in.mx      = x;
+    in.my      = y;
+    in.present = 1;
+    in.down    = down;
     ret in;
 }
 
