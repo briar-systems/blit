@@ -49,8 +49,17 @@
 # a hand-off: a frame leaves text to copy in copied() and a paste request in
 # wants_paste(), and the consumer answers the request with the next frame's
 # input.paste (see blit.input).
+#
+# the rest of the host contract runs the same way. the context keeps the
+# host's clock (dt), and after end() it asks the host for a pointer shape
+# (cursor), for a place to show the IME's candidate window (ime_rect) and for
+# when to draw again (next_frame): widgets ask for a frame by a time with
+# wake_at, so an idle interface can sleep until input arrives instead of
+# drawing every frame. the IME's composition in progress is kept here, for
+# the focus holder to show at its caret (preedit).
 
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -72,10 +81,10 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.math.float.sqrt_f32;
 
-# maximum nesting of pushed clip rects, local origins and layers
+# capacity the clip, origin and layer stacks start with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
-# maximum single-texture spans one frame's draw list may divide into
+# capacity the span list starts with, doubling from there
 pub val RUN_DEPTH: usize = 64;
 
 # the claim handle reserve_claim returns when the claim was refused
@@ -89,6 +98,15 @@ pub val CORNERS_NONE:   u8 = 0;
 pub val CORNERS_TOP:    u8 = 1;
 pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
+
+# a saved local origin in screen pixels
+# ---
+# x: origin x
+# y: origin y
+rec Origin {
+    x: f32;
+    y: f32;
+}
 
 # one contiguous span of the draw list sampling a single texture on one layer
 #
@@ -158,18 +176,17 @@ pub rec Area {
 # clip_x1:       active clip rect right in screen pixels
 # clip_y1:       active clip rect bottom in screen pixels
 # clip_sp:       clip stack depth (number of pushed parent rects)
-# clip_x0s:      saved parent clip lefts
-# clip_y0s:      saved parent clip tops
-# clip_x1s:      saved parent clip rights
-# clip_y1s:      saved parent clip bottoms
+# clips:         saved parent clip rects, grown on demand
+# clips_cap:     rects allocated for clips
 # org_sp:        local-origin stack depth
-# org_xs:        saved parent local-origin xs
-# org_ys:        saved parent local-origin ys
+# origins:       saved parent local origins, grown on demand
+# origins_cap:   origins allocated for origins
 # tex:           texture handle subsequent geometry samples (draw.ATLAS = font atlas)
 # page:          atlas page subsequent atlas geometry samples
 # filter:        sampling filter subsequent consumer-texture geometry asks for
 # run_start:     first vertex of the span being accumulated
-# runs:          closed single-texture spans, in draw order
+# runs:          closed single-texture spans, in draw order, grown on demand
+# runs_cap:      spans allocated for runs
 # run_len:       how many spans are closed
 # oom:           1 if an allocation or a claim was refused this frame, else 0
 # out:           scratch draw list end() composes layers into
@@ -179,11 +196,13 @@ pub rec Area {
 # layer:         layer subsequent geometry and claims land on
 # ordinal:       claims made so far this frame
 # layer_sp:      layer stack depth
-# layers:        saved parent layers
+# layers:        saved parent layers, grown on demand
+# layers_cap:    layers allocated for layers
 # font:          the glyph source, its glyph cache and its atlas
 # scale:         interface scale theme metrics and text are sized at, 1.0 by default
 # theme:         the colors and unscaled metrics widgets draw with
 # srgb:          1 if colors are converted to linear light for an sRGB target, else 0
+# lin:           authored colors already converted to linear light
 # wheel_taken:   1 once a scroll region consumed this frame's wheel, else 0
 # free:          the screen area docked containers have not taken this frame
 # focus:         id of the widget holding the keyboard, persists across frames (0 = none)
@@ -193,6 +212,18 @@ pub rec Area {
 # clip_cap:      bytes allocated for clip
 # clip_on:       1 if the frame copied text into clip, else 0
 # paste_wanted:  1 if a widget asked for the clipboard's text this frame, else 0
+# timed:         1 once a frame has carried the host's clock, else 0
+# delta:         seconds since the previous frame, 0 on the first
+# wake:          the earliest time a widget asked for a frame by this frame
+# wake_on:       1 if a widget asked for a frame this frame, else 0
+# shape:         the input.CURSOR_* shape the frame asks the host for
+# ime:           where the IME's candidate window goes, in screen pixels
+# ime_on:        1 if a widget placed the candidate window this frame, else 0
+# pre:           the IME's composition in progress, NUL-terminated, nil before the first
+# pre_cap:       bytes allocated for pre
+# pre_len:       bytes in the composition, 0 when there is none
+# pre_caret:     the composition's caret as a byte offset into pre
+# pre_owner:     id of the focus holder the composition was typed into
 pub rec Context {
     dl:            draw.DrawList;
     in:            input.Input;
@@ -216,18 +247,17 @@ pub rec Context {
     clip_x1:       f32;
     clip_y1:       f32;
     clip_sp:       usize;
-    clip_x0s:      [16]f32;
-    clip_y0s:      [16]f32;
-    clip_x1s:      [16]f32;
-    clip_y1s:      [16]f32;
+    clips:         *Area;
+    clips_cap:     usize;
     org_sp:        usize;
-    org_xs:        [16]f32;
-    org_ys:        [16]f32;
+    origins:       *Origin;
+    origins_cap:   usize;
     tex:           u64;
     page:          u32;
     filter:        u32;
     run_start:     usize;
-    runs:          [64]Run;
+    runs:          *Run;
+    runs_cap:      usize;
     run_len:       usize;
     oom:           u8;
     out:           draw.DrawList;
@@ -237,11 +267,13 @@ pub rec Context {
     layer:         u32;
     ordinal:       u64;
     layer_sp:      usize;
-    layers:        [16]u32;
+    layers:        *u32;
+    layers_cap:    usize;
     font:          font.Font;
     scale:         f32;
     theme:         th.Theme;
     srgb:          u8;
+    lin:           draw.LinearCache;
     wheel_taken:   u8;
     free:          Area;
     focus:         u64;
@@ -251,6 +283,18 @@ pub rec Context {
     clip_cap:      usize;
     clip_on:       u8;
     paste_wanted:  u8;
+    timed:         u8;
+    delta:         f64;
+    wake:          f64;
+    wake_on:       u8;
+    shape:         u8;
+    ime:           Area;
+    ime_on:        u8;
+    pre:           *u8;
+    pre_cap:       usize;
+    pre_len:       usize;
+    pre_caret:     usize;
+    pre_owner:     u64;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -292,12 +336,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         ret ep;
     }
 
-    ctx.in.mx        = 0.0::f32;
-    ctx.in.my        = 0.0::f32;
-    ctx.in.down      = 0;
-    ctx.in.prev_down = 0;
-    ctx.in.wheel     = 0.0::f32;
-    input.clear_keys(?ctx.in);
+    var none: input.Input;
+    ctx.in = none;
 
     ctx.sw            = 0.0::f32;
     ctx.sh            = 0.0::f32;
@@ -319,20 +359,29 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_x1       = 0.0::f32;
     ctx.clip_y1       = 0.0::f32;
     ctx.clip_sp       = 0;
+    ctx.clips         = nil;
+    ctx.clips_cap     = 0;
     ctx.org_sp        = 0;
+    ctx.origins       = nil;
+    ctx.origins_cap   = 0;
     ctx.tex           = draw.ATLAS;
     ctx.page          = 0;
     ctx.filter        = draw.FILTER_NEAREST;
     ctx.run_start     = 0;
+    ctx.runs          = nil;
+    ctx.runs_cap      = 0;
     ctx.run_len       = 0;
     ctx.oom           = 0;
     ctx.hover         = 0;
     ctx.layer         = 0;
     ctx.ordinal       = 0;
     ctx.layer_sp      = 0;
+    ctx.layers        = nil;
+    ctx.layers_cap    = 0;
     ctx.scale         = 1.0::f32;
     ctx.theme         = th.default();
     ctx.srgb          = 0;
+    ctx.lin           = draw.LinearCache{};
     ctx.wheel_taken   = 0;
     ctx.free          = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
     ctx.focus         = 0;
@@ -342,20 +391,56 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_cap      = 0;
     ctx.clip_on       = 0;
     ctx.paste_wanted  = 0;
+    ctx.timed         = 0;
+    ctx.delta         = 0.0::f64;
+    ctx.wake          = 0.0::f64;
+    ctx.wake_on       = 0;
+    ctx.shape         = input.CURSOR_ARROW;
+    ctx.ime           = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
+    ctx.ime_on        = 0;
+    ctx.pre           = nil;
+    ctx.pre_cap       = 0;
+    ctx.pre_len       = 0;
+    ctx.pre_caret     = 0;
+    ctx.pre_owner     = 0;
     ret err[allo.Error].ok{};
 }
 
-# release the context's draw lists, claim lists, font and clipboard text
+# release the context's draw lists, claim lists, font, clipboard text and
+# composition
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
+    if (ctx.pre != nil) {
+        val ep: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.pre, ctx.pre_cap);
+        if (sel ep.err) { ret ep; }
+        ctx.pre     = nil;
+        ctx.pre_cap = 0;
+        ctx.pre_len = 0;
+    }
     if (ctx.clip != nil) {
         val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
         if (sel ec.err) { ret ec; }
         ctx.clip     = nil;
         ctx.clip_cap = 0;
     }
+    val er: err[allo.Error] = allo.deallocate[Run](ctx.a, ctx.runs, ctx.runs_cap);
+    if (sel er.err) { ret er; }
+    ctx.runs     = nil;
+    ctx.runs_cap = 0;
+    val ek: err[allo.Error] = allo.deallocate[Area](ctx.a, ctx.clips, ctx.clips_cap);
+    if (sel ek.err) { ret ek; }
+    ctx.clips     = nil;
+    ctx.clips_cap = 0;
+    val eg: err[allo.Error] = allo.deallocate[Origin](ctx.a, ctx.origins, ctx.origins_cap);
+    if (sel eg.err) { ret eg; }
+    ctx.origins     = nil;
+    ctx.origins_cap = 0;
+    val ey: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.layers, ctx.layers_cap);
+    if (sel ey.err) { ret ey; }
+    ctx.layers     = nil;
+    ctx.layers_cap = 0;
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
     val e1: err[allo.Error] = draw.free(?ctx.out);
@@ -367,22 +452,28 @@ pub fun free(ctx: *Context) err[allo.Error] {
     ret font.free(?ctx.font);
 }
 
-# start a frame: store input (carrying the previous button state into
-# prev_down), resolve the hovered claimant, clear the draw list, and reset ids,
-# layout and layers
+# start a frame: store input (carrying the previous buttons into prev_down),
+# take dt from the host's clock, resolve the hovered claimant, clear the draw
+# list, and reset ids, layout and layers
 #
-# hover is the topmost of the previous frame's claims under this frame's cursor.
-# a press on anything but the focus holder drops the focus, and the last
-# frame's copied text and paste request are cleared.
+# hover is the topmost of the previous frame's claims under this frame's
+# cursor, and nothing while no pointer is present. a primary press on anything
+# but the focus holder drops the focus. the last frame's copied text, paste
+# request, cursor shape, candidate window and wake time are cleared, and the
+# frame's last composition event replaces the composition in progress.
 # ---
 # ctx: context
-# in:  this frame's input (consumer sets mx/my/down; prev_down is managed here)
+# in:  this frame's input (prev_down is managed here)
 # sw:  screen width in pixels
 # sh:  screen height in pixels
 pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
-    val prev: u8 = ctx.in.down;
+    val prev: u8  = ctx.in.down;
+    val then: f64 = ctx.in.time;
     ctx.in           = in;
     ctx.in.prev_down = prev;
+    ctx.delta        = 0.0::f64;
+    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
+    ctx.timed = 1;
 
     ctx.sw  = sw;
     ctx.sh  = sh;
@@ -417,22 +508,27 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.claims = ctx.prior;
     ctx.prior  = done;
     hit.reset(?ctx.claims);
-    ctx.hover    = hit.resolve(?ctx.prior, ctx.in.mx, ctx.in.my);
+    ctx.hover = 0;
+    if (ctx.in.present != 0) { ctx.hover = hit.resolve(?ctx.prior, ctx.in.mx, ctx.in.my); }
     ctx.layer    = 0;
     ctx.ordinal  = 0;
     ctx.layer_sp = 0;
 
-    if (input.pressed(ctx.in) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
+    if (input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
     ctx.focus_drawn  = 0;
     ctx.clip_on      = 0;
     ctx.paste_wanted = 0;
+    ctx.wake_on      = 0;
+    ctx.shape        = input.CURSOR_ARROW;
+    ctx.ime_on       = 0;
+    take_preedit(ctx);
 
     draw.reset(?ctx.dl);
 }
 
 # finish a frame: close the last texture span, compose the draw list by layer,
-# drop the active widget once the button is released and drop the focus when
-# its holder was not drawn
+# drop the active widget once the primary button is released and drop the
+# focus when its holder was not drawn
 #
 # vertex indices taken during the frame (begin_panel's handle) are emission
 # indices and are only valid until end().
@@ -441,8 +537,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (ctx.in.down == 0)     { ctx.active = 0; }
-    if (ctx.focus_drawn == 0) { ctx.focus = 0; }
+    if (input.held(ctx.in, input.BUTTON_LEFT) == 0) { ctx.active = 0; }
+    if (ctx.focus_drawn == 0)                       { ctx.focus = 0; }
 }
 
 # give a widget the keyboard
@@ -549,6 +645,139 @@ pub fun wants_paste(ctx: *Context) bool {
     ret ctx.paste_wanted != 0;
 }
 
+# seconds between the previous frame and this one by the host's clock
+# ---
+# ctx: context
+# ret: dt, 0 on the first frame and whenever the clock did not advance
+pub fun dt(ctx: *Context) f64 {
+    ret ctx.delta;
+}
+
+# ask for a frame by time t on the host's clock, for a hover delay, an
+# animation or a caret blink
+#
+# the earliest time asked for during a frame is what next_frame reports.
+# a widget that still needs it asks again in the frame it gets.
+# ---
+# ctx: context
+# t:   the time in seconds, as input.time counts it
+pub fun wake_at(ctx: *Context, t: f64) {
+    if (ctx.wake_on == 0 || t < ctx.wake) { ctx.wake = t; }
+    ctx.wake_on = 1;
+}
+
+# when the host should draw the next frame, read after end
+#
+# some(0) asks for one now: a wake time has already passed, or a widget asked
+# for the clipboard, which only the next frame can deliver. some(t) asks for
+# one by time t on the host's clock. none means nothing is pending, and an
+# idle host can sleep until input arrives.
+# ---
+# ctx: context
+# ret: some(0) for now, some(t) by time t, none for only on input
+pub fun next_frame(ctx: *Context) opt[f64] {
+    if (ctx.paste_wanted != 0)   { ret opt[f64].some{0.0::f64}; }
+    if (ctx.wake_on == 0)        { ret opt[f64].none{}; }
+    if (ctx.wake <= ctx.in.time) { ret opt[f64].some{0.0::f64}; }
+    ret opt[f64].some{ctx.wake};
+}
+
+# ask the host for a pointer shape while the cursor is over a widget
+#
+# a widget sets it while hovered or held. the last one set in a frame wins,
+# and a frame that sets none asks for input.CURSOR_ARROW.
+# ---
+# ctx:   context
+# shape: an input.CURSOR_* shape
+pub fun set_cursor(ctx: *Context, shape: u8) {
+    ctx.shape = shape;
+}
+
+# the pointer shape the frame asks the host for, read after end
+# ---
+# ctx: context
+# ret: an input.CURSOR_* shape
+pub fun cursor(ctx: *Context) u8 {
+    ret ctx.shape;
+}
+
+# place the IME's candidate window by a rect, the caret of the widget taking
+# text
+# ---
+# ctx: context
+# x0:  left x in local pixels
+# y0:  top y in local pixels
+# x1:  right x in local pixels
+# y1:  bottom y in local pixels
+pub fun set_ime_rect(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) {
+    ctx.ime    = Area{x0: x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly};
+    ctx.ime_on = 1;
+}
+
+# where the host should put the IME's candidate window, read after end
+# ---
+# ctx: context
+# ret: the rect in screen pixels, none when no widget takes text this frame
+pub fun ime_rect(ctx: *Context) opt[Area] {
+    if (ctx.ime_on == 0) { ret opt[Area].none{}; }
+    ret opt[Area].some{ctx.ime};
+}
+
+# the IME's composition in progress for a focus holder to show at its caret
+# ---
+# ctx: context
+# id:  the asking widget's id
+# ret: the composition's utf-8 text, nil when the widget does not hold the
+#      keyboard or nothing is being composed
+pub fun preedit(ctx: *Context, id: u64) str {
+    if (id == 0 || ctx.focus != id || ctx.pre_owner != id || ctx.pre_len == 0) { ret nil; }
+    ret ctx.pre;
+}
+
+# the composition's caret as a byte offset into preedit's text
+# ---
+# ctx: context
+# ret: the caret, 0 when nothing is being composed
+pub fun preedit_caret(ctx: *Context) usize {
+    ret ctx.pre_caret;
+}
+
+# take the frame's last composition event as the composition in progress,
+# typed into the focus holder
+fun take_preedit(ctx: *Context) {
+    var i: usize = ctx.in.events.len;
+    for (i > 0) {
+        i = i - 1;
+        val e: input.Event = ctx.in.events.data[i];
+        if (!sel e.preedit) { cnt; }
+        val p: input.Preedit = e.preedit;
+        ctx.pre_len   = 0;
+        ctx.pre_caret = 0;
+        ctx.pre_owner = ctx.focus;
+        if (p.text == nil) { ret; }
+        val n: usize = str_len(p.text);
+        if (n + 1 > ctx.pre_cap) {
+            val r: res[*u8, allo.Error] = allo.reallocate[u8](ctx.a, ctx.pre, ctx.pre_cap, n + 1);
+            if (sel r.err) {
+                ctx.oom = 1;
+                ret;
+            }
+            ctx.pre     = r.ok;
+            ctx.pre_cap = n + 1;
+        }
+        var k: usize = 0;
+        for (k < n) {
+            ctx.pre[k] = p.text[k];
+            k          = k + 1;
+        }
+        ctx.pre[n]    = 0;
+        ctx.pre_len   = n;
+        ctx.pre_caret = p.caret;
+        if (ctx.pre_caret > n) { ctx.pre_caret = n; }
+        ret;
+    }
+}
+
 # allocate the next widget id for this frame (stable while call order is)
 # ---
 # ctx: context
@@ -583,6 +812,31 @@ pub fun draw_count(ctx: *Context) usize {
     ret draw.count(?ctx.dl);
 }
 
+# grow a stack's backing array to hold need entries
+#
+# capacity doubles from init. if the allocator refuses, oom is set and the
+# array is returned as it was, so the caller checks need against the capacity.
+# ---
+# ctx:   context, whose allocator backs the array
+# items: the array, nil before the first growth
+# cap:   entries allocated, updated on growth
+# need:  entries the array must hold
+# init:  capacity of the first allocation
+# ret:   the array, moved if it grew
+fun room[T](ctx: *Context, items: *T, cap: *usize, need: usize, init: usize) *T {
+    if (need <= @cap) { ret items; }
+    var n: usize = @cap * 2;
+    if (n < init) { n = init; }
+    if (n < need) { n = need; }
+    val r: res[*T, allo.Error] = allo.reallocate[T](ctx.a, items, @cap, n);
+    if (sel r.err) {
+        ctx.oom = 1;
+        ret items;
+    }
+    @cap = n;
+    ret r.ok;
+}
+
 # fold a draw-list result into the context's oom flag
 fun record(ctx: *Context, e: err[allo.Error]) {
     if (sel e.err) { ctx.oom = 1; }
@@ -592,9 +846,8 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 #
 # a switch with nothing emitted since the last one retargets in place, so
 # alternating between an image and the atlas records spans only where
-# something was drawn. a frame that closes more than RUN_DEPTH spans keeps
-# drawing into the last one, which mistextures (and mislayers) those vertices
-# rather than dropping them; raise RUN_DEPTH before drawing that many spans.
+# something was drawn. the span list grows with the frame; if it cannot, oom is
+# set and the vertices stay in the open span, which mistextures them.
 # ---
 # ctx:    context
 # tex:    consumer texture handle, draw.ATLAS for the font atlas
@@ -674,17 +927,12 @@ pub fun run_at(ctx: *Context, index: usize) Run {
 
 # close the span being accumulated, if it holds any vertices
 #
-# with RUN_DEPTH spans closed, the last span absorbs the vertices instead, so
-# every vertex stays covered by a span.
+# if the span list cannot grow, oom is set and the span stays open.
 fun flush_run(ctx: *Context) {
     val len: usize = draw.count(?ctx.dl);
     if (len == ctx.run_start) { ret; }
-    if (ctx.run_len >= RUN_DEPTH) {
-        val last: usize = RUN_DEPTH - 1;
-        ctx.runs[last].count = len - ctx.runs[last].start;
-        ctx.run_start        = len;
-        ret;
-    }
+    ctx.runs = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
+    if (ctx.run_len >= ctx.runs_cap) { ret; }
     var run: Run = current(ctx);
     run.layer             = ctx.layer;
     run.start             = ctx.run_start;
@@ -798,8 +1046,8 @@ fun minf(a: f32, b: f32) f32 {
 #
 # the rect is shifted by the local origin like geometry. quads emitted until the
 # matching pop_clip are clipped to the intersection, which never exceeds the
-# parent clip. beyond CLIP_DEPTH nesting the old rect is not saved but depth
-# still balances.
+# parent clip. the stack grows with nesting; if it cannot, oom is set, the old
+# rect is not saved and depth still balances.
 # ---
 # ctx: context
 # x0:  clip left in local pixels
@@ -818,11 +1066,9 @@ pub fun push_clip(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) {
 
 # push the active clip rect unchanged, for pop_clip to restore
 fun save_clip(ctx: *Context) {
-    if (ctx.clip_sp < CLIP_DEPTH) {
-        ctx.clip_x0s[ctx.clip_sp] = ctx.clip_x0;
-        ctx.clip_y0s[ctx.clip_sp] = ctx.clip_y0;
-        ctx.clip_x1s[ctx.clip_sp] = ctx.clip_x1;
-        ctx.clip_y1s[ctx.clip_sp] = ctx.clip_y1;
+    ctx.clips = room[Area](ctx, ctx.clips, ?ctx.clips_cap, ctx.clip_sp + 1, CLIP_DEPTH);
+    if (ctx.clip_sp < ctx.clips_cap) {
+        ctx.clips[ctx.clip_sp] = Area{x0: ctx.clip_x0, y0: ctx.clip_y0, x1: ctx.clip_x1, y1: ctx.clip_y1};
     }
     ctx.clip_sp = ctx.clip_sp + 1;
 }
@@ -833,11 +1079,11 @@ fun save_clip(ctx: *Context) {
 pub fun pop_clip(ctx: *Context) {
     if (ctx.clip_sp == 0) { ret; }
     ctx.clip_sp = ctx.clip_sp - 1;
-    if (ctx.clip_sp < CLIP_DEPTH) {
-        ctx.clip_x0 = ctx.clip_x0s[ctx.clip_sp];
-        ctx.clip_y0 = ctx.clip_y0s[ctx.clip_sp];
-        ctx.clip_x1 = ctx.clip_x1s[ctx.clip_sp];
-        ctx.clip_y1 = ctx.clip_y1s[ctx.clip_sp];
+    if (ctx.clip_sp < ctx.clips_cap) {
+        ctx.clip_x0 = ctx.clips[ctx.clip_sp].x0;
+        ctx.clip_y0 = ctx.clips[ctx.clip_sp].y0;
+        ctx.clip_x1 = ctx.clips[ctx.clip_sp].x1;
+        ctx.clip_y1 = ctx.clips[ctx.clip_sp].y1;
     }
 }
 
@@ -846,9 +1092,9 @@ pub fun pop_clip(ctx: *Context) {
 # callers compose: a surface passes its parent origin plus its offset, a layer
 # passes zero.
 fun push_origin(ctx: *Context, nx: f32, ny: f32) {
-    if (ctx.org_sp < CLIP_DEPTH) {
-        ctx.org_xs[ctx.org_sp] = ctx.lx;
-        ctx.org_ys[ctx.org_sp] = ctx.ly;
+    ctx.origins = room[Origin](ctx, ctx.origins, ?ctx.origins_cap, ctx.org_sp + 1, CLIP_DEPTH);
+    if (ctx.org_sp < ctx.origins_cap) {
+        ctx.origins[ctx.org_sp] = Origin{x: ctx.lx, y: ctx.ly};
     }
     ctx.org_sp = ctx.org_sp + 1;
     ctx.lx     = nx;
@@ -859,9 +1105,9 @@ fun push_origin(ctx: *Context, nx: f32, ny: f32) {
 fun pop_origin(ctx: *Context) {
     if (ctx.org_sp == 0) { ret; }
     ctx.org_sp = ctx.org_sp - 1;
-    if (ctx.org_sp < CLIP_DEPTH) {
-        ctx.lx = ctx.org_xs[ctx.org_sp];
-        ctx.ly = ctx.org_ys[ctx.org_sp];
+    if (ctx.org_sp < ctx.origins_cap) {
+        ctx.lx = ctx.origins[ctx.org_sp].x;
+        ctx.ly = ctx.origins[ctx.org_sp].y;
     }
 }
 
@@ -884,13 +1130,14 @@ pub fun input_visible(ctx: *Context, x: f32, y: f32) u8 {
 # a layer is an overlay: until the matching pop_layer it paints above, and its
 # claims win over, everything on lower layers, whatever the call order. the clip
 # resets to the whole screen and the local origin to zero, so coordinates inside
-# a layer are screen pixels. beyond CLIP_DEPTH nesting the parent is not saved
-# but depth still balances.
+# a layer are screen pixels. the stack grows with nesting; if it cannot, oom is
+# set, the parent is not saved and depth still balances.
 # ---
 # ctx: context
 pub fun push_layer(ctx: *Context) {
     flush_run(ctx);
-    if (ctx.layer_sp < CLIP_DEPTH) { ctx.layers[ctx.layer_sp] = ctx.layer; }
+    ctx.layers = room[u32](ctx, ctx.layers, ?ctx.layers_cap, ctx.layer_sp + 1, CLIP_DEPTH);
+    if (ctx.layer_sp < ctx.layers_cap) { ctx.layers[ctx.layer_sp] = ctx.layer; }
     ctx.layer_sp = ctx.layer_sp + 1;
     ctx.layer    = ctx.layer + 1;
 
@@ -911,8 +1158,8 @@ pub fun pop_layer(ctx: *Context) {
     pop_clip(ctx);
     flush_run(ctx);
     ctx.layer_sp = ctx.layer_sp - 1;
-    if (ctx.layer_sp < CLIP_DEPTH) { ctx.layer = ctx.layers[ctx.layer_sp]; }
-    or                             { ctx.layer = ctx.layer - 1; }
+    if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
+    or                                 { ctx.layer = ctx.layer - 1; }
 }
 
 # move a local rect into screen space and clip it to the active rect
@@ -1057,7 +1304,7 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 
 # a color as it is emitted: converted to linear light for an sRGB target
 fun paint(ctx: *Context, c: draw.Color) draw.Color {
-    if (ctx.srgb != 0) { ret draw.linear(c); }
+    if (ctx.srgb != 0) { ret draw.linear_cached(?ctx.lin, c); }
     ret c;
 }
 
@@ -1473,7 +1720,7 @@ pub fun free_area(ctx: *Context) Area {
 # h:        region height in pixels
 # local_mx: cursor x expressed in the region's local content coordinates
 # local_my: cursor y expressed in the region's local content coordinates
-# inside:   1 if the cursor is inside the (clipped) region, else 0
+# inside:   1 if a pointer is present and inside the (clipped) region, else 0
 pub rec Surface {
     x:        f32;
     y:        f32;
@@ -1513,7 +1760,8 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
     s.h        = h;
     s.local_mx = ctx.in.mx - ctx.lx;
     s.local_my = ctx.in.my - ctx.ly;
-    s.inside   = input_visible(ctx, ctx.in.mx, ctx.in.my);
+    s.inside   = 0;
+    if (ctx.in.present != 0) { s.inside = input_visible(ctx, ctx.in.mx, ctx.in.my); }
     ret s;
 }
 
@@ -1579,6 +1827,7 @@ test surface__maps_cursor_and_clips {
     var in: input.Input;
     in.mx        = 60.0::f32;
     in.my        = 70.0::f32;
+    in.present   = 1;
     in.down      = 0;
     in.prev_down = 0;
     begin(?ctx, in, 200.0::f32, 200.0::f32);
@@ -1651,6 +1900,66 @@ test runs__split_by_texture_in_draw_order {
     ret 0;
 }
 
+test stacks__nest_far_past_the_initial_capacity {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var in: input.Input;
+    in.mx        = 0.0::f32;
+    in.my        = 0.0::f32;
+    in.down      = 0;
+    in.prev_down = 0;
+    begin(?ctx, in, 200.0::f32, 200.0::f32);
+
+    # 64 nested surfaces, each inside a layer, every level moving the clip and origin
+    var i: usize = 0;
+    for (i < 64) {
+        push_layer(?ctx);
+        push_clip(?ctx, i::f32, i::f32, 200.0::f32, 200.0::f32);
+        push_origin(?ctx, i::f32, 0.0::f32);
+        i = i + 1;
+    }
+    if (ctx.layer != 64 || ctx.clip_x0 != 63.0::f32 || ctx.lx != 63.0::f32) { ret 1; }
+
+    # each pop restores the level it opened, back to the root
+    for (i > 0) {
+        i = i - 1;
+        pop_origin(?ctx);
+        pop_clip(?ctx);
+        pop_layer(?ctx);
+        if (ctx.layer != i::u32)                                       { ret 1; }
+        if (ctx.clip_x1 != 200.0::f32)                                 { ret 1; }
+        if (i == 0 && (ctx.clip_x0 != 0.0::f32 || ctx.lx != 0.0::f32)) { ret 1; }
+    }
+    if (ctx.oom != 0) { ret 1; }
+
+    # 256 spans through alternating textures, each keeping its own texture
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    i = 0;
+    for (i < 256) {
+        val img: draw.Image = draw.whole(1 + (i % 2)::u64, draw.FILTER_LINEAR);
+        image_at(?ctx, img, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+        i = i + 1;
+    }
+    end(?ctx);
+    if (run_count(?ctx) != 256) { ret 1; }
+    i = 0;
+    for (i < 256) {
+        val r: Run = run_at(?ctx, i);
+        if (r.tex != 1 + (i % 2)::u64 || r.start != i * 6 || r.count != 6) { ret 1; }
+        i = i + 1;
+    }
+    if (ctx.oom != 0) { ret 1; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test runs__same_texture_images_merge {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -1691,8 +2000,9 @@ test runs__same_texture_images_merge {
 #[testing]
 fun start_at(ctx: *Context, mx: f32, my: f32) {
     var in: input.Input;
-    in.mx = mx;
-    in.my = my;
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
     begin(ctx, in, 100.0::f32, 100.0::f32);
 }
 
@@ -2028,9 +2338,10 @@ test focus__held_while_drawn_and_dropped_by_a_press_elsewhere {
 
     # a press on the holder keeps it, a press elsewhere drops it
     var in: input.Input;
-    in.mx   = 5.0::f32;
-    in.my   = 5.0::f32;
-    in.down = 1;
+    in.mx      = 5.0::f32;
+    in.my      = 5.0::f32;
+    in.present = 1;
+    in.down    = input.BUTTON_LEFT;
     begin(?ctx, in, 100.0::f32, 100.0::f32);
     val c3: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
     if (!focused(?ctx, 1)) { ret 5; }
@@ -2078,6 +2389,88 @@ test clipboard__copied_and_paste_request_last_one_frame {
     start_at(?ctx, 0.0::f32, 0.0::f32);
     end(?ctx);
     if (copied(?ctx) != nil || wants_paste(?ctx)) { ret 5; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# begin a frame at time t with the cursor at (mx, my) and the button up
+#[testing]
+fun start_timed(ctx: *Context, t: f64) {
+    var in: input.Input;
+    in.time    = t;
+    in.mx      = 5.0::f32;
+    in.my      = 5.0::f32;
+    in.present = 1;
+    begin(ctx, in, 100.0::f32, 100.0::f32);
+}
+
+test schedule__next_frame_only_while_something_is_pending {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # a static interface asks for nothing, and dt starts at 0
+    start_timed(?ctx, 10.0::f64);
+    val c1: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    end(?ctx);
+    val idle: opt[f64] = next_frame(?ctx);
+    if (!sel idle.none || dt(?ctx) != 0.0::f64) { ret 2; }
+
+    # the earliest wake asked for is the time reported
+    start_timed(?ctx, 10.5::f64);
+    wake_at(?ctx, 12.0::f64);
+    wake_at(?ctx, 11.0::f64);
+    wake_at(?ctx, 13.0::f64);
+    end(?ctx);
+    val later: opt[f64] = next_frame(?ctx);
+    if (!(sel later.some && later.some == 11.0::f64)) { ret 3; }
+    if (dt(?ctx) != 0.5::f64)                         { ret 4; }
+
+    # a wake already due asks for a frame now, and lasts only its frame
+    start_timed(?ctx, 11.0::f64);
+    wake_at(?ctx, 11.0::f64);
+    end(?ctx);
+    val now: opt[f64] = next_frame(?ctx);
+    if (!(sel now.some && now.some == 0.0::f64)) { ret 5; }
+    start_timed(?ctx, 11.25::f64);
+    end(?ctx);
+    val after: opt[f64] = next_frame(?ctx);
+    if (!sel after.none) { ret 6; }
+
+    # so does a paste request, which only the next frame can answer
+    start_timed(?ctx, 11.5::f64);
+    request_paste(?ctx);
+    end(?ctx);
+    val paste: opt[f64] = next_frame(?ctx);
+    if (!(sel paste.some && paste.some == 0.0::f64)) { ret 7; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test pointer__absent_hovers_nothing {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    start_at(?ctx, 5.0::f32, 5.0::f32);
+    val c1: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    end(?ctx);
+    var in: input.Input;
+    in.mx = 5.0::f32;
+    in.my = 5.0::f32;
+    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32) != 0) { ret 2; }
+    end(?ctx);
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }

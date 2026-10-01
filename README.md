@@ -123,18 +123,67 @@ innermost region holding the topmost claim under the cursor.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
 
-## Keyboard, focus & text fields
+## Input & the host contract
 
-The keyboard is plain data in `Input` like the mouse, so blit still never
-touches a window. Each frame the consumer empties it (`blit.input.clear_keys`)
-and fills it in arrival order: `type_text(?in, cp)` for each typed codepoint and
-`press_key(?in, code, mods)` for each key press or repeat (releases are not
-events). A key that types a printable ASCII character is that character, letters
-in uppercase (`'A'`, `'7'`, `' '`); every other key is a `KEY_*` constant
-(`KEY_ENTER`, `KEY_ESCAPE`, `KEY_BACKSPACE`, `KEY_DELETE`, the arrows,
-`KEY_HOME`, `KEY_END`, ...). Modifiers are `MOD_SHIFT`, `MOD_CTRL`, `MOD_ALT`
-and `MOD_SUPER` bits, and `blit.input.shortcut(mods)` is ctrl, or super as
-darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
+blit never touches a window. Each frame the consumer fills a
+`blit.input.Input`, plain data written against the hardest host (a desktop
+window with an IME, high-resolution wheels and several pointer buttons), and
+hands it to `begin`. A simpler host leaves what it lacks zeroed.
+
+```mach
+var in: blit.input.Input;
+blit.input.init(?in, ?a);           # once: the events grow in storage `in` owns
+# per frame:
+blit.input.clear_keys(?in);
+in.time    = clock_seconds();       # the host's monotonic clock, as f64
+in.present = 1;                     # 0 while the pointer is off the surface
+in.mx      = x;
+in.my      = y;
+in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held this frame
+in.mods    = blit.input.MOD_SHIFT;   # MOD_* bits held this frame
+in.wheel   = dy_pixels;             # both wheels in pixels
+in.wheel_x = dx_pixels;
+blit.input.type_text(?in, cp);      # then every event, in arrival order
+blit.context.begin(?ctx, in, w, h);
+# ... widgets ...
+blit.context.end(?ctx);
+# blit.input.free(?in) at shutdown
+```
+
+- **Time.** `in.time` is the host's monotonic clock in seconds, and
+  `blit.context.dt(?ctx)` is the time since the previous frame (0 on the
+  first).
+- **Pointer.** `down` and `prev_down` are bitmasks of `BUTTON_LEFT`,
+  `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
+  `blit.input.pressed`, `released` and `held` take the button. The context
+  carries `prev_down` across frames. With `present` 0 nothing is hovered and
+  `in_rect` misses. Widgets act on the left button.
+- **Keyboard events.** `type_text(?in, cp)` for each typed codepoint,
+  `press_key(?in, code, mods)` for each key press or repeat,
+  `release_key(?in, code, mods)` for each release and `compose(?in, text,
+  caret)` for the IME's composition in progress (an empty one ends it; the
+  committed text arrives as typed text). They live in storage the `Input`
+  owns, bound to an allocator by `init`, so a frame holds any number of them,
+  and passing the `Input` by value copies only the view. A key that types a
+  printable ASCII character is that character, letters in uppercase (`'A'`,
+  `'7'`, `' '`); every other key is a `KEY_*` constant (`KEY_ENTER`,
+  `KEY_ESCAPE`, `KEY_BACKSPACE`, `KEY_DELETE`, the arrows, `KEY_HOME`,
+  `KEY_END`, ...). Modifiers are `MOD_SHIFT`, `MOD_CTRL`, `MOD_ALT` and
+  `MOD_SUPER` bits, both held (`in.mods`) and carried by each key event, and
+  `blit.input.shortcut(mods)` is ctrl, or super as darwin's command, without
+  alt.
+- **Back to the host.** After `end`, `blit.context.cursor(?ctx)` is the
+  pointer shape to show (`CURSOR_ARROW`, `TEXT`, `HAND`, `MOVE`, `RESIZE_EW`,
+  `RESIZE_NS`, `RESIZE_NWSE`, `RESIZE_NESW`, `NOT_ALLOWED`), which widgets set
+  while hovered, and `ime_rect(?ctx)` is where to put the IME's candidate
+  window, in screen pixels, none while nothing takes text.
+- **Scheduling.** Widgets call `blit.context.wake_at(?ctx, t)` for a time they
+  need a frame by (a hover delay, an animation, a caret blink). After `end`,
+  `next_frame(?ctx)` is `some(0)` to draw again now, `some(t)` to draw by time
+  `t`, or `none` to draw only on input, so an idle tool can sleep instead of
+  redrawing every frame.
+
+## Keyboard, focus & text fields
 
 - **Focus.** One widget at a time holds the keyboard, by id across frames
   (`blit.context.focus`, `focused`, `unfocus`). A press that lands anywhere
@@ -162,6 +211,8 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   the selection), shortcut A to select all, shortcut C, X and V through the
   clipboard hand-off, and enter or escape, which end the edit and give the
   keyboard back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
+  While focused it shows the IME's composition inline at the caret, underlined,
+  and places the candidate window at the caret.
   The edit model in `blit.field` needs no context, so it can be driven
   directly.
 
@@ -388,7 +439,8 @@ cell.
 - **Color.** Colors are straight rgba as authored. When the target encodes sRGB
   on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
   in linear light, so the encoding brings it back to what was authored. Alpha is
-  never converted.
+  never converted. Each distinct color is converted once and cached on the
+  context (`blit.draw.LinearCache`), so sRGB output costs next to nothing.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
   straight rgba.
@@ -424,6 +476,36 @@ demo/harness/out/linux-x86_64/debug/bin/harness
 ```
 
 `demo/panel/` builds and runs the same way.
+
+## Benchmark
+
+`demo/bench/` measures blit's per-frame cost on a few representative
+interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
+line chart of 100,000 samples, and six overlapping windows each holding a
+section and a scroll region. Each scene runs with sRGB output off and then on,
+and the table reports the mean frame time, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. It is local only,
+never a CI job. Build it in the release profile:
+
+```
+mach dep pull demo/bench
+mach build demo/bench -p release
+demo/bench/out/linux-x86_64/release/bin/bench
+```
+
+Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+
+```
+scene          srgb    us/frame  vertices  runs  allocs   srgb cost
+dense panel    off        292.4      5298     1       0
+dense panel    on         295.6      5298     1       0   +1.0%
+10k row list   off        123.6      1704     1       0
+10k row list   on         124.1      1704     1       0   +0.4%
+100k chart     off       1924.6     15738     1       0
+100k chart     on        1966.7     15738     1       0   +2.1%
+windows        off        273.9      5472     1       0
+windows        on         277.5      5472     1       0   +1.3%
+```
 
 ## Conventions
 

@@ -62,11 +62,13 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.field.init(?name, ?name_buf[0], 64, 24, nil);
     blit.field.set(?name, "caf\xC3\xA9");
 
+    # the input's events grow in storage the harness owns through it
     var in: blit.input.Input;
-    in.mx        = 20.0::f32;
-    in.my        = 30.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
+    blit.input.init(?in, ?a);
+    in.time    = 0.0::f64;
+    in.mx      = 20.0::f32;
+    in.my      = 30.0::f32;
+    in.present = 1;
     # keyboard events are plain data too, though no field holds the keyboard yet
     blit.input.type_text(?in, '!');
 
@@ -166,6 +168,11 @@ fun main(argc: i64, argv: **u8) i64 {
         blit.field.text(?name),
         blit.context.typing(?ctx)::u64);
 
+    val freed_in: err[allo.Error] = blit.input.free(?in);
+    if (sel freed_in.err) {
+        print.println("input free failed");
+        ret 1;
+    }
     val freed: err[allo.Error] = blit.context.free(?ctx);
     if (sel freed.err) {
         print.println("context free failed");
