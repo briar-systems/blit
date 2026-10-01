@@ -1421,6 +1421,51 @@ test space__builds_splits_tabs_and_resizes {
     ret 0;
 }
 
+test space__keyboard_crosses_docked_tabs_in_focus_order {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.build = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val a:   u64 = win(?d, "A");
+    val b:   u64 = win(?d, "B");
+    val c:   u64 = win(?d, "C");
+    val la:  u64 = node_of(?d.ctx, a);
+    val lr:  u64 = node_of(?d.ctx, b);
+    val tab: u32 = input.KEY_TAB;
+
+    # each leaf's tab bar is one stop, in the order the space draws them
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, tabs.tab_id(bar_of(la), a))) { ret 2; }
+    # a bar is entered at its selected tab
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, tabs.tab_id(bar_of(lr), c))) { ret 3; }
+
+    # the arrows move along the bar, and enter selects the tab
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (!driver.focused(?d, tabs.tab_id(bar_of(lr), b))) { ret 4; }
+    driver.key(?d, input.KEY_ENTER, 0);
+    driver.step(?d);
+    if (left_of(?d, "B/b") < 0.0::f32 || left_of(?d, "C/b") >= 0.0::f32) { ret 5; }
+
+    # then the docked windows' widgets, the selected tab's alone
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, driver.find(?d, "A/b"))) { ret 6; }
+    driver.key(?d, tab, 0);
+    if (!driver.focused(?d, driver.find(?d, "B/b"))) { ret 7; }
+
+    # and back, entering the bar at the tab now selected
+    driver.key(?d, tab, input.MOD_SHIFT);
+    driver.key(?d, tab, input.MOD_SHIFT);
+    if (!driver.focused(?d, tabs.tab_id(bar_of(lr), b))) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test space__docks_by_drag_and_tears_off {
     var al:   allo.Allocator;
     val made: err[allo.Error] = page.make(?al);

@@ -599,6 +599,50 @@ test list__matcher_and_multiple_selection {
     ret 0;
 }
 
+test list__keys_move_the_selection_into_view {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var items: [20]str;
+    var k:     usize = 0;
+    for (k < 20) {
+        items[k] = "item";
+        k        = k + 1;
+    }
+    var p: Probe;
+    p.r          = rows(?items[0], 20);
+    p.l.selected = 20;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # tab reaches the list, and down selects from the top
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, driver.find(?d, "list"))) { ret 2; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (p.l.selected != 0 || p.changed != 1) { ret 3; }
+
+    # moving past the view scrolls the selection into it
+    k = 0;
+    for (k < 6) {
+        driver.key(?d, input.KEY_DOWN, 0);
+        k = k + 1;
+    }
+    driver.settle(?d);
+    if (p.l.selected != 6 || p.l.scroll.offset <= 0.0::f32) { ret 4; }
+    if (!driver.drawn(?d, row_id(?d, 6)))                   { ret 5; }
+
+    # end and home jump to either end, and up stops at the top
+    driver.key(?d, input.KEY_END, 0);
+    if (p.l.selected != 19) { ret 6; }
+    driver.key(?d, input.KEY_HOME, 0);
+    driver.key(?d, input.KEY_UP, 0);
+    if (p.l.selected != 0 || p.l.scroll.offset != 0.0::f32) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # paints a bar in each row and records what it was given
 #[testing]
 fun paint_row(ctx: *context.Context, user: ptr, row: Row) {

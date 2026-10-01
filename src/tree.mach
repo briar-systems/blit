@@ -644,14 +644,10 @@ fun keys(ctx: *context.Context, w: *Walk, rows: usize, h: f32) {
     if (rows == 0) { ret; }
 
     var to: i64 = -1;
-    if (has) { to = t.crow::i64; }
-    if (steps != 0) {
-        if (!has) {
-            to = 0;
-            if (steps < 0) { to = rows::i64; }
-        }
-        to = to + steps;
-    }
+    if (has)                                        { to = t.crow::i64; }
+    if (steps > 0 && !has)                          { to = steps - 1; }
+    or (steps < 0 && !has)                          { to = rows::i64 + steps; }
+    or (steps != 0)                                 { to = to + steps; }
     if (interact.presses(ctx, input.KEY_HOME) != 0) { to = 0; }
     if (interact.presses(ctx, input.KEY_END) != 0)  { to = rows::i64 - 1; }
     if (has) {
@@ -891,6 +887,49 @@ test tree__selects_one_and_many {
     driver.click(?d, top_id(?f, 0));
     d.in.mods = 0;
     if (!f.sel[0] || !f.sel[1] || !f.sel[2] || f.sel[3]) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test tree__keys_move_open_and_activate {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f: Fake;
+    fake(?f, 3, 2);
+    f.t.mode = SELECT_ONE;
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 400.0::f32, fake_ui, (?f)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+
+    # tab reaches the tree, and down puts the cursor on the first row, selected
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, driver.find(?d, "tree"))) { ret 2; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (f.t.cursor != top_id(?f, 0) || !f.sel[0]) { ret 3; }
+
+    # right opens the node, then steps into it, and left steps back out and closes it
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (!is_open(?d.ctx, top_id(?f, 0))) { ret 4; }
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (f.t.cursor != leaf_id(?f, 0, 0)) { ret 5; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (f.t.cursor != top_id(?f, 0)) { ret 6; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (is_open(?d.ctx, top_id(?f, 0))) { ret 7; }
+
+    # down moves a row, end to the last, and enter activates and opens a node
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (f.t.cursor != top_id(?f, 1) || !f.sel[1] || f.sel[0]) { ret 8; }
+    driver.key(?d, input.KEY_END, 0);
+    if (f.t.cursor != top_id(?f, 2)) { ret 9; }
+    driver.key(?d, input.KEY_ENTER, 0);
+    if (f.acts != 1 || !is_open(?d.ctx, top_id(?f, 2))) { ret 10; }
+    driver.key(?d, input.KEY_HOME, 0);
+    if (f.t.cursor != top_id(?f, 0)) { ret 11; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

@@ -1182,6 +1182,45 @@ test menu__keyboard_navigates_an_open_menu {
     ret 0;
 }
 
+test menu__tab_reaches_the_bar_and_the_open_menu_keeps_the_keys {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+    val file: u64 = driver.find(?d, "main/File");
+    val view: u64 = driver.find(?d, "main/View");
+
+    # the bar's headers are one stop, the arrows moving between them
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, file)) { ret 2; }
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (!driver.focused(?d, view)) { ret 3; }
+    driver.key(?d, input.KEY_LEFT, 0);
+
+    # enter opens the menu on its first item, and the open menu owns tab
+    driver.key(?d, input.KEY_ENTER, 0);
+    driver.step(?d);
+    val st: *MenuState = state.get[MenuState](?d.ctx, file);
+    if (!driver.drawn(?d, driver.find(?d, "main/File/New")) || st.cursor != 1) { ret 4; }
+    driver.key(?d, input.KEY_TAB, 0);
+    if (driver.focused(?d, driver.find(?d, "name"))) { ret 5; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 2) { ret 6; }
+
+    # escape closes it and hands the keyboard back to the header
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    driver.steps(?d, 2);
+    if (driver.drawn(?d, driver.find(?d, "main/File/New")) || !driver.focused(?d, file)) { ret 7; }
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, driver.find(?d, "name"))) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test menu__an_open_menu_owns_the_keyboard {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);

@@ -200,11 +200,13 @@ test tooltip__shows_after_the_delay_and_stays_on_screen {
     if (sel e.err) { ret 1; }
     drv.step(?d);
 
-    # resting on the button asks for the frame the delay ends in, and no sooner
+    # resting on the button asks for the frame the delay ends in, and no
+    # sooner once its hover has eased in
     val save:  u64 = drv.find(?d, "save");
     val since: f64 = d.time;
     if (!drv.hover(?d, save)) { ret 2; }
     drv.step(?d);
+    drv.settle(?d);
     val wait: opt[f64] = context.next_frame(?d.ctx);
     if (p.shown != 0)               { ret 3; }
     if (!sel wait.some)             { ret 3; }
