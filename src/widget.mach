@@ -2378,6 +2378,15 @@ fun scroll_most(content: f32, h: f32) f32 {
     ret maxf(content - h, 0.0::f32);
 }
 
+# whether a region at offset, scrolling at most most, can move by a wheel
+# turned wheel pixels: away from the user towards the top, towards the user
+# towards the bottom
+fun can_wheel(offset: f32, most: f32, wheel: f32) bool {
+    if (wheel > 0.0::f32) { ret offset > 0.0::f32; }
+    if (wheel < 0.0::f32) { ret offset < most; }
+    ret false;
+}
+
 # open a scroll region h tall as the next item of the layout, spanning the column
 #
 # widgets placed until end_scroll lay out in a column inside it, clipped to
@@ -2454,12 +2463,14 @@ fun scroll_in(ctx: *context.Context, id: u64, s: *Scroll, a: context.Area, scope
 # its scrollbar and close its column
 #
 # the wheel goes to the innermost region holding the topmost claim under the
-# cursor within the same band (see context.push_band), so a region under a
-# popup, modal or window does not scroll, even one the popup was opened in,
-# and a region nested in another scrolls before its parent. a region in a
-# disabled scope (see context.begin_disabled) takes no wheel, which goes on to
-# its parent. scrolling applies from the next frame, like all input. a tab
-# stop inside the region that the keyboard moved the focus to this frame is
+# cursor within the same band (see context.push_band) that can move the way
+# the wheel turns, so a region under a popup, modal or window does not
+# scroll, even one the popup was opened in, and a region nested in another
+# scrolls before its parent. a region with no overflow, or at its limit in
+# the wheel's direction, takes no wheel, and neither does a region in a
+# disabled scope (see context.begin_disabled): the wheel goes on to its
+# parent. scrolling applies from the next frame, like all input. a tab stop
+# inside the region that the keyboard moved the focus to this frame is
 # scrolled into view, when it fits.
 # ---
 # ctx: context
@@ -2474,8 +2485,11 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     context.pop_layout(ctx);
     context.end_surface(ctx, r.surf);
 
-    # the hovered widget claimed inside this region, or the region itself
-    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.in.wheel != 0.0::f32 && ctx.hover_seen > r.seen) {
+    val most: f32 = scroll_most(s.content, r.h);
+    s.offset = clampf(s.offset, 0.0::f32, most);
+    # the hovered widget claimed inside this region, or the region itself, and
+    # the region can move the way the wheel turns
+    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.hover_seen > r.seen && can_wheel(s.offset, most, ctx.in.wheel)) {
         s.offset        = s.offset - ctx.in.wheel;
         ctx.wheel_taken = 1;
     }
@@ -2489,7 +2503,6 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
             if (c1 > s.offset + r.h) { s.offset = c1 - r.h; }
         }
     }
-    val most: f32 = scroll_most(s.content, r.h);
     s.offset = clampf(s.offset, 0.0::f32, most);
     # the content shows the new offset from the next frame
     if (s.offset != r.top) { context.wake_at(ctx, ctx.in.time); }
