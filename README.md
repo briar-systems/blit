@@ -1995,20 +1995,20 @@ Baseline on dev ahead of 0.10.0 (after #152), on an AMD Ryzen 7 5800X3D, to
 compare later work against. Run it on an idle machine and pinned to one core
 (`taskset -c 15`): other load shows up as a large spread, and a run whose
 spread is large is not worth comparing. Two consecutive runs recorded this way
-agreed within 0.5% on every scene.
+agreed within 2% on every scene.
 
 ```
 scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
-dense panel    off        252.2     0.4%      3532     3       0
-dense panel    on         257.3     0.3%      3532     3       0   +2.0%
-10k row list   off         58.9     0.6%      1136     3       0
-10k row list   on          59.1     0.4%      1136     3       0   +0.3%
-100k chart     off       1700.5     0.3%     10492     3       0
-100k chart     on        1750.8     0.3%     10492     3       0   +2.9%
-windows        off        240.3     0.3%      3672    18       0
-windows        on         245.7     0.4%      3672    18       0   +2.2%
-10k-edge fill  off      14351.6     0.3%    231520     1       0
-10k-edge fill  on       14351.0     0.4%    231520     1       0   +0.0%
+dense panel    off        253.4     3.4%      3532     3       0
+dense panel    on         258.0     0.4%      3532     3       0   +1.8%
+10k row list   off         60.4     2.3%      1136     3       0
+10k row list   on          60.7     0.4%      1136     3       0   +0.5%
+100k chart     off       1697.3     4.4%     10492     3       0
+100k chart     on        1756.1     0.7%     10492     3       0   +3.4%
+windows        off        241.5     3.9%      3672    18       0
+windows        on         246.4     0.6%      3672    18       0   +2.0%
+10k-edge fill  off      14413.6     1.5%    231520     1       0
+10k-edge fill  on       14404.5     0.9%    231520     1       0   +0.0%
 ```
 
 ## Conventions
