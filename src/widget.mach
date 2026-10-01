@@ -47,6 +47,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
@@ -280,9 +281,14 @@ pub fun end_columns(ctx: *context.Context, c: *Columns) {
 # ret: 1 if the widget is hovered this frame, else 0
 fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
     val hov: u8 = context.claim(ctx, id, x0, y0, x1, y1);
-    if (hov != 0)                               { ctx.hot = id; }
-    if (hov != 0 && input.pressed(ctx.in) != 0) { ctx.active = id; }
+    if (hov != 0)                                                  { ctx.hot = id; }
+    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.active = id; }
     ret hov;
+}
+
+# ask for the hand pointer over a clickable widget while it is hovered
+fun hand(ctx: *context.Context, hov: u8) {
+    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_HAND); }
 }
 
 # the handle begin_panel and begin_window return for their matching end
@@ -427,9 +433,10 @@ pub fun note(ctx: *context.Context, s: str) {
 pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, y1: f32, on: bool) bool {
     val id:  u64 = context.id_of(ctx, label);
     val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
+    hand(ctx, hov);
 
     var clicked: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         clicked = true;
     }
 
@@ -532,9 +539,10 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val tw:  f32 = label_width(ctx, label);
     val rx1: f32 = bx1 + pad(ctx) + tw;
     val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
+    hand(ctx, hov);
 
     var toggled: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -574,9 +582,10 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val y1: f32 = y0 + h;
 
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+    hand(ctx, hov);
 
     var flipped: bool = false;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -655,7 +664,7 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
 
     var changed: bool = false;
-    if (ctx.active == id && ctx.in.down != 0) {
+    if (ctx.active == id && input.held(ctx.in, input.BUTTON_LEFT) != 0) {
         val track: f32 = x1 - x0;
         var t:     f32 = 0.0::f32;
         if (track > 0.0::f32) { t = clampf((ctx.in.mx - ctx.lx - x0) / track, 0.0::f32, 1.0::f32); }
@@ -754,7 +763,7 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) P
     context.push_id(ctx, id);
 
     val out_hov: u8 = interact(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
-    if (out_hov != 0 && input.pressed(ctx.in) != 0) { p.dismissed = 1; }
+    if (out_hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { p.dismissed = 1; }
 
     p.claim = context.reserve_claim(ctx, 0);
     ctx.ox  = sx;
@@ -813,7 +822,8 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val y1: f32 = y0 + h;
 
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    hand(ctx, hov);
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         if (ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
         or                           { ctx.open_dropdown = id; }
     }
@@ -849,7 +859,8 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             val oy1: f32 = oy0 + h;
 
             val ohov: u8 = interact(ctx, oid, ox0, oy0, ox1, oy1);
-            if (ctx.active == oid && input.released(ctx.in) != 0 && ohov != 0) {
+            hand(ctx, ohov);
+            if (ctx.active == oid && input.released(ctx.in, input.BUTTON_LEFT) != 0 && ohov != 0) {
                 @selected         = i;
                 ctx.open_dropdown = 0;
                 changed           = 1;
@@ -870,19 +881,24 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     ret changed;
 }
 
-# width of the field's bytes [lo, hi) laid out on one line at the context's scale
-fun span(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
+# width of the utf-8 bytes [lo, hi) of s laid out on one line at the context's scale
+fun bytes_width(ctx: *context.Context, s: *u8, lo: usize, hi: usize) f32 {
     val fnt:  *font.Font = context.font_of(ctx);
     var w:    f32        = 0.0::f32;
     var prev: u32        = 0;
     var i:    usize      = lo;
     for (i < hi) {
         var cp: u32 = 0;
-        i    = i + font.next(f.buf, i, hi, ?cp);
+        i    = i + font.next(s, i, hi, ?cp);
         w    = w + font.advance(fnt, prev, cp, ctx.scale);
         prev = cp;
     }
     ret w;
+}
+
+# width of the field's bytes [lo, hi) laid out on one line at the context's scale
+fun span(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
+    ret bytes_width(ctx, f.buf, lo, hi);
 }
 
 # scroll the field's shown text so the caret is in view in w pixels, showing
@@ -916,13 +932,14 @@ fun feed(ctx: *context.Context, f: *field.Field) u8 {
     var out: u8 = 0;
     if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
     var i: usize = 0;
-    for (i < ctx.in.events_len) {
-        val e: input.Event = ctx.in.events[i];
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
         i = i + 1;
         if (sel e.text) {
             if (field.insert(f, e.text)) { out = out | field.EDITED; }
             cnt;
         }
+        if (!sel e.key) { cnt; }
         val k:   input.Key = e.key;
         val cmd: bool      = input.shortcut(k.mods);
         if (cmd && (k.code == 'C' || k.code == 'X')) {
@@ -956,7 +973,10 @@ fun feed(ctx: *context.Context, f: *field.Field) u8 {
 # selection to the clipboard hand-off (see context.copied), shortcut V asks for
 # the clipboard (see context.wants_paste) and takes the next frame's
 # input.paste, and enter or escape end the edit and give the keyboard back.
-# the text scrolls to keep the caret in view.
+# the text scrolls to keep the caret in view. while it holds the keyboard it
+# shows the IME's composition (see context.preedit) inline at the caret,
+# underlined, and places the IME's candidate window at the caret (see
+# context.ime_rect). it asks for the text pointer while hovered.
 # ---
 # ctx:  context
 # key:  the field's key in the current id scope, so id_of(ctx, key) gives it the
@@ -975,7 +995,8 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
 
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    if (hov != 0 && input.pressed(ctx.in) != 0) {
+    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_TEXT); }
+    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
         context.focus(ctx, id);
         keep_in_view(ctx, f, tw);
         val at: usize = caret_at(ctx, f, ctx.in.mx - ctx.lx - tx);
@@ -1007,11 +1028,22 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
         val sx1: f32 = tx + span(ctx, f, f.first, field.sel_hi(f));
         context.quad(ctx, sx0, ty, sx1, ty + lh, ctx.theme.select);
     }
-    context.text_at(ctx, ?f.buf[f.first], tx, ty, ctx.theme.text);
+    val cw:  f32 = context.px(ctx, ctx.theme.caret_w);
+    val pre: str = context.preedit(ctx, id);
+    var cx:  f32 = tx + span(ctx, f, f.first, f.caret);
+    if (pre == nil) { context.text_at(ctx, ?f.buf[f.first], tx, ty, ctx.theme.text); }
+    or {
+        val pw: f32 = bytes_width(ctx, pre, 0, str_len(pre));
+        context.text_span(ctx, ?f.buf[f.first], f.caret - f.first, tx, ty, ctx.theme.text);
+        context.text_at(ctx, pre, cx, ty, ctx.theme.text);
+        context.quad(ctx, cx, ty + lh - cw, cx + pw, ty + lh, ctx.theme.text);
+        context.text_at(ctx, ?f.buf[f.caret], cx + pw, ty, ctx.theme.text);
+        cx = cx + bytes_width(ctx, pre, 0, context.preedit_caret(ctx));
+    }
     context.pop_clip(ctx);
     if (on) {
-        val cx: f32 = tx + span(ctx, f, f.first, f.caret);
-        context.quad(ctx, cx, ty, cx + context.px(ctx, ctx.theme.caret_w), ty + lh, ctx.theme.text);
+        context.quad(ctx, cx, ty, cx + cw, ty + lh, ctx.theme.text);
+        context.set_ime_rect(ctx, cx, ty, cx + cw, ty + lh);
     }
 
     advance(ctx, h);
@@ -1035,9 +1067,10 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
 pub fun region_clicked(ctx: *context.Context, key: str, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
     val id:  u64 = context.id_of(ctx, key);
     val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
+    hand(ctx, hov);
 
     var clicked: u8 = 0;
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         clicked = 1;
     }
     ret clicked;
@@ -1196,7 +1229,7 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     b.claim = context.reserve_claim(ctx, 0);
 
     # follow a drag before claiming, so the claims match where the window paints
-    if (ctx.active == drag_id && ctx.in.down != 0) {
+    if (ctx.active == drag_id && input.held(ctx.in, input.BUTTON_LEFT) != 0) {
         win.x = ctx.in.mx - ctx.drag_off_x;
         win.y = ctx.in.my - ctx.drag_off_y;
     }
@@ -1207,16 +1240,18 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     val dx1: f32 = win.x + win.w;
 
     val chov: u8 = interact(ctx, col_id, win.x, ty0, bx1, ty1);
-    if (ctx.active == col_id && input.released(ctx.in) != 0 && chov != 0) {
+    hand(ctx, chov);
+    if (ctx.active == col_id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && chov != 0) {
         if (win.open == 0) { win.open = 1; }
         or                 { win.open = 0; }
     }
 
     val dhov: u8 = interact(ctx, drag_id, bx1, ty0, dx1, ty1);
-    if (dhov != 0 && input.pressed(ctx.in) != 0) {
+    if (dhov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
         ctx.drag_off_x = ctx.in.mx - win.x;
         ctx.drag_off_y = ctx.in.my - win.y;
     }
+    if (dhov != 0 || ctx.active == drag_id) { context.set_cursor(ctx, input.CURSOR_MOVE); }
 
     var tbg: draw.Color = ctx.theme.header;
     if (ctx.hot == drag_id || ctx.hot == col_id) { tbg = ctx.theme.header_hot; }
@@ -1395,13 +1430,13 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
         val travel:  f32 = r.h - thumb_h;
         val my:      f32 = ctx.in.my - ctx.ly;
 
-        if (ctx.active == r.thumb && ctx.in.down != 0 && travel > 0.0::f32) {
+        if (ctx.active == r.thumb && input.held(ctx.in, input.BUTTON_LEFT) != 0 && travel > 0.0::f32) {
             val t: f32 = clampf((my - ctx.drag_off_y - r.y) / travel, 0.0::f32, 1.0::f32);
             s.offset = t * most;
         }
         val ty:  f32 = r.y + travel * s.offset / most;
         val hov: u8  = interact(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h);
-        if (hov != 0 && input.pressed(ctx.in) != 0) { ctx.drag_off_y = my - ty; }
+        if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.drag_off_y = my - ty; }
 
         var tc: draw.Color = ctx.theme.handle;
         if (ctx.active == r.thumb) { tc = ctx.theme.handle_on; }
@@ -1430,7 +1465,8 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     val y1: f32 = y0 + h;
 
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0) {
+    hand(ctx, hov);
+    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
         if (@open == 0) { @open = 1; }
         or              { @open = 0; }
     }
@@ -1644,7 +1680,7 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
             val y1: f32 = y0 + rh;
             if (y1 > top && y0 < top + r.h) {
                 val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-                if (ctx.active == id && input.released(ctx.in) != 0 && hov != 0 && l.selected != i) {
+                if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0 && l.selected != i) {
                     l.selected = i;
                     changed    = true;
                 }
@@ -1671,9 +1707,10 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
 #[testing]
 fun input_at(mx: f32, my: f32, down: u8) input.Input {
     var in: input.Input;
-    in.mx   = mx;
-    in.my   = my;
-    in.down = down;
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
+    in.down    = down;
     ret in;
 }
 
@@ -2976,6 +3013,16 @@ fun click_field(ctx: *context.Context, f: *field.Field, x: f32) {
     frame_field(ctx, input_at(x, 8.0::f32, 0), f, 1);
 }
 
+# empty a bound input's events and put the cursor at (mx, my) with the button up
+#[testing]
+fun refill(in: *input.Input, mx: f32, my: f32) {
+    input.clear_keys(in);
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
+    in.down    = 0;
+}
+
 test text_field__types_edits_and_reports_enter {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -2988,7 +3035,9 @@ test text_field__types_edits_and_reports_enter {
     field.init(?f, ?buf[0], 64, 0, nil);
 
     # typing reaches no field until one is clicked
-    var in: input.Input = input_at(10.0::f32, 8.0::f32, 0);
+    var in: input.Input;
+    input.init(?in, ?a);
+    refill(?in, 10.0::f32, 8.0::f32);
     input.type_text(?in, 'q');
     frame_field(?ctx, in, ?f, 1);
     if (f.len != 0 || context.typing(?ctx)) { ret 2; }
@@ -2996,7 +3045,7 @@ test text_field__types_edits_and_reports_enter {
     if (!context.typing(?ctx)) { ret 3; }
 
     # typed text, non-ascii included, lands at the caret in arrival order
-    in = input_at(10.0::f32, 8.0::f32, 0);
+    refill(?in, 10.0::f32, 8.0::f32);
     input.type_text(?in, 'c');
     input.type_text(?in, 'f');
     input.press_key(?in, input.KEY_LEFT, 0);
@@ -3007,7 +3056,7 @@ test text_field__types_edits_and_reports_enter {
     if (!str_equals(field.text(?f), "caf\xC3\xA9") || f.caret != 5) { ret 5; }
 
     # shift+arrows select, and typing replaces the selection
-    in = input_at(10.0::f32, 8.0::f32, 0);
+    refill(?in, 10.0::f32, 8.0::f32);
     input.press_key(?in, input.KEY_LEFT, input.MOD_SHIFT);
     input.press_key(?in, input.KEY_LEFT, input.MOD_SHIFT);
     input.type_text(?in, 'X');
@@ -3021,20 +3070,20 @@ test text_field__types_edits_and_reports_enter {
 
     # select all and cut hands the text to the clipboard, paste asks for it
     # and takes it from the next frame
-    in = input_at(13.0::f32, 8.0::f32, 0);
+    refill(?in, 13.0::f32, 8.0::f32);
     input.press_key(?in, 'A', input.MOD_CTRL);
     input.press_key(?in, 'X', input.MOD_CTRL);
     input.press_key(?in, 'V', input.MOD_CTRL);
     if (frame_field(?ctx, in, ?f, 1) != field.EDITED || f.len != 0) { ret 8; }
     if (!str_equals(context.copied(?ctx), "caX"))                   { ret 9; }
     if (!context.wants_paste(?ctx))                                 { ret 10; }
-    in       = input_at(13.0::f32, 8.0::f32, 0);
+    refill(?in, 13.0::f32, 8.0::f32);
     in.paste = "caX";
     frame_field(?ctx, in, ?f, 1);
     if (!str_equals(field.text(?f), "caX") || context.copied(?ctx) != nil) { ret 11; }
 
     # enter reports and gives the keyboard back, and what follows it is not taken
-    in = input_at(13.0::f32, 8.0::f32, 0);
+    refill(?in, 13.0::f32, 8.0::f32);
     input.press_key(?in, input.KEY_ENTER, 0);
     input.type_text(?in, 'z');
     if (frame_field(?ctx, in, ?f, 1) != field.ENTERED) { ret 12; }
@@ -3042,12 +3091,14 @@ test text_field__types_edits_and_reports_enter {
 
     # escape reports the same way
     click_field(?ctx, ?f, 13.0::f32);
-    in = input_at(13.0::f32, 8.0::f32, 0);
+    refill(?in, 13.0::f32, 8.0::f32);
     input.type_text(?in, 'y');
     input.press_key(?in, input.KEY_ESCAPE, 0);
     if (frame_field(?ctx, in, ?f, 1) != (field.EDITED | field.ESCAPED)) { ret 14; }
     if (context.typing(?ctx))                                           { ret 15; }
 
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
@@ -3069,7 +3120,9 @@ test text_field__focus_lost_when_undrawn_or_clicked_elsewhere {
     if (!context.typing(?ctx)) { ret 2; }
     frame_field(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?f, 0);
     if (context.typing(?ctx)) { ret 3; }
-    var in: input.Input = input_at(10.0::f32, 8.0::f32, 0);
+    var in: input.Input;
+    input.init(?in, ?a);
+    refill(?in, 10.0::f32, 8.0::f32);
     input.type_text(?in, 'k');
     frame_field(?ctx, in, ?f, 1);
     if (f.len != 0) { ret 4; }
@@ -3083,6 +3136,58 @@ test text_field__focus_lost_when_undrawn_or_clicked_elsewhere {
     frame_field(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?f, 1);
     if (context.typing(?ctx)) { ret 6; }
 
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test text_field__shows_the_composition_at_the_caret {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [16]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 16, 0, nil);
+    var in: input.Input;
+    input.init(?in, ?a);
+
+    # nothing takes text, so the candidate window has no place
+    refill(?in, 10.0::f32, 8.0::f32);
+    frame_field(?ctx, in, ?f, 1);
+    val idle: opt[context.Area] = context.ime_rect(?ctx);
+    if (!sel idle.none) { ret 2; }
+
+    # the bitmap font's cells are 8 wide after 4 of padding, so after "ab"
+    # the caret is at 20, and the composition's caret one cell into it
+    click_field(?ctx, ?f, 10.0::f32);
+    if (context.cursor(?ctx) != input.CURSOR_TEXT) { ret 3; }
+    refill(?in, 10.0::f32, 8.0::f32);
+    input.type_text(?in, 'a');
+    input.type_text(?in, 'b');
+    input.compose(?in, "xyz", 1);
+    frame_field(?ctx, in, ?f, 1);
+    val r: opt[context.Area] = context.ime_rect(?ctx);
+    if (!(sel r.some && r.some.x0 == 28.0::f32)) { ret 4; }
+    if (f.len != 2)                              { ret 5; }
+
+    # it stays until a composition ends it, and the field's text is untouched
+    refill(?in, 10.0::f32, 8.0::f32);
+    frame_field(?ctx, in, ?f, 1);
+    if (!str_equals(context.preedit(?ctx, ctx.focus), "xyz")) { ret 6; }
+    refill(?in, 10.0::f32, 8.0::f32);
+    input.compose(?in, "", 0);
+    frame_field(?ctx, in, ?f, 1);
+    val ended: opt[context.Area] = context.ime_rect(?ctx);
+    if (!(sel ended.some && ended.some.x0 == 20.0::f32)) { ret 7; }
+    if (context.preedit(?ctx, ctx.focus) != nil)         { ret 8; }
+
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
@@ -3130,11 +3235,15 @@ test ids__survive_a_widget_appearing_before_them {
     frame_shifted(?ctx, input_at(10.0::f32, 48.0::f32, 1), 1, ?v, ?f);
     frame_shifted(?ctx, input_at(10.0::f32, 48.0::f32, 0), 1, ?v, ?f);
     if (ctx.focus != context.id_of(?ctx, "name")) { ret 5; }
-    var in: input.Input = input_at(10.0::f32, 48.0::f32, 0);
+    var in: input.Input;
+    input.init(?in, ?a);
+    refill(?in, 10.0::f32, 28.0::f32);
     input.type_text(?in, 'k');
     frame_shifted(?ctx, in, 0, ?v, ?f);
     if (!context.typing(?ctx) || f.len != 1) { ret 6; }
 
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;

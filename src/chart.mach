@@ -832,8 +832,9 @@ pub fun sparkline(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f3
 #[testing]
 fun at(mx: f32, my: f32) input.Input {
     var in: input.Input;
-    in.mx = mx;
-    in.my = my;
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
     ret in;
 }
 
