@@ -31,10 +31,10 @@
 #
 # in the header, a header cell's right edge is a grip that resizes its column,
 # a click sorts by the column (ascending, then descending), a drag drops the
-# column onto another's place (blit.dnd) and a right click opens a popup that
-# shows and hides columns. the header and the first freeze_cols visible
-# columns stay where they are while the rest scrolls under the wheel and the
-# scrollbars. frozen and scrolled parts are clipped to disjoint rects, so
+# column onto another's place (blit.dnd) and a right click opens a context
+# menu (blit.menu) that shows and hides columns. the header and the first
+# freeze_cols visible columns stay where they are while the rest scrolls under
+# the wheel and the scrollbars. frozen and scrolled parts are clipped to disjoint rects, so
 # neither paints or claims over the other whatever order they are drawn in.
 #
 # the table never sorts: it reports the column and direction asked for, and
@@ -62,6 +62,7 @@ use bid: blit.id;
 use blit.input;
 use blit.interact;
 use blit.layout;
+use blit.menu;
 use blit.state;
 use blit.widget;
 
@@ -91,6 +92,9 @@ pub val HIDDEN: u32 = 16;
 
 # the drag and drop type tag a column's header drags under
 pub val DRAG_KIND: str = "blit.table.column";
+
+# the key of the header's context menu, under the table's id
+pub val MENU_KEY: str = "#columns";
 
 # one column as the caller describes it, and where the table put it
 #
@@ -234,10 +238,7 @@ pub rec ColumnState {
 # dir:    SORT_ASC or SORT_DESC while sort names a column
 # custom: 1 once the user changed the sort, or it was loaded
 # kept:   1 once pinned for custom
-# menu:   1 while the column popup is open
 # moved:  1 once a header dragged since the last press on one
-# mx:     where the column popup opened, in local pixels
-# my:     where the column popup opened
 # sx:     pixels scrolled sideways
 # sy:     pixels scrolled down past the frozen rows
 # gx:     sx when the horizontal thumb was pressed
@@ -247,10 +248,7 @@ pub rec TableState {
     dir:    u8;
     custom: u8;
     kept:   u8;
-    menu:   u8;
     moved:  u8;
-    mx:     f32;
-    my:     f32;
     sx:     f32;
     sy:     f64;
     gx:     f32;
@@ -647,11 +645,7 @@ fun head(ctx: *context.Context, t: *Table, st: *TableState, c: *Column, ci: usiz
             dnd.end_preview(ctx, p);
         }
     }
-    if (h.clicked && h.button == input.BUTTON_RIGHT) {
-        st.menu = 1;
-        st.mx   = h.mx;
-        st.my   = h.my;
-    }
+    if (h.clicked && h.button == input.BUTTON_RIGHT) { menu.open_context(ctx, MENU_KEY); }
     or (h.clicked && st.moved == 0 && (c.flags & NO_SORT) == 0) {
         if (st.sort == c.id && st.dir == SORT_ASC) { st.dir = SORT_DESC; }
         or {
@@ -791,35 +785,27 @@ pub fun cell(ctx: *context.Context, t: *Table, c: usize) bool {
     ret true;
 }
 
-# the popup a right click on the header opens, a checkbox per column that
-# can be hidden
+# the context menu a right click on the header opens, a checked item per
+# column that can be hidden
 fun chooser(ctx: *context.Context, t: *Table, st: *TableState) {
-    var w: f32   = 0.0::f32;
-    var i: usize = 0;
+    var m: menu.Menu = menu.begin_context(ctx, MENU_KEY, 0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
+    var i: usize     = 0;
     for (i < t.n) {
-        w = maxf(w, context.text_width_n(ctx, t.cols[i].label, bid.shown(t.cols[i].label)));
+        val ci: usize   = t.cols[i].order;
+        val c:  *Column = ?t.cols[ci];
+        if ((c.flags & NO_HIDE) == 0) {
+            var on: u8 = 0;
+            if (c.shown) { on = 1; }
+            var it: menu.Item = menu.of(c.label);
+            it.check = ?on;
+            if (menu.item(ctx, ?m, it)) {
+                column_state(ctx, c, ci).hidden = 1 - on;
+                customise(ctx, t, st);
+            }
+        }
         i = i + 1;
     }
-    w = w + row_h(ctx) + pad(ctx) * 3.0::f32;
-    val p: widget.Popup = widget.begin_popup(ctx, "#columns", st.menu, st.mx, st.my, w);
-    if (p.open != 0) {
-        i = 0;
-        for (i < t.n) {
-            val ci: usize   = t.cols[i].order;
-            val c:  *Column = ?t.cols[ci];
-            if ((c.flags & NO_HIDE) == 0) {
-                var on: u8 = 0;
-                if (c.shown) { on = 1; }
-                if (widget.checkbox(ctx, c.label, ?on)) {
-                    column_state(ctx, c, ci).hidden = 1 - on;
-                    customise(ctx, t, st);
-                }
-            }
-            i = i + 1;
-        }
-    }
-    widget.end_popup(ctx, p);
-    if (p.dismissed != 0) { st.menu = 0; }
+    menu.end_menu(ctx, ?m);
 }
 
 # a scrollbar's thumb over a track from a to b along one axis: where the
@@ -878,7 +864,7 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
     }
 }
 
-# close a table: rule its columns, open the column popup, take the wheel and
+# close a table: rule its columns, run the column menu, take the wheel and
 # draw the scrollbars
 #
 # the wheel goes to the table when the widget under the cursor is in it and
@@ -1210,13 +1196,14 @@ test table__sorts_hides_and_freezes {
     if (sel r3.none)                                                                         { ret 14; }
     if (r0.some.y0 != 16.0::f32 || r3.some.y0 != 32.0::f32 || drv.drawn(?d, mark_id(?p, 2))) { ret 15; }
 
-    # a right click on the header opens the column popup, where B hides
+    # a right click on the header opens the column menu, where B hides
     if (!drv.right_click(?d, hb))                        { ret 9; }
     if (!drv.click(?d, drv.find(?d, "grid/#columns/B"))) { ret 10; }
     drv.step(?d);
     if (drv.drawn(?d, hb) || p.cols[1].shown) { ret 11; }
     if (p.cols[2].x != 80.0::f32)             { ret 12; }
     # and shows again
+    drv.right_click(?d, drv.find(?d, "grid/C"));
     drv.click(?d, drv.find(?d, "grid/#columns/B"));
     drv.step(?d);
     if (!p.cols[1].shown) { ret 13; }

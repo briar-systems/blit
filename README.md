@@ -703,8 +703,9 @@ blit.table.end(?ctx, ?t);
   table reports it as `t.sort` (the column's index, the column count for
   none) and `t.dir`, with `t.sorted` set on the frame it changed: the table
   never sorts, the caller orders its rows. Dragging a header drops the column
-  on another's place through `blit.dnd`, and a right click opens a popup that
-  shows and hides columns. `NO_RESIZE`, `NO_REORDER`, `NO_HIDE` and `NO_SORT`
+  on another's place through `blit.dnd`, and a right click opens a context
+  menu (`blit.menu`, under `MENU_KEY`) whose checked items show and hide
+  columns. `NO_RESIZE`, `NO_REORDER`, `NO_HIDE` and `NO_SORT`
   turn each off per column and `HIDDEN` starts a column hidden.
 - **Frozen columns and rows.** The header, the first `freeze_cols` shown
   columns and the first `freeze_rows` rows stay put while the rest scrolls,
