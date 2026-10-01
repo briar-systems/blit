@@ -120,6 +120,25 @@ pub fun push(l: *ClaimList, c: Claim) res[usize, allo.Error] {
     ret res[usize, allo.Error].ok{l.len - 1};
 }
 
+# index of the highest-key claim whose rect contains (x, y)
+# ---
+# l:   claims to search
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the topmost claim's index, or l.len when no claim contains the point
+pub fun top(l: *ClaimList, x: f32, y: f32) usize {
+    var at: usize = l.len;
+    var i:  usize = 0;
+    for (i < l.len) {
+        val c: Claim = l.items[i];
+        if (x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1) {
+            if (at == l.len || c.key > l.items[at].key) { at = i; }
+        }
+        i = i + 1;
+    }
+    ret at;
+}
+
 # id of the highest-key claim whose rect contains (x, y)
 # ---
 # l:   claims to search
@@ -127,22 +146,9 @@ pub fun push(l: *ClaimList, c: Claim) res[usize, allo.Error] {
 # y:   point y in screen pixels
 # ret: the topmost claim's id, or 0 when no claim contains the point
 pub fun resolve(l: *ClaimList, x: f32, y: f32) u64 {
-    var found: u8    = 0;
-    var best:  u64   = 0;
-    var id:    u64   = 0;
-    var i:     usize = 0;
-    for (i < l.len) {
-        val c: Claim = l.items[i];
-        if (x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1) {
-            if (found == 0 || c.key > best) {
-                found = 1;
-                best  = c.key;
-                id    = c.id;
-            }
-        }
-        i = i + 1;
-    }
-    ret id;
+    val at: usize = top(l, x, y);
+    if (at >= l.len) { ret 0; }
+    ret l.items[at].id;
 }
 
 test resolve__highest_key_under_point {

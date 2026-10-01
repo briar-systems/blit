@@ -96,7 +96,7 @@ rec State {
     checks:  [8]u8;
     values:  [8]f32;
     choices: [8]usize;
-    list:    blit.widget.List;
+    list:    blit.list.List;
     rows:    *str;
     samples: *f32;
     wins:    [6]blit.widget.Window;
@@ -148,7 +148,7 @@ fun dense(ctx: *blit.context.Context, s: *State) {
 # a panel holding a list of ROWS items
 fun rows(ctx: *blit.context.Context, s: *State) {
     val b: blit.widget.Block = blit.widget.begin_panel(ctx, 8.0::f32, 8.0::f32, 400.0::f32);
-    blit.widget.list(ctx, "rows", ?s.list, s.rows, ROWS, nil, 700.0::f32);
+    blit.list.show(ctx, "rows", ?s.list, blit.list.rows(s.rows, ROWS), 700.0::f32);
     blit.widget.end_panel(ctx, b);
 }
 
@@ -165,8 +165,8 @@ fun windows(ctx: *blit.context.Context, s: *State) {
     var k: usize = 0;
     for (k < WINDOWS) {
         blit.context.push_id_int(ctx, k::u64);
-        val b: blit.widget.Block = blit.widget.begin_window(ctx, ?s.wins[k]);
-        if (s.wins[k].open != 0 && blit.widget.section(ctx, "contents", ?s.wopen[k])) {
+        val b: blit.widget.WindowArea = blit.widget.begin_window(ctx, s.wins[k]);
+        if (b.body != 0 && blit.widget.section(ctx, "contents", ?s.wopen[k])) {
             val r: blit.widget.ScrollArea = blit.widget.begin_scroll(ctx, "scroll", ?s.scrolls[k], 200.0::f32);
             var i: usize                  = 0;
             for (i < 6) {
@@ -179,7 +179,7 @@ fun windows(ctx: *blit.context.Context, s: *State) {
             }
             blit.widget.end_scroll(ctx, ?s.scrolls[k], r);
         }
-        blit.widget.end_window(ctx, ?s.wins[k], b);
+        blit.widget.end_window(ctx, b);
         blit.context.pop_id(ctx);
         k = k + 1;
     }
@@ -321,11 +321,8 @@ fun setup(s: *State, data: *allo.Allocator) u8 {
 
     k = 0;
     for (k < WINDOWS) {
-        s.wins[k].x     = 40.0::f32 + k::f32 * 60.0::f32;
-        s.wins[k].y     = 30.0::f32 + k::f32 * 50.0::f32;
-        s.wins[k].w     = 320.0::f32;
-        s.wins[k].open  = 1;
-        s.wins[k].title = "window";
+        s.wins[k]       = blit.widget.window("window", 40.0::f32 + k::f32 * 60.0::f32, 30.0::f32 + k::f32 * 50.0::f32, 320.0::f32, 0.0::f32);
+        s.wins[k].flags = blit.widget.WINDOW_AUTO_SIZE;
         s.wopen[k]      = 1;
         k               = k + 1;
     }
