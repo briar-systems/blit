@@ -123,6 +123,18 @@ fun swatch(ctx: *context.Context, c: draw.Color) {
 }
 
 # one field's editor: its name, its meaning and a slider per float
+# the range a field's slider spans: a factor's own from the field table, a
+# colour's 0 to 1, and a length's 0 to LENGTH_MAX
+fun slider_range(f: *th.Field, lo: *f32, hi: *f32) {
+    @lo = 0.0::f32;
+    @hi = LENGTH_MAX;
+    if (f.unit == th.UNIT_COLOR) { @hi = 1.0::f32; }
+    if (f.unit == th.UNIT_FACTOR) {
+        @lo = f.lo;
+        @hi = f.hi;
+    }
+}
+
 fun field(ctx: *context.Context, row: usize, p: th.Path, name: str) u8 {
     val f: th.Field = th.FIELDS[row];
     val r: th.Ref   = th.ref_at(p, 0);
@@ -131,13 +143,9 @@ fun field(ctx: *context.Context, row: usize, p: th.Path, name: str) u8 {
     widget.note(ctx, f.doc);
     if (f.unit == th.UNIT_COLOR) { swatch(ctx, th.color_of(v)); }
 
-    var lo: f32 = 0.0::f32;
-    var hi: f32 = LENGTH_MAX;
-    if (f.unit == th.UNIT_COLOR) { hi = 1.0::f32; }
-    if (f.unit == th.UNIT_FACTOR) {
-        lo = f.lo;
-        hi = f.hi;
-    }
+    var lo: f32;
+    var hi: f32;
+    slider_range(?th.FIELDS[row], ?lo, ?hi);
     val edges: bool = str_equals(f.name, "pad") || str_equals(f.name, "inset") || str_equals(f.name, "margin");
 
     var out: u8    = 0;
@@ -309,5 +317,26 @@ test editor__factor_slider_spans_its_fields_range {
     if (d.ctx.theme.hover_ease != 2.0::f32)                                                   { ret 6; }
 
     val f: err[allo.Error] = driver.free(?d);
+    ret 0;
+}
+
+test editor__slider_range_comes_from_the_field {
+    var lo: f32;
+    var hi: f32;
+    # a factor range the old fixed caps could never give
+    var f: th.Field;
+    f.unit = th.UNIT_FACTOR;
+    f.lo   = -1.0::f32;
+    f.hi   = 3.0::f32;
+    slider_range(?f, ?lo, ?hi);
+    if (lo != -1.0::f32 || hi != 3.0::f32) { ret 1; }
+    var c: th.Field;
+    c.unit = th.UNIT_COLOR;
+    slider_range(?c, ?lo, ?hi);
+    if (lo != 0.0::f32 || hi != 1.0::f32) { ret 2; }
+    var l: th.Field;
+    l.unit = th.UNIT_LENGTH;
+    slider_range(?l, ?lo, ?hi);
+    if (lo != 0.0::f32 || hi != LENGTH_MAX) { ret 3; }
     ret 0;
 }
