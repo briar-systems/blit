@@ -450,6 +450,83 @@ test registry__a_registered_kind_loads_from_toml_and_paints {
     ret 0;
 }
 
+# whether a kind's paint in a state is a flat face of a color's red
+#[testing]
+fun flat(ctx: *context.Context, k: u32, state: u8, r: f32) bool {
+    val p: th.Paint = th.style(?ctx.theme, k).states[state];
+    ret p.fill.r == r && p.fill_to.r == r && p.fill_to.g == p.fill.g && p.fill_to.b == p.fill.b;
+}
+
+# whether a kind's paint in a state runs from one red at the top to another
+#[testing]
+fun graded(ctx: *context.Context, k: u32, state: u8, top: f32, bottom: f32) bool {
+    val p: th.Paint = th.style(?ctx.theme, k).states[state];
+    ret p.fill.r == top && p.fill_to.r == bottom;
+}
+
+test fill__alone_is_flat_and_fill_to_makes_the_gradient {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    # the dark look shades its buttons, so every face starts as a gradient
+    val e: err[th.LoadError] = load_theme(?ctx, "base = \"dark\"\n");
+    if (sel e.err) { ret 2; }
+    var was: th.Theme = snapshot(?ctx, ?a);
+    val top: f32      = th.style(?was, th.BUTTON).states[th.HOT].fill.r;
+    if (th.style(?was, th.BUTTON).states[th.HOT].fill_to.r == top) { ret 3; }
+    val red:  draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val dark: draw.Color = draw.rgba(0.5::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+
+    # a pushed fill is flat, a fill_to pushed after it grades it, and the
+    # pops restore the theme's gradient
+    push_color(?ctx, "button.*.fill", red);
+    if (!flat(?ctx, th.BUTTON, th.HOT, 1.0::f32)) { ret 4; }
+    push_color(?ctx, "button.hot.fill_to", dark);
+    if (!graded(?ctx, th.BUTTON, th.HOT, 1.0::f32, 0.5::f32)) { ret 5; }
+    if (!flat(?ctx, th.BUTTON, th.NORMAL, 1.0::f32))          { ret 6; }
+    pop(?ctx);
+    if (!flat(?ctx, th.BUTTON, th.HOT, 1.0::f32)) { ret 7; }
+    pop(?ctx);
+    if (!same_look(?ctx.theme, ?was)) { ret 8; }
+
+    # a class grades only where it sets fill_to, wherever it lists it
+    val id: opt[u32] = add_class(?ctx, "graded");
+    if (sel id.none) { ret 9; }
+    set(?ctx, id.some, "button.hot.fill_to", th.of_color(dark));
+    set(?ctx, id.some, "button.*.fill", th.of_color(red));
+    push_class(?ctx, id.some);
+    if (!graded(?ctx, th.BUTTON, th.HOT, 1.0::f32, 0.5::f32)) { ret 10; }
+    if (!flat(?ctx, th.BUTTON, th.ON, 1.0::f32))              { ret 11; }
+    pop(?ctx);
+    if (!same_look(?ctx.theme, ?was)) { ret 12; }
+
+    # so does a document, and setting a path
+    val doc: str               = "base = \"dark\"\n[button.hot]\nfill_to = \"#800000\"\nfill = \"#ff0000\"\n[button.on]\nfill = \"#ff0000\"\n";
+    val d:   err[th.LoadError] = load_theme(?ctx, doc);
+    if (sel d.err)                                                           { ret 13; }
+    if (!graded(?ctx, th.BUTTON, th.HOT, 1.0::f32, 128.0::f32 / 255.0::f32)) { ret 14; }
+    if (!flat(?ctx, th.BUTTON, th.ON, 1.0::f32))                             { ret 15; }
+    val p: opt[th.Path] = th.path(?ctx.theme, "button.active.fill");
+    if (sel p.none) { ret 16; }
+    th.set_path(?ctx.theme, p.some, th.of_color(red));
+    if (!flat(?ctx, th.BUTTON, th.ACTIVE, 1.0::f32)) { ret 17; }
+
+    # a fill changed on a shaded face saves its fill_to and reads back the same
+    th.style(?ctx.theme, th.BUTTON).states[th.NORMAL].fill.r = 1.0::f32;
+    val saved: res[str, allo.Error] = save_theme(?ctx);
+    if (sel saved.err) { ret 18; }
+    var b:    allo.Allocator;
+    var back: context.Context;
+    if (!made(?back, ?b)) { ret 19; }
+    val e2: err[th.LoadError] = load_theme(?back, saved.ok);
+    if (sel e2.err)                          { ret 20; }
+    if (!same_look(?ctx.theme, ?back.theme)) { ret 21; }
+    val f:  err[allo.Error] = context.free(?ctx);
+    val f2: err[allo.Error] = context.free(?back);
+    val f3: err[allo.Error] = th.free(?was);
+    ret 0;
+}
+
 # whether a vertex of the frame's draw list has a premultiplied color's red
 # and alpha, and how far down the lowest one lies
 #[testing]
