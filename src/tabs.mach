@@ -357,8 +357,11 @@ fun least(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
     ret minf(natural(ctx, g, t), g.pad * 2.0::f32 + g.lh * 2.0::f32 + close_w(g, t));
 }
 
-# a tab's width this frame
+# a tab's width this frame. a tab the bar has room for is exactly its natural
+# width: rebuilt through the shrink, least plus the rest times one, it can come
+# out a hair short and cut a label that fits.
 fun width(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    if (g.fit >= 1.0::f32) { ret natural(ctx, g, t); }
     val lo: f32 = least(ctx, g, t);
     ret lo + (natural(ctx, g, t) - lo) * g.fit;
 }
@@ -749,6 +752,34 @@ fun keys(a: *App) u64 {
         i = i + 1;
     }
     ret k;
+}
+
+test bar__unshrunk_tabs_are_their_natural_width {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: App;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?a, 8, 2000.0::f32)) { ret 1; }
+    a.tabs[1].closable = false;
+    a.tabs[4].closable = false;
+    var g: Geom;
+    g.fit = 1.0::f32;
+    g.lh  = context.line_height(?d.ctx);
+    # paddings that do not land on whole pixels, as a scaled theme gives
+    var k: u32 = 1;
+    for (k < 400) {
+        g.pad = k::f32 * 0.037::f32;
+        var i: usize = 0;
+        for (i < a.n) {
+            if (width(?d.ctx, ?g, ?a.tabs[i]) != natural(?d.ctx, ?g, ?a.tabs[i])) { ret 2; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    val f: err[allo.Error] = driver.free(?d);
+    if (sel f.err) { ret 1; }
+    ret 0;
 }
 
 test bar__selects_closes_and_reorders {
