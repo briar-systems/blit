@@ -1,0 +1,212 @@
+# the drag a context carries: at most one in flight, its typed payload and
+# how the last one ended
+#
+# a drag belongs to the context, not to the widget that started it, so it
+# outlives the frames its source is drawn in and reaches every target in
+# every window, dock, popup and surface. its payload is a type tag and bytes
+# the context copies into storage it owns, so a source may hand over a
+# record on its stack. blit.dnd is the interface widgets use, and this module
+# is the state it works on, kept apart so the context can own it.
+#
+# a drag ends at the end of the frame its button comes up in: dropped when a
+# target took it that frame, missed when none did. Escape ends it at once as
+# cancelled, and the source cannot start another until its button comes up.
+# the outcome stays readable through the frame after, for the source to learn
+# what became of what it dragged.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use allo: std.allocator;
+use std.memory;
+
+use blit.input;
+
+# the default move threshold in unscaled pixels: how far the pointer travels
+# from a press on a source before a drag starts
+pub val THRESHOLD: f32 = 4.0;
+
+# how a drag ended
+pub val ENDED_NONE:      u8 = 0;
+pub val ENDED_DROPPED:   u8 = 1;
+pub val ENDED_MISSED:    u8 = 2;
+pub val ENDED_CANCELLED: u8 = 3;
+
+# the drag in flight and the last one's outcome
+# ---
+# a:         allocator backing buf
+# live:      1 while a drag is in flight
+# source:    the id of the widget that started it
+# button:    the input.BUTTON_* bit that holds it
+# gx:        cursor x less the grabbed rect's left edge at the press
+# gy:        cursor y less the grabbed rect's top edge at the press
+# w:         the grabbed rect's width
+# h:         the grabbed rect's height
+# buf:       the type tag, NUL-terminated, then the payload bytes
+# cap:       bytes allocated for buf
+# kind_len:  bytes of the type tag, without its NUL
+# n:         payload bytes after the tag
+# delivered: 1 once a target took the drag this frame
+# spent:     a source whose drag was cancelled, kept from starting another
+#            until its button comes up, 0 for none
+# spent_btn: the button spent waits on
+# ended:     how the last drag ended, an ENDED_* value
+# ended_src: the source of the last drag
+# fresh:     1 until the end of the frame the last drag ended in
+# threshold: the move threshold in unscaled pixels
+pub rec Session {
+    a:         *allo.Allocator;
+    live:      u8;
+    source:    u64;
+    button:    u8;
+    gx:        f32;
+    gy:        f32;
+    w:         f32;
+    h:         f32;
+    buf:       *u8;
+    cap:       usize;
+    kind_len:  usize;
+    n:         usize;
+    delivered: u8;
+    spent:     u64;
+    spent_btn: u8;
+    ended:     u8;
+    ended_src: u64;
+    fresh:     u8;
+    threshold: f32;
+}
+
+# bind a session to an allocator, with nothing in flight and nothing allocated
+# ---
+# s: session
+# a: allocator backing the payload
+pub fun init(s: *Session, a: *allo.Allocator) {
+    memory.raw_zero(s::ptr, $size_of(Session));
+    s.a         = a;
+    s.threshold = THRESHOLD;
+}
+
+# release the payload storage
+# ---
+# s:   session
+# ret: ok, or the allocator's refusal with the storage still owned
+pub fun free(s: *Session) err[allo.Error] {
+    if (s.buf != nil) {
+        val e: err[allo.Error] = allo.deallocate[u8](s.a, s.buf, s.cap);
+        if (sel e.err) { ret e; }
+    }
+    s.buf  = nil;
+    s.cap  = 0;
+    s.live = 0;
+    ret err[allo.Error].ok{};
+}
+
+# copy a type tag and payload bytes in as the drag's payload
+# ---
+# s:    session
+# kind: the type tag
+# data: the payload bytes, nil when n is 0
+# n:    payload byte count
+# ret:  ok, or the allocator's refusal with the old payload kept
+pub fun put(s: *Session, kind: str, data: ptr, n: usize) err[allo.Error] {
+    var k: usize = 0;
+    if (kind != nil) { k = str_len(kind); }
+    val need: usize = k + 1 + n;
+    if (need > s.cap) {
+        var want: usize = s.cap * 2;
+        if (want < need) { want = need; }
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](s.a, s.buf, s.cap, want);
+        if (sel r.err) { ret err[allo.Error].err{r.err}; }
+        s.buf = r.ok;
+        s.cap = want;
+    }
+    if (k > 0) { memory.raw_copy(s.buf::ptr, kind::ptr, k); }
+    s.buf[k] = 0;
+    if (n > 0 && data != nil) { memory.raw_copy((?s.buf[k + 1])::ptr, data, n); }
+    s.kind_len = k;
+    s.n        = n;
+    ret err[allo.Error].ok{};
+}
+
+# the drag's type tag, valid until the next drag starts
+pub fun kind(s: *Session) str {
+    if (s.buf == nil) { ret ""; }
+    ret s.buf;
+}
+
+# the drag's payload bytes, valid until the next drag starts
+pub fun data(s: *Session) *u8 {
+    if (s.buf == nil) { ret nil; }
+    ret ?s.buf[s.kind_len + 1];
+}
+
+# whether the drag's type tag is kind
+pub fun is_kind(s: *Session, kind: str) bool {
+    if (s.live == 0 || kind == nil) { ret false; }
+    val k: usize = str_len(kind);
+    if (k != s.kind_len) { ret false; }
+    var i: usize = 0;
+    for (i < k) {
+        if (s.buf[i] != kind[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# end the drag in flight with an outcome
+fun finish(s: *Session, how: u8) {
+    s.ended     = how;
+    s.ended_src = s.source;
+    s.fresh     = 1;
+    s.live      = 0;
+    s.delivered = 0;
+}
+
+# whether a frame's input pressed Escape
+pub fun escaped(in: input.Input) bool {
+    var i: usize = 0;
+    for (i < in.events.len) {
+        val e: input.Event = in.events.data[i];
+        if (sel e.key && e.key.code == input.KEY_ESCAPE) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# cancel the drag in flight when the frame pressed Escape
+#
+# the source is spent until its button comes up, so it does not start again
+# under the same press.
+# ---
+# s:  session
+# in: the frame's input
+pub fun check_escape(s: *Session, in: input.Input) {
+    if (s.live == 0 || !escaped(in)) { ret; }
+    s.spent     = s.source;
+    s.spent_btn = s.button;
+    finish(s, ENDED_CANCELLED);
+}
+
+# close a frame: end a drag whose button came up, dropped when a target took
+# it and missed otherwise, cancel one the frame pressed Escape on, forget the
+# outcome of the drag before, and let a spent source go once its button is up
+# ---
+# s:  session
+# in: the frame's input
+pub fun settle(s: *Session, in: input.Input) {
+    if (s.fresh == 0) { s.ended = ENDED_NONE; }
+    check_escape(s, in);
+    if (s.live != 0 && input.held(in, s.button) == 0) {
+        if (s.delivered != 0) { finish(s, ENDED_DROPPED); }
+        or                    { finish(s, ENDED_MISSED); }
+    }
+    s.fresh     = 0;
+    s.delivered = 0;
+    if (s.spent != 0 && input.held(in, s.spent_btn) == 0) { s.spent = 0; }
+}

@@ -102,6 +102,7 @@ use blit.hit;
 use bid: blit.id;
 use blit.input;
 use blit.path;
+use blit.payload;
 use blit.store;
 use blit.tess;
 use th:   blit.theme;
@@ -368,6 +369,7 @@ pub rec TextLine {
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
+# drag:         the drag and drop in flight and how the last one ended (see blit.dnd)
 # backlog:      button events held back for the frames after, in arrival order
 # backlog_cap:  events allocated for backlog
 # backlog_len:  events held in backlog
@@ -469,6 +471,7 @@ pub rec Context {
     collided_cap: usize;
     collided_len: usize;
     store:        store.Store;
+    drag:         payload.Session;
     backlog:      *input.Event;
     backlog_cap:  usize;
     backlog_len:  usize;
@@ -607,6 +610,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.backlog_len  = 0;
     ctx.lag          = 0;
     store.init(?ctx.store, a);
+    payload.init(?ctx.drag, a);
     ctx.trace_on    = 0;
     ctx.traced      = nil;
     ctx.traced_cap  = 0;
@@ -618,13 +622,16 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, held-back button events, state, id bookkeeping and text trace
+# composition, held-back button events, state, drag payload, id bookkeeping
+# and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    val ex: err[allo.Error] = payload.free(?ctx.drag);
+    if (sel ex.err) { ret ex; }
     if (ctx.backlog != nil) {
         val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
         if (sel eh.err) { ret eh; }
@@ -803,7 +810,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 
 # finish a frame: close the last run, compose the runs by layer, drop the
 # active widget once its button is released, drop the focus when its
-# holder was not drawn, and age out the state no widget reached
+# holder was not drawn, age out the state no widget reached, and settle the
+# drag and drop in flight (see blit.payload.settle)
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
@@ -812,6 +820,7 @@ pub fun end(ctx: *Context) {
     if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
     if (ctx.focus_drawn == 0)                    { ctx.focus = 0; }
     if (store.sweep(?ctx.store) != 0)            { ctx.oom = 1; }
+    payload.settle(?ctx.drag, ctx.in);
 }
 
 # set how close in time and space a press must follow the previous press on
