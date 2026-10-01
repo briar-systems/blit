@@ -210,6 +210,13 @@ blit.style.pop(?ctx);
 blit.style.pop(?ctx);
 ```
 
+A paint's `fill_to` follows its `fill`: every write of a fill through a path
+(a push, a class, `theme.set` and `set_path`, a TOML document) writes `fill_to`
+too, so a fill alone gives a flat face. Writing `fill_to` as well, in the same
+push, class or document in any order, or in a later push, gives the gradient,
+and a pop restores both. A save writes `fill_to` after `fill` whenever the two
+differ, so the gradient reads back.
+
 `push_color`, `push_length`, `push_radii`, `push_edges` and the untyped `push`
 refuse a path naming no field of their unit, and still open an empty push so
 every push pairs with its pop. A frame left with pushes open is restored at
@@ -347,7 +354,7 @@ shows.
 | `<kind>.shadow_y` | length | shadow offset down |
 | `<kind>.shadow_blur` | length | how far the shadow fades out, 0 for a hard edge |
 | `<kind>.<state>.fill` | color | the face, at its top when it is a gradient |
-| `<kind>.<state>.fill_to` | color | the face at its bottom: equal to fill for a flat face, else a vertical gradient |
+| `<kind>.<state>.fill_to` | color | the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat |
 | `<kind>.<state>.text` | color | text drawn on the face |
 | `<kind>.<state>.mark` | color | secondary ink: a glyph, a caret, a reading or a hint |
 | `<kind>.<state>.border` | color | the outline, transparent for none |
