@@ -8,10 +8,11 @@
 #
 # each widget places itself at the layout cursor, advances the cursor for the
 # next one, emits its geometry through the context painter, and claims its
-# interactive rect through context.claim. interaction uses the classic hot/active
-# id pair: `hot` is the widget hovered this frame, meaning the topmost claimant
-# under the cursor (see blit.context), and `active` is the one being pressed or
-# dragged, which persists until the button releases.
+# interactive rect through interact.hit, the same call a custom control makes,
+# so hover, press, click and drag mean the same thing everywhere. a widget is
+# hot while it is the topmost claimant under the cursor (see blit.context), and
+# active while it owns the pointer after a press on it, until the button
+# releases.
 #
 # a widget's id is its label hashed in the current id scope (see blit.id and
 # context.id_of), so widgets appearing or vanishing before it never move it.
@@ -61,6 +62,7 @@ use blit.font;
 use gly: blit.glyph;
 use bid: blit.id;
 use blit.input;
+use blit.interact;
 use blit.state;
 use rich_text: blit.text;
 use blit.theme;
@@ -269,27 +271,9 @@ pub fun end_columns(ctx: *context.Context, c: *Columns) {
     ctx.cy   = c.bottom;
 }
 
-# claim a widget's rect and apply the hot/active rules to it
-#
-# the widget becomes hot when hovered and active when pressed while hovered.
-# ---
-# ctx: context
-# id:  the widget's id
-# x0:  left x in pixels
-# y0:  top y in pixels
-# x1:  right x in pixels
-# y1:  bottom y in pixels
-# ret: 1 if the widget is hovered this frame, else 0
-fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val hov: u8 = context.claim(ctx, id, x0, y0, x1, y1);
-    if (hov != 0)                                                  { ctx.hot = id; }
-    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.active = id; }
-    ret hov;
-}
-
 # ask for the hand pointer over a clickable widget while it is hovered
-fun hand(ctx: *context.Context, hov: u8) {
-    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_HAND); }
+fun hand(ctx: *context.Context, h: interact.Hit) {
+    if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
 }
 
 # the handle begin_panel and begin_window return for their matching end
@@ -449,19 +433,13 @@ pub fun note(ctx: *context.Context, s: str) {
 # on:    true to draw the button chosen, in the theme's accent
 # ret:   true if the button was clicked this frame
 pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, y1: f32, on: bool) bool {
-    val id:  u64 = context.id_of(ctx, label);
-    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-
-    var clicked: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
-        clicked = true;
-    }
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, label), x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, h);
 
     var bg:  draw.Color = ctx.theme.control;
     var ink: draw.Color = ctx.theme.text;
-    if (ctx.hot == id)    { bg = ctx.theme.control_hot; }
-    if (ctx.active == id) { bg = ctx.theme.control_on; }
+    if (h.hot)    { bg = ctx.theme.control_hot; }
+    if (h.active) { bg = ctx.theme.control_on; }
     if (on) {
         bg  = ctx.theme.accent;
         ink = ctx.theme.accent_text;
@@ -472,7 +450,7 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
     val tx: f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
     val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
     label_at(ctx, label, tx, ty, ink);
-    ret clicked;
+    ret h.clicked;
 }
 
 # a full-width clickable button with a centered label
@@ -554,13 +532,13 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val bx1: f32 = x0 + box;
     val y1:  f32 = y0 + box;
 
-    val tw:  f32 = label_width(ctx, label);
-    val rx1: f32 = bx1 + pad(ctx) + tw;
-    val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
-    hand(ctx, hov);
+    val tw:  f32          = label_width(ctx, label);
+    val rx1: f32          = bx1 + pad(ctx) + tw;
+    val hc:  interact.Hit = interact.hit(ctx, id, x0, y0, rx1, y1, input.BUTTON_LEFT);
+    hand(ctx, hc);
 
     var toggled: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    if (hc.clicked) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -568,7 +546,7 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     }
 
     var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
+    if (hc.hot) { bg = ctx.theme.control_hot; }
     face(ctx, x0, y0, bx1, y1, bg);
     if (@state != 0) {
         val in: f32 = pad(ctx);
@@ -599,11 +577,11 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hs);
 
     var flipped: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    if (hs.clicked) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -621,7 +599,7 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val sy: f32        = y0 + (h - sh) / 2.0::f32;
     var tc: draw.Color = ctx.theme.track;
     var kc: draw.Color = ctx.theme.handle;
-    if (ctx.hot == id) {
+    if (hs.hot) {
         tc = ctx.theme.control_hot;
         kc = ctx.theme.handle_on;
     }
@@ -679,13 +657,13 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
 
     var changed: bool = false;
-    if (ctx.active == id && input.held(ctx.in, input.BUTTON_LEFT) != 0) {
+    if (hs.held) {
         val track: f32 = x1 - x0;
         var t:     f32 = 0.0::f32;
-        if (track > 0.0::f32) { t = clampf((ctx.in.mx - ctx.lx - x0) / track, 0.0::f32, 1.0::f32); }
+        if (track > 0.0::f32) { t = clampf((hs.mx - x0) / track, 0.0::f32, 1.0::f32); }
         val nv: f32 = lo + t * (hi - lo);
         if (nv != @v) {
             @v      = nv;
@@ -703,7 +681,7 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val hx: f32 = x0 + t_out * span;
 
     var hc: draw.Color = ctx.theme.handle;
-    if (ctx.active == id) { hc = ctx.theme.handle_on; }
+    if (hs.active) { hc = ctx.theme.handle_on; }
     face(ctx, hx, y0, hx + hw, y1, hc);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
@@ -779,8 +757,8 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) P
     context.push_layer(ctx);
     context.push_id(ctx, id);
 
-    val out_hov: u8 = interact(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
-    if (out_hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { p.dismissed = 1; }
+    val out: interact.Hit = interact.hit(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, input.BUTTON_LEFT);
+    if (out.pressed) { p.dismissed = 1; }
 
     p.claim = context.reserve_claim(ctx, 0);
     ctx.ox  = sx;
@@ -851,16 +829,16 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val x1: f32            = ctx.cx + ctx.pw;
     val y1: f32            = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    val hd: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hd);
+    if (hd.clicked) {
         if (st.open != 0) { st.open = 0; }
         or                { st.open = 1; }
     }
 
     var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
-    if (st.open != 0)  { bg = ctx.theme.control_on; }
+    if (hd.hot)       { bg = ctx.theme.control_hot; }
+    if (st.open != 0) { bg = ctx.theme.control_on; }
     face(ctx, x0, y0, x1, y1, bg);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
@@ -886,16 +864,16 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             val ox1: f32 = ctx.cx + ctx.pw;
             val oy1: f32 = oy0 + h;
 
-            val ohov: u8 = interact(ctx, oid, ox0, oy0, ox1, oy1);
-            hand(ctx, ohov);
-            if (ctx.active == oid && input.released(ctx.in, input.BUTTON_LEFT) != 0 && ohov != 0) {
+            val ho: interact.Hit = interact.hit(ctx, oid, ox0, oy0, ox1, oy1, input.BUTTON_LEFT);
+            hand(ctx, ho);
+            if (ho.clicked) {
                 @selected = i;
                 st.open   = 0;
                 changed   = 1;
             }
 
             var obg: draw.Color = ctx.theme.track;
-            if (ctx.hot == oid) { obg = ctx.theme.control_hot; }
+            if (ho.hot) { obg = ctx.theme.control_hot; }
             face(ctx, ox0, oy0, ox1, oy1, obg);
             context.text_at(ctx, options[i], ox0 + pad(ctx), oy0 + (h - context.line_height(ctx)) / 2.0::f32, ctx.theme.text);
 
@@ -1013,12 +991,12 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val tx: f32 = x0 + pad(ctx);
     val tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_TEXT); }
-    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
+    val hf: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
+    if (hf.pressed) {
         context.focus(ctx, id);
         keep_in_view(ctx, f, tw);
-        val at: usize = caret_at(ctx, f, ctx.in.mx - ctx.lx - tx);
+        val at: usize = caret_at(ctx, f, hf.mx - tx);
         f.caret  = at;
         f.anchor = at;
     }
@@ -1027,7 +1005,7 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val on: bool = ctx.focus == id;
 
     var bg: draw.Color = ctx.theme.track;
-    if (ctx.hot == id && !on) { bg = ctx.theme.control_hot; }
+    if (hf.hot && !on) { bg = ctx.theme.control_hot; }
     if (on) {
         val ew: f32 = context.px(ctx, ctx.theme.edge_w);
         face(ctx, x0, y0, x1, y1, ctx.theme.accent);
@@ -1084,15 +1062,10 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
 # y1:  bottom y in pixels
 # ret: 1 if the rect was clicked this frame, else 0
 pub fun region_clicked(ctx: *context.Context, key: str, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val id:  u64 = context.id_of(ctx, key);
-    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-
-    var clicked: u8 = 0;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
-        clicked = 1;
-    }
-    ret clicked;
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, key), x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, h);
+    if (h.clicked) { ret 1; }
+    ret 0;
 }
 
 # draw a region of a consumer texture w by h at the cursor and advance to the
@@ -1224,6 +1197,16 @@ pub rec Window {
     title: str;
 }
 
+# where a dragged part stood when the press on it began, kept in the state
+# store under the part's id
+# ---
+# x: the window's x, unused by a scrollbar thumb
+# y: the window's y, or the scroll offset under a scrollbar thumb
+rec Grab {
+    x: f32;
+    y: f32;
+}
+
 # draw a window's titlebar and, when open, start its body column
 #
 # the titlebar drags the window (press and move updates win.x/win.y) and carries a
@@ -1247,9 +1230,12 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     b.claim = context.reserve_claim(ctx, 0);
 
     # follow a drag before claiming, so the claims match where the window paints
-    if (ctx.active == drag_id && input.held(ctx.in, input.BUTTON_LEFT) != 0) {
-        win.x = ctx.in.mx - ctx.drag_off_x;
-        win.y = ctx.in.my - ctx.drag_off_y;
+    val grab: *Grab = state.get[Grab](ctx, drag_id);
+    var dx:   f32;
+    var dy:   f32;
+    if (interact.drag(ctx, drag_id, ?dx, ?dy)) {
+        win.x = grab.x + dx;
+        win.y = grab.y + dy;
     }
 
     val bx1: f32 = win.x + th;
@@ -1257,22 +1243,22 @@ pub fun begin_window(ctx: *context.Context, win: *Window) Block {
     val ty1: f32 = win.y + th;
     val dx1: f32 = win.x + win.w;
 
-    val chov: u8 = interact(ctx, col_id, win.x, ty0, bx1, ty1);
-    hand(ctx, chov);
-    if (ctx.active == col_id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && chov != 0) {
+    val hc: interact.Hit = interact.hit(ctx, col_id, win.x, ty0, bx1, ty1, input.BUTTON_LEFT);
+    hand(ctx, hc);
+    if (hc.clicked) {
         if (win.open == 0) { win.open = 1; }
         or                 { win.open = 0; }
     }
 
-    val dhov: u8 = interact(ctx, drag_id, bx1, ty0, dx1, ty1);
-    if (dhov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
-        ctx.drag_off_x = ctx.in.mx - win.x;
-        ctx.drag_off_y = ctx.in.my - win.y;
+    val hd: interact.Hit = interact.hit(ctx, drag_id, bx1, ty0, dx1, ty1, input.BUTTON_LEFT);
+    if (hd.pressed) {
+        grab.x = win.x;
+        grab.y = win.y;
     }
-    if (dhov != 0 || ctx.active == drag_id) { context.set_cursor(ctx, input.CURSOR_MOVE); }
+    if (hd.hot || hd.active) { context.set_cursor(ctx, input.CURSOR_MOVE); }
 
     var tbg: draw.Color = ctx.theme.header;
-    if (ctx.hot == drag_id || ctx.hot == col_id) { tbg = ctx.theme.header_hot; }
+    if (hd.hot || hc.hot) { tbg = ctx.theme.header_hot; }
     var ends: u8 = context.CORNERS_ALL;
     if (win.open != 0) { ends = context.CORNERS_TOP; }
     context.fill(ctx, win.x, win.y, win.x + win.w, win.y + th, corner(ctx), ends, tbg);
@@ -1445,22 +1431,23 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     s.offset = clampf(s.offset, 0.0::f32, most);
 
     if (most > 0.0::f32) {
-        val tx0:     f32 = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
-        val tx1:     f32 = r.x + r.w;
-        val thumb_h: f32 = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
-        val travel:  f32 = r.h - thumb_h;
-        val my:      f32 = ctx.in.my - ctx.ly;
+        val tx0:     f32   = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
+        val tx1:     f32   = r.x + r.w;
+        val thumb_h: f32   = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
+        val travel:  f32   = r.h - thumb_h;
+        val grab:    *Grab = state.get[Grab](ctx, r.thumb);
+        var dx:      f32;
+        var dy:      f32;
 
-        if (ctx.active == r.thumb && input.held(ctx.in, input.BUTTON_LEFT) != 0 && travel > 0.0::f32) {
-            val t: f32 = clampf((my - ctx.drag_off_y - r.y) / travel, 0.0::f32, 1.0::f32);
-            s.offset = t * most;
+        if (interact.drag(ctx, r.thumb, ?dx, ?dy) && travel > 0.0::f32) {
+            s.offset = clampf(grab.y + dy * most / travel, 0.0::f32, most);
         }
-        val ty:  f32 = r.y + travel * s.offset / most;
-        val hov: u8  = interact(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h);
-        if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.drag_off_y = my - ty; }
+        val ty: f32          = r.y + travel * s.offset / most;
+        val ht: interact.Hit = interact.hit(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h, input.BUTTON_LEFT);
+        if (ht.pressed) { grab.y = s.offset; }
 
         var tc: draw.Color = ctx.theme.handle;
-        if (ctx.active == r.thumb) { tc = ctx.theme.handle_on; }
+        if (ht.active) { tc = ctx.theme.handle_on; }
         face(ctx, tx0, r.y, tx1, r.y + r.h, ctx.theme.track);
         face(ctx, tx0, ty, tx1, ty + thumb_h, tc);
     }
@@ -1485,16 +1472,16 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hs);
+    if (hs.clicked) {
         if (@open == 0) { @open = 1; }
         or              { @open = 0; }
     }
 
     var bg:  draw.Color = ctx.theme.header;
     var ink: draw.Color = ctx.theme.text_dim;
-    if (ctx.hot == id) {
+    if (hs.hot) {
         bg  = ctx.theme.header_hot;
         ink = ctx.theme.text;
     }
@@ -1701,8 +1688,8 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
             val x1: f32 = ctx.cx + ctx.pw;
             val y1: f32 = y0 + rh;
             if (y1 > top && y0 < top + r.h) {
-                val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-                if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0 && l.selected != i) {
+                val hi: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+                if (hi.clicked && l.selected != i) {
                     l.selected = i;
                     changed    = true;
                 }
@@ -1712,8 +1699,8 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
                     face(ctx, x0, y0, x1, y1, ctx.theme.accent);
                     ink = ctx.theme.accent_text;
                 }
-                or (ctx.active == id) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
-                or (ctx.hot == id)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
+                or (hi.active) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
+                or (hi.hot)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
                 val ty: f32 = y0 + (rh - context.line_height(ctx)) / 2.0::f32;
                 context.text_at(ctx, items[i], x0 + pad(ctx), ty, ink);
             }
@@ -3309,6 +3296,13 @@ test text_field__types_edits_and_reports_enter {
     input.type_text(?in, 'z');
     if (frame_field(?ctx, in, ?f, 1) != field.ENTERED) { ret 12; }
     if (context.typing(?ctx) || f.len != 3)            { ret 13; }
+
+    # a caller refusing the entry hands the keyboard straight back by the field's id
+    context.focus(?ctx, context.id_of(?ctx, "name"));
+    refill(?in, 13.0::f32, 8.0::f32);
+    input.type_text(?in, 'w');
+    if (frame_field(?ctx, in, ?f, 1) != field.EDITED) { ret 16; }
+    if (!context.typing(?ctx) || f.len != 4)          { ret 17; }
 
     # escape reports the same way
     click_field(?ctx, ?f, 13.0::f32);
