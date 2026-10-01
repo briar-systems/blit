@@ -3404,7 +3404,7 @@ pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners:
 # the style a widget kind draws with, overrides included
 # ---
 # ctx:  context
-# kind: theme.LABEL .. theme.SCRIM
+# kind: any theme kind
 # ret:  the style, in the context's theme
 pub fun look_of(ctx: *Context, kind: u32) *th.Style {
     ret ?ctx.theme.styles[kind];
@@ -3413,7 +3413,7 @@ pub fun look_of(ctx: *Context, kind: u32) *th.Style {
 # how a widget kind draws in a state, theme.DISABLED inside a disabled scope
 # ---
 # ctx:   context
-# kind:  theme.LABEL .. theme.SCRIM
+# kind:  any theme kind
 # state: theme.NORMAL .. theme.FOCUSED
 # ret:   the paint, in the context's theme
 pub fun paint_of(ctx: *Context, kind: u32, state: u8) *th.Paint {
@@ -3485,7 +3485,7 @@ fun same_color(a: draw.Color, b: draw.Color) bool {
 # for box_part, box_shadow, box_face and paint_of.
 # ---
 # ctx:   context
-# kind:  theme.LABEL .. theme.SCRIM
+# kind:  any theme kind
 # state: theme.NORMAL .. theme.FOCUSED
 # x0:    left x in pixels
 # y0:    top y in pixels
@@ -3514,7 +3514,7 @@ fun radii_of(ctx: *Context, s: *th.Style, corners: u8) draw.Radii {
 # above its body or a dock's inner edge
 # ---
 # ctx:     context
-# kind:    theme.LABEL .. theme.SCRIM
+# kind:    any theme kind
 # state:   theme.NORMAL .. theme.FOCUSED
 # x0:      left x in pixels
 # y0:      top y in pixels
@@ -3531,7 +3531,7 @@ pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32,
 # drawn apart, such as a window's titlebar and body under one shadow
 # ---
 # ctx:     context
-# kind:    theme.LABEL .. theme.SCRIM
+# kind:    any theme kind
 # state:   theme.NORMAL .. theme.FOCUSED
 # x0:      left x in pixels
 # y0:      top y in pixels
@@ -3553,7 +3553,7 @@ fun shadow_with(ctx: *Context, s: *th.Style, p: *th.Paint, x0: f32, y0: f32, x1:
 # paint a widget kind's face and outline in a state, without its shadow
 # ---
 # ctx:     context
-# kind:    theme.LABEL .. theme.SCRIM
+# kind:    any theme kind
 # state:   theme.NORMAL .. theme.FOCUSED
 # x0:      left x in pixels
 # y0:      top y in pixels
