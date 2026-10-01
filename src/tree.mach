@@ -828,6 +828,39 @@ test tree__opens_lazily_and_collapses {
     ret 0;
 }
 
+test tree__a_caret_click_shows_in_the_frame_after_with_no_more_input {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f: Fake;
+    fake(?f, 3, 4);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 400.0::f32, fake_ui, (?f)::ptr);
+    if (sel ie.err) { ret 1; }
+
+    # an idle interface asks for no frame
+    driver.steps(?d, 2);
+    driver.settle(?d);
+    val idle: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel idle.none) { ret 3; }
+
+    # the click applies the toggle after drawing, and asks for the frame that shows it
+    if (!driver.click(?d, bid.child(top_id(?f, 0), "#caret"))) { ret 4; }
+    if (!f.ev.toggled || driver.drawn(?d, leaf_id(?f, 0, 0)))  { ret 5; }
+    val asked: opt[f64] = context.next_frame(?d.ctx);
+    if (!(sel asked.some && asked.some == 0.0::f64)) { ret 6; }
+
+    # that frame takes no input, draws the node open and asks for nothing more
+    driver.step(?d);
+    if (!driver.drawn(?d, leaf_id(?f, 0, 0))) { ret 7; }
+    val after: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel after.none) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test tree__selects_one_and_many {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);

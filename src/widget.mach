@@ -2753,8 +2753,11 @@ test button__clicks_on_presses_and_releases_between_frames {
     input.clear_keys(?in);
     if (frame_button(?ctx, in) != true) { ret 4; }
     if (!asks_now(?ctx))                { ret 5; }
+    # the frame after takes the host's cursor, a move that asks for one more
     frame_button(?ctx, in);
-    if (asks_now(?ctx) || ctx.in.mx != 500.0::f32) { ret 6; }
+    if (!asks_now(?ctx) || ctx.in.mx != 500.0::f32) { ret 6; }
+    frame_button(?ctx, in);
+    if (asks_now(?ctx)) { ret 12; }
 
     # press, release, press: a click, then the button held
     in.mx = 10.0::f32;
@@ -2768,7 +2771,8 @@ test button__clicks_on_presses_and_releases_between_frames {
     if (frame_button(?ctx, in) != true)                      { ret 8; }
     if (frame_button(?ctx, in) != false || ctx.active != id) { ret 9; }
     if (input.pressed(ctx.in, input.BUTTON_LEFT) != 1)       { ret 10; }
-    if (asks_now(?ctx))                                      { ret 11; }
+    frame_button(?ctx, in);
+    if (asks_now(?ctx) || ctx.active != id) { ret 11; }
 
     val fi: err[allo.Error] = input.free(?in);
     if (sel fi.err) { ret 1; }

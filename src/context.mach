@@ -72,10 +72,11 @@
 # the rest of the host contract runs the same way. the context keeps the
 # host's clock (dt), and after end() it asks the host for a pointer shape
 # (cursor), for a place to show the IME's candidate window (ime_rect) and for
-# when to draw again (next_frame): widgets ask for a frame by a time with
-# wake_at, so an idle interface can sleep until input arrives instead of
-# drawing every frame. the IME's composition in progress is kept here, for
-# the focus holder to show at its caret (preedit).
+# when to draw again (next_frame): a frame that received input asks for the
+# one after, which shows what the input changed, and widgets ask for a frame by
+# a time with wake_at, so an idle interface can sleep until input arrives
+# instead of drawing every frame. the IME's composition in progress is kept
+# here, for the focus holder to show at its caret (preedit).
 #
 # keyboard navigation follows the frame's tab stops: widgets that take the
 # keyboard register one as they claim (see blit.interact), in call order,
@@ -497,7 +498,7 @@ pub rec TextLine {
 # backlog:      button events held back for the frames after, in arrival order
 # backlog_cap:  events allocated for backlog
 # backlog_len:  events held in backlog
-# lag:          1 if the frame left button events or the cursor behind the host's, else 0
+# had_input:    1 if the frame received input, which asks for the frame after, else 0
 # trace_on:     1 if the frame's text lines are recorded (see set_trace), else 0
 # traced:       the frame's recorded text lines, grown on demand
 # traced_cap:   lines allocated for traced
@@ -632,7 +633,7 @@ pub rec Context {
     backlog:      *input.Event;
     backlog_cap:  usize;
     backlog_len:  usize;
-    lag:          u8;
+    had_input:    u8;
     trace_on:     u8;
     traced:       *Traced;
     traced_cap:   usize;
@@ -804,7 +805,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.backlog      = nil;
     ctx.backlog_cap  = 0;
     ctx.backlog_len  = 0;
-    ctx.lag          = 0;
+    ctx.had_input    = 0;
     store.init(?ctx.store, a);
     sheet.init(?ctx.sheet, a);
     payload.init(?ctx.drag, a);
@@ -977,15 +978,19 @@ pub fun free(ctx: *Context) err[allo.Error] {
 # previous frame's tab stops (see navigate). the last frame's copied text, paste
 # request, cursor shape, candidate window and wake time are cleared, and the
 # frame's last composition event replaces the composition in progress. each
-# button pressed becomes that button's last press (see last_press).
+# button pressed becomes that button's last press (see last_press). a frame
+# whose input differs from the previous frame's, or that carries events,
+# wheel travel or a paste, received input, and next_frame asks for the frame
+# after it.
 # ---
 # ctx: context
 # in:  this frame's input (prev_down is managed here)
 # sw:  screen width in pixels
 # sh:  screen height in pixels
 pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
-    val prev: u8  = ctx.in.down;
-    val then: f64 = ctx.in.time;
+    val last: input.Input = ctx.in;
+    val prev: u8          = ctx.in.down;
+    val then: f64         = ctx.in.time;
     ctx.in           = in;
     ctx.in.prev_down = prev;
     ctx.delta        = 0.0::f64;
@@ -1003,7 +1008,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.frame_sp = 0;
     ctx.hot      = 0;
     ctx.oom      = 0;
-    trickle(ctx, prev);
+    val applied: u8 = trickle(ctx, prev);
+    ctx.had_input = stirred(last, ctx.in, applied);
 
     ctx.lx        = 0.0::f32;
     ctx.ly        = 0.0::f32;
@@ -1678,17 +1684,20 @@ pub fun wake_at(ctx: *Context, t: f64) {
 
 # when the host should draw the next frame, read after end
 #
-# some(0) asks for one now: a wake time has already passed, a widget asked
-# for the clipboard, which only the next frame can deliver, or button events
-# are held back for the frames after (see begin). some(t) asks for
-# one by time t on the host's clock. none means nothing is pending, and an
-# idle host can sleep until input arrives.
+# some(0) asks for one now: the frame received input, a wake time has already
+# passed, or a widget asked for the clipboard, which only the next frame can
+# deliver. a frame that received input always asks for the one after, which
+# shows what the input changed: a state a widget applies after it drew, a
+# widget that first claimed and is hovered from the next frame, a button event
+# held back for the frames after (see begin). some(t) asks for one by time t
+# on the host's clock. none means nothing is pending, and an idle host can
+# sleep until input arrives.
 # ---
 # ctx: context
 # ret: some(0) for now, some(t) by time t, none for only on input
 pub fun next_frame(ctx: *Context) opt[f64] {
     if (ctx.paste_wanted != 0)   { ret opt[f64].some{0.0::f64}; }
-    if (ctx.lag != 0)            { ret opt[f64].some{0.0::f64}; }
+    if (ctx.had_input != 0)      { ret opt[f64].some{0.0::f64}; }
     if (ctx.wake_on == 0)        { ret opt[f64].none{}; }
     if (ctx.wake <= ctx.in.time) { ret opt[f64].some{0.0::f64}; }
     ret opt[f64].some{ctx.wake};
@@ -1797,8 +1806,14 @@ pub fun last_press(ctx: *Context, button: u8) Press {
 # queue the frame's button events behind those held back, apply them in order
 # until a button would change twice, and hold the rest for the frames after
 #
-# ctx.in is this frame's input, and prev the buttons held last frame.
-fun trickle(ctx: *Context, prev: u8) {
+# ctx.in is this frame's input, and prev the buttons held last frame. a frame
+# that applies an event takes the cursor where it happened, and the host's
+# cursor from the frame after, which then reads as a move (see stirred).
+# ---
+# ctx:  context
+# prev: the buttons held last frame
+# ret:  1 if the frame applied a button event, else 0
+fun trickle(ctx: *Context, prev: u8) u8 {
     var i: usize = 0;
     for (i < ctx.in.events.len) {
         val e: input.Event = ctx.in.events.data[i];
@@ -1850,13 +1865,29 @@ fun trickle(ctx: *Context, prev: u8) {
     ctx.backlog_len = k;
 
     ctx.in.down = (down & waiting) | (ctx.in.down & (waiting ^ 0xFF));
-    ctx.lag     = 0;
-    if (k != 0) { ctx.lag = 1; }
     if (moved != 0) {
-        if (x != ctx.in.mx || y != ctx.in.my) { ctx.lag = 1; }
         ctx.in.mx = x;
         ctx.in.my = y;
     }
+    ret moved;
+}
+
+# whether a frame received input, against the frame before as the context saw
+# it: any event (a button, key, text or composition), a button applied or
+# changed, wheel travel, a paste, the pointer arriving or leaving, the pointer
+# moving while present, or the modifiers changing
+# ---
+# last:    the previous frame's input, as begin left it
+# now:     this frame's input, after its button events applied
+# applied: 1 if the frame applied a held or new button event, else 0
+# ret:     1 if the frame received input, else 0
+fun stirred(last: input.Input, now: input.Input, applied: u8) u8 {
+    if (applied != 0 || now.events.len != 0)                          { ret 1; }
+    if (now.down != last.down || now.mods != last.mods)               { ret 1; }
+    if (now.wheel != 0.0::f32 || now.wheel_x != 0.0::f32)             { ret 1; }
+    if (now.paste != nil || now.present != last.present)              { ret 1; }
+    if (now.present != 0 && (now.mx != last.mx || now.my != last.my)) { ret 1; }
+    ret 0;
 }
 
 # take the frame's last composition event as the composition in progress,
@@ -5308,12 +5339,20 @@ test schedule__next_frame_only_while_something_is_pending {
     val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    # a static interface asks for nothing, and dt starts at 0
+    # the pointer arriving is input, which asks for the frame after, and dt
+    # starts at 0
     start_timed(?ctx, 10.0::f64);
     val c1: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
     end(?ctx);
+    val came: opt[f64] = next_frame(?ctx);
+    if (!(sel came.some && came.some == 0.0::f64) || dt(?ctx) != 0.0::f64) { ret 2; }
+
+    # a static interface with no input asks for nothing
+    start_timed(?ctx, 10.0::f64);
+    val c2: u8 = claim(?ctx, 1, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    end(?ctx);
     val idle: opt[f64] = next_frame(?ctx);
-    if (!sel idle.none || dt(?ctx) != 0.0::f64) { ret 2; }
+    if (!sel idle.none) { ret 8; }
 
     # the earliest wake asked for is the time reported
     start_timed(?ctx, 10.5::f64);
