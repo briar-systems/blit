@@ -31,6 +31,8 @@ fwd blit.tree;
 fwd blit.textarea;
 fwd blit.chart;
 fwd blit.controls;
+fwd blit.payload;
+fwd blit.dnd;
 fwd blit.driver;
 
 # blit library version
