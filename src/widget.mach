@@ -987,11 +987,14 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
 # dismissed: 1 if a press outside the popup dismissed it this frame
 # ch:        the channels the body's background and children draw in
 # claim:     the popup body's reserved claim
+# kind:      the style its body is padded and painted in, theme.POPUP unless
+#            begin_popup_as named another
 pub rec Popup {
     open:      u8;
     dismissed: u8;
     ch:        context.Channels;
     claim:     usize;
+    kind:      u32;
 }
 
 # open a popup column at (x, y) of width w in the popup band, when @open is
@@ -1019,7 +1022,7 @@ pub rec Popup {
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup(ctx: *context.Context, key: str, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w, true);
+    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w, true, theme.POPUP);
 }
 
 # begin_popup for a popup whose id is already known, such as a part of a widget
@@ -1032,7 +1035,7 @@ pub fun begin_popup(ctx: *context.Context, key: str, open: u8, x: f32, y: f32, w
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup_id(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, id, open, x, y, w, true);
+    ret popup_at(ctx, id, open, x, y, w, true, theme.POPUP);
 }
 
 # open a popup nested in an open popup, which closes with it rather than on a
@@ -1050,13 +1053,31 @@ pub fun begin_popup_id(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32,
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup_nested(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, id, open, x, y, w, false);
+    ret popup_at(ctx, id, open, x, y, w, false, theme.POPUP);
+}
+
+# open a popup whose body is padded and painted in a style of its own, such
+# as a menu's
+# ---
+# ctx:    context
+# id:     the popup's id, which is also the id scope of what it holds
+# open:   nonzero to draw the popup this frame
+# x:      popup left in local pixels
+# y:      popup top in local pixels
+# w:      popup width in pixels
+# nested: true to nest it in the open popup it is opened in, as
+#         begin_popup_nested does, false to open it as begin_popup_id does
+# kind:   the style, such as theme.MENU
+# ret:    a handle for end_popup
+pub fun begin_popup_as(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, nested: bool, kind: u32) Popup {
+    ret popup_at(ctx, id, open, x, y, w, !nested, kind);
 }
 
 # a popup at (x, y), claiming the screen beneath its body when outside is true
-fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, outside: bool) Popup {
+fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, outside: bool, kind: u32) Popup {
     var p: Popup;
     p.claim = context.NO_CLAIM;
+    p.kind  = kind;
     if (open == 0) { ret p; }
     p.open = 1;
 
@@ -1072,7 +1093,7 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, o
     }
 
     p.claim = context.reserve_claim(ctx, 0);
-    val pd: theme.Edges = padding(ctx, theme.POPUP);
+    val pd: theme.Edges = padding(ctx, kind);
     open_column(ctx, sx + pd.l, sy + pd.t, maxf(w - pd.l - pd.r, 0.0::f32), 0.0::f32);
     p.ch = context.split(ctx, 2);
     context.set_channel(ctx, p.ch, 1);
@@ -1089,14 +1110,14 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
     if (p.open == 0) { ret; }
 
     val f:  *layout.Frame = context.top_layout(ctx);
-    val pd: theme.Edges   = padding(ctx, theme.POPUP);
+    val pd: theme.Edges   = padding(ctx, p.kind);
     val x0: f32           = f.x0 - pd.l;
     val y0: f32           = f.y0 - pd.t;
     val x1: f32           = f.x0 + f.w + pd.r;
     val y1: f32           = f.y + pd.b;
     context.pop_layout(ctx);
     context.set_channel(ctx, p.ch, 0);
-    context.box(ctx, theme.POPUP, theme.NORMAL, x0, y0, x1, y1);
+    context.box(ctx, p.kind, theme.NORMAL, x0, y0, x1, y1);
     context.merge(ctx, p.ch);
     context.fill_claim(ctx, p.claim, x0, y0, x1, y1);
     context.pop_id(ctx);
@@ -1164,9 +1185,9 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
     val pid:   u64         = bid.child(id, "#popup");
     val below: f32         = context.px(ctx, look(ctx, theme.DROPDOWN).margin.b);
-    val pop:   Popup       = popup_at(ctx, pid, st.open, x0, y1 + below, x1 - x0, true);
-    val oh:    f32         = row_of(ctx, theme.MENU_ITEM);
-    val oin:   theme.Edges = inset(ctx, theme.MENU_ITEM);
+    val pop:   Popup       = popup_at(ctx, pid, st.open, x0, y1 + below, x1 - x0, true, theme.POPUP);
+    val oh:    f32         = row_of(ctx, theme.OPTION);
+    val oin:   theme.Edges = inset(ctx, theme.OPTION);
 
     var changed: u8    = 0;
     var i:       usize = 0;
@@ -1188,8 +1209,8 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             }
 
             val os: u8 = state_of(ho, false, false);
-            context.box(ctx, theme.MENU_ITEM, os, ox0, oy0, ox1, oy1);
-            context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, oy1 - oy0), ink(ctx, theme.MENU_ITEM, os).text);
+            context.box(ctx, theme.OPTION, os, ox0, oy0, ox1, oy1);
+            context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, oy1 - oy0), ink(ctx, theme.OPTION, os).text);
         }
         i = i + 1;
     }

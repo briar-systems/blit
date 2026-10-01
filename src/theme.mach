@@ -52,7 +52,7 @@ use std.memory;
 pub val SERIES: usize = 8;
 
 # how many widget kinds a theme styles
-pub val KINDS: u32 = 39;
+pub val KINDS: u32 = 44;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -105,13 +105,13 @@ pub val LIST: u32 = 21;
 pub val LIST_ITEM: u32 = 22;
 # a chart: border the grid, mark the axes, ticks and labels, inset around labels, margin.r between bars
 pub val CHART: u32 = 23;
-# a tab, on while chosen
+# a tab, on while chosen, and a tab bar's overflow buttons: margin.r between tabs
 pub val TAB: u32 = 24;
 # a tooltip, and a chart's read-out
 pub val TOOLTIP: u32 = 25;
-# a menu's body
+# a menu's body: pad around its rows, min_w its least width
 pub val MENU: u32 = 26;
-# a row of a menu or of a dropdown's options
+# a row of a menu, on while its submenu is open: mark its shortcut and arrow
 pub val MENU_ITEM: u32 = 27;
 # an overlay, chrome-free unless its style gives it a fill
 pub val OVERLAY: u32 = 28;
@@ -135,6 +135,16 @@ pub val TREE_ITEM: u32 = 36;
 pub val DROP_TARGET: u32 = 37;
 # what a drag carries, drawn at the cursor
 pub val DRAG_PREVIEW: u32 = 38;
+# a menu bar's background
+pub val MENU_BAR: u32 = 39;
+# a menu's header in a menu bar, on while its menu is open
+pub val MENU_TITLE: u32 = 40;
+# a row of a dropdown's or a tab list's options, on while chosen
+pub val OPTION: u32 = 41;
+# a tab bar's strip behind its tabs
+pub val TAB_BAR: u32 = 42;
+# a tab's close box: fill under the cursor, border_w the cross's stroke
+pub val TAB_CLOSE: u32 = 43;
 
 # at rest
 pub val NORMAL: u8 = 0;
@@ -272,7 +282,7 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
-    styles:      [39]Style;
+    styles:      [44]Style;
 }
 
 # a field holding a color, four floats
@@ -380,7 +390,7 @@ pub rec Name {
 }
 
 # every widget kind, indexed by the kind constants
-pub val KIND_NAMES: [39]Name = [39]Name{
+pub val KIND_NAMES: [44]Name = [44]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin between cells, columns and rows placed by hand, and a generic container's pad"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -405,10 +415,10 @@ pub val KIND_NAMES: [39]Name = [39]Name{
     Name{name: "list", doc: "a list's body"},
     Name{name: "list_item", doc: "a list's row, on while selected"},
     Name{name: "chart", doc: "a chart: border the grid, mark the axes, ticks, labels and hover guide, inset around labels, margin.r between bars"},
-    Name{name: "tab", doc: "a tab, on while chosen"},
+    Name{name: "tab", doc: "a tab, on while chosen, and a tab bar's overflow buttons, disabled when they cannot act: margin.r between tabs"},
     Name{name: "tooltip", doc: "a tooltip, and a chart's read-out"},
-    Name{name: "menu", doc: "a menu's body"},
-    Name{name: "menu_item", doc: "a row of a menu, and a dropdown's option"},
+    Name{name: "menu", doc: "a menu's body, pad around its rows, min_w its least width"},
+    Name{name: "menu_item", doc: "a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent"},
     Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill"},
     Name{name: "modal", doc: "a modal dialog's body"},
     Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"},
@@ -419,7 +429,12 @@ pub val KIND_NAMES: [39]Name = [39]Name{
     Name{name: "separator", doc: "a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule"},
     Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret"},
     Name{name: "drop_target", doc: "where a drag would drop: fill and border"},
-    Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"}
+    Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"},
+    Name{name: "menu_bar", doc: "a menu bar's background"},
+    Name{name: "menu_title", doc: "a menu's header in a menu bar, on while its menu is open"},
+    Name{name: "option", doc: "a row of a dropdown's or a tab list's options, on while chosen"},
+    Name{name: "tab_bar", doc: "a tab bar's strip behind its tabs"},
+    Name{name: "tab_close", doc: "a tab's close box: fill under the cursor, border_w the cross's stroke"}
 };
 
 # every state, indexed by the state constants
@@ -969,183 +984,119 @@ fun below(t: *Theme, fill: draw.Color) Style {
 # ---
 # t: the theme, its styles overwritten
 pub fun derive(t: *Theme) {
-    var s: Style = base(t);
-    t.styles[LABEL]  = s;
-    t.styles[LAYOUT] = s;
-    t.styles[LIST]   = s;
+    var i: usize = 0;
+    for (i < KINDS::usize) {
+        t.styles[i] = base(t);
+        i           = i + 1;
+    }
 
     t.styles[PANEL]         = below(t, t.panel);
     t.styles[WINDOW]        = below(t, t.window);
     t.styles[WINDOW].margin = edges(t.pad);
     t.styles[POPUP]         = below(t, t.window);
     t.styles[MENU]          = below(t, t.window);
+    t.styles[MENU].pad.t    = t.pad;
+    t.styles[MENU].min_w    = t.row * 8.0::f32;
+    t.styles[MODAL]         = below(t, t.window);
+    fill_all(?t.styles[TOOLTIP], t.window);
 
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fills(?s, t.header, t.header_hot, t.header_hot, t.header);
-    t.styles[WINDOW_TITLE] = s;
+    t.styles[WINDOW_TITLE].inset = edges(t.pad);
+    fills(?t.styles[WINDOW_TITLE], t.header, t.header_hot, t.header_hot, t.header);
 
-    s        = base(t);
-    s.radius = draw.radii(0.0::f32);
-    fill_all(?s, t.dock);
-    var i: usize = 0;
-    for (i < STATES::usize) {
-        s.states[i].border   = t.edge;
-        s.states[i].border_w = t.edge_w;
-        i                    = i + 1;
-    }
-    t.styles[DOCK] = s;
+    t.styles[DOCK].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[DOCK], t.dock);
+    outline(t, DOCK, t.edge, t.edge_w);
 
-    s = base(t);
-    fills(?s, t.control, t.control_hot, t.control_on, t.accent);
-    s.states[ON].text = t.accent_text;
-    t.styles[BUTTON]  = s;
-    s.radius          = draw.Radii{tl: t.corner, tr: t.corner, br: 0.0::f32, bl: 0.0::f32};
-    fills(?s, t.control, t.control_hot, t.control_on, t.window);
-    s.states[ON].text = t.text;
-    t.styles[TAB]     = s;
+    fills(?t.styles[BUTTON], t.control, t.control_hot, t.control_on, t.accent);
+    t.styles[BUTTON].states[ON].text = t.accent_text;
 
-    s = base(t);
-    fills(?s, t.control, t.control_hot, t.control_hot, t.control);
-    t.styles[CHECKBOX] = s;
-    s                  = base(t);
-    fill_all(?s, t.accent);
-    t.styles[CHECKBOX_MARK] = s;
-
-    s     = base(t);
-    s.pad = Edges{l: 0.0::f32, t: t.pad / 2.0::f32, r: 0.0::f32, b: t.pad / 2.0::f32};
-    fills(?s, t.track, t.control_hot, t.control_hot, t.accent);
-    t.styles[TOGGLE] = s;
-    s                = base(t);
-    s.margin         = edges(t.pad / 2.0::f32);
-    fills(?s, t.handle, t.handle_on, t.handle_on, t.accent_text);
-    t.styles[TOGGLE_KNOB] = s;
-
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fill_all(?s, t.track);
-    t.styles[SLIDER] = s;
-    s                = base(t);
-    s.min_w          = t.handle_w;
-    fills(?s, t.handle, t.handle, t.handle_on, t.handle);
-    t.styles[SLIDER_HANDLE] = s;
-
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fills(?s, t.control, t.control_hot, t.control_hot, t.control_on);
-    t.styles[DROPDOWN] = s;
-    s                  = base(t);
-    s.inset            = edges(t.pad);
-    fills(?s, t.track, t.control_hot, t.control_hot, t.track);
-    t.styles[MENU_ITEM] = s;
-
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fills(?s, t.track, t.control_hot, t.control_hot, t.track);
+    t.styles[TAB]            = t.styles[BUTTON];
+    t.styles[TAB].radius     = draw.Radii{tl: t.corner, tr: t.corner, br: 0.0::f32, bl: 0.0::f32};
+    t.styles[TAB].margin.r   = t.edge_w;
+    t.styles[TAB_BAR].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[TAB_BAR], t.track);
+    fills(?t.styles[TAB_CLOSE], clear(), t.control_hot, t.control_hot, clear());
     i = 0;
     for (i < STATES::usize) {
-        s.states[i].mark = t.text_faint;
-        i                = i + 1;
+        t.styles[TAB_CLOSE].states[i].border_w = t.edge_w;
+        i                                      = i + 1;
     }
-    s.states[FOCUSED].border   = t.accent;
-    s.states[FOCUSED].border_w = t.edge_w;
-    t.styles[FIELD]            = s;
-    s                          = base(t);
-    s.min_w                    = t.caret_w;
-    fill_all(?s, t.text);
-    t.styles[FIELD_CARET] = s;
-    s                     = base(t);
-    fill_all(?s, t.select);
-    t.styles[FIELD_SELECT] = s;
 
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fills(?s, t.header, t.header_hot, t.header_hot, t.header);
-    s.states[HOT].mark    = t.text;
-    s.states[ACTIVE].mark = t.text;
-    t.styles[SECTION]     = s;
+    fills(?t.styles[CHECKBOX], t.control, t.control_hot, t.control_hot, t.control);
+    fill_all(?t.styles[CHECKBOX_MARK], t.accent);
+    fills(?t.styles[RADIO], t.control, t.control_hot, t.control_hot, t.control);
+    fill_all(?t.styles[RADIO_MARK], t.accent);
 
-    s        = base(t);
-    s.min_w  = t.bar_w;
-    s.margin = Edges{l: t.pad, t: 0.0::f32, r: 0.0::f32, b: t.gap};
-    fill_all(?s, t.track);
-    t.styles[SCROLLBAR] = s;
-    s                   = base(t);
-    s.min_h             = t.thumb_min;
-    fills(?s, t.handle, t.handle, t.handle_on, t.handle);
-    t.styles[SCROLLBAR_THUMB] = s;
+    t.styles[TOGGLE].pad = Edges{l: 0.0::f32, t: t.pad / 2.0::f32, r: 0.0::f32, b: t.pad / 2.0::f32};
+    fills(?t.styles[TOGGLE], t.track, t.control_hot, t.control_hot, t.accent);
+    t.styles[TOGGLE_KNOB].margin = edges(t.pad / 2.0::f32);
+    fills(?t.styles[TOGGLE_KNOB], t.handle, t.handle_on, t.handle_on, t.accent_text);
 
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fills(?s, clear(), t.control_hot, t.control_on, t.accent);
-    s.states[ON].text   = t.accent_text;
-    t.styles[LIST_ITEM] = s;
+    t.styles[SLIDER].inset = edges(t.pad);
+    fill_all(?t.styles[SLIDER], t.track);
+    t.styles[SLIDER_HANDLE].min_w = t.handle_w;
+    fills(?t.styles[SLIDER_HANDLE], t.handle, t.handle, t.handle_on, t.handle);
 
-    s       = base(t);
-    s.inset = edges(t.pad);
-    i       = 0;
-    for (i < STATES::usize) {
-        s.states[i].border   = t.grid;
-        s.states[i].border_w = t.edge_w;
-        i                    = i + 1;
-    }
-    t.styles[CHART] = s;
+    t.styles[DROPDOWN].inset = edges(t.pad);
+    fills(?t.styles[DROPDOWN], t.control, t.control_hot, t.control_hot, t.control_on);
+    t.styles[OPTION].inset = edges(t.pad);
+    fills(?t.styles[OPTION], t.track, t.control_hot, t.control_hot, t.accent);
+    t.styles[OPTION].states[ON].text = t.accent_text;
 
-    s       = base(t);
-    s.inset = edges(t.pad);
-    fill_all(?s, t.window);
-    t.styles[TOOLTIP] = s;
+    t.styles[MENU_BAR].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[MENU_BAR], t.header);
+    t.styles[MENU_TITLE].radius = draw.radii(0.0::f32);
+    t.styles[MENU_TITLE].inset  = Edges{l: t.pad * 2.0::f32, t: t.inset, r: t.pad * 2.0::f32, b: t.inset};
+    fills(?t.styles[MENU_TITLE], clear(), t.header_hot, t.header_hot, t.control_on);
+    t.styles[MENU_ITEM].radius = draw.radii(0.0::f32);
+    t.styles[MENU_ITEM].inset  = edges(t.pad);
+    fills(?t.styles[MENU_ITEM], clear(), t.control_hot, t.control_hot, t.control_hot);
 
-    s                 = base(t);
-    t.styles[OVERLAY] = s;
-    s                 = base(t);
-    fill_all(?s, t.window);
-    t.styles[MODAL] = s;
-    s               = base(t);
-    s.radius        = draw.radii(0.0::f32);
-    fill_all(?s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
-    t.styles[SCRIM] = s;
-
-    s = base(t);
-    fills(?s, t.control, t.control_hot, t.control_hot, t.control);
-    t.styles[RADIO] = s;
-    s               = base(t);
-    fill_all(?s, t.accent);
-    t.styles[RADIO_MARK] = s;
-
-    s = base(t);
-    fill_all(?s, t.track);
-    t.styles[PROGRESS] = s;
-    s                  = base(t);
-    fill_all(?s, t.accent);
-    t.styles[PROGRESS_BAR] = s;
-
-    s = base(t);
+    t.styles[FIELD].inset = edges(t.pad);
+    fills(?t.styles[FIELD], t.track, t.control_hot, t.control_hot, t.track);
     i = 0;
     for (i < STATES::usize) {
-        s.states[i].border   = t.edge;
-        s.states[i].border_w = t.edge_w;
-        i                    = i + 1;
+        t.styles[FIELD].states[i].mark = t.text_faint;
+        i                              = i + 1;
     }
-    t.styles[SEPARATOR] = s;
+    t.styles[FIELD].states[FOCUSED].border   = t.accent;
+    t.styles[FIELD].states[FOCUSED].border_w = t.edge_w;
+    t.styles[FIELD_CARET].min_w              = t.caret_w;
+    fill_all(?t.styles[FIELD_CARET], t.text);
+    fill_all(?t.styles[FIELD_SELECT], t.select);
 
-    s                   = t.styles[LIST_ITEM];
-    t.styles[TREE_ITEM] = s;
+    t.styles[SECTION].inset = edges(t.pad);
+    fills(?t.styles[SECTION], t.header, t.header_hot, t.header_hot, t.header);
+    t.styles[SECTION].states[HOT].mark    = t.text;
+    t.styles[SECTION].states[ACTIVE].mark = t.text;
 
-    s        = base(t);
-    s.radius = draw.radii(0.0::f32);
-    fill_all(?s, t.select);
-    i = 0;
-    for (i < STATES::usize) {
-        s.states[i].border   = t.accent;
-        s.states[i].border_w = t.edge_w;
-        i                    = i + 1;
-    }
-    t.styles[DROP_TARGET] = s;
-    s                     = base(t);
-    s.radius              = draw.radii(0.0::f32);
-    fill_all(?s, t.control);
-    t.styles[DRAG_PREVIEW] = s;
+    t.styles[SCROLLBAR].min_w  = t.bar_w;
+    t.styles[SCROLLBAR].margin = Edges{l: t.pad, t: 0.0::f32, r: 0.0::f32, b: t.gap};
+    fill_all(?t.styles[SCROLLBAR], t.track);
+    t.styles[SCROLLBAR_THUMB].min_h = t.thumb_min;
+    fills(?t.styles[SCROLLBAR_THUMB], t.handle, t.handle, t.handle_on, t.handle);
+
+    t.styles[LIST_ITEM].inset = edges(t.pad);
+    fills(?t.styles[LIST_ITEM], clear(), t.control_hot, t.control_on, t.accent);
+    t.styles[LIST_ITEM].states[ON].text = t.accent_text;
+    t.styles[LIST_ITEM].states[ON].mark = t.accent_text;
+    t.styles[TREE_ITEM]                 = t.styles[LIST_ITEM];
+
+    t.styles[CHART].inset = edges(t.pad);
+    outline(t, CHART, t.grid, t.edge_w);
+
+    fill_all(?t.styles[PROGRESS], t.track);
+    fill_all(?t.styles[PROGRESS_BAR], t.accent);
+    outline(t, SEPARATOR, t.edge, t.edge_w);
+
+    t.styles[DROP_TARGET].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[DROP_TARGET], t.select);
+    outline(t, DROP_TARGET, t.accent, t.edge_w);
+    t.styles[DRAG_PREVIEW].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[DRAG_PREVIEW], t.control);
+
+    t.styles[SCRIM].radius = draw.radii(0.0::f32);
+    fill_all(?t.styles[SCRIM], draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
 }
 
 # the floats of a theme's styles
