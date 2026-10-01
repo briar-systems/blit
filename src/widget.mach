@@ -34,8 +34,9 @@
 # containers (panels, windows, popups) claim their whole rect beneath their
 # children, so input over their empty areas stops at them instead of reaching
 # whatever they cover. a popup paints and claims on a layer above everything
-# drawn so far. a press anywhere outside an open popup dismisses it, and that
-# press is consumed rather than delivered to what lies beneath.
+# drawn so far. a press of any button outside an open popup dismisses it, and
+# that press is consumed rather than delivered to what lies beneath. menus,
+# menu bars and context menus are popups too, in blit.menu.
 #
 # a text field takes the keyboard (see context.focus) when pressed and edits a
 # blit.field.Field with the frame's keyboard events while it holds it.
@@ -979,10 +980,11 @@ pub rec Popup {
 # (x, y) is in the caller's local coordinates. inside the popup the layout
 # is in screen pixels, so widgets placed between begin_popup and end_popup land in
 # the popup and paint and claim above what they overlap. the popup also claims
-# the whole screen beneath its body: a press outside the body sets `dismissed`
-# and is consumed, so it never activates what lies under it. the caller owns the
-# open state and closes it on dismissal. while open, the popup is an id scope
-# for the widgets inside it. pair every begin_popup with an end_popup.
+# the whole screen beneath its body: a press of any button outside the body
+# sets `dismissed` and is consumed, so it never activates what lies under it.
+# the caller owns the open state and closes it on dismissal. while open, the
+# popup is an id scope for the widgets inside it. pair every begin_popup with
+# an end_popup.
 # ---
 # ctx:  context
 # key:  the popup's key in the current id scope
@@ -992,11 +994,42 @@ pub rec Popup {
 # w:    popup width in pixels
 # ret:  a handle for end_popup
 pub fun begin_popup(ctx: *context.Context, key: str, open: u8, x: f32, y: f32, w: f32) Popup {
-    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w);
+    ret popup_at(ctx, context.id_of(ctx, key), open, x, y, w, true);
 }
 
-# begin_popup for a popup whose id is already known
-fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
+# begin_popup for a popup whose id is already known, such as a part of a widget
+# ---
+# ctx:  context
+# id:   the popup's id, which is also the id scope of what it holds
+# open: nonzero to draw the popup this frame
+# x:    popup left in local pixels
+# y:    popup top in local pixels
+# w:    popup width in pixels
+# ret:  a handle for end_popup
+pub fun begin_popup_id(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
+    ret popup_at(ctx, id, open, x, y, w, true);
+}
+
+# open a popup nested in an open popup, which closes with it rather than on a
+# press outside itself
+#
+# it claims nothing beyond its body, so what the enclosing popup holds stays
+# under the pointer while it is open, as a submenu needs. `dismissed` is never
+# set: the enclosing popup's outside claim takes every press outside both.
+# ---
+# ctx:  context
+# id:   the popup's id, which is also the id scope of what it holds
+# open: nonzero to draw the popup this frame
+# x:    popup left in local pixels
+# y:    popup top in local pixels
+# w:    popup width in pixels
+# ret:  a handle for end_popup
+pub fun begin_popup_nested(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) Popup {
+    ret popup_at(ctx, id, open, x, y, w, false);
+}
+
+# a popup at (x, y), claiming the screen beneath its body when outside is true
+fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32, outside: bool) Popup {
     var p: Popup;
     p.claim = context.NO_CLAIM;
     if (open == 0) { ret p; }
@@ -1007,8 +1040,11 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) P
     context.push_layer(ctx);
     context.push_id(ctx, id);
 
-    val out: interact.Hit = interact.hit(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, input.BUTTON_LEFT);
-    if (out.pressed) { p.dismissed = 1; }
+    if (outside) {
+        val every: u8           = input.BUTTON_LEFT | input.BUTTON_RIGHT | input.BUTTON_MIDDLE | input.BUTTON_X1 | input.BUTTON_X2;
+        val out:   interact.Hit = interact.hit(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, every);
+        if (out.pressed) { p.dismissed = 1; }
+    }
 
     p.claim = context.reserve_claim(ctx, 0);
     open_column(ctx, sx, sy, w, 0.0::f32);
@@ -1100,7 +1136,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     }
 
     val pid: u64   = bid.child(id, "#popup");
-    val pop: Popup = popup_at(ctx, pid, st.open, x0, y1 + gap(ctx), x1 - x0);
+    val pop: Popup = popup_at(ctx, pid, st.open, x0, y1 + gap(ctx), x1 - x0, true);
 
     var changed: u8    = 0;
     var i:       usize = 0;

@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -677,6 +677,52 @@ entry, so a widget never reads another's bytes.
 The store is one owner, not the only one. Widgets that take a caller-owned
 record (`Window`, `Scroll`, `List`, `Field`) keep taking it, so an app can own
 its state where it wants to.
+
+## Menus
+
+`blit.menu` draws a menu bar, the menus it drops, submenus and context menus.
+A bar is the next item of the current layout frame, one row high across it.
+Each menu's body runs every frame, open or not, so its items answer their
+shortcuts while it is closed:
+
+```mach
+var bar:  blit.menu.Menu = blit.menu.begin_bar(?ctx, "main");
+var file: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?bar, "File");
+var save: blit.menu.Item = blit.menu.of("Save");
+save.shortcut = blit.menu.keys('S', blit.menu.MOD_PRIMARY);
+if (blit.menu.item(?ctx, ?file, save)) { ... }
+var recent: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?file, "Recent");
+blit.menu.item(?ctx, ?recent, blit.menu.of("notes.txt"));
+blit.menu.end_menu(?ctx, ?recent);
+blit.menu.end_menu(?ctx, ?file);
+blit.menu.end_bar(?ctx, ?bar);
+
+var cm: blit.menu.Menu = blit.menu.begin_context(?ctx, "canvas", x0, y0, x1, y1);
+if (blit.menu.item(?ctx, ?cm, blit.menu.of("Cut"))) { ... }
+blit.menu.end_menu(?ctx, ?cm);
+```
+
+- **Opening.** A bar header opens on a press, and while one is open, moving
+  onto another opens that one. A submenu row opens its menu on hover. A context
+  menu opens at the cursor on a right press over its region, or through
+  `open_context`.
+- **Items.** An `Item` carries a label, a `Shortcut` shown at its right, a
+  check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
+  drawn before the label (text, nil for none) and a disabled flag.
+- **Shortcuts.** An item fires when its key is pressed with exactly its
+  modifiers, open or closed, and stays quiet while another widget holds the
+  keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
+  ctrl or super (see `input.shortcut`), shown as `Cmd` on darwin and `Ctrl`
+  elsewhere.
+- **Focus.** An open tree owns the keyboard: it takes the focus when it opens
+  and gives it back to the previous holder the frame after it closes.
+- **Keys.** The deepest open menu takes up and down (over enabled items),
+  enter, right and left (into and out of submenus, and across a bar's headers)
+  and escape.
+- **Closing.** A click or enter on an item closes the whole tree, and so does
+  a press of any button outside it, which is consumed.
+- **Ids.** A bar's key, then each header and submenu label, then the item's
+  label: `driver.find(?d, "main/File/Recent/notes.txt")`.
 
 ## Charts
 
