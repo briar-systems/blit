@@ -1,0 +1,97 @@
+# charts: lines, steps over uneven samples, bars and sparklines
+#
+# a chart plots columns of the caller's values into a rect without copying
+# them, fits or fixes its axes, and reads out the value under the pointer.
+# a series may have its own x column of ascending positions, so samples
+# need not be evenly spaced, and STEP holds each value until the next.
+
+use std.types.size.usize;
+
+use blit;
+
+# samples in each series
+val N: usize = 64;
+
+# the charts' data
+# ---
+# wave: a sine
+# echo: a slower cosine, filled to zero
+# t:    uneven timestamps for the step series
+# heap: a counter that holds between samples
+# net:  values up and down from zero, for bars
+# x:    where the read-out of the first chart stood
+pub rec State {
+    wave: [64]f32;
+    echo: [64]f32;
+    t:    [64]u64;
+    heap: [64]u64;
+    net:  [16]f32;
+    x:    blit.chart.Num;
+}
+
+# a sine of x in radians, by its series, close enough to plot
+fun sine(x: f32) f32 {
+    var v: f32 = x;
+    for (v > 3.14159265::f32) { v = v - 6.2831853::f32; }
+    for (v < -3.14159265::f32) { v = v + 6.2831853::f32; }
+    val v2: f32 = v * v;
+    ret v * (1.0::f32 - v2 / 6.0::f32 * (1.0::f32 - v2 / 20.0::f32 * (1.0::f32 - v2 / 42.0::f32 * (1.0::f32 - v2 / 72.0::f32))));
+}
+
+pub fun init(s: *State) {
+    var i:  usize = 0;
+    var at: u64   = 1000000000;
+    for (i < N) {
+        s.wave[i] = sine(i::f32 * 0.2::f32) * 40.0::f32 + 50.0::f32;
+        s.echo[i] = sine(i::f32 * 0.07::f32 + 1.57::f32) * 25.0::f32 + 30.0::f32;
+        at        = at + 1000 + (i::u64 * 7919) % 5000;
+        s.t[i]    = at;
+        s.heap[i] = 4096 + (i::u64 * 2654435761) % 65536;
+        i         = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        s.net[i] = sine(i::f32 * 0.9::f32) * 8.0::f32;
+        i        = i + 1;
+    }
+}
+
+# a rect h pixels tall across the column
+fun area(ctx: *blit.context.Context, h: f32) blit.context.Area {
+    val ph: f32 = blit.context.px(ctx, h);
+    ret blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(ph), 0.0::f32, ph);
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    blit.controls.separator_label(ctx, "Line");
+    var sr: [2]blit.chart.Series;
+    sr[0]      = blit.chart.series(blit.chart.f32s(?s.wave[0]), N);
+    sr[1]      = blit.chart.series(blit.chart.f32s(?s.echo[0]), N);
+    sr[1].fill = 1;
+    var o: blit.chart.Options = blit.chart.options();
+    o.y = blit.chart.fixed(blit.chart.Num.f{0.0::f64}, blit.chart.Num.f{100.0::f64});
+    # while it is not hovered, the chart holds its guide where it last read
+    o.cursor.x = s.x;
+    val a:   blit.context.Area = area(ctx, 140.0::f32);
+    val hov: blit.chart.Hover  = blit.chart.line(ctx, "wave", a.x0, a.y0, a.x1 - a.x0, a.y1 - a.y0, ?sr[0], 2, o);
+    if (hov.hot != 0) { s.x = hov.x; }
+
+    # u64 timestamps keep every digit, and STEP holds a value until the next
+    blit.controls.separator_label(ctx, "Steps over uneven samples");
+    var heap: blit.chart.Series = blit.chart.series(blit.chart.u64s(?s.heap[0]), N);
+    heap.x     = blit.chart.u64s(?s.t[0]);
+    heap.shape = blit.chart.STEP;
+    val b: blit.context.Area = area(ctx, 110.0::f32);
+    blit.chart.line(ctx, "heap", b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, ?heap, 1, blit.chart.options());
+
+    blit.controls.separator_label(ctx, "Bars");
+    val c: blit.context.Area = area(ctx, 100.0::f32);
+    blit.chart.bars(ctx, "net", c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0, blit.chart.f32s(?s.net[0]), 16, blit.chart.options());
+
+    # a series fitted to its values with no axes, for a row or a cell
+    blit.controls.separator_label(ctx, "Sparkline");
+    val d: blit.context.Area = area(ctx, 24.0::f32);
+    blit.chart.sparkline(ctx, "spark", d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, sr[0]);
+}

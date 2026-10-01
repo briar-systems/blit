@@ -1,0 +1,60 @@
+# modals: dialogs that block everything beneath them until they close
+#
+# a modal paints in the modals band behind a scrim that takes every press
+# meant for what lies under it. its open state lives in the store under its
+# title's id, so open and close reach it from anywhere in the same id scope,
+# and begin_modal runs every frame, open or not. escape, its close button
+# and, when asked, a press on the scrim close it.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# what the dialogs edit and answered
+# ---
+# name:     the rename dialog's field
+# name_buf: its text
+# answer:   what the question was last answered with
+pub rec State {
+    name:     blit.field.Field;
+    name_buf: [48]u8;
+    answer:   str;
+}
+
+pub fun init(s: *State) {
+    blit.field.init(?s.name, ?s.name_buf[0], 48, 0, nil);
+    blit.field.set(?s.name, "untitled");
+    s.answer = "not asked yet";
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    if (blit.widget.button(ctx, "Rename")) { blit.modal.open(ctx, "Rename"); }
+    var m: blit.modal.Modal = blit.modal.dialog("Rename");
+    m.w = blit.context.px(ctx, 280.0::f32);
+    val r: blit.modal.ModalArea = blit.modal.begin_modal(ctx, m);
+    if (r.shown != 0) {
+        blit.widget.text(ctx, "A new name for the file:");
+        val did: u8 = blit.widget.text_field(ctx, "name", ?s.name, "name");
+        var ok:  [2]str;
+        ok[0] = "Rename";
+        ok[1] = "Cancel";
+        val hit: usize = blit.widget.buttons(ctx, ?ok[0], 2);
+        if (hit < 2 || (did & blit.field.ENTERED) != 0) { blit.modal.close(ctx, "Rename"); }
+    }
+    blit.modal.end_modal(ctx, r);
+    blit.widget.text(ctx, blit.field.text(?s.name));
+
+    # a question and a row of answers, in one call
+    if (blit.widget.button(ctx, "Quit")) { blit.modal.open(ctx, "Unsaved changes"); }
+    var labels: [3]str;
+    labels[0] = "Save";
+    labels[1] = "Discard";
+    labels[2] = "Cancel";
+    val c: usize = blit.modal.confirm(ctx, "Unsaved changes", "Save the changes before quitting?", ?labels[0], 3);
+    if (c < 3)                     { s.answer = labels[c]; }
+    or (c == blit.modal.CANCELLED) { s.answer = "closed without a choice"; }
+    blit.widget.text(ctx, s.answer);
+}

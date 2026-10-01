@@ -1,0 +1,85 @@
+# drives the blit gallery (see gallery.app) headless through blit.driver:
+# the script visits every section, then prints how many sections and
+# vertices the last frame drew. with --snapshot it prints the last frame's
+# snapshot instead, which is how gallery.snap, the golden the gallery's test
+# compares against, is made
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use blit;
+use gallery.app;
+
+# the golden snapshot of the scripted gallery's last frame
+#[embed("gallery.snap")]
+val GOLDEN: [_]u8;
+
+# the screen the gallery is driven on
+val SW: f32 = 1280.0;
+val SH: f32 = 800.0;
+
+test gallery__visits_every_section_and_matches_its_golden_snapshot {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var g: app.Gallery;
+    if (!app.make(?g, ?a)) { ret 1; }
+    var d:  blit.driver.Driver;
+    val ie: err[allo.Error] = blit.driver.init(?d, ?a, SW, SH, app.ui, (?g)::ptr);
+    if (sel ie.err)          { ret 1; }
+    if (!app.script(?d, ?g)) { ret 2; }
+    val snap: str   = blit.driver.snapshot(?d);
+    val n:    usize = $length_of(GOLDEN);
+    var k:    usize = 0;
+    for (k < n) {
+        if (snap[k] != GOLDEN[k]) { ret 3; }
+        k = k + 1;
+    }
+    if (snap[n] != 0) { ret 4; }
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err)       { ret 1; }
+    if (!app.unmake(?g, ?a)) { ret 1; }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) {
+        print.println("allocator init failed");
+        ret 1;
+    }
+    var g: app.Gallery;
+    if (!app.make(?g, ?a)) {
+        print.println("gallery init failed");
+        ret 1;
+    }
+    var d:  blit.driver.Driver;
+    val de: err[allo.Error] = blit.driver.init(?d, ?a, SW, SH, app.ui, (?g)::ptr);
+    if (sel de.err) {
+        print.println("driver init failed");
+        ret 1;
+    }
+    val ok: bool = app.script(?d, ?g);
+    if (argc > 1 && str_equals(argv[1], "--snapshot")) { print.print(blit.driver.snapshot(?d)); }
+    or {
+        print.printf("blit {} gallery: {} sections, {} vertices, ok={}\n",
+            blit.VERSION,
+            app.COUNT,
+            blit.context.draw_count(?d.ctx),
+            ok::u64);
+    }
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err)       { ret 1; }
+    if (!app.unmake(?g, ?a)) { ret 1; }
+    if (!ok)                 { ret 2; }
+    ret 0;
+}

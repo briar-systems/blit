@@ -1,0 +1,62 @@
+# disabled: widgets that draw and lay out but take no input
+#
+# begin_disabled and end_disabled wrap a scope of widgets. inside a
+# disabling scope they keep their ids and state and paint in their DISABLED
+# state, but nothing is hot, pressed or dragged, tab passes over them, and
+# the focus is neither given nor kept. scopes nest, and one that does not
+# disable inside one that does stays disabled, so a caller writes one call
+# with a condition, not a branch.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# what the scope holds
+# ---
+# off:    the scope is disabled
+# inner:  the nested scope asks to be disabled
+# level:  a slider inside
+# mode:   a choice inside
+# check:  a checkbox inside
+# clicks: clicks on the button inside
+pub rec State {
+    off:    u8;
+    inner:  u8;
+    level:  f32;
+    mode:   usize;
+    check:  u8;
+    clicks: u64;
+}
+
+pub fun init(s: *State) {
+    s.off   = 1;
+    s.level = 0.5::f32;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    blit.widget.toggle(ctx, "Disable the controls below", ?s.off);
+    blit.widget.toggle(ctx, "Disable the nested scope alone", ?s.inner);
+
+    blit.context.begin_disabled(ctx, s.off != 0);
+    if (blit.widget.button(ctx, "Run")) { s.clicks = s.clicks + 1; }
+    blit.widget.slider_f(ctx, "Level", ?s.level, 0.0::f32, 1.0::f32);
+    var modes: [3]str;
+    modes[0] = "Fast";
+    modes[1] = "Fair";
+    modes[2] = "Fine";
+    blit.widget.segmented(ctx, ?modes[0], 3, ?s.mode);
+
+    # a scope inside a disabling one stays disabled whatever it asks
+    blit.context.begin_disabled(ctx, s.inner != 0);
+    blit.widget.checkbox(ctx, "Nested", ?s.check);
+    blit.widget.button(ctx, "Nested button");
+    blit.context.end_disabled(ctx);
+    blit.context.end_disabled(ctx);
+
+    var buf: [48]u8;
+    blit.widget.text(ctx, "runs:");
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](s.clicks), ?buf[0]));
+}

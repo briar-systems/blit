@@ -1,0 +1,30 @@
+# the inspector: a window showing what the context knows about the frame
+#
+# its ids and their claims by layer band, collisions, the focus order, the
+# draw list's runs, the windows, the dock tree and the state store, as a
+# tree. hovering an entry outlines its rect on the surface. the app owns an
+# Inspector, calls show last in every frame, and toggles it with one call;
+# while closed it costs one branch. the gallery's inspector is drawn after
+# everything else in the frame.
+
+use std.types.string.str;
+
+use blit;
+
+# the gallery's inspector, which the section toggles
+pub rec State {
+    insp: *blit.inspect.Inspector;
+}
+
+pub fun init(s: *State, i: *blit.inspect.Inspector) {
+    s.insp = i;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s:     *State = user::*State;
+    var label: str    = "Open the inspector###toggle";
+    if (s.insp.open != 0)               { label = "Close the inspector###toggle"; }
+    if (blit.widget.button(ctx, label)) { blit.inspect.toggle(s.insp); }
+    blit.widget.note(ctx, "Open its sections to read the frame. Hover an entry to outline its rect: a claim, a window, a dock node, a run's clip.");
+    blit.widget.note(ctx, "Two widgets claiming one id in a frame show under Collisions; give repeated labels an id scope with push_id_int, or a ## suffix.");
+}

@@ -1,0 +1,115 @@
+# trees: nodes that open and close, asked for lazily
+#
+# the caller describes its tree through a Source: how many children a node
+# has and what each one is, over handles of its own. the tree asks only for
+# the children of open nodes, and of those only the rows in view.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# how many nodes the sample tree has
+val NODES: usize = 12;
+
+# one node of the sample tree
+# ---
+# name:   its label
+# parent: its parent's handle, 0 for the top level
+rec Node {
+    name:   str;
+    parent: u64;
+}
+
+# the sample tree, a node's handle its index plus one
+val TREE: [12]Node = [12]Node{
+    Node{name: "src", parent: 0},
+    Node{name: "lib", parent: 1},
+    Node{name: "blit.mach", parent: 2},
+    Node{name: "widget.mach", parent: 1},
+    Node{name: "tree.mach", parent: 1},
+    Node{name: "demo", parent: 0},
+    Node{name: "gallery", parent: 6},
+    Node{name: "main.mach", parent: 7},
+    Node{name: "panel", parent: 6},
+    Node{name: "README.md", parent: 0},
+    Node{name: "LICENSE", parent: 0},
+    Node{name: "mach.toml", parent: 0}
+};
+
+# what the tree keeps
+# ---
+# tree:     the tree's open state, scroll and selection mode
+# selected: one byte per node, nonzero while selected
+# opened:   the node last double clicked or entered, 0 for none
+pub rec State {
+    tree:     blit.tree.Tree;
+    selected: [12]u8;
+    opened:   u64;
+}
+
+pub fun init(s: *State) {
+    s.tree.root = 0;
+    s.tree.mode = blit.tree.SELECT_MANY;
+}
+
+# how many children the node with handle h has
+fun count(user: ptr, h: u64) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < NODES) {
+        if (TREE[i].parent == h) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the k-th child of the node with handle h
+fun child(user: ptr, h: u64, k: usize, it: *blit.tree.Item) {
+    val s: *State = user::*State;
+    var n: usize  = 0;
+    var i: usize  = 0;
+    for (i < NODES) {
+        if (TREE[i].parent == h) {
+            if (n == k) {
+                it.key      = i::u64 + 1;
+                it.handle   = i::u64 + 1;
+                it.label    = TREE[i].name;
+                it.leaf     = count(user, i::u64 + 1) == 0;
+                it.selected = s.selected[i] != 0;
+                ret;
+            }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun select(user: ptr, h: u64, on: bool) {
+    val s: *State = user::*State;
+    s.selected[(h - 1)::usize] = on::u8;
+}
+
+fun clear(user: ptr) {
+    val s: *State = user::*State;
+    var i: usize  = 0;
+    for (i < NODES) {
+        s.selected[i] = 0;
+        i             = i + 1;
+    }
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    blit.widget.note(ctx, "Click selects, ctrl or command adds, shift selects a run. A double click, the caret or the right arrow opens a node.");
+    var src: blit.tree.Source;
+    src.user   = user;
+    src.count  = count;
+    src.child  = child;
+    src.select = select;
+    src.clear  = clear;
+    val ev: blit.tree.Event = blit.tree.tree(ctx, "files", ?s.tree, ?src, blit.context.px(ctx, 220.0::f32));
+    if (ev.activated)  { s.opened = ev.handle; }
+    if (s.opened != 0) { blit.widget.text(ctx, TREE[(s.opened - 1)::usize].name); }
+}

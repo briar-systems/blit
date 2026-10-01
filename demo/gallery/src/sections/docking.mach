@@ -1,0 +1,80 @@
+# docking: windows docked into a dock space, split and tabbed
+#
+# the gallery's screen is a dock space, the desk, and the gallery itself is
+# docked in it. a space is a tree of splits and tab stacks kept in the state
+# store. build one in code with root, split and add, or drag a window's
+# titlebar over a space and drop it on a zone. drag a tab out to float it
+# again. the windows here are drawn by the section's root hook every frame.
+
+use std.types.string.str;
+
+use blit;
+
+# the sample windows and what was asked of them
+# ---
+# open: the sample windows are drawn
+# ask:  1 to dock them beside the gallery, 2 to float them, 0 for nothing
+# was:  whether each window was open last frame
+pub rec State {
+    open: u8;
+    ask:  u8;
+    was:  [2]u8;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    blit.widget.note(ctx, "The gallery is a window docked in the desk, a dock space over the whole screen.");
+    if (blit.widget.button(ctx, "Dock two windows beside the gallery")) { s.ask = 1; }
+    if (blit.widget.button(ctx, "Float them"))                          { s.ask = 2; }
+    blit.widget.toggle(ctx, "Show them", ?s.open);
+    blit.widget.note(ctx, "Drag a floating window's titlebar over the desk to see its drop zones: the centre docks it as a tab, an edge splits the leaf beneath. Hold shift to drop it without docking.");
+}
+
+# open or close a window by its state: a window that was open and is now
+# closed was closed by its close button
+fun sync(ctx: *blit.context.Context, key: str, open: *u8, was: *u8) {
+    val st: *blit.widget.WindowState = blit.widget.window_state(ctx, key);
+    if (@was != 0 && st.closed != 0) { @open = 0; }
+    st.closed = 1 - @open;
+    @was      = @open;
+}
+
+pub fun root(ctx: *blit.context.Context, user: ptr) {
+    val s:     *State = user::*State;
+    val scene: u64    = blit.context.id_of(ctx, "Scene");
+    val props: u64    = blit.context.id_of(ctx, "Properties");
+
+    # a layout built in code: a strip on the left of whatever the desk holds,
+    # split again across its middle
+    if (s.ask == 1) {
+        val desk: u64 = blit.context.id_of(ctx, "desk");
+        val left: u64 = blit.dock.split(ctx, blit.dock.root(ctx, desk), blit.context.Side.left{}, 0.3::f32);
+        blit.dock.add(ctx, left, scene);
+        val low: u64 = blit.dock.split(ctx, left, blit.context.Side.bottom{}, 0.5::f32);
+        blit.dock.add(ctx, low, props);
+        s.open = 1;
+    }
+    if (s.ask == 2) {
+        blit.dock.remove(ctx, scene);
+        blit.dock.remove(ctx, props);
+        s.open = 1;
+    }
+    s.ask = 0;
+    var open: u8 = s.open;
+    sync(ctx, "Scene", ?open, ?s.was[0]);
+    sync(ctx, "Properties", ?s.open, ?s.was[1]);
+    if (open == 0) { s.open = 0; }
+
+    val a: blit.widget.WindowArea = blit.widget.begin_window(ctx, blit.widget.window("Scene", 60.0::f32, 120.0::f32, 220.0::f32, 160.0::f32));
+    if (a.body != 0) {
+        blit.widget.text(ctx, "camera");
+        blit.widget.text(ctx, "light");
+        blit.widget.text(ctx, "ground");
+    }
+    blit.widget.end_window(ctx, a);
+    val b: blit.widget.WindowArea = blit.widget.begin_window(ctx, blit.widget.window("Properties", 300.0::f32, 120.0::f32, 220.0::f32, 160.0::f32));
+    if (b.body != 0) { blit.widget.note(ctx, "Its content and ids are the same docked or floating."); }
+    blit.widget.end_window(ctx, b);
+}

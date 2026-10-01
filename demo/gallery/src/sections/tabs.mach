@@ -1,0 +1,59 @@
+# tabs: a bar of tabs that select, reorder by drag and close
+#
+# tabs are keyed, so reordering or closing one never changes another's
+# identity. the bar sorts the caller's array into its order in place and
+# reports what changed; the selected key is kept in the state store.
+
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use blit;
+
+# what the tabs keep
+# ---
+# tabs: the open tabs, in the bar's order
+# n:    how many are open
+pub rec State {
+    tabs: [5]blit.tabs.Tab;
+    n:    usize;
+}
+
+pub fun init(s: *State) {
+    s.tabs[0] = blit.tabs.Tab{key: 1, label: "Scene", closable: false};
+    s.tabs[1] = blit.tabs.Tab{key: 2, label: "Console", closable: true};
+    s.tabs[2] = blit.tabs.Tab{key: 3, label: "Profiler", closable: true};
+    s.tabs[3] = blit.tabs.Tab{key: 4, label: "Assets", closable: true};
+    s.tabs[4] = blit.tabs.Tab{key: 5, label: "Settings", closable: true};
+    s.n       = 5;
+}
+
+# what each tab shows
+fun body(ctx: *blit.context.Context, key: u64) {
+    if (key == 1) { blit.widget.note(ctx, "The scene tab cannot be closed. Drag tabs to reorder them."); }
+    or (key == 2) { blit.widget.note(ctx, "> build ok in 1.2 s"); }
+    or (key == 3) { blit.controls.progress(ctx, 0.62::f32, "frame 62%"); }
+    or (key == 4) { blit.widget.note(ctx, "12 textures, 4 meshes"); }
+    or            { blit.widget.note(ctx, "Nothing to set yet."); }
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s:  *State          = user::*State;
+    val ev: blit.tabs.Event = blit.tabs.bar(ctx, "docs", ?s.tabs[0], s.n);
+
+    # a closed tab leaves the array; the bar selects a neighbour
+    if (ev.closed) {
+        var i: usize = 0;
+        var o: usize = 0;
+        for (i < s.n) {
+            if (s.tabs[i].key != ev.key) {
+                s.tabs[o] = s.tabs[i];
+                o         = o + 1;
+            }
+            i = i + 1;
+        }
+        s.n = o;
+    }
+    if (ev.selected != 0)                                       { body(ctx, ev.selected); }
+    if (s.n < 5 && blit.widget.button(ctx, "Reopen every tab")) { init(s); }
+}

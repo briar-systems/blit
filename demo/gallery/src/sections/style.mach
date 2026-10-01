@@ -1,0 +1,80 @@
+# style and themes: overrides, classes, built-in looks, scale and the editor
+#
+# every colour and length a widget draws with is a field of the theme with a
+# path, such as button.hot.fill. blit.style pushes values onto the fields a
+# path names for a scope of widgets, and a class is a named list of such
+# settings. the theme editor edits the live theme with blit's own widgets,
+# and a theme saves and loads as TOML.
+
+use allo: std.allocator;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use blit;
+
+# what the section keeps
+# ---
+# danger: the class handle, 0 before it is made
+# scale:  the interface scale chosen
+# saved:  bytes the last save wrote
+pub rec State {
+    danger: u32;
+    scale:  usize;
+    saved:  usize;
+}
+
+pub fun init(s: *State) {}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    # a push changes every field its path names until the matching pop
+    blit.controls.separator_label(ctx, "Overrides");
+    blit.style.push_color(ctx, "button.*.fill", blit.draw.hex(0x2F6F4F, 1.0::f32));
+    blit.style.push_length(ctx, "button.radius", blit.context.px(ctx, 12.0::f32));
+    blit.widget.button(ctx, "Pushed green and round");
+    blit.style.pop(ctx);
+    blit.style.pop(ctx);
+    blit.widget.button(ctx, "Back to the theme");
+
+    # a class is made once and applied to any scope
+    blit.controls.separator_label(ctx, "Classes");
+    if (s.danger == 0) {
+        val c: opt[u32] = blit.style.add_class(ctx, "danger");
+        if (sel c.some) {
+            s.danger = c.some;
+            blit.style.set(ctx, s.danger, "button.*.fill", blit.theme.of_color(blit.draw.hex(0xB03030, 1.0::f32)));
+            blit.style.set(ctx, s.danger, "button.hot.fill", blit.theme.of_color(blit.draw.hex(0xD04040, 1.0::f32)));
+        }
+    }
+    blit.style.push_class(ctx, s.danger);
+    blit.widget.button(ctx, "Delete everything");
+    blit.style.pop(ctx);
+
+    # every length scales with the interface, layout and hit rects included
+    blit.controls.separator_label(ctx, "Interface scale");
+    var scales: [3]str;
+    scales[0] = "100%";
+    scales[1] = "125%";
+    scales[2] = "150%";
+    if (blit.widget.segmented(ctx, ?scales[0], 3, ?s.scale)) {
+        blit.context.set_scale(ctx, 1.0::f32 + s.scale::f32 * 0.25::f32);
+    }
+
+    blit.controls.separator_label(ctx, "Theme editor");
+    val did: u8 = blit.editor.theme_editor(ctx, "editor", blit.context.px(ctx, 260.0::f32));
+    if ((did & blit.editor.SAVE) != 0) {
+        # a host writes the TOML wherever it keeps themes
+        val text: res[str, allo.Error] = blit.style.save_theme(ctx);
+        if (sel text.ok) { s.saved = str_len(text.ok); }
+    }
+    if (s.saved != 0) {
+        var buf: [48]u8;
+        blit.widget.text(ctx, "bytes of TOML saved:");
+        blit.widget.same_line(ctx);
+        blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](s.saved::u64), ?buf[0]));
+    }
+}
