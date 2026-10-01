@@ -672,7 +672,7 @@ shortcuts while it is closed:
 var bar:  blit.menu.Menu = blit.menu.begin_bar(?ctx, "main");
 var file: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?bar, "File");
 var save: blit.menu.Item = blit.menu.of("Save");
-save.shortcut = blit.menu.keys('S', blit.input.MOD_CTRL);
+save.shortcut = blit.menu.keys('S', blit.menu.MOD_PRIMARY);
 if (blit.menu.item(?ctx, ?file, save)) { ... }
 var recent: blit.menu.Menu = blit.menu.begin_menu(?ctx, ?file, "Recent");
 blit.menu.item(?ctx, ?recent, blit.menu.of("notes.txt"));
@@ -693,8 +693,12 @@ blit.menu.end_menu(?ctx, ?cm);
   check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
   drawn before the label (text, nil for none) and a disabled flag.
 - **Shortcuts.** An item fires when its key is pressed with exactly its
-  modifiers, open or closed, and stays quiet while a widget holds the keyboard
-  (`context.typing`).
+  modifiers, open or closed, and stays quiet while another widget holds the
+  keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
+  ctrl or super (see `input.shortcut`), shown as `Cmd` on darwin and `Ctrl`
+  elsewhere.
+- **Focus.** An open tree owns the keyboard: it takes the focus when it opens
+  and gives it back to the previous holder the frame after it closes.
 - **Keys.** The deepest open menu takes up and down (over enabled items),
   enter, right and left (into and out of submenus, and across a bar's headers)
   and escape.

@@ -13,7 +13,13 @@
 # return a Menu whose open says whether it is drawn, and item draws only in an
 # open menu. what an item does whatever the menu's state is answer its
 # shortcut, so a registered shortcut fires its item while the menu is closed.
-# shortcuts stay quiet while a widget holds the keyboard (see context.typing).
+# shortcuts stay quiet while a widget holds the keyboard (see context.typing),
+# unless that widget is the item's own open menu.
+#
+# an open tree owns the keyboard: the frame it opens it takes the focus under
+# its bar's or context menu's id (see context.focus), so a text field beneath
+# no longer sees its keys, and the frame after it closes it gives the focus
+# back to the widget that held it before, which keeps it while it is drawn.
 #
 # the open menu deepest in a tree takes the arrow keys, enter and escape: up
 # and down move its highlight over the enabled items, enter fires the
@@ -81,6 +87,10 @@ val SHIFT_NONE: u8 = 0;
 val SHIFT_NEXT: u8 = 1;
 val SHIFT_PREV: u8 = 2;
 
+# a Shortcut.mods bit for the platform's command key: ctrl or super, as
+# input.shortcut accepts, shown as "Cmd" on darwin and "Ctrl" elsewhere
+pub val MOD_PRIMARY: u8 = 0x80;
+
 # the bytes a shortcut's text can take, NUL included
 pub val SHORTCUT_TEXT: usize = 40;
 
@@ -89,7 +99,7 @@ pub val SHORTCUT_TEXT: usize = 40;
 # code: a printable ascii character, letters uppercase, or an input.KEY_*
 #       constant, 0 for none
 # mods: the input.MOD_* bits held with it, all of which must be held and no
-#       others
+#       others, or MOD_PRIMARY with shift as needed for the platform's command key
 pub rec Shortcut {
     code: u32;
     mods: u8;
@@ -128,6 +138,9 @@ pub rec Item {
 # h:      the height the menu took last frame
 # mx:     the cursor x the menu saw last frame
 # my:     the cursor y the menu saw last frame
+# owns:   1 while a bar or context menu holds the focus for its open tree,
+#         2 the frame after it closed, before it gives the focus back
+# prev:   the focus holder before the tree took it, given back on close
 pub rec MenuState {
     child:  u64;
     open:   u8;
@@ -140,6 +153,8 @@ pub rec MenuState {
     h:      f32;
     mx:     f32;
     my:     f32;
+    owns:   u8;
+    prev:   u64;
 }
 
 # the handle a bar or menu hands its items, submenus and end call
@@ -150,6 +165,7 @@ pub rec MenuState {
 # st:     its state, valid until the frame ends
 # parent: the bar or menu it opened from, nil for a bar or context menu
 # root:   the state of the bar or context menu its tree hangs from
+# rid:    the id of the bar or context menu its tree hangs from
 # pop:    its popup, for a menu
 # keys:   the K_* bits it answers this frame, 0 unless it is the deepest open
 # moved:  true when the cursor moved since the menu's last frame
@@ -182,6 +198,7 @@ pub rec Menu {
     st:     *MenuState;
     parent: *Menu;
     root:   *MenuState;
+    rid:    u64;
     pop:    widget.Popup;
     keys:   u8;
     moved:  bool;
@@ -293,6 +310,14 @@ pub fun shortcut_text(s: Shortcut, buf: *u8, cap: usize) usize {
     buf[0] = 0;
     if (s.code == 0) { ret 0; }
     var n: usize = 0;
+    if ((s.mods & MOD_PRIMARY) != 0) {
+        $if ($mach.build.os == $mach.os.darwin) {
+            n = put(buf, cap, n, "Cmd+");
+        }
+        $or {
+            n = put(buf, cap, n, "Ctrl+");
+        }
+    }
     if ((s.mods & input.MOD_CTRL) != 0)  { n = put(buf, cap, n, "Ctrl+"); }
     if ((s.mods & input.MOD_ALT) != 0)   { n = put(buf, cap, n, "Alt+"); }
     if ((s.mods & input.MOD_SHIFT) != 0) { n = put(buf, cap, n, "Shift+"); }
@@ -316,6 +341,15 @@ pub fun shortcut_text(s: Shortcut, buf: *u8, cap: usize) usize {
     ret n;
 }
 
+# whether held modifiers are a shortcut's: exactly its own, or for
+# MOD_PRIMARY the command key (see input.shortcut) and the rest exactly
+fun mods_match(held: u8, want: u8) bool {
+    if ((want & MOD_PRIMARY) == 0) { ret held == want; }
+    val cmd: u8 = input.MOD_CTRL | input.MOD_SUPER;
+    if (!input.shortcut(held)) { ret false; }
+    ret (held & (cmd ^ 0xFF)) == (want & ((cmd | MOD_PRIMARY) ^ 0xFF));
+}
+
 # whether the frame pressed a shortcut's key with exactly its modifiers
 fun struck(ctx: *context.Context, s: Shortcut) bool {
     if (s.code == 0) { ret false; }
@@ -327,8 +361,8 @@ fun struck(ctx: *context.Context, s: Shortcut) bool {
         val e: input.Event = ctx.in.events.data[i];
         if (sel e.key) {
             var c: u32 = e.key.code;
-            if (c >= 'a' && c <= 'z')                       { c = c - 32; }
-            if (c == want && (e.key.mods & mask) == s.mods) { ret true; }
+            if (c >= 'a' && c <= 'z')                               { c = c - 32; }
+            if (c == want && mods_match(e.key.mods & mask, s.mods)) { ret true; }
         }
         i = i + 1;
     }
@@ -355,6 +389,37 @@ fun nav_keys(ctx: *context.Context) u8 {
     ret k;
 }
 
+# keep the keyboard with an open tree, rooted at id with state st, taking it
+# the frame the tree opens and giving it back the frame after it closes, so
+# the key that closed it never reaches the widget it goes back to
+#
+# a press inside the open tree drops the focus at begin (see context.begin),
+# so an open tree takes a dropped focus back. a widget that took the focus
+# from the tree keeps it.
+fun hold(ctx: *context.Context, id: u64, st: *MenuState, open: bool) {
+    if (open) {
+        if (st.owns == 0) {
+            st.owns = 1;
+            st.prev = ctx.focus;
+            context.focus(ctx, id);
+            ret;
+        }
+        st.owns = 1;
+        if (ctx.focus == 0) { context.focus(ctx, id); }
+        context.focused(ctx, id);
+        ret;
+    }
+    if (st.owns == 0) { ret; }
+    if (st.owns == 1) {
+        st.owns = 2;
+        context.focused(ctx, id);
+        ret;
+    }
+    st.owns = 0;
+    if (ctx.focus == id || ctx.focus == 0) { context.focus(ctx, st.prev); }
+    st.prev = 0;
+}
+
 # close a whole tree from its root's state
 fun close(root: *MenuState) {
     root.open  = 0;
@@ -369,7 +434,11 @@ fun menu_of(ctx: *context.Context, id: u64, kind: u8, st: *MenuState, parent: *M
     m.st     = st;
     m.parent = parent;
     m.root   = st;
-    if (parent != nil) { m.root = parent.root; }
+    m.rid    = id;
+    if (parent != nil) {
+        m.root = parent.root;
+        m.rid  = parent.rid;
+    }
     m.first = NONE;
     m.last  = NONE;
     m.prev  = NONE;
@@ -406,7 +475,7 @@ fun open_popup(ctx: *context.Context, m: *Menu, x: f32, y: f32, flip_x: f32, nes
     m.moved = ctx.in.mx != st.mx || ctx.in.my != st.my;
     st.mx   = ctx.in.mx;
     st.my   = ctx.in.my;
-    if (st.child == 0) { m.keys = nav_keys(ctx); }
+    if (st.child == 0 && ctx.focus == m.rid) { m.keys = nav_keys(ctx); }
 }
 
 # start a menu bar as the next item of the current layout frame
@@ -458,6 +527,7 @@ pub fun end_bar(ctx: *context.Context, m: *Menu) {
         st.child                            = to;
         state.get[MenuState](ctx, to).first = 1;
     }
+    hold(ctx, m.id, st, st.child != 0);
 
     context.set_channel(ctx, m.ch, 0);
     context.quad(ctx, m.x0, m.y0, m.x1, m.y1, ctx.theme.header);
@@ -618,7 +688,10 @@ fun label_x(ctx: *context.Context, m: *Menu, x0: f32) f32 {
 # m:   the value begin_menu or begin_context returned
 pub fun end_menu(ctx: *context.Context, m: *Menu) {
     val st: *MenuState = m.st;
-    if (m.open == 0) { ret; }
+    if (m.open == 0) {
+        if (m.kind == KIND_CONTEXT) { hold(ctx, m.id, st, false); }
+        ret;
+    }
 
     if ((m.keys & K_DOWN) != 0) {
         if (m.next != NONE)  { st.cursor = m.next + 1; }
@@ -656,7 +729,8 @@ pub fun end_menu(ctx: *context.Context, m: *Menu) {
     st.icons = icons;
 
     widget.end_popup(ctx, m.pop);
-    if (m.pop.dismissed != 0) { close(m.root); }
+    if (m.pop.dismissed != 0)   { close(m.root); }
+    if (m.kind == KIND_CONTEXT) { hold(ctx, m.id, st, st.open != 0); }
 }
 
 # a thin line between groups of items in an open menu
@@ -683,7 +757,8 @@ pub fun separator(ctx: *context.Context, m: *Menu) {
 # ret: true on the frame it fires
 pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
     var fired: bool = false;
-    if (!it.disabled && !context.typing(ctx) && struck(ctx, it.shortcut)) { fired = true; }
+    val quiet: bool = context.typing(ctx) && ctx.focus != m.rid;
+    if (!it.disabled && !quiet && struck(ctx, it.shortcut)) { fired = true; }
 
     if (m.open != 0 && m.kind != KIND_BAR) {
         val i:       u32          = row_index(m, !it.disabled);
@@ -817,6 +892,7 @@ rec Probe {
     quits:  u32;
     cut:    u32;
     exp:    u32;
+    zooms:  u32;
     grid:   u8;
     typing: u8;
     f:      field.Field;
@@ -853,6 +929,9 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
     grid.check = ?pr.grid;
     grid.icon  = "#";
     item(ctx, ?view, grid);
+    var zoom: Item = of("Zoom");
+    zoom.shortcut = keys('Z', MOD_PRIMARY);
+    if (item(ctx, ?view, zoom)) { pr.zooms = pr.zooms + 1; }
     end_menu(ctx, ?view);
     end_bar(ctx, ?bar);
 
@@ -999,6 +1078,15 @@ test menu__shortcuts_fire_closed_and_stay_quiet_while_typing {
     driver.key(?d, 'S', 0);
     if (pr.saved != 1) { ret 3; }
 
+    # the primary modifier is ctrl or super, with the rest exact
+    driver.key(?d, 'Z', input.MOD_CTRL);
+    driver.key(?d, 'Z', input.MOD_SUPER);
+    if (pr.zooms != 2) { ret 8; }
+    driver.key(?d, 'Z', input.MOD_CTRL | input.MOD_ALT);
+    driver.key(?d, 'Z', input.MOD_CTRL | input.MOD_SHIFT);
+    driver.key(?d, 'Z', 0);
+    if (pr.zooms != 2) { ret 9; }
+
     # quiet while a text field holds the keyboard
     driver.click(?d, driver.find(?d, "name"));
     if (!driver.focused(?d, driver.find(?d, "name"))) { ret 4; }
@@ -1009,6 +1097,13 @@ test menu__shortcuts_fire_closed_and_stay_quiet_while_typing {
     if (shortcut_text(keys('S', input.MOD_CTRL | input.MOD_SHIFT), ?buf[0], SHORTCUT_TEXT) != 12) { ret 6; }
     if (buf[0] != 'C' || buf[11] != 'S' || buf[12] != 0)                                          { ret 6; }
     if (shortcut_text(keys(input.KEY_DELETE, 0), ?buf[0], SHORTCUT_TEXT) != 3)                    { ret 7; }
+    val n: usize = shortcut_text(keys('Z', MOD_PRIMARY | input.MOD_SHIFT), ?buf[0], SHORTCUT_TEXT);
+    $if ($mach.build.os == $mach.os.darwin) {
+        if (n != 11 || buf[0] != 'C' || buf[1] != 'm') { ret 10; }
+    }
+    $or {
+        if (n != 12 || buf[0] != 'C' || buf[1] != 't') { ret 10; }
+    }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
@@ -1068,6 +1163,44 @@ test menu__keyboard_navigates_an_open_menu {
     driver.key(?d, input.KEY_ESCAPE, 0);
     driver.step(?d);
     if (driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 12; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__an_open_menu_owns_the_keyboard {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    val name: u64 = driver.find(?d, "name");
+    driver.click(?d, name);
+    driver.type_text(?d, "ab");
+    if (!driver.focused(?d, name) || pr.f.caret != 2) { ret 2; }
+
+    # a context menu opened over the focused field takes the keyboard
+    driver.move(?d, 50.0::f32, 150.0::f32);
+    driver.press(?d, input.BUTTON_RIGHT);
+    driver.release(?d, input.BUTTON_RIGHT);
+    if (!driver.drawn(?d, driver.find(?d, "canvas/Cut")) || driver.focused(?d, name)) { ret 3; }
+
+    # the arrows move the menu's highlight and leave the caret alone
+    val st: *MenuState = state.get[MenuState](?d.ctx, driver.find(?d, "canvas"));
+    driver.key(?d, input.KEY_DOWN, 0);
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (st.cursor != 1 || pr.f.caret != 2) { ret 4; }
+
+    # escape closes it and the field has the keyboard again
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    driver.step(?d);
+    if (driver.drawn(?d, driver.find(?d, "canvas/Cut"))) { ret 5; }
+    if (!driver.focused(?d, name))                       { ret 6; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (pr.f.caret != 1) { ret 7; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
