@@ -47,7 +47,9 @@ use blit.context;
 use blit.draw;
 use blit.field;
 use blit.font;
+use gly: blit.glyph;
 use blit.input;
+use rich_text: blit.text;
 use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
@@ -321,6 +323,20 @@ pub fun text(ctx: *context.Context, s: str) {
     advance(ctx, context.line_height(ctx));
 }
 
+# draw a rich line of spans at the cursor and advance to the next row
+#
+# each span draws in its own style and color, all on one baseline (see
+# blit.text.Span).
+# ---
+# ctx: context
+# sp:  the spans
+# n:   how many
+pub fun rich(ctx: *context.Context, sp: *rich_text.Span, n: usize) {
+    val m: gly.LineMetrics = rich_text.spans_line(ctx, sp, n);
+    val w: f32             = rich_text.spans_at(ctx, sp, n, ctx.cx, ctx.cy);
+    advance(ctx, m.ascent + m.descent + m.gap);
+}
+
 # where the line of s starting at byte i ends when wrapped to w pixels
 #
 # a line breaks at a newline, else after the last space that keeps it within
@@ -380,7 +396,7 @@ pub fun note(ctx: *context.Context, s: str) {
     for (i < n || lines == 0) {
         var next: usize = n;
         val end:  usize = wrap_line(ctx, s, n, i, ctx.pw, ?next);
-        if (end > i) { context.text_span(ctx, ?s[i], end - i, ctx.cx, y, ctx.theme.text_faint); }
+        if (end > i) { context.text_span(ctx, ?s[i], end - i, ctx.cx, y, ctx.theme.text_dim); }
         y     = y + lh;
         lines = lines + 1;
         i     = next;
@@ -959,7 +975,7 @@ pub fun text_field(ctx: *context.Context, f: *field.Field, hint: str) u8 {
     val lh: f32 = context.line_height(ctx);
     val ty: f32 = y0 + (h - lh) / 2.0::f32;
     context.push_clip(ctx, tx, y0, tx + tw, y1);
-    if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, ctx.theme.text_dim); }
+    if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, ctx.theme.text_faint); }
     if (on && field.selected(f)) {
         var lo: usize = field.sel_lo(f);
         if (lo < f.first) { lo = f.first; }
