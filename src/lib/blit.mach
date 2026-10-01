@@ -12,6 +12,7 @@ use std.runtime;
 fwd blit.atlas;
 fwd blit.bitmap;
 fwd blit.draw;
+fwd blit.path;
 fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;

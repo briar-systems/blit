@@ -2,10 +2,10 @@
 
 An immediate-mode GUI library in Mach.
 
-Widgets accumulate a draw list of colored, textured triangles and report
-interaction. The consumer feeds input each frame, runs the widgets, and uploads
-and renders the resulting vertices — blit stays out of the windowing and
-rendering.
+Widgets accumulate an indexed draw list of colored, textured triangles and
+report interaction. The consumer feeds input each frame, runs the widgets, and
+uploads and renders the resulting vertices and indices, so blit stays out of
+the windowing and rendering.
 
 ```mach
 use blit;
@@ -23,12 +23,12 @@ blit.widget.checkbox(?ctx, "running", ?running);
 blit.widget.slider_f(?ctx, "rate", ?rate, 0.0::f32, 1.0::f32);
 blit.widget.end_panel(?ctx, panel);
 blit.context.end(?ctx);
-# upload the atlas pages that changed (see Rendering), then
-# blit.context.draw_verts(?ctx) / draw_count(?ctx), and draw as triangles.
+# upload the atlas pages that changed (see Rendering), then the vertices and
+# indices, and draw each run with its texture and scissor.
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
 `blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
@@ -153,10 +153,9 @@ blit.context.set_scale(?ctx, 2.0::f32);
 - **Rows fit their text.** A control row is `row` tall, or a line of text plus
   `pad` above and below if that is taller, so a larger glyph source never
   overflows its rows.
-- **Corners from quads.** `corner` rounds controls and containers with one
-  quad per pixel row of each rounded end (`blit.context.fill`), so rounding
-  needs nothing of the renderer and clips like any quad. The default is square,
-  one quad per rect.
+- **Rounded corners.** `corner` rounds controls and containers through
+  `blit.context.fill`, a feathered rounded rect (see Shapes & paths). The
+  default is square, one quad per rect.
 
 ## Docked containers
 
@@ -272,11 +271,12 @@ blit.context.end(?ctx);
 
 ## Clipping & sub-surfaces
 
-Clipping is geometric and CPU-side, so blit stays out of the backend. Push a
-clip rect with `blit.context.push_clip(?ctx, x0, y0, x1, y1)` — intersected with
-the active rect — and restore it with `pop_clip`. Quads fully outside the rect
-are dropped and partial ones are shrunk with their uvs interpolated, and a
-clipped-out widget never becomes hot.
+Push a clip rect with `blit.context.push_clip(?ctx, x0, y0, x1, y1)`,
+intersected with the active rect, and restore it with `pop_clip`. Geometry
+wholly outside the rect is dropped on the CPU, and the rest is kept whole: every
+run of the draw list carries the clip rect it was drawn under, which the
+renderer sets as its scissor (see Rendering). So any shape clips, rotated,
+curved or feathered, and a clipped-out widget never becomes hot.
 
 `blit.context.begin_surface(?ctx, x, y, w, h, scroll_x, scroll_y)` opens a
 clipped region with its own scrolled local coordinate space: emit content and
@@ -349,8 +349,8 @@ if (h.held) { drag_by(h.dx, h.dy); }
 ## Widgets & layout
 
 Every widget places itself at the layout cursor, spans the column, advances
-the cursor and emits only quads, so each one clips and scrolls like any
-geometry and works inside surfaces, docks and windows alike.
+the cursor and draws through the painter, so each one clips and scrolls like
+any geometry and works inside surfaces, docks and windows alike.
 
 - **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
   `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
@@ -502,7 +502,7 @@ blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
   screen pixels, and every length is a theme metric at the context's scale.
 - **Plain quads.** Charts emit through the painter like every widget, clipped to
   their rect and to any clip or sub-surface they sit in, and allocate nothing
-  beyond their vertices.
+  beyond their vertices and indices.
 
 ## Layers & input routing
 
@@ -514,7 +514,14 @@ click is always the one visibly on top.
   the clip reset to the screen. `pop_layer` returns. `end()` composes the draw
   list by layer, keeping call order within a layer, so a popup opened early in
   the frame still paints over a window called after it. `run_at` reports each
-  span's `layer`.
+  run's `layer`.
+- **Channels.** A container that paints its background once its contents are
+  known (a panel, window or popup) splits the runs drawn after it into
+  channels: `ch = blit.context.split(?ctx, 2)`, `set_channel(?ctx, ch, 1)` for
+  its children, then `set_channel(?ctx, ch, 0)` to draw its background and
+  `merge(?ctx, ch)`. A lower channel paints beneath a higher one whatever the
+  order they were drawn in, so the background can be any shape. Splits nest,
+  and each is merged on the layer it was made on.
 - **Claims.** Interactive widgets claim through `blit.interact.hit`, which calls
   `blit.context.claim(?ctx, id, x0, y0, x1, y1)`: it records the rect with the
   key (layer, then claim order) and returns whether the widget is hovered. Containers call `reserve_claim` before
@@ -541,13 +548,13 @@ click is always the one visibly on top.
 blit draws textures it does not own. A consumer texture is named by an opaque
 `u64` handle, whatever the renderer understands (a GL texture name, an index
 into its own table). blit never creates, owns or binds one, it only passes the
-handle through to the draw list's spans. `0` is reserved for the atlas.
+handle through to the draw list's runs. `0` is reserved for the atlas.
 
 - **Image.** `blit.draw.Image` is a handle, a source rect in uv and a filter.
   `blit.draw.region(tex, tw, th, x, y, w, h, filter)` builds one from a rect in
   texels, `whole(tex, filter)` covers the texture.
 - **Drawing.** `blit.context.image_at(?ctx, img, x0, y0, x1, y1, tint)` stretches
-  the region into a rect, clipped like any geometry with its uvs cut to match.
+  the region into a rect, clipped like any geometry by its run's scissor.
   `blit.widget.image(?ctx, img, w, h)` places it at the layout cursor.
 - **Grids.** `blit.widget.Grid` is a row-major field of cells, each colored by
   the consumer (`colors`) or by mapping `values` through a `Palette` of equal
@@ -556,40 +563,105 @@ handle through to the draw list's spans. `0` is reserved for the atlas.
   texture. A large one is better uploaded as a texture and drawn with
   `FILTER_NEAREST`.
 
+## Shapes & paths
+
+The painter draws shapes in the current local space, clipped by the run's
+scissor like everything else. Every edge but a plain quad's is antialiased by
+feathered geometry: a strip one pixel wide whose outer vertices carry no
+color, so antialiasing needs nothing of the renderer beyond the contract
+below. Curves and arcs stay within a quarter pixel of the true shape, so their
+segment count follows their size on screen and the interface scale.
+
+- **Rects.** `quad` fills a rect with one quad and `frame(?ctx, x0, y0, x1, y1,
+  w, c)` outlines it with a band `w` wide inside its edges, both crisp on whole
+  pixels. `rounded_rect` and `stroke_rounded_rect` take a radius per corner
+  (`blit.draw.Radii`, `blit.draw.radii(r)` for all four), scaled down together
+  when they would overlap. `fill` is a rounded rect with one radius on the
+  corners `CORNERS_*` names.
+- **Triangles, lines and arcs.** `tri` fills a triangle. `line` and
+  `polyline(?ctx, ?pts[0], n, closed, w, join, c)` stroke `w` wide, centred on
+  their points, ending square, with `blit.draw.JOIN_MITER`, `JOIN_BEVEL` or
+  `JOIN_ROUND` at each corner (a miter past 4 half widths bevels). `circle`
+  fills, `stroke_circle` rings inside the radius, and `arc(?ctx, cx, cy, r,
+  a0, a1, w, c)` strokes from angle `a0` to `a1` in radians, clockwise on
+  screen.
+- **Paths.** `blit.path` builds contours of `move`, `line`, `quad` (quadratic),
+  `cubic` and `close` commands into a `Path` the consumer owns:
+  ```mach
+  var p: blit.path.Path = blit.path.init(?a);
+  blit.path.move(?p, 0.0::f32, 0.0::f32);
+  blit.path.cubic(?p, 4.0::f32, -6.0::f32, 12.0::f32, -6.0::f32, 16.0::f32, 0.0::f32);
+  blit.path.line(?p, 8.0::f32, 12.0::f32);
+  blit.path.close(?p);
+  blit.context.fill_path(?ctx, ?p, look.accent);
+  blit.context.stroke_path(?ctx, ?p, 1.5::f32, blit.draw.JOIN_ROUND, look.text);
+  ```
+  A fill takes the nonzero rule, so a hole is a contour wound against its
+  outline and crossing contours fill their union. Contours that overlap still
+  show the faint feathers of the edges they hide, so icons are cleanest drawn
+  as contours that meet without overlapping. Filling costs the square of the
+  edge count, which suits icons and small shapes.
+- **Gradients.** `blit.draw.gradient(x0, y0, c0, x1, y1, c1)` is a linear
+  gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
+  `rounded_rect_gradient` and `fill_path_gradient`.
+- **Colors.** `blit.draw.hex(0xRRGGBB, alpha)` sits beside `blit.draw.rgba`.
+
 ## Rendering
 
-blit emits one vertex stream that draws both solid rectangles and text through
-a single shader per texture. Solid quads sample a white block every atlas page
-carries, so `color * texel` is the flat color; glyph quads sample the glyph's
-cell.
+blit emits one indexed triangle list that draws solid shapes and text through
+a single shader per texture. Solid shapes sample a white block every atlas
+page carries, so `color * texel` is the flat color, and glyphs sample their
+cell. Colors and texels are premultiplied.
 
+- **Buffers.** After `end`, upload the vertices (`draw_verts` / `draw_count`,
+  `blit.draw.Vert`) and the u32 indices (`draw_indices` / `index_count`), three
+  per triangle, in composed paint order. Vertices stay in the order they were
+  drawn. Only the indices are reordered to paint layers and channels.
+- **Runs.** `run_count` / `run_at` divide the index list into runs, in paint
+  order. A `Run` is plain numbers: `kind` (u32), `tex` (u64), `page`, `layer`
+  and `filter` (u32), the scissor `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1`
+  (f32) and `start` and `count` (usize, in indices). Every index lies in one
+  run. Draw the runs in order:
+  - **Kind.** `blit.context.RUN_TRIANGLES` (0) is the only kind today: bind,
+    scissor and draw as below. Skip a run of any other kind, so later kinds
+    (such as consumer spans) need no change to a renderer that ignores them.
+  - **Texture.** When `tex` is `blit.draw.ATLAS` (0), bind atlas page `page`.
+    Otherwise `tex` is the consumer's own texture handle, passed through
+    untouched, and `filter` asks for `FILTER_NEAREST` (0) or `FILTER_LINEAR` (1)
+    sampling. On the atlas `filter` is always `FILTER_NEAREST` and how to sample
+    it stays the renderer's choice. Rebind only when `tex`, `page` or `filter`
+    change.
+  - **Scissor.** The clip is in screen pixels, y down, the space vertices are
+    in. Round each edge to the nearest pixel, scale by the framebuffer's pixels
+    per screen pixel when they differ, and in GL flip y:
+    `glScissor(x0, fb_h - y1, x1 - x0, y1 - y0)`. Set it whenever it changes,
+    with `GL_SCISSOR_TEST` enabled.
+  - **Draw.** `glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT,
+    start * 4)`: indices are absolute vertex numbers, so no base vertex.
+- **State.** Blend premultiplied: `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)`.
+  Disable face culling (triangles come in either winding) and depth testing.
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
   pages, each an RGBA8 square of `blit.atlas.PAGE_SIDE` (512) texels at
-  `page_pixels(at, i)`. Pages open as glyphs arrive and never resize, and past
-  `blit.atlas.PAGE_MAX` (16) the least recently drawn one is cleared and
-  reused, wholly dirty. Each has a
-  `page_version` bumped on every write and a `page_dirty` rect: upload the dirty
-  rect of each changed page before drawing, then `page_clean` it. Every glyph
-  has a transparent gutter, so linear filtering is safe. The built-in font at
-  whole scales looks sharpest with nearest.
-- **Spans.** `run_count`/`run_at` split the draw list into spans that each
-  sample one texture, so every quad's texture is its span's. A `Run` is plain
-  integers: `tex` (u64), `page` (u32), `layer` (u32), `start` and `count`
-  (vertices, usize), `filter` (u32). When `tex` is `blit.draw.ATLAS` (0), bind atlas
-  page `page`. Otherwise `tex` is the consumer's own texture handle, passed
-  through untouched, and `filter` asks for `FILTER_NEAREST` (0) or
-  `FILTER_LINEAR` (1) sampling. On the atlas `filter` is always
-  `FILTER_NEAREST` and how to sample it stays the renderer's choice. Draw
-  spans in order, rebinding only when `tex`, `page` or `filter` differ from
-  the previous span.
-- **Color.** Colors are straight rgba as authored. When the target encodes sRGB
-  on write, call `blit.context.set_srgb(?ctx, 1)`: every color is then emitted
-  in linear light, so the encoding brings it back to what was authored. Alpha is
-  never converted. Each distinct color is converted once and cached on the
-  context (`blit.draw.LinearCache`), so sRGB output costs next to nothing.
+  `page_pixels(at, i)`, premultiplied (a glyph's coverage in all four channels,
+  the white block opaque). Pages open as glyphs arrive and never resize, and
+  past `blit.atlas.PAGE_MAX` (16) the least recently drawn one is cleared and
+  reused, wholly dirty. Each has a `page_version` bumped on every write and a
+  `page_dirty` rect: upload the dirty rect of each changed page before drawing,
+  then `page_clean` it. Every glyph has a transparent gutter, so linear
+  filtering is safe. The built-in font at whole scales looks sharpest with
+  nearest.
+- **Consumer textures** are sampled as premultiplied alpha: upload them
+  premultiplied.
+- **Color.** Colors are authored as straight rgba and premultiplied as they are
+  emitted. When the target encodes sRGB on write, call
+  `blit.context.set_srgb(?ctx, 1)`: every color is then converted to linear
+  light before premultiplying, so the encoding brings it back to what was
+  authored. Alpha is never converted. Each distinct color is converted once and
+  cached on the context (`blit.draw.LinearCache`), so sRGB output costs next to
+  nothing. Gradients interpolate the emitted colors.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
-  straight rgba.
+  premultiplied rgba.
 - **Shader.** One `vec2 uScreen` uniform:
   ```glsl
   gl_Position = vec4(aPos.x / uScreen.x * 2.0 - 1.0,
@@ -598,9 +670,18 @@ cell.
   ```
 - **Per frame.** Fill an `Input` (`mx`, `my`, `down`, `wheel`, the keyboard
   events and any `paste`), `begin`, widgets, `end`, hand `copied` to the
-  clipboard and answer `wants_paste`, then upload `draw_verts` / `draw_count` and draw each span as
-  `GL_TRIANGLES` with its texture bound and `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA`
-  blending.
+  clipboard and answer `wants_paste`, upload the changed atlas pages, the
+  vertices and the indices, and draw each run as above.
+- **From 0.9.** A renderer written for the 0.9 contract changes in these
+  places, and the atlas upload, the vertex layout and the shader stay as they
+  were:
+  - upload the index buffer and draw each run with `glDrawElements` over
+    `start` and `count`, which now count indices, where it drew arrays
+  - apply each run's scissor
+  - blend `ONE` / `ONE_MINUS_SRC_ALPHA` where it blended `SRC_ALPHA` /
+    `ONE_MINUS_SRC_ALPHA`, and leave face culling off
+  - skip runs whose `kind` is not `RUN_TRIANGLES`
+  - upload consumer textures premultiplied
 
 ## Build & test
 
@@ -612,7 +693,7 @@ mach test .
 
 `demo/harness/` is its own project with a path dependency on this checkout. It
 drives a headless frame end to end through a bare `use blit;` and prints the
-vertex count and atlas pages. It takes std from this checkout's `dep/std`, so
+vertex, index and run counts and atlas pages. It takes std from this checkout's `dep/std`, so
 pull the root first:
 
 ```
