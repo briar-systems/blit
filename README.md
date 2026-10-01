@@ -496,8 +496,9 @@ blit.widget.end_window(?ctx, w);
 - **The tree.** A split node divides its rect between two children along an
   axis by a ratio, and a leaf is a tab stack of windows. `root`, `split` (a
   new empty leaf on one side of a node, taking a share of it), `add` (dock a
-  window as a leaf's last tab), `remove` (float it again) and `node_of` build
-  and read it in code. A window is its title's id. The tree lives in the
+  window as a leaf's last tab), `insert` (dock it at an index in the leaf's
+  tab stack), `select` (bring a docked window to its leaf's front), `remove`
+  (float it again) and `node_of` build and read it in code. A window is its title's id. The tree lives in the
   state store, one small entry per space, node and docked window, so a layout
   of any size fits, and everything in it is pinned.
 - **Drawing.** `space(?ctx, key, area)` lays the tree out over the rect, in
