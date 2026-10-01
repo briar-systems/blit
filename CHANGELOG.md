@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-01
+
+The #92 epic: a first-class immediate-mode toolkit.
+
+### Added
+- Hashed widget ids scoped by an id stack (#94): `push_id_str`, `push_id_int`, `pop_id`, `id_of`, `##` and `###` labels, and same-frame collision counts.
+- A per-id state store on the context (#95): typed `state.get[T]`, frame-age eviction and pinning, and save and load through TOML.
+- The full host input contract (#96): host time and `dt`, five buttons as a mask, both wheel axes, held modifiers, key releases, a growable event queue, IME preedit with an IME rect, cursor shape requests, and `wake_at`/`next_frame` so an idle interface can sleep.
+- Vector primitives (#79): triangles, outlines, lines and polylines with joins, rounded rects with per-corner radii, circles, arcs, paths with quadratic and cubic curves, linear gradients and feathered antialiasing, with path fills by sorted-edge sweep (#123).
+- Public interaction primitives (#78): `blit.interact.hit` with hover, press, click, double click, drag and the local cursor, the one path every widget uses.
+- Text styles (#80): several glyph sources and sizes, a style stack, a `text_faint` tier, truncation helpers, rich spans, atlas eviction, and an optional shaping hook in the glyph source.
+- A data-driven style system (#81): a style record per registered widget kind with per-state paints, a push/pop override stack, named classes, TOML themes, built-in dark, light and high-contrast themes, a live theme editor, and one field table as the source of truth.
+- A stack layout (#87): nesting horizontal and vertical stacks, alignment, fixed, fit, fill and fractional sizing with limits, same-line placement, and a hidden measuring first frame.
+- Full windows and layer bands (#82): resize from every edge, close, auto-size, scrolling bodies, z order kept by the context, persistence, flags, and bands for docked, windows, overlays, popups, modals, tooltips and drag.
+- Docking (#83): dock spaces with splits and tab stacks, drop targets and previews, splitters, tear-off, code-built layouts and persistence.
+- Overlays, toasts and tooltips (#84), modal dialogs with a confirm helper (#100), drag and drop payloads (#99), and a disabled scope (#149).
+- Widgets (#85): menus, menu bars and context menus (#104), tab bars (#105), a tree view (#106), tables (#107), value editors and a colour picker (#108), radio buttons, progress bars, separators and a filtering combo (#109), and richer lists (#110).
+- Text editing parity and a text area (#98): word movement and deletion, click, double and triple click and drag selection, undo and redo, masked and read-only fields, a character count and caret blink.
+- Charts (#86): uneven x, step series, exact u64 and f64 axes, no-gap bars, a caller-driven cursor and log scales.
+- Animation and keyboard navigation (#88): animated values keyed by id with a reduce-motion switch, tab order, arrow groups and a focus ring.
+- A built-in vector icon set (#89), usable inline in any text.
+- Consumer draw spans (#101) for app-rendered content in paint order.
+- A public headless test driver (#102) with label paths and golden snapshots.
+- An interface inspector and a demo gallery (#90).
+- A local benchmark in `demo/bench` (#103), timed in interleaved median batches (#119).
+
+### Changed
+- Breaking: widget ids are hashed from labels and keys instead of call order, and unlabelled widgets take a key argument (#94).
+- Breaking: `Input` carries time, a button mask, `present`, `mods` and `wheel_x`, its event queue is host-owned storage set up with `input.init`, and button presses and releases are queue events (#96, #121). A host must set `present = 1` while the pointer is over the surface.
+- Breaking: the draw list is indexed, colours are premultiplied, and every run carries a scissor rect and a kind; clipping is left to the renderer (#79). Channels replace `reserve_fill`/`grow_fill`.
+- Breaking: the glyph source takes an optional `shape`, glyphs are keyed by glyph id, and font functions take a style (#80).
+- Breaking: the context's layout fields are replaced by a layout stack (#87), `begin_window` takes a declaration (#82), the dock moves to `blit.dock` (#83), the list moves to `blit.list` (#110), and the chart API takes columns, series and axes (#86).
+- Per-frame cost is below 0.9.0 on every bench scene and a steady frame allocates nothing (#152).
+
+### Fixed
+- `VERSION` matches `mach.toml`, checked at release (#91).
+- Clip, origin, layer and run stacks grow instead of failing silently past a fixed depth (#97).
+- A press and release between two frames is no longer lost (#121).
+- Without a host clock, repeat clicks are single clicks (#137).
+- The wheel over a popup no longer scrolls the region beneath it (#147).
+- A change made by input or from code shows on the next frame without waiting for more input: one settle frame follows any frame with input, and setters that change what is shown ask for a frame (`context.redraw`) (#154).
+- Window, popup and other container faces are opaque in the built-in themes, so content behind them no longer reads through under linear blending (#156).
+
 ## [0.9.0] - 2026-09-30
 
 ### Added
