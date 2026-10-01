@@ -1,0 +1,292 @@
+# state that outlives a frame, kept on the context by widget id
+#
+# get[T](ctx, id) hands back the T an id keeps, zeroed the first time it is
+# asked for. the pointer stays valid until end. one id can keep several types
+# of state, each its own entry. an entry no frame has reached for max_age
+# frames (MAX_AGE by default, see set_max_age) is dropped at end, so state of
+# widgets that stopped drawing does not pile up, and pin opts an entry out.
+# when the store cannot grow, get sets the context's oom and hands back zeroed
+# scratch state that every refused entry shares, never a dangling pointer.
+#
+# a kind of state registers a name and a save and a load hook to persist.
+# save writes every entry of a registered kind into one TOML document, a
+# [<name>.<id>] table per entry, and load reads one back through std.data.toml.
+#
+# the store is one owner among several: a widget taking a caller-owned record
+# (Window, Scroll, List, Field) keeps it, so an app can still own its state.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+
+use blit.context;
+use blit.input;
+use blit.store;
+
+fwd blit.store.Writer;
+fwd blit.store.Error;
+fwd blit.store.MAX_AGE;
+fwd blit.store.put_int;
+fwd blit.store.put_float;
+fwd blit.store.put_bool;
+fwd blit.store.put_str;
+
+# the state an id keeps, zeroed on first use
+#
+# T is at most store.SCRATCH bytes and store.SCRATCH_ALIGN aligned, a compile
+# error otherwise. larger state belongs in a caller-owned record the entry
+# points at.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: the entry, valid until end; scratch state with oom set when refused
+pub fun get[T](ctx: *context.Context, id: u64) *T {
+    $if ($size_of(T) > 1024) {
+        $error("state larger than store.SCRATCH bytes");
+    }
+    $if ($align_of(T) > 16) {
+        $error("state aligned wider than store.SCRATCH_ALIGN");
+    }
+    val r: res[ptr, allo.Error] = store.slot(?ctx.store, id, $type_id(T), $size_of(T), $align_of(T));
+    if (sel r.err) {
+        ctx.oom = 1;
+        ret store.scratch(?ctx.store)::*T;
+    }
+    ret r.ok::*T;
+}
+
+# keep an id's T through any number of untouched frames, or stop keeping it
+#
+# pinning reaches the entry, creating it zeroed when there is none.
+# ---
+# ctx: context
+# id:  the widget's id
+# on:  1 to pin, 0 to let the entry age out again
+pub fun pin[T](ctx: *context.Context, id: u64, on: u8) {
+    val p: *T           = get[T](ctx, id);
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(T));
+    if (e != nil) { e.pinned = on; }
+}
+
+# frames an unpinned entry survives untouched before end drops it
+# ---
+# ctx:    context
+# frames: the age, 0 to keep every entry until the context is freed
+pub fun set_max_age(ctx: *context.Context, frames: u64) {
+    ctx.store.max_age = frames;
+}
+
+# register T for persistence under a name
+#
+# save writes T's fields through the writer's put_* calls, and load reads them
+# from the entry's table with std.data.toml's getters into a zeroed T. strings
+# a load hook reads are freed once load returns, so it copies what it keeps.
+# registering T again replaces its hooks.
+# ---
+# ctx:  context
+# name: the kind's table name in a saved document, which must outlive the context
+# save: writes one entry
+# load: reads one entry
+# ret:  ok, taken when another type holds the name, or the registry's refusal
+pub fun register[T](ctx: *context.Context, name: str, save: fun(*T, *store.Writer), load: fun(*T, *toml.Table)) err[store.Error] {
+    var k: store.Kind;
+    k.kind  = $type_id(T);
+    k.name  = name;
+    k.size  = $size_of(T);
+    k.align = $align_of(T);
+    k.save  = save:~store.SaveFun;
+    k.load  = load:~store.LoadFun;
+    ret store.register(?ctx.store, k);
+}
+
+# write every entry of a registered kind as one TOML document
+# ---
+# ctx: context
+# ret: the document, owned by the context until the next save or free, or the
+#      refusal that cut it short
+pub fun save(ctx: *context.Context) res[str, allo.Error] {
+    ret store.save(?ctx.store);
+}
+
+# read a document save wrote back into the store
+#
+# every entry it holds is zeroed, filled by its kind's load hook and counts as
+# reached this frame. tables of unregistered kinds are skipped.
+# ---
+# ctx:  context
+# text: the document, NUL-terminated
+# ret:  ok, or the failure, positioned in the text where it has a position
+pub fun load(ctx: *context.Context, text: str) err[toml.TomlError] {
+    ret store.load(?ctx.store, text);
+}
+
+rec Pane {
+    x:    f32;
+    y:    f32;
+    open: u8;
+}
+
+rec Note {
+    n:    i64;
+    text: [16]u8;
+}
+
+#[testing]
+fun pane_save(p: *Pane, w: *store.Writer) {
+    store.put_float(w, "x", p.x::f64);
+    store.put_float(w, "y", p.y::f64);
+    store.put_bool(w, "open", p.open);
+}
+
+#[testing]
+fun pane_load(p: *Pane, t: *toml.Table) {
+    val x: opt[f64]  = toml.get_float(t, "x");
+    val y: opt[f64]  = toml.get_float(t, "y");
+    val o: opt[bool] = toml.get_bool(t, "open");
+    if (sel x.some) { p.x = x.some::f32; }
+    if (sel y.some) { p.y = y.some::f32; }
+    if (sel o.some) { p.open = o.some; }
+}
+
+#[testing]
+fun note_save(n: *Note, w: *store.Writer) {
+    store.put_int(w, "n", n.n);
+    store.put_str(w, "the text", ?n.text[0]);
+}
+
+#[testing]
+fun note_load(n: *Note, t: *toml.Table) {
+    val v: opt[i64] = toml.get_int(t, "n");
+    val s: opt[str] = toml.get_str(t, "the text");
+    if (sel v.some) { n.n = v.some; }
+    if (sel s.some) {
+        var i: usize = 0;
+        for (i < 15 && s.some[i] != 0) {
+            n.text[i] = s.some[i];
+            i         = i + 1;
+        }
+    }
+}
+
+# one empty frame
+#[testing]
+fun idle(ctx: *context.Context) {
+    var in: input.Input;
+    context.begin(ctx, in, 100.0::f32, 100.0::f32);
+    context.end(ctx);
+}
+
+test get__keeps_ages_out_and_pins {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    set_max_age(?ctx, 2);
+
+    # zeroed on first use, and one id keeps each type apart
+    var in: input.Input;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    val p: *Pane = get[Pane](?ctx, 7);
+    if (p.x != 0.0::f32 || p.open != 0) { ret 2; }
+    p.x = 5.0::f32;
+    val n: *Note = get[Note](?ctx, 7);
+    if (n.n != 0) { ret 3; }
+    n.n = 9;
+    val q: *Pane = get[Pane](?ctx, 8);
+    q.x = 6.0::f32;
+    pin[Pane](?ctx, 8, 1);
+    context.end(?ctx);
+
+    # kept across a frame that reaches it, then one untouched frame
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (get[Pane](?ctx, 7).x != 5.0::f32) { ret 4; }
+    context.end(?ctx);
+    idle(?ctx);
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (get[Pane](?ctx, 7).x != 5.0::f32) { ret 5; }
+    if (get[Note](?ctx, 7).n != 0)        { ret 6; }
+    context.end(?ctx);
+
+    # two untouched frames drop the entry, the pinned one stays
+    idle(?ctx);
+    idle(?ctx);
+    if (get[Pane](?ctx, 7).x != 0.0::f32) { ret 7; }
+    if (get[Pane](?ctx, 8).x != 6.0::f32) { ret 8; }
+
+    # unpinned, it ages out like any other. reached between frames, it counts
+    # as reached in the next one
+    pin[Pane](?ctx, 8, 0);
+    idle(?ctx);
+    idle(?ctx);
+    idle(?ctx);
+    if (get[Pane](?ctx, 8).x != 0.0::f32) { ret 9; }
+    if (context.ok(?ctx) == 0)            { ret 10; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test save__load_round_trips_two_kinds {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var src: context.Context;
+    val ie:  err[allo.Error] = context.init(?src, ?a);
+    if (sel ie.err) { ret 1; }
+
+    val rp: err[store.Error] = register[Pane](?src, "pane", pane_save, pane_load);
+    if (sel rp.err) { ret 2; }
+    val rn: err[store.Error] = register[Note](?src, "note", note_save, note_load);
+    if (sel rn.err) { ret 2; }
+    val dup: err[store.Error] = register[Note](?src, "pane", note_save, note_load);
+    if (sel dup.ok) { ret 3; }
+
+    val p: *Pane = get[Pane](?src, 3);
+    p.x    = 1.5::f32;
+    p.y    = -2.0::f32;
+    p.open = 1;
+    val n: *Note = get[Note](?src, 0xFFFFFFFFFFFFFFF0u64);
+    n.n       = -9;
+    n.text[0] = 'a';
+    n.text[1] = '"';
+    n.text[2] = '\n';
+    n.text[3] = 'b';
+
+    val doc: res[str, allo.Error] = save(?src);
+    if (sel doc.err) { ret 4; }
+
+    var dst: context.Context;
+    val je:  err[allo.Error] = context.init(?dst, ?a);
+    if (sel je.err) { ret 1; }
+    register[Pane](?dst, "pane", pane_save, pane_load);
+    register[Note](?dst, "note", note_save, note_load);
+    val ld: err[toml.TomlError] = load(?dst, doc.ok);
+    if (sel ld.err) { ret 5; }
+
+    val lp: *Pane = get[Pane](?dst, 3);
+    if (lp.x != 1.5::f32 || lp.y != -2.0::f32 || lp.open != 1) { ret 6; }
+    val ln: *Note = get[Note](?dst, 0xFFFFFFFFFFFFFFF0u64);
+    if (ln.n != -9)                                                   { ret 7; }
+    if (ln.text[0] != 'a' || ln.text[1] != '"' || ln.text[2] != '\n') { ret 8; }
+    if (ln.text[3] != 'b' || ln.text[4] != 0)                         { ret 9; }
+
+    # an entry key that is not an id is refused where it stands
+    val bad: err[toml.TomlError] = load(?dst, "[pane.x]\n");
+    if (sel bad.ok) { ret 10; }
+
+    val f0: err[allo.Error] = context.free(?src);
+    if (sel f0.err) { ret 1; }
+    val f1: err[allo.Error] = context.free(?dst);
+    if (sel f1.err) { ret 1; }
+    ret 0;
+}
