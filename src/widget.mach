@@ -380,7 +380,7 @@ pub fun note(ctx: *context.Context, s: str) {
     for (i < n || lines == 0) {
         var next: usize = n;
         val end:  usize = wrap_line(ctx, s, n, i, ctx.pw, ?next);
-        if (end > i) { context.text_span(ctx, ?s[i], end - i, ctx.cx, y, ctx.theme.text_dim); }
+        if (end > i) { context.text_span(ctx, ?s[i], end - i, ctx.cx, y, ctx.theme.text_faint); }
         y     = y + lh;
         lines = lines + 1;
         i     = next;
