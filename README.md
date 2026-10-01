@@ -1781,10 +1781,12 @@ demo/panel/out/linux-x86_64/debug/bin/panel --snapshot > demo/panel/src/bin/pane
 
 `demo/bench/` measures blit's per-frame cost on a few representative
 interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
-line chart of 100,000 samples, and six overlapping windows each holding a
-section and a scroll region. Each scene runs with sRGB output off and then on,
-and the table reports the mean frame time, the vertices and runs the frame
-emits, the allocations a frame makes, and what sRGB adds. It is local only,
+line chart of 100,000 samples, six overlapping windows each holding a
+section and a scroll region, and one path of 10,000 edges filled. Each scene runs with sRGB output off and then on,
+and the table reports the median frame time over 21 timed batches with the
+spread between the fastest and slowest batch, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. The off and on
+batches are interleaved so drift in the machine's speed lands on both. It is local only,
 never a CI job. Build it in the release profile:
 
 ```
@@ -1793,18 +1795,24 @@ mach build demo/bench -p release
 demo/bench/out/linux-x86_64/release/bin/bench
 ```
 
-Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+Baseline on dev ahead of 0.10.0 (after #81), on an AMD Ryzen 7 5800X3D, to
+compare later work against. Run it on an idle machine and pinned to one core
+(`taskset -c 15`): other load shows up as a large spread, and a run whose
+spread is large is not worth comparing. Two consecutive runs recorded this way
+agreed within 1.5% on every scene.
 
 ```
-scene          srgb    us/frame  vertices  runs  allocs   srgb cost
-dense panel    off        292.4      5298     1       0
-dense panel    on         295.6      5298     1       0   +1.0%
-10k row list   off        123.6      1704     1       0
-10k row list   on         124.1      1704     1       0   +0.4%
-100k chart     off       1924.6     15738     1       0
-100k chart     on        1966.7     15738     1       0   +2.1%
-windows        off        273.9      5472     1       0
-windows        on         277.5      5472     1       0   +1.3%
+scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
+dense panel    off        495.7     0.3%      3532     3       2
+dense panel    on         501.1     0.4%      3532     3       2   +1.1%
+10k row list   off       5557.5     1.2%      1136     3       0
+10k row list   on        5555.7     1.0%      1136     3       0   +0.0%
+100k chart     off       1816.3     3.4%     10492     3       0
+100k chart     on        1854.3     4.9%     10492     3       0   +2.0%
+windows        off        424.7     1.6%      3672    18       0
+windows        on         430.0     2.7%      3672    18       0   +1.2%
+10k-edge fill  off      14532.5     0.7%    231520     1       0
+10k-edge fill  on       14539.1     2.3%    231520     1       0   +0.0%
 ```
 
 ## Conventions
