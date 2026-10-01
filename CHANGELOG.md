@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-01
+
+### Fixed
+- The demo gallery's Style and themes section no longer asks for a frame every frame, and the gallery test fails if a section that should settle keeps asking (#160).
+
 ## [0.10.0] - 2026-10-01
 
 The #92 epic: a first-class immediate-mode toolkit.
