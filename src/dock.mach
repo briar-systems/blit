@@ -1683,6 +1683,44 @@ test space__docks_by_drag_and_tears_off {
     ret 0;
 }
 
+test space__docked_body_pads_as_floating {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    var d:  driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val t:   *theme.Theme    = context.theme_of(?d.ctx);
+    val pad: opt[theme.Path] = theme.path(t, "window.pad");
+    if (sel pad.none) { ret 2; }
+    theme.set_path(t, pad.some, theme.of_edges(theme.Edges{l: 7.0::f32, t: 5.0::f32, r: 9.0::f32, b: 11.0::f32}));
+    # no titlebar, so a floating body starts where its window does
+    ap.wins[0].flags = widget.WINDOW_NO_TITLE;
+    driver.steps(?d, 2);
+
+    # floating, A's button sits the window's padding inside its body
+    val st: *widget.WindowState = widget.window_state(?d.ctx, "A");
+    val fl: opt[context.Area]   = driver.rect(?d, driver.find(?d, "A/b"));
+    if (sel fl.none) { ret 3; }
+    val fx: f32 = fl.some.x0 - st.x;
+    val fy: f32 = fl.some.y0 - st.y;
+    if (fx != 7.0::f32 || fy != 5.0::f32) { ret 4; }
+
+    # docked, the same content sits the same padding inside its rect
+    ap.build = true;
+    driver.steps(?d, 2);
+    val a:  u64               = win(?d, "A");
+    val dk: *widget.Docked    = state.find[widget.Docked](?d.ctx, a);
+    val dr: opt[context.Area] = driver.rect(?d, driver.find(?d, "A/b"));
+    if (dk == nil || node_of(?d.ctx, a) == 0)                 { ret 5; }
+    if (sel dr.none)                                          { ret 6; }
+    if (dr.some.x0 - dk.x0 != fx || dr.some.y0 - dk.y0 != fy) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test space__layout_saves_and_loads {
     var al:   allo.Allocator;
     val made: err[allo.Error] = page.make(?al);
