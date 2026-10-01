@@ -25,6 +25,11 @@
 # context.set_double_click) of the one before extends a run of clicks, and the
 # second of a run is a double click. the press that made a widget active is
 # also where its drag is measured from.
+#
+# inside a disabled scope (see context.begin_disabled) a widget still claims
+# its rect, so it hides what is under it, but reports nothing: never hot,
+# never pressed, never dragged. one that owned the pointer or held the
+# keyboard when it became disabled loses them.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -122,11 +127,13 @@ fun lowest(bits: u8) u8 {
 # id:  the widget's id
 # dx:  set to the travel in x since the press, 0 when not dragged
 # dy:  set to the travel in y since the press, 0 when not dragged
-# ret: true while the id owns the pointer and its button is down
+# ret: true while the id owns the pointer and its button is down, never in
+#      a disabled scope
 pub fun drag(ctx: *context.Context, id: u64, dx: *f32, dy: *f32) bool {
     @dx = 0.0::f32;
     @dy = 0.0::f32;
     if (id == 0 || ctx.active != id)             { ret false; }
+    if (context.disabled(ctx))                   { ret false; }
     if (input.held(ctx.in, ctx.active_btn) == 0) { ret false; }
     val p: context.Press = context.last_press(ctx, ctx.active_btn);
     @dx = ctx.in.mx - p.x;
@@ -163,7 +170,13 @@ pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, 
     h.my  = context.local_my(ctx);
     h.hot = context.claim(ctx, id, x0, y0, x1, y1) != 0;
     if (id == 0) { ret h; }
-    if (h.hot)   { ctx.hot = id; }
+    if (context.disabled(ctx)) {
+        h.hot = false;
+        if (ctx.active == id) { ctx.active = 0; }
+        if (ctx.focus == id)  { context.unfocus(ctx); }
+        ret h;
+    }
+    if (h.hot) { ctx.hot = id; }
 
     # a press takes the pointer only while no button already owns it
     val free: bool = ctx.active == 0 || input.held(ctx.in, ctx.active_btn) == 0;

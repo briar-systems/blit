@@ -64,6 +64,11 @@
 # wants_paste(), and the consumer answers the request with the next frame's
 # input.paste (see blit.input).
 #
+# a disabled scope (begin_disabled) holds widgets that draw and lay out but
+# take no input: blit.interact.hit reports nothing in it, the focus is never
+# given to or kept by a widget in it, and every kind paints in its
+# theme.DISABLED state. disabled(ctx) says whether the call site is in one.
+#
 # the rest of the host contract runs the same way. the context keeps the
 # host's clock (dt), and after end() it asks the host for a pointer shape
 # (cursor), for a place to show the IME's candidate window (ime_rect) and for
@@ -445,6 +450,8 @@ pub rec TextLine {
 # alpha_sp:     open push_alpha scopes
 # alphas:       saved parent opacities, grown on demand
 # alphas_cap:   opacities allocated for alphas
+# off_sp:       open begin_disabled scopes, disabling or not
+# off_from:     the depth of the outermost disabling scope, 0 while enabled
 # scale:        interface scale theme metrics and text are sized at, 1.0 by default
 # theme:        the colors and unscaled metrics widgets draw with
 # srgb:         1 if colors are converted to linear light for an sRGB target, else 0
@@ -578,6 +585,8 @@ pub rec Context {
     alpha_sp:     usize;
     alphas:       *f32;
     alphas_cap:   usize;
+    off_sp:       usize;
+    off_from:     usize;
     scale:        f32;
     theme:        th.Theme;
     srgb:         u8;
@@ -750,6 +759,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.alpha_sp     = 0;
     ctx.alphas       = nil;
     ctx.alphas_cap   = 0;
+    ctx.off_sp       = 0;
+    ctx.off_from     = 0;
     ctx.scale        = 1.0::f32;
     ctx.srgb         = 0;
     ctx.lin          = draw.LinearCache{};
@@ -1021,6 +1032,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.style_sp = 0;
     ctx.alpha    = 1.0::f32;
     ctx.alpha_sp = 0;
+    ctx.off_sp   = 0;
+    ctx.off_from = 0;
     ctx.font.oom = 0;
     font.begin_frame(?ctx.font);
 
@@ -1142,11 +1155,12 @@ pub fun hovered_layer(ctx: *Context) u32 {
 #
 # it holds it across frames until a press lands elsewhere, a frame does not
 # draw it (see focused), or unfocus. a widget given it during a frame counts
-# as drawn in that frame.
+# as drawn in that frame. inside a disabled scope nothing takes it.
 # ---
 # ctx: context
 # id:  the widget's id (see id_of), 0 to drop the focus
 pub fun focus(ctx: *Context, id: u64) {
+    if (id != 0 && disabled(ctx)) { ret; }
     ctx.focus       = id;
     ctx.focus_drawn = 0;
     ctx.focus_plain = plain(ctx, id);
@@ -1166,13 +1180,17 @@ pub fun unfocus(ctx: *Context) {
 # whether a widget holds the keyboard, marking it drawn this frame when it does
 #
 # a focusable widget asks this every frame it is drawn, which is what keeps
-# the focus past end().
+# the focus past end(). a holder asking inside a disabled scope loses it.
 # ---
 # ctx: context
 # id:  the widget's id
 # ret: true if the widget holds the keyboard
 pub fun focused(ctx: *Context, id: u64) bool {
     if (id == 0 || ctx.focus != id) { ret false; }
+    if (disabled(ctx)) {
+        ctx.focus = 0;
+        ret false;
+    }
     ctx.focus_drawn = 1;
     ret true;
 }
@@ -2917,6 +2935,45 @@ pub fun alpha_of(ctx: *Context) f32 {
     ret ctx.alpha;
 }
 
+# disable every widget until the matching end_disabled when on holds
+#
+# widgets inside still draw, lay out and keep their ids and state, but take
+# no hover, press, focus, keyboard or drag, and paint in their kind's
+# theme.DISABLED state. scopes nest: one opened with on false inside a
+# disabling scope stays disabled, and every scope is closed by end_disabled
+# whether it disabled or not, so a caller writes one call, not a branch.
+# ---
+# ctx: context
+# on:  true to disable what the scope holds
+pub fun begin_disabled(ctx: *Context, on: bool) {
+    ctx.off_sp = ctx.off_sp + 1;
+    if (on && ctx.off_from == 0) { ctx.off_from = ctx.off_sp; }
+}
+
+# close the scope opened by the matching begin_disabled
+# ---
+# ctx: context
+pub fun end_disabled(ctx: *Context) {
+    if (ctx.off_sp == 0)            { ret; }
+    if (ctx.off_from == ctx.off_sp) { ctx.off_from = 0; }
+    ctx.off_sp = ctx.off_sp - 1;
+}
+
+# whether widgets drawn now are disabled, for a widget or navigation that
+# reads input other than through blit.interact.hit
+# ---
+# ctx: context
+# ret: true inside a disabling begin_disabled scope
+pub fun disabled(ctx: *Context) bool {
+    ret ctx.off_from != 0;
+}
+
+# the state a kind paints in: state, or theme.DISABLED inside a disabled scope
+fun shown(ctx: *Context, state: u8) u8 {
+    if (disabled(ctx)) { ret th.DISABLED; }
+    ret state;
+}
+
 # say whether the target encodes sRGB on write
 #
 # with it on, every color passed to the painter (quads, text, image tints) is
@@ -3186,14 +3243,14 @@ pub fun look_of(ctx: *Context, kind: u32) *th.Style {
     ret ?ctx.theme.styles[kind];
 }
 
-# how a widget kind draws in a state
+# how a widget kind draws in a state, theme.DISABLED inside a disabled scope
 # ---
 # ctx:   context
 # kind:  theme.LABEL .. theme.SCRIM
 # state: theme.NORMAL .. theme.FOCUSED
 # ret:   the paint, in the context's theme
 pub fun paint_of(ctx: *Context, kind: u32, state: u8) *th.Paint {
-    ret ?ctx.theme.styles[kind].states[state];
+    ret ?ctx.theme.styles[kind].states[shown(ctx, state)];
 }
 
 # unscaled edges, in pixels at the context's scale
@@ -3256,6 +3313,9 @@ fun same_color(a: draw.Color, b: draw.Color) bool {
 
 # paint a widget kind's box in a state: its shadow, its flat or gradient
 # face and its outline, with its radii, at the context's scale
+#
+# inside a disabled scope every state paints as theme.DISABLED, as it does
+# for box_part, box_shadow, box_face and paint_of.
 # ---
 # ctx:   context
 # kind:  theme.LABEL .. theme.SCRIM
@@ -3312,7 +3372,7 @@ pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32,
 # y1:      bottom y in pixels
 # corners: which corners are rounded, CORNERS_* combined with |
 pub fun box_shadow(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8) {
-    shadow_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[state], x0, y0, x1, y1, corners);
+    shadow_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[shown(ctx, state)], x0, y0, x1, y1, corners);
 }
 
 # a style's shadow in a paint
@@ -3335,7 +3395,7 @@ fun shadow_with(ctx: *Context, s: *th.Style, p: *th.Paint, x0: f32, y0: f32, x1:
 # corners: which corners are rounded, CORNERS_* combined with |
 # sides:   which sides are outlined, SIDES_* combined with |
 pub fun box_face(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
-    face_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[state], x0, y0, x1, y1, corners, sides);
+    face_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[shown(ctx, state)], x0, y0, x1, y1, corners, sides);
 }
 
 # paint a widget kind's box with a paint of the caller's: the kind's radii,

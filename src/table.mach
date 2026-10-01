@@ -877,7 +877,8 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
 # draw the scrollbars
 #
 # the wheel goes to the table when the widget under the cursor is in it and
-# no scroll region inside took it first, and scrolls from the next frame.
+# no scroll region inside took it first, and scrolls from the next frame. a
+# table in a disabled scope (see context.begin_disabled) takes no wheel.
 # ---
 # ctx: context
 # t:   the table begin opened
@@ -912,7 +913,7 @@ pub fun end(ctx: *context.Context, t: *Table) {
 
     chooser(ctx, t, st);
 
-    if (ctx.wheel_taken == 0 && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
+    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
         st.sy           = st.sy - ctx.in.wheel::f64;
         st.sx           = st.sx + ctx.in.wheel_x;
         ctx.wheel_taken = 1;

@@ -211,6 +211,9 @@ pub val FOCUSED: u8 = 5;
 
 # the state a widget paints in, the first that holds of on, focused, active
 # and hot, else normal
+#
+# inside a disabled scope the context paints whatever state is picked as
+# DISABLED (see context.begin_disabled), so widgets never pick it themselves.
 # ---
 # hot:     under the cursor
 # active:  pressed or dragged

@@ -2057,7 +2057,7 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     # a press on the layer the window last drew on brings it to the front
     # this frame
     # and so does the keyboard moving the focus onto it
-    var lift: bool = input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != 0
+    var lift: bool = input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != 0 && !context.disabled(ctx)
         && context.hovered_layer(ctx) == band.layer(band.WINDOWS, st.slot);
     val went: opt[u32] = context.moved_to(ctx);
     if (sel went.some) {
@@ -2454,9 +2454,11 @@ fun scroll_in(ctx: *context.Context, id: u64, s: *Scroll, a: context.Area, scope
 # the wheel goes to the innermost region holding the topmost claim under the
 # cursor within the same band (see context.push_band), so a region under a
 # popup, modal or window does not scroll, even one the popup was opened in,
-# and a region nested in another scrolls before its parent. scrolling applies
-# from the next frame, like all input. a tab stop inside the region that the
-# keyboard moved the focus to this frame is scrolled into view, when it fits.
+# and a region nested in another scrolls before its parent. a region in a
+# disabled scope (see context.begin_disabled) takes no wheel, which goes on to
+# its parent. scrolling applies from the next frame, like all input. a tab
+# stop inside the region that the keyboard moved the focus to this frame is
+# scrolled into view, when it fits.
 # ---
 # ctx: context
 # s:   the region's state, updated with its content, the wheel and any drag
@@ -2471,7 +2473,7 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     context.end_surface(ctx, r.surf);
 
     # the hovered widget claimed inside this region, or the region itself
-    if (ctx.wheel_taken == 0 && ctx.in.wheel != 0.0::f32 && ctx.hover_seen > r.seen) {
+    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.in.wheel != 0.0::f32 && ctx.hover_seen > r.seen) {
         s.offset        = s.offset - ctx.in.wheel;
         ctx.wheel_taken = 1;
     }
@@ -3135,6 +3137,107 @@ test slider__maps_cursor_linearly {
     if (p.v != 5.0::f32) { ret 4; }
     driver.drag(?d, x, r.some.x1 + 50.0::f32, y);
     if (p.v != 10.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# what the disabled probe drew with and what it saw
+# ---
+# outer:  whether the outer scope disables
+# inner:  whether the inner scope disables
+# ok:     times the button in the inner scope clicked
+# go:     times the button between the scopes clicked
+# after:  times the button after both scopes clicked
+# f:      the field in the inner scope
+# buf:    its text
+# off:    whether the inner scope read disabled
+# dimmed: whether the inner scope painted a hot button as disabled
+#[testing]
+rec Gate {
+    outer:  bool;
+    inner:  bool;
+    ok:     usize;
+    go:     usize;
+    after:  usize;
+    f:      field.Field;
+    buf:    [16]u8;
+    off:    bool;
+    dimmed: bool;
+}
+
+# a panel with a button and a field in an inner scope, a button in the outer
+# scope after it and one past both
+#[testing]
+fun gate_ui(ctx: *context.Context, user: ptr) {
+    val g: *Gate = user::*Gate;
+    val b: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    context.begin_disabled(ctx, g.outer);
+    context.begin_disabled(ctx, g.inner);
+    g.off    = context.disabled(ctx);
+    g.dimmed = context.paint_of(ctx, theme.BUTTON, theme.HOT) == context.paint_of(ctx, theme.BUTTON, theme.DISABLED);
+    if (button(ctx, "ok")) { g.ok = g.ok + 1; }
+    text_field(ctx, "name", ?g.f, nil);
+    context.end_disabled(ctx);
+    if (button(ctx, "go")) { g.go = g.go + 1; }
+    context.end_disabled(ctx);
+    if (button(ctx, "after")) { g.after = g.after + 1; }
+    end_panel(ctx, b);
+}
+
+test disabled__scope_takes_no_click_or_focus_and_nests {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var g: Gate;
+    g.outer = false;
+    g.inner = false;
+    g.ok    = 0;
+    g.go    = 0;
+    g.after = 0;
+    field.init(?g.f, ?g.buf[0], 16, 0, nil);
+    var d: driver.Driver;
+    val e: err[allo.Error] = driver.init(?d, ?a, 200.0::f32, 200.0::f32, gate_ui, (?g)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+    val ok:   u64 = driver.find(?d, "ok");
+    val name: u64 = driver.find(?d, "name");
+
+    # enabled, the button clicks and the field takes the focus
+    if (g.off || g.dimmed)                  { ret 2; }
+    if (!driver.click(?d, ok) || g.ok != 1) { ret 3; }
+    driver.click(?d, name);
+    if (!driver.focused(?d, name)) { ret 4; }
+
+    # a field that becomes disabled drops the focus, and a disabled button
+    # paints disabled, is never hot and does not click
+    g.inner = true;
+    driver.step(?d);
+    if (driver.focused(?d, name) || !g.off || !g.dimmed) { ret 5; }
+    driver.hover(?d, ok);
+    if (driver.hot(?d, ok)) { ret 6; }
+    driver.click(?d, ok);
+    if (g.ok != 1) { ret 7; }
+    driver.click(?d, name);
+    if (driver.focused(?d, name)) { ret 8; }
+    driver.type_text(?d, "x");
+    driver.step(?d);
+    if (g.f.len != 0) { ret 9; }
+    # the enabled scope around it still takes input
+    driver.click(?d, driver.find(?d, "go"));
+    if (g.go != 1) { ret 10; }
+
+    # an enabling scope inside a disabling one stays disabled, and closing
+    # the disabling one enables again
+    g.outer = true;
+    g.inner = false;
+    driver.step(?d);
+    if (!g.off) { ret 11; }
+    driver.click(?d, ok);
+    driver.click(?d, driver.find(?d, "go"));
+    driver.click(?d, driver.find(?d, "after"));
+    if (g.ok != 1 || g.go != 1 || g.after != 1) { ret 12; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

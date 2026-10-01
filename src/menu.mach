@@ -776,19 +776,21 @@ pub fun separator(ctx: *context.Context, m: *Menu) {
 # while highlighted, or by its shortcut whether the menu is open or not
 #
 # firing it flips @check for a checkable item. a click or enter also closes
-# the menu's whole tree. a disabled item never fires.
+# the menu's whole tree. a disabled item, or one in a disabled scope (see
+# context.begin_disabled), never fires.
 # ---
 # ctx: context
 # m:   the menu it belongs to
 # it:  the item
 # ret: true on the frame it fires
 pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
+    val off:   bool = it.disabled || context.disabled(ctx);
     var fired: bool = false;
     val quiet: bool = context.typing(ctx) && ctx.focus != m.rid;
-    if (!it.disabled && !quiet && struck(ctx, it.shortcut)) { fired = true; }
+    if (!off && !quiet && struck(ctx, it.shortcut)) { fired = true; }
 
     if (m.open != 0 && m.kind != KIND_BAR) {
-        val i:       u32          = row_index(m, !it.disabled);
+        val i:       u32          = row_index(m, !off);
         val id:      u64          = context.id_of(ctx, it.label);
         val p:       f32          = pad(ctx);
         val rh:      f32          = row_h(ctx);
@@ -798,27 +800,27 @@ pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
         val x1:      f32          = r.x1;
         val y1:      f32          = r.y1;
         var buttons: u8           = input.BUTTON_LEFT;
-        if (it.disabled) { buttons = 0; }
+        if (off) { buttons = 0; }
 
         val h: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, buttons);
         if (h.hot) {
-            if (it.disabled) { context.set_cursor(ctx, input.CURSOR_NOT_ALLOWED); }
-            or               { context.set_cursor(ctx, input.CURSOR_HAND); }
+            if (off) { context.set_cursor(ctx, input.CURSOR_NOT_ALLOWED); }
+            or       { context.set_cursor(ctx, input.CURSOR_HAND); }
         }
         if (h.hot && m.moved) {
             m.st.child = 0;
-            if (!it.disabled) { m.st.cursor = i + 1; }
+            if (!off) { m.st.cursor = i + 1; }
         }
-        val here:   bool = m.st.cursor == i + 1 && !it.disabled;
+        val here:   bool = m.st.cursor == i + 1 && !off;
         var picked: bool = h.clicked;
         if (here && (m.keys & K_ENTER) != 0) { picked = true; }
-        if (picked && !it.disabled) {
+        if (picked && !off) {
             fired = true;
             close(m.root);
         }
 
         var st: u8 = theme.pick(here, false, false, false);
-        if (it.disabled) { st = theme.DISABLED; }
+        if (off) { st = theme.DISABLED; }
         val ip:  *theme.Paint = context.paint_of(ctx, theme.MENU_ITEM, st);
         val ink: draw.Color   = ip.text;
         context.box(ctx, theme.MENU_ITEM, st, x0, y0, x1, y1);
