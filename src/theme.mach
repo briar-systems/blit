@@ -12,13 +12,39 @@
 #
 # colors are straight rgba as authored in sRGB, like every color passed to the
 # painter (see context.set_srgb).
+#
+# motion is data too: a duration and an easing curve per kind of motion (see
+# MOTIONS), which widgets read through blit.anim.timing alone.
 
 use std.types.size.usize;
 
 use blit.draw;
+use blit.ease;
 
 # how many series colors a theme holds
 pub val SERIES: usize = 8;
+
+# the kinds of motion a theme times, indexing Theme.motion
+#
+# hover:  hover and press transitions of a control's face
+# open:   a section opening and closing
+# scroll: a scroll region gliding to where the wheel, a key or the keyboard
+#         focus sent it
+pub val MOTION_HOVER:  usize = 0;
+pub val MOTION_OPEN:   usize = 1;
+pub val MOTION_SCROLL: usize = 2;
+
+# how many kinds of motion a theme times
+pub val MOTIONS: usize = 3;
+
+# how one kind of motion moves
+# ---
+# dur:   seconds it takes, 0 to jump straight to the end
+# curve: a blit.ease curve
+pub rec Motion {
+    dur:   f32;
+    curve: u8;
+}
 
 # the colors and unscaled metrics widgets draw with
 # ---
@@ -55,6 +81,9 @@ pub val SERIES: usize = 8;
 # line_w:      width of a chart line
 # tick:        length of a chart axis tick
 # area:        alpha factor of the area filled under a chart line, in [0, 1]
+# focus:       the focus ring drawn around the widget the keyboard moved to
+# focus_w:     width of the focus ring
+# motion:      each kind of motion's duration and curve, indexed by MOTION_*
 pub rec Theme {
     panel:       draw.Color;
     window:      draw.Color;
@@ -89,6 +118,9 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
+    focus:       draw.Color;
+    focus_w:     f32;
+    motion:      [3]Motion;
 }
 
 # blit's own look: dark surfaces, square corners and 4 pixel spacing
@@ -136,5 +168,11 @@ pub fun default() Theme {
     t.line_w      = 2.0::f32;
     t.tick        = 4.0::f32;
     t.area        = 0.25::f32;
+    t.focus       = draw.rgba(0.40::f32, 0.65::f32, 1.0::f32, 1.0::f32);
+    t.focus_w     = 2.0::f32;
+
+    t.motion[MOTION_HOVER]  = Motion{dur: 0.08::f32, curve: ease.OUT};
+    t.motion[MOTION_OPEN]   = Motion{dur: 0.15::f32, curve: ease.IN_OUT};
+    t.motion[MOTION_SCROLL] = Motion{dur: 0.12::f32, curve: ease.OUT};
     ret t;
 }

@@ -1,0 +1,59 @@
+# easing curves: how an animation moves from its start to its end
+#
+# a curve maps progress t in [0, 1] to how far along the value is, 0 at the
+# start and 1 at the end. curves are data, named by the constants below, so a
+# theme stores one per kind of motion (see blit.theme.Motion) and a new curve
+# is one more constant and one more case in at.
+
+# constant speed
+pub val LINEAR: u8 = 0;
+
+# fast at first, slowing into the end (cubic), for things reacting to the user
+pub val OUT: u8 = 1;
+
+# slow at both ends (cubic), for things moving on their own
+pub val IN_OUT: u8 = 2;
+
+# how many curves there are
+pub val COUNT: u8 = 3;
+
+# how far along a curve is at progress t
+# ---
+# curve: LINEAR, OUT or IN_OUT; any other is LINEAR
+# t:     progress, clamped to [0, 1]
+# ret:   the eased progress in [0, 1], 0 at t 0 and 1 at t 1
+pub fun at(curve: u8, t: f32) f32 {
+    var p: f32 = t;
+    if (p <= 0.0::f32) { ret 0.0::f32; }
+    if (p >= 1.0::f32) { ret 1.0::f32; }
+    if (curve == OUT) {
+        val q: f32 = 1.0::f32 - p;
+        ret 1.0::f32 - q * q * q;
+    }
+    if (curve == IN_OUT) {
+        if (p < 0.5::f32) { ret 4.0::f32 * p * p * p; }
+        val q: f32 = 2.0::f32 - 2.0::f32 * p;
+        ret 1.0::f32 - q * q * q / 2.0::f32;
+    }
+    ret p;
+}
+
+test at__ends_fixed_and_monotonic {
+    var c: u8 = 0;
+    for (c < COUNT) {
+        if (at(c, 0.0::f32) != 0.0::f32 || at(c, 1.0::f32) != 1.0::f32)  { ret 1; }
+        if (at(c, -1.0::f32) != 0.0::f32 || at(c, 2.0::f32) != 1.0::f32) { ret 2; }
+        var last: f32 = 0.0::f32;
+        var k:    u32 = 1;
+        for (k <= 20) {
+            val v: f32 = at(c, k::f32 / 20.0::f32);
+            if (v < last) { ret 3; }
+            last = v;
+            k    = k + 1;
+        }
+        c = c + 1;
+    }
+    # out leads linear, in-out trails it in the first half
+    if (at(OUT, 0.25::f32) <= 0.25::f32 || at(IN_OUT, 0.25::f32) >= 0.25::f32) { ret 4; }
+    ret 0;
+}

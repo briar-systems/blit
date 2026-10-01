@@ -156,6 +156,38 @@ pub fun steps(d: *Driver, n: usize) {
     }
 }
 
+# the most frames settle runs before giving up on an interface that never rests
+pub val SETTLE_MAX: usize = 600;
+
+# run frames while the interface asks for the next one at once (see
+# context.next_frame), so its animations and glides reach their ends
+#
+# a frame asked for later, such as a caret's next blink, ends it.
+# ---
+# d:   driver
+# ret: the frames run, SETTLE_MAX when it never settled
+pub fun settle(d: *Driver) usize {
+    var n: usize = 0;
+    for (n < SETTLE_MAX) {
+        val next: opt[f64] = context.next_frame(?d.ctx);
+        if (sel next.none) { ret n; }
+        if (sel next.some) {
+            if (next.some != 0.0::f64) { ret n; }
+        }
+        step(d);
+        n = n + 1;
+    }
+    ret n;
+}
+
+# whichever widget holds the keyboard after the last frame
+# ---
+# d:   driver
+# ret: its id, 0 for none
+pub fun focus_of(d: *Driver) u64 {
+    ret d.ctx.focus;
+}
+
 # the id a label path names from the root scope
 # ---
 # d:    driver
