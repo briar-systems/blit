@@ -31,6 +31,7 @@ use blit.edit;
 use blit.field;
 use blit.font;
 use blit.input;
+use blit.interact;
 use blit.widget;
 
 # rows a TextArea first allocates, doubled whenever they fill
@@ -268,6 +269,13 @@ fun vertical(ctx: *context.Context, t: *TextArea, f: *field.Field, k: input.Key,
     field.move(f, offset_in(ctx, t, f, to, t.goal), shift);
 }
 
+# scroll so the caret's row is in view in an area h tall
+fun reveal(t: *TextArea, f: *field.Field, lh: f32, p: f32, h: f32) {
+    val cy: f32 = row_of(t, f.caret)::f32 * lh;
+    if (cy < t.scroll.offset)                         { t.scroll.offset = cy; }
+    if (cy + lh + p * 2.0::f32 > t.scroll.offset + h) { t.scroll.offset = cy + lh + p * 2.0::f32 - h; }
+}
+
 # whether a key moves the caret by rows
 fun is_vertical(code: u32) bool {
     ret code == input.KEY_UP || code == input.KEY_DOWN || code == input.KEY_PAGE_UP || code == input.KEY_PAGE_DOWN;
@@ -306,36 +314,9 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     f.flags = f.flags | field.LINES;
     lay_out(ctx, t, f, wide, narrow, bh, p);
 
-    # the pointer, in the text's own coordinates
-    val sx:  f32   = ctx.lx + x0;
-    val sy:  f32   = ctx.ly + y0;
-    val hov: bool  = ctx.hover == id && input.in_rect(ctx.in, sx, sy, sx + w, sy + bh) != 0;
-    val px:  f32   = ctx.in.mx - sx - p;
-    val py:  f32   = ctx.in.my - sy + t.scroll.offset - p;
-    var pr:  usize = 0;
-    if (py > 0.0::f32)                   { pr = (py / lh)::usize; }
-    if (pr + 1 > t.count && t.count > 0) { pr = t.count - 1; }
-
     var moved: bool = false;
     val rev:   u64  = f.rev;
-    if (hov) {
-        ctx.hot = id;
-        context.set_cursor(ctx, input.CURSOR_TEXT);
-    }
-    if (hov && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
-        ctx.active = id;
-        context.focus(ctx, id);
-        edit.press(ctx, id, f, offset_in(ctx, t, f, pr, px), edit.click(ctx, id));
-        t.aiming = 0;
-        moved    = true;
-    }
-    or (ctx.active == id && input.held(ctx.in, input.BUTTON_LEFT) != 0 && ctx.focus == id) {
-        edit.drag(ctx, id, f, offset_in(ctx, t, f, pr, px));
-        t.aiming = 0;
-        moved    = true;
-    }
-
-    var out: u8 = 0;
+    var out:   u8   = 0;
     if (context.focused(ctx, id)) {
         if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
         var i: usize = 0;
@@ -361,17 +342,13 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     lay_out(ctx, t, f, wide, narrow, bh, p);
 
     val content: f32 = t.count::f32 * lh + p * 2.0::f32;
-    if (moved || f.rev != rev) {
-        val cy: f32 = row_of(t, f.caret)::f32 * lh;
-        if (cy < t.scroll.offset)                          { t.scroll.offset = cy; }
-        if (cy + lh + p * 2.0::f32 > t.scroll.offset + bh) { t.scroll.offset = cy + lh + p * 2.0::f32 - bh; }
-    }
+    if (moved || f.rev != rev) { reveal(t, f, lh, p, bh); }
     t.scroll.content = content;
 
     val on:    bool       = ctx.focus == id;
     val quiet: bool       = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
     var bg:    draw.Color = ctx.theme.track;
-    if (ctx.hot == id && !on) { bg = ctx.theme.control_hot; }
+    if (ctx.hover == id && !on) { bg = ctx.theme.control_hot; }
     val corner: f32 = context.px(ctx, ctx.theme.corner);
     if (on) {
         val ew: f32 = context.px(ctx, ctx.theme.edge_w);
@@ -381,8 +358,22 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     or { context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, bg); }
 
     context.push_id(ctx, id);
-    val r:   widget.ScrollArea = widget.begin_scroll(ctx, "#scroll", ?t.scroll, bh);
-    val hit: u8                = context.claim(ctx, id, 0.0::f32, 0.0::f32, ctx.pw, maxf(content, bh));
+    val r:  widget.ScrollArea = widget.begin_scroll(ctx, "#scroll", ?t.scroll, bh);
+    val hf: interact.Hit      = interact.hit(ctx, id, 0.0::f32, 0.0::f32, ctx.pw, maxf(content, bh), input.BUTTON_LEFT);
+    if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
+    if (hf.pressed || (hf.held && ctx.focus == id)) {
+        var pr: usize = 0;
+        if (hf.my > p)                       { pr = ((hf.my - p) / lh)::usize; }
+        if (pr + 1 > t.count && t.count > 0) { pr = t.count - 1; }
+        val at: usize = offset_in(ctx, t, f, pr, hf.mx - p);
+        if (hf.pressed) {
+            context.focus(ctx, id);
+            edit.press(ctx, id, f, at, hf.clicks);
+        }
+        or { edit.drag(ctx, id, f, at); }
+        t.aiming = 0;
+        reveal(t, f, lh, p, bh);
+    }
 
     var pre: str = nil;
     if (on && !quiet) { pre = context.preedit(ctx, id); }

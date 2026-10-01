@@ -2,15 +2,15 @@
 #
 # the keyboard: event hands one keyboard event to a field, with shortcut C, X
 # and V going through the context's clipboard hand-off, and feed hands it the
-# whole frame. the pointer: click counts presses that land close together in
-# time and place, from input.time, so a widget tells a double or triple click
-# from a single one. the caret: touch restarts its blink and caret_on says
-# whether it shows, asking the host for a frame when it next turns (see
-# context.wake_at). a host whose input.time stays 0 gets a steady caret and
-# single clicks only. text: width and draw measure and draw a field's bytes,
-# hidden behind MASK_GLYPH in a MASKED field.
+# whole frame. the pointer: press places the caret for a run of clicks (see
+# blit.interact.Hit.clicks), a word for a double click and a line for a
+# triple, and drag extends the selection by the same unit. the caret: touch
+# restarts its blink and caret_on says whether it shows, asking the host for
+# a frame when it next turns (see context.wake_at). a host whose input.time
+# stays 0 gets a steady caret. text: width and draw_text measure and draw a
+# field's bytes, hidden behind MASK_GLYPH in a MASKED field.
 #
-# the per-widget state behind click and blink lives in the context's state
+# the per-widget state behind drag and blink lives in the context's state
 # store under the widget's id (see blit.state).
 
 use allo: std.allocator;
@@ -28,13 +28,6 @@ use blit.draw;
 use blit.field;
 use blit.input;
 use blit.state;
-
-# most seconds between the presses of a double or triple click
-pub val CLICK_TIME: f64 = 0.4;
-
-# most pixels, before the interface scale, a later press of a multi-click may
-# land from the first
-pub val CLICK_SLOP: f32 = 4.0;
 
 # seconds the caret shows, then hides, while it blinks
 pub val BLINK: f64 = 0.53;
@@ -70,53 +63,29 @@ pub fun pointer(ctx: *context.Context, id: u64) *Pointer {
     ret state.get[Pointer](ctx, id);
 }
 
-# count a press on a widget into a run of clicks
-#
-# a press within CLICK_TIME of the one before and CLICK_SLOP of the run's
-# first is the next of the run, and a fourth starts a new one.
-# ---
-# ctx: context
-# id:  the pressed widget's id
-# ret: 1 for a single click, 2 for a double, 3 for a triple
-pub fun click(ctx: *context.Context, id: u64) u8 {
-    val p:    *Pointer = pointer(ctx, id);
-    val now:  f64      = ctx.in.time;
-    val slop: f32      = context.px(ctx, CLICK_SLOP);
-    var dx:   f32      = ctx.in.mx - p.x;
-    var dy:   f32      = ctx.in.my - p.y;
-    if (dx < 0.0::f32) { dx = 0.0::f32 - dx; }
-    if (dy < 0.0::f32) { dy = 0.0::f32 - dy; }
-    val near: bool = dx <= slop && dy <= slop;
-    if (now > 0.0::f64 && p.n > 0 && p.n < 3 && near && now - p.t <= CLICK_TIME) { p.n = p.n + 1; }
-    or {
-        p.n = 1;
-        p.x = ctx.in.mx;
-        p.y = ctx.in.my;
-    }
-    p.t   = now;
-    p.act = now;
-    ret p.n;
-}
-
-# place a field's caret for a press of a run of n clicks at byte offset at
+# place a field's caret for a press that is the clicks-th of a run
 #
 # one click puts the caret there, or extends the selection to it with shift
-# held. two select the word and three the line. the selection is kept for
-# drag to extend by the same unit.
+# held. two select the word and three the line, and a fourth starts over.
+# the selection is kept for drag to extend by the same unit.
 # ---
-# ctx: context
-# id:  the pressed widget's id
-# f:   the field
-# at:  byte offset under the pointer
-# n:   the click's count, from click
-pub fun press(ctx: *context.Context, id: u64, f: *field.Field, at: usize, n: u8) {
+# ctx:    context
+# id:     the pressed widget's id
+# f:      the field
+# at:     byte offset under the pointer
+# clicks: the press's place in its run of clicks, from interact.Hit.clicks
+pub fun press(ctx: *context.Context, id: u64, f: *field.Field, at: usize, clicks: u32) {
+    var n: u8 = 1;
+    if (clicks > 0)                           { n = ((clicks - 1) % 3 + 1)::u8; }
     if (n == 2)                               { field.select_word(f, at); }
     or (n == 3)                               { field.select_line(f, at); }
     or ((ctx.in.mods & input.MOD_SHIFT) != 0) { field.place(f, at, f.anchor); }
     or                                        { field.place(f, at, at); }
     val p: *Pointer = pointer(ctx, id);
-    p.lo = field.sel_lo(f);
-    p.hi = field.sel_hi(f);
+    p.n   = n;
+    p.lo  = field.sel_lo(f);
+    p.hi  = field.sel_hi(f);
+    p.act = ctx.in.time;
 }
 
 # extend a field's selection to byte offset at while the button that pressed
@@ -319,7 +288,7 @@ pub fun count_text(f: *field.Field, out: *u8) str {
     ret out;
 }
 
-test edit__counts_clicks_by_time_and_place {
+test edit__blinks_and_counts {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -332,25 +301,10 @@ test edit__counts_clicks_by_time_and_place {
     in.my      = 10.0::f32;
     in.time    = 1.0::f64;
     context.begin(?ctx, in, 100.0::f32, 100.0::f32);
-    if (click(?ctx, 7) != 1) { ret 2; }
-    ctx.in.time = 1.2::f64;
-    ctx.in.mx   = 12.0::f32;
-    if (click(?ctx, 7) != 2) { ret 3; }
-    ctx.in.time = 1.4::f64;
-    if (click(?ctx, 7) != 3) { ret 4; }
-    ctx.in.time = 1.5::f64;
-    if (click(?ctx, 7) != 1) { ret 5; }
-    # too late, or too far
-    ctx.in.time = 2.5::f64;
-    if (click(?ctx, 7) != 1) { ret 6; }
-    ctx.in.time = 2.6::f64;
-    ctx.in.mx   = 30.0::f32;
-    if (click(?ctx, 7) != 1) { ret 7; }
-
     # the caret shows, hides and asks for a frame when it turns
     touch(?ctx, 7);
     if (!caret_on(?ctx, 7)) { ret 8; }
-    ctx.in.time = 2.6::f64 + BLINK + 0.01::f64;
+    ctx.in.time = 1.0::f64 + BLINK + 0.01::f64;
     if (caret_on(?ctx, 7)) { ret 9; }
     context.end(?ctx);
 
