@@ -128,6 +128,25 @@ pub val CORNERS_TOP:    u8 = 1;
 pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
 
+# pointer buttons input.BUTTON_* names, one bit each from BUTTON_LEFT up
+pub val BUTTONS: usize = 5;
+
+# the last press of one pointer button, which runs of clicks and drags are
+# measured against
+# ---
+# time:   the host's clock at the press
+# x:      cursor x in screen pixels at the press
+# y:      cursor y in screen pixels at the press
+# id:     the topmost claimant under the press, 0 for none
+# clicks: presses in the run of clicks on id it extends, 0 before the first
+pub rec Press {
+    time:   f64;
+    x:      f32;
+    y:      f32;
+    id:     u64;
+    clicks: u32;
+}
+
 # a saved local origin in screen pixels
 # ---
 # x: origin x
@@ -227,6 +246,7 @@ pub rec Area {
 # active_btn:   the input.BUTTON_* bit whose press made active the owner
 # dbl_time:     seconds within which a press extends a run of clicks
 # dbl_dist:     unscaled pixels within which a press extends a run of clicks
+# presses:      each button's last press, by bit index
 # lx:           local origin x added to emitted positions before clipping
 # ly:           local origin y added to emitted positions before clipping
 # clip_x0:      active clip rect left in screen pixels
@@ -316,6 +336,7 @@ pub rec Context {
     active_btn:   u8;
     dbl_time:     f64;
     dbl_dist:     f32;
+    presses:      [5]Press;
     lx:           f32;
     ly:           f32;
     clip_x0:      f32;
@@ -426,18 +447,23 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     var none: input.Input;
     ctx.in = none;
 
-    ctx.sw           = 0.0::f32;
-    ctx.sh           = 0.0::f32;
-    ctx.ox           = 0.0::f32;
-    ctx.oy           = 0.0::f32;
-    ctx.cx           = 0.0::f32;
-    ctx.cy           = 0.0::f32;
-    ctx.pw           = 0.0::f32;
-    ctx.hot          = 0;
-    ctx.active       = 0;
-    ctx.active_btn   = 0;
-    ctx.dbl_time     = DOUBLE_TIME;
-    ctx.dbl_dist     = DOUBLE_DIST;
+    ctx.sw         = 0.0::f32;
+    ctx.sh         = 0.0::f32;
+    ctx.ox         = 0.0::f32;
+    ctx.oy         = 0.0::f32;
+    ctx.cx         = 0.0::f32;
+    ctx.cy         = 0.0::f32;
+    ctx.pw         = 0.0::f32;
+    ctx.hot        = 0;
+    ctx.active     = 0;
+    ctx.active_btn = 0;
+    ctx.dbl_time   = DOUBLE_TIME;
+    ctx.dbl_dist   = DOUBLE_DIST;
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        ctx.presses[b] = Press{time: 0.0::f64, x: 0.0::f32, y: 0.0::f32, id: 0, clicks: 0};
+        b              = b + 1;
+    }
     ctx.lx           = 0.0::f32;
     ctx.ly           = 0.0::f32;
     ctx.clip_x0      = 0.0::f32;
@@ -587,7 +613,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
 # cursor, and nothing while no pointer is present. a primary press on anything
 # but the focus holder drops the focus. the last frame's copied text, paste
 # request, cursor shape, candidate window and wake time are cleared, and the
-# frame's last composition event replaces the composition in progress.
+# frame's last composition event replaces the composition in progress. each
+# button pressed becomes that button's last press (see last_press).
 # ---
 # ctx: context
 # in:  this frame's input (prev_down is managed here)
@@ -655,6 +682,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.shape        = input.CURSOR_ARROW;
     ctx.ime_on       = 0;
     take_preedit(ctx);
+    take_presses(ctx);
 
     ctx.id_sp        = 0;
     ctx.hover_seen   = 0;
@@ -889,6 +917,46 @@ pub fun preedit(ctx: *Context, id: u64) str {
 # ret: the caret, 0 when nothing is being composed
 pub fun preedit_caret(ctx: *Context) usize {
     ret ctx.pre_caret;
+}
+
+# record each button pressed this frame as its last press, extending the run
+# of clicks when it lands on the claimant the one before did, soon and near
+# enough
+fun take_presses(ctx: *Context) {
+    val near: f32   = px(ctx, ctx.dbl_dist);
+    var b:    usize = 0;
+    for (b < BUTTONS) {
+        if (input.pressed(ctx.in, (1::u8) << b::u8) != 0) {
+            val p:   *Press = ?ctx.presses[b];
+            val dx:  f32    = ctx.in.mx - p.x;
+            val dy:  f32    = ctx.in.my - p.y;
+            var run: u32    = 1;
+            if (p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
+                run = p.clicks + 1;
+            }
+            @p = Press{time: ctx.in.time, x: ctx.in.mx, y: ctx.in.my, id: ctx.hover, clicks: run};
+        }
+        b = b + 1;
+    }
+}
+
+# the last press of a pointer button (see Press)
+#
+# begin records every press, on a widget or not, against the topmost
+# claimant under it: a press on the same claimant within the double-click
+# time and distance (see set_double_click) of the one before extends its run.
+# ---
+# ctx:    context
+# button: an input.BUTTON_* bit
+# ret:    the press, a zeroed one for a bit that names no button
+pub fun last_press(ctx: *Context, button: u8) Press {
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        if (button == (1::u8) << b::u8) { ret ctx.presses[b]; }
+        b = b + 1;
+    }
+    var none: Press;
+    ret none;
 }
 
 # take the frame's last composition event as the composition in progress,

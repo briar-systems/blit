@@ -328,10 +328,12 @@ if (h.held) { drag_by(h.dx, h.dy); }
   press, wherever the cursor goes. `released` is the frame the button comes up,
   over it or not, and `clicked` is a release over it. `button` is the
   `BUTTON_*` bit it acted on.
-- **Double clicks.** Each press is remembered under the id in the state store.
-  A press within the context's double-click time and distance of the previous
-  press on the same id with the same button extends a run: `clicks` is 1, 2 or
-  3 for a single, double or triple click, and `double` is the second.
+- **Double clicks.** The context keeps each button's last press
+  (`blit.context.last_press`): its time, where it landed in screen space, the
+  claimant it landed on and its run of clicks. A press on the same claimant
+  within the double-click time and distance of the one before extends the run:
+  `clicks` is 1, 2 or 3 for a single, double or triple click, and `double` is
+  the second.
   `blit.context.set_double_click(?ctx, seconds, pixels)` sets the threshold
   (`DOUBLE_TIME`, 0.3 s, and `DOUBLE_DIST`, 6 unscaled pixels, by default), so
   a host can pass its platform's settings.

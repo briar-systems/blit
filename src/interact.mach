@@ -11,12 +11,11 @@
 # drag and the release wherever the cursor goes, and a release over it is a
 # click. a press while another button already owns the pointer takes nothing.
 #
-# each press is remembered under the widget's id in the state store (see
-# blit.state): when it comes within the context's double-click time and
-# distance (see context.set_double_click) of the previous press on the same
-# widget with the same button, it extends a run of clicks, and the second of
-# a run is a double click. the remembered press is also where a drag is
-# measured from.
+# the context keeps each button's last press (see context.last_press): a
+# press on the same widget within the double-click time and distance (see
+# context.set_double_click) of the one before extends a run of clicks, and the
+# second of a run is a double click. the press that made a widget active is
+# also where its drag is measured from.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -28,7 +27,6 @@ use std.allocator.page;
 
 use blit.context;
 use blit.input;
-use blit.state;
 
 # what one widget's pointer did this frame
 # ---
@@ -65,21 +63,6 @@ pub rec Hit {
     dy:       f32;
 }
 
-# the last press on a widget, kept in the state store under its id
-# ---
-# time:   the host's clock at the press
-# x:      cursor x in screen pixels at the press
-# y:      cursor y in screen pixels at the press
-# button: the input.BUTTON_* bit pressed, 0 before the first press
-# clicks: presses in the run it ended
-pub rec Press {
-    time:   f64;
-    x:      f32;
-    y:      f32;
-    button: u8;
-    clicks: u32;
-}
-
 # the lowest input.BUTTON_* bit set in bits, 0 for none
 fun lowest(bits: u8) u8 {
     var b: u8 = input.BUTTON_LEFT;
@@ -107,7 +90,7 @@ pub fun drag(ctx: *context.Context, id: u64, dx: *f32, dy: *f32) bool {
     @dy = 0.0::f32;
     if (id == 0 || ctx.active != id)             { ret false; }
     if (input.held(ctx.in, ctx.active_btn) == 0) { ret false; }
-    val p: *Press = state.get[Press](ctx, id);
+    val p: context.Press = context.last_press(ctx, ctx.active_btn);
     @dx = ctx.in.mx - p.x;
     @dy = ctx.in.my - p.y;
     ret true;
@@ -146,27 +129,8 @@ pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, 
         ctx.active     = id;
         ctx.active_btn = down;
         h.pressed      = true;
-
-        val p:    *Press = state.get[Press](ctx, id);
-        val ddx:  f32    = ctx.in.mx - p.x;
-        val ddy:  f32    = ctx.in.my - p.y;
-        val near: f32    = context.px(ctx, ctx.dbl_dist);
-        var run:  u32    = 1;
-        if (p.button == down && ctx.in.time - p.time <= ctx.dbl_time && ddx * ddx + ddy * ddy <= near * near) {
-            run = p.clicks + 1;
-        }
-        p.time   = ctx.in.time;
-        p.x      = ctx.in.mx;
-        p.y      = ctx.in.my;
-        p.button = down;
-        p.clicks = run;
-        h.clicks = run;
-        h.double = run == 2;
-    }
-    or (h.hot) {
-        # keep the last press alive while the cursor rests on the widget, so a
-        # fast host does not age it out between the clicks of a double
-        val keep: *Press = state.get[Press](ctx, id);
+        h.clicks       = context.last_press(ctx, down).clicks;
+        h.double       = h.clicks == 2;
     }
 
     if (ctx.active != id) { ret h; }
@@ -283,6 +247,14 @@ test hit__double_click_within_time_and_distance {
     context.set_double_click(?ctx, 5.0::f64, 6.0::f32);
     val w: Hit = frame(?ctx, at(18.0::f32, 18.0::f32, L, 7.0::f64), L);
     if (!w.double) { ret 7; }
+    frame(?ctx, at(18.0::f32, 18.0::f32, 0, 7.1::f64), L);
+
+    # a press on anything else between breaks the run, soon and near or not
+    context.set_double_click(?ctx, 5.0::f64, 100.0::f32);
+    frame(?ctx, at(30.0::f32, 18.0::f32, L, 7.2::f64), L);
+    frame(?ctx, at(18.0::f32, 18.0::f32, 0, 7.3::f64), L);
+    val o: Hit = frame(?ctx, at(18.0::f32, 18.0::f32, L, 7.4::f64), L);
+    if (!o.pressed || o.double || o.clicks != 1) { ret 8; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
