@@ -272,16 +272,19 @@ pub fun is_open(ctx: *context.Context, id: u64) bool {
 # open or close a node from code, as a click on its caret does
 #
 # an open node's state is pinned in the store, so it outlives any number of
-# frames the node is not drawn in. the change shows from the next frame.
+# frames the node is not drawn in. the change shows from the next frame, which
+# it asks for (see context.redraw).
 # ---
 # ctx: context
 # t:   the node's tree
 # id:  the node's id (see node_id)
 # on:  true to open
 pub fun set_open(ctx: *context.Context, t: *Tree, id: u64, on: bool) {
-    val f: *Fold = state.get[Fold](ctx, id);
+    val f:   *Fold = state.get[Fold](ctx, id);
+    val was: u8    = f.open;
     f.open = 0;
-    if (on) { f.open = 1; }
+    if (on)            { f.open = 1; }
+    if (f.open != was) { context.redraw(ctx); }
     state.pin[Fold](ctx, id, f.open);
     invalidate(t);
 }
@@ -289,6 +292,8 @@ pub fun set_open(ctx: *context.Context, t: *Tree, id: u64, on: bool) {
 # forget what the tree measured, after the caller's data changed
 #
 # the next frame walks every open node once, asking for its children again.
+# a caller that changed its data between frames asks for that frame with
+# context.redraw.
 # ---
 # t: the tree
 pub fun invalidate(t: *Tree) {
@@ -828,7 +833,7 @@ test tree__opens_lazily_and_collapses {
     ret 0;
 }
 
-test tree__a_caret_click_shows_in_the_frame_after_with_no_more_input {
+test tree__a_change_by_input_or_code_shows_in_the_frame_after {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -855,6 +860,15 @@ test tree__a_caret_click_shows_in_the_frame_after_with_no_more_input {
     if (!driver.drawn(?d, leaf_id(?f, 0, 0))) { ret 7; }
     val after: opt[f64] = context.next_frame(?d.ctx);
     if (!sel after.none) { ret 8; }
+
+    # a node opened from code between idle frames asks for the frame that shows it
+    set_open(?d.ctx, ?f.t, top_id(?f, 1), true);
+    val coded: opt[f64] = context.next_frame(?d.ctx);
+    if (!(sel coded.some && coded.some == 0.0::f64)) { ret 9; }
+    driver.step(?d);
+    if (!driver.drawn(?d, leaf_id(?f, 1, 0))) { ret 10; }
+    val rest: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel rest.none) { ret 11; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

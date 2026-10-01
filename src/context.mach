@@ -1182,6 +1182,7 @@ pub fun hovered_layer(ctx: *Context) u32 {
 # id:  the widget's id (see id_of), 0 to drop the focus
 pub fun focus(ctx: *Context, id: u64) {
     if (id != 0 && disabled(ctx)) { ret; }
+    if (ctx.focus != id)          { redraw(ctx); }
     ctx.focus       = id;
     ctx.focus_drawn = 0;
     ctx.focus_plain = plain(ctx, id);
@@ -1238,6 +1239,7 @@ pub fun typing(ctx: *Context) bool {
 # ctx: context
 # on:  1 to reduce motion, 0 to move as the theme times it
 pub fun set_reduce_motion(ctx: *Context, on: u8) {
+    if (ctx.still != on) { redraw(ctx); }
     ctx.still = on;
 }
 
@@ -1680,6 +1682,18 @@ pub fun dt(ctx: *Context) f64 {
 pub fun wake_at(ctx: *Context, t: f64) {
     if (ctx.wake_on == 0 || t < ctx.wake) { ctx.wake = t; }
     ctx.wake_on = 1;
+}
+
+# ask for the next frame at once, for a change made from code that shows only
+# from the next frame
+#
+# the setters that make such a change ask for it themselves. a caller that
+# changes state in place, such as a window's state, the theme or its own data
+# behind a tree or a list, calls it after.
+# ---
+# ctx: context
+pub fun redraw(ctx: *Context) {
+    wake_at(ctx, ctx.in.time);
 }
 
 # when the host should draw the next frame, read after end
@@ -3123,6 +3137,7 @@ fun shown(ctx: *Context, state: u8) u8 {
 # ctx: context
 # on:  1 for an sRGB-encoding target, 0 to emit colors as authored
 pub fun set_srgb(ctx: *Context, on: u8) {
+    if (ctx.srgb != on) { redraw(ctx); }
     ctx.srgb = on;
 }
 
@@ -3135,6 +3150,7 @@ pub fun set_srgb(ctx: *Context, on: u8) {
 # src: the glyph source
 pub fun set_glyph_source(ctx: *Context, src: gly.GlyphSource) {
     font.set_source(?ctx.font, src);
+    redraw(ctx);
 }
 
 # hold one more glyph source for text styles to name
@@ -3162,7 +3178,10 @@ pub fun add_style(ctx: *Context, st: font.Style) opt[u32] {
 # st:  what it becomes
 # ret: false for an id not registered or a bad source or size
 pub fun set_style(ctx: *Context, id: u32, st: font.Style) bool {
-    ret font.set_style(?ctx.font, id, st);
+    val was: font.Style = font.style(?ctx.font, id);
+    if (!font.set_style(?ctx.font, id, st))             { ret false; }
+    if (was.source != st.source || was.size != st.size) { redraw(ctx); }
+    ret true;
 }
 
 # draw text in a style until the matching pop_style
@@ -3280,7 +3299,10 @@ pub fun set_theme(ctx: *Context, t: *th.Theme) err[allo.Error] {
     if (t == ?ctx.theme) { ret err[allo.Error].ok{}; }
     sheet.unwind(?ctx.sheet, ?ctx.theme);
     val e: err[allo.Error] = th.copy(?ctx.theme, t);
-    if (sel e.ok) { sheet.forget(?ctx.sheet); }
+    if (sel e.ok) {
+        sheet.forget(?ctx.sheet);
+        redraw(ctx);
+    }
     ret e;
 }
 
@@ -3291,9 +3313,12 @@ pub fun set_theme(ctx: *Context, t: *th.Theme) err[allo.Error] {
 # ctx: context
 pub fun theme_replaced(ctx: *Context) {
     sheet.forget(?ctx.sheet);
+    redraw(ctx);
 }
 
 # the theme widgets draw with, to read or adjust in place
+#
+# an adjustment made between frames asks for the next one with redraw.
 # ---
 # ctx: context
 # ret: the context's theme
@@ -3312,7 +3337,9 @@ pub fun theme_of(ctx: *Context) *th.Theme {
 # ctx: context
 # s:   interface scale, above zero
 pub fun set_scale(ctx: *Context, s: f32) {
-    if (s > 0.0::f32) { ctx.scale = s; }
+    if (s <= 0.0::f32 || s == ctx.scale) { ret; }
+    ctx.scale = s;
+    redraw(ctx);
 }
 
 # the interface scale

@@ -166,6 +166,7 @@ pub fun fade(ctx: *context.Context, id: u64, on: bool, kind: usize) f32 {
 # v:   the value
 pub fun snap(ctx: *context.Context, id: u64, v: f32) {
     val t: *Track = state.get[Track](ctx, id);
+    if (t.from != v || t.to != v) { context.redraw(ctx); }
     t.from  = v;
     t.to    = v;
     t.start = ctx.in.time;

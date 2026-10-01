@@ -1834,6 +1834,8 @@ pub rec WindowArea {
 # the state of the window titled or keyed key in the current id scope
 #
 # set closed to 0 to reopen a window, or pinned and locked to pin or lock one.
+# a change made through it from code shows from the next frame, which
+# context.redraw asks for.
 # ---
 # ctx: context
 # key: the window's title or key

@@ -191,6 +191,9 @@ pub fun free(i: *Inspector) err[allo.Error] {
 
 # open a closed inspector or close an open one, the one call an app binds
 # to a key or a button
+#
+# bound to input, the frame after it comes on its own. a caller toggling it
+# between frames asks for that frame with context.redraw.
 # ---
 # i: the inspector
 pub fun toggle(i: *Inspector) {
