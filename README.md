@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -657,6 +657,41 @@ layout cursor across the column like `blit.widget`'s:
   scroll live in the state store under its id, and its parts are reached by
   path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
   each option an index under it.
+
+## Value editors & the colour picker
+
+`blit.value` edits numbers of any of `i8` to `i64`, `u8` to `u64`, `f32` and
+`f64` without loss: nothing passes a 64-bit integer through a float or an
+`f64` through anything narrower, a value shows as the shortest text that
+reads back as exactly that value, and typed text is read exactly.
+
+- **Drag.** `drag[T](?ctx, label, ?v, speed, lo, hi)` moves `@v` by `speed`
+  per pixel dragged across it, `FINE` times as far while shift is held. An
+  integer moves by whole steps and keeps the fraction for the next pixel, and
+  a float lands on the decimals of its value at the press or of the speed, so
+  dragging 1.5 by 0.01 a pixel gives 1.6. A double click turns it into a text
+  field with the value selected: enter or a press elsewhere commits, escape
+  leaves the value. `drag_n[T](?ctx, label, ?vec[0], n, speed, lo, hi)` edits
+  2 to 4 values in one row, and `drag_range[T](?ctx, label, ?a, ?b, speed, lo,
+  hi)` a low and a high value that never cross.
+- **Typed numbers.** `number[T](?ctx, label, ?v, step, lo, hi)` is a text
+  field with `-` and `+` steppers, committing as a double-clicked drag does.
+- **Bounds.** `lo < hi` clamps dragged, stepped and typed values, and equal
+  bounds leave a value to its type's range. Typed text that is no number of
+  the type leaves the value as it was.
+
+Each value's cell is a part of its editor keyed `#0` to `#3`, so a driver
+reaches the first cell of `speed` as `speed/#0`, and a number's steppers as
+`speed/-` and `speed/+`. `drag_scalars`, `range_scalars` and `number_scalar`
+take a kind (`I8` to `F64`) and a pointer for values typed at run time, and
+`value.entry` is the typed text cell under them all.
+
+`blit.color.picker(?ctx, label, ?c, flags)` edits a colour in hue, saturation
+and value: a square of saturation and value beside a hue bar, or inside a hue
+ring with `RING`, an alpha bar over a checkerboard with `ALPHA`, and beneath
+them a swatch, the label and hex text (`#RRGGBB`, `#RRGGBBAA` with alpha)
+typed in like a value. The picker keeps its hue across greys and black, and
+hex text read back shows as the same text.
 
 ## Widget ids
 
