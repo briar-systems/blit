@@ -397,11 +397,16 @@ works inside surfaces, docks and windows alike.
   side to the item. Widgets that spanned the column (buttons, sliders,
   toggles, fields, dropdowns, sections, scroll regions) fill the width by
   default, and text, checkboxes, images and grids fit their content.
-- **One frame to settle.** A single pass cannot know a container's content
+- **A hidden first frame.** A single pass cannot know a container's content
   before placing it, so a stack fitted to its content, a stack centered or
   end-aligned in its parent, and fill shares along a stack read what the
-  stack measured last frame, kept in the state store under its id, and settle
-  one frame after the content changes, as Dear ImGui's auto-fit does.
+  stack measured last frame, kept in the state store under its id. A stack
+  that would place anything by such a measure before it has one lays out its
+  first frame only to measure: its geometry and claims, and its children's,
+  are dropped (`blit.context.push_measure`/`pop_measure`), and it asks for
+  the next frame at once, so `next_frame` is `some(0)`. A guess is never seen
+  or clicked, as with Dear ImGui's hidden first frame for auto-fit windows.
+  After that, a change of content settles one frame late.
 - **Same line.** `same_line(?ctx)` puts the next item beside the last one in a
   column, for quick inline rows. The line is as tall as its tallest item.
 - **By hand.** `avail(?ctx)` is the space the next item may take, from the pen

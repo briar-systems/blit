@@ -131,6 +131,7 @@ pub rec Stack {
 # slot:        the rect the frame takes in its parent, before it is measured
 # rule_w:      the frame's own width rule in its parent
 # rule_h:      the frame's own height rule in its parent
+# hidden:      1 when the frame lays out only to measure, drawing and claiming nothing
 pub rec Frame {
     axis:        Axis;
     align:       Align;
@@ -164,6 +165,7 @@ pub rec Frame {
     slot:        Item;
     rule_w:      Size;
     rule_h:      Size;
+    hidden:      u8;
 }
 
 # a placed item: its rect and what it adds to its frame's measure

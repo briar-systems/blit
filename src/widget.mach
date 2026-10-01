@@ -67,6 +67,7 @@ use blit.driver;
 use blit.field;
 use blit.font;
 use gly: blit.glyph;
+use blit.hit;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
@@ -269,11 +270,30 @@ pub fun stack(ctx: *context.Context, axis: layout.Axis) layout.Stack {
 # h:      natural height of its content
 # fixed:  pixels along its axis taken by items not filling, and the gaps
 # weight: fill weight along its axis
+# seen:   1 once a frame has measured it
 rec Measure {
     w:      f32;
     h:      f32;
     fixed:  f32;
     weight: f32;
+    seen:   u8;
+}
+
+# whether a stack opening at it, never measured, would place anything by a
+# guess: shares along a known axis need last frame's totals, a side fitted to
+# its content has no length to fill, stretch or align across, and centering or
+# end-aligning the stack in its parent needs its size
+fun guessing(f: *layout.Frame, s: layout.Stack, it: layout.Item) bool {
+    var main: u8 = it.fit_h;
+    var over: u8 = it.fit_w;
+    if (sel s.axis.horizontal) {
+        main = it.fit_w;
+        over = it.fit_h;
+    }
+    if (main == 0 || over != 0) { ret true; }
+    var cross: u8 = it.fit_w;
+    if (layout.across(f)) { cross = it.fit_h; }
+    ret cross != 0 && f.inline == 0 && ((sel f.align.center) || (sel f.align.end));
 }
 
 # open a stack as the next item of the current frame
@@ -283,9 +303,13 @@ rec Measure {
 # s.w and s.h, else by the parent's item rules, else filling the width and
 # fitting the content's height. a side fitted to the content, and an
 # alignment of the stack in its parent, use the size the stack measured last
-# frame, kept in the state store under its id, so they settle one frame after
-# the content changes, like any single-pass layout. its fill shares come from
-# last frame's totals the same way. stacks nest. pair it with end_stack.
+# frame, kept in the state store under its id, and its fill shares come from
+# last frame's totals the same way. a stack that would place anything by such a
+# measure before it has one lays out its first frame only to measure, drawing
+# and claiming nothing (see context.push_measure), and asks for the next frame
+# at once, as Dear ImGui hides an auto-fit window's first frame. after that, a
+# change of content settles one frame late. stacks nest. pair it with
+# end_stack.
 # ---
 # ctx: context
 # key: the stack's key in the current id scope
@@ -314,7 +338,12 @@ pub fun begin_stack(ctx: *context.Context, key: str, s: layout.Stack) {
     c.slot        = it;
     c.rule_w      = rw;
     c.rule_h      = rh;
+    if (m.seen == 0 && guessing(f, s, it)) { c.hidden = 1; }
     context.push_layout(ctx, c);
+    if (c.hidden != 0) {
+        context.push_measure(ctx);
+        context.wake_at(ctx, ctx.in.time);
+    }
 }
 
 # close the stack begin_stack opened and place it in its parent
@@ -326,9 +355,11 @@ pub fun begin_stack(ctx: *context.Context, key: str, s: layout.Stack) {
 pub fun end_stack(ctx: *context.Context) {
     val c: layout.Frame = @context.top_layout(ctx);
     context.pop_layout(ctx);
-    if (c.id == 0) { ret; }
+    if (c.hidden != 0) { context.pop_measure(ctx); }
+    if (c.id == 0)     { ret; }
 
     val m: *Measure = state.get[Measure](ctx, c.id);
+    m.seen   = 1;
     m.w      = c.need_w;
     m.h      = c.need_h;
     m.fixed  = c.fixed;
@@ -3124,6 +3155,48 @@ test layout__panel_in_window_keeps_the_window_layout {
     ret 0;
 }
 
+# a frame holding a row of two buttons sharing the screen's width
+#[testing]
+fun frame_row(ctx: *context.Context) {
+    context.begin(ctx, input_at(50.0::f32, 8.0::f32, 0), 200.0::f32, 200.0::f32);
+    begin_stack(ctx, "row", stack(ctx, layout.Axis.horizontal{}));
+    button(ctx, "a");
+    button(ctx, "b");
+    end_stack(ctx);
+    context.end(ctx);
+}
+
+test layout__unmeasured_row_hides_its_first_frame {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    # the shares are not measured yet: nothing drawn, nothing claimed, and
+    # the next frame asked for now
+    frame_row(?ctx);
+    if (context.draw_count(?ctx) != 0 || ctx.claims.len != 0) { ret 2; }
+    val again: opt[f64] = context.next_frame(?ctx);
+    if (!(sel again.some && again.some == 0.0::f64)) { ret 3; }
+
+    # then the buttons split the 200 pixels evenly, 4 apart
+    frame_row(?ctx);
+    if (context.draw_count(?ctx) == 0 || ctx.claims.len != 2) { ret 4; }
+    val l: hit.Claim = ctx.claims.items[0];
+    val r: hit.Claim = ctx.claims.items[1];
+    if (l.x0 != 0.0::f32 || l.x1 != 98.0::f32)    { ret 5; }
+    if (r.x0 != 102.0::f32 || r.x1 != 200.0::f32) { ret 6; }
+    # and are hovered from the frame after they first claimed
+    frame_row(?ctx);
+    if (ctx.hot != context.id_of(?ctx, "a")) { ret 7; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # a frame holding a panel with a centered row (fit, fit and fill items), a
 # stack fitted to its content centered in another, and a same-line row
 #[testing]
@@ -3167,7 +3240,8 @@ test layout__stacks_size_align_and_share_lines {
 
     var r: [7]context.Area;
     frame_stacks(?ctx, ?r[0]);
-    # the row's height and the inner stack's width are not measured yet
+    # the row's height and the inner stack's width are not measured yet, so
+    # both lay out only to measure
     if (r[1].y0 != 0.0::f32)  { ret 2; }
     if (r[3].x0 != 50.0::f32) { ret 3; }
 

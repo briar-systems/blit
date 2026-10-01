@@ -131,6 +131,9 @@ pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 pub val DOUBLE_TIME: f64 = 0.3;
 pub val DOUBLE_DIST: f32 = 6.0;
 
+# a coordinate beyond any surface, where a measuring scope's clip sits
+val NOWHERE: f32 = 3.0e38;
+
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
 pub val CORNERS_TOP:    u8 = 1;
@@ -331,6 +334,7 @@ pub rec TextLine {
 # frames_cap:   frames allocated for frames
 # frame_sp:     open layout frames, saved or not
 # spare:        the frame handed out while the stack cannot grow
+# measuring:    open push_measure scopes, which draw and claim nothing
 # style:        id of the text style text is drawn in
 # style_sp:     text style stack depth
 # style_ids:    saved parent text styles, grown on demand
@@ -431,6 +435,7 @@ pub rec Context {
     frames_cap:   usize;
     frame_sp:     usize;
     spare:        layout.Frame;
+    measuring:    usize;
     style:        u32;
     style_sp:     usize;
     style_ids:    *u32;
@@ -563,6 +568,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.frames       = nil;
     ctx.frames_cap   = 0;
     ctx.frame_sp     = 0;
+    ctx.measuring    = 0;
     ctx.style        = font.STYLE_BODY;
     ctx.style_sp     = 0;
     ctx.style_ids    = nil;
@@ -744,14 +750,15 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.oom      = 0;
     trickle(ctx, prev);
 
-    ctx.lx      = 0.0::f32;
-    ctx.ly      = 0.0::f32;
-    ctx.clip_x0 = 0.0::f32;
-    ctx.clip_y0 = 0.0::f32;
-    ctx.clip_x1 = sw;
-    ctx.clip_y1 = sh;
-    ctx.clip_sp = 0;
-    ctx.org_sp  = 0;
+    ctx.lx        = 0.0::f32;
+    ctx.ly        = 0.0::f32;
+    ctx.clip_x0   = 0.0::f32;
+    ctx.clip_y0   = 0.0::f32;
+    ctx.clip_x1   = sw;
+    ctx.clip_y1   = sh;
+    ctx.clip_sp   = 0;
+    ctx.measuring = 0;
+    ctx.org_sp    = 0;
 
     ctx.tex       = draw.ATLAS;
     ctx.page      = 0;
@@ -1916,6 +1923,7 @@ pub fun push_layer(ctx: *Context) {
     ctx.clip_y0 = 0.0::f32;
     ctx.clip_x1 = ctx.sw;
     ctx.clip_y1 = ctx.sh;
+    if (ctx.measuring != 0) { clip_nowhere(ctx); }
     push_origin(ctx, 0.0::f32, 0.0::f32);
 }
 
@@ -1929,6 +1937,46 @@ pub fun pop_layer(ctx: *Context) {
     ctx.layer_sp = ctx.layer_sp - 1;
     if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
     or                                 { ctx.layer = ctx.layer - 1; }
+}
+
+# lay out without drawing or claiming until the matching pop_measure
+#
+# everything placed in the scope is measured as usual, but its geometry is
+# dropped and its claims are never recorded, so nothing in it is hovered or
+# clicked. a layer opened inside it stays hidden too. a layout that needs a
+# size it has not measured yet (see blit.widget.begin_stack) spends its first
+# frame here, so a guess is never seen or clicked.
+# ---
+# ctx: context
+pub fun push_measure(ctx: *Context) {
+    save_clip(ctx);
+    clip_nowhere(ctx);
+    ctx.measuring = ctx.measuring + 1;
+}
+
+# end the scope push_measure opened, drawing and claiming again
+# ---
+# ctx: context
+pub fun pop_measure(ctx: *Context) {
+    if (ctx.measuring == 0) { ret; }
+    ctx.measuring = ctx.measuring - 1;
+    pop_clip(ctx);
+}
+
+# whether a push_measure scope is open
+# ---
+# ctx: context
+# ret: true while geometry and claims are dropped
+pub fun measuring(ctx: *Context) bool {
+    ret ctx.measuring != 0;
+}
+
+# clip to a rect no geometry or claim reaches, past any coordinate in use
+fun clip_nowhere(ctx: *Context) {
+    ctx.clip_x0 = NOWHERE;
+    ctx.clip_y0 = NOWHERE;
+    ctx.clip_x1 = NOWHERE;
+    ctx.clip_y1 = NOWHERE;
 }
 
 # open a layout frame inside the current one (see blit.layout)
