@@ -181,6 +181,16 @@ rec Origin {
     y: f32;
 }
 
+# a parent layer saved by push_band, with the hovered widget's claim count
+# when the band opened
+# ---
+# layer: the parent's layer
+# seen:  hover_seen at the push
+rec Root {
+    layer: u32;
+    seen:  u64;
+}
+
 # a run of indexed triangles: bind the texture, set the scissor, draw the indices
 pub val RUN_TRIANGLES: u32 = 0;
 
@@ -341,7 +351,7 @@ pub rec TextLine {
 # layer:        layer subsequent geometry and claims land on
 # ordinal:      claims made so far this frame
 # layer_sp:     layer stack depth
-# layers:       saved parent layers, grown on demand
+# layers:       saved parent layers and their hover_seen, grown on demand
 # layers_cap:   layers allocated for layers
 # font:         the glyph sources, the text styles, the glyph cache and the atlas
 # frames:       the open layout frames, innermost last, grown on demand
@@ -386,7 +396,9 @@ pub rec TextLine {
 # ids:          seeds of the open id scopes, innermost last
 # ids_cap:      seeds allocated for ids
 # id_sp:        open id scopes, saved or not
-# hover_seen:   claims the hovered widget recorded so far this frame
+# hover_seen:   claims the hovered widget recorded so far this frame in the
+#               open root: pop_band restores it, so a band's claims never count
+#               as inside a scroll region opened outside the band
 # seen:         ids claimed so far this frame
 # collided:     ids claimed again this frame, once per repeat claim
 # collided_cap: ids allocated for collided
@@ -450,7 +462,7 @@ pub rec Context {
     layer:        u32;
     ordinal:      u64;
     layer_sp:     usize;
-    layers:       *u32;
+    layers:       *Root;
     layers_cap:   usize;
     font:         font.Font;
     frames:       *layout.Frame;
@@ -723,7 +735,7 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel eg.err) { ret eg; }
     ctx.origins     = nil;
     ctx.origins_cap = 0;
-    val ey: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.layers, ctx.layers_cap);
+    val ey: err[allo.Error] = allo.deallocate[Root](ctx.a, ctx.layers, ctx.layers_cap);
     if (sel ey.err) { ret ey; }
     ctx.layers     = nil;
     ctx.layers_cap = 0;
@@ -2022,15 +2034,17 @@ pub fun input_visible(ctx: *Context, x: f32, y: f32) u8 {
 # until the matching pop_band everything paints above, and its claims win
 # over, everything on lower layers, whatever the call order. the clip resets
 # to the whole screen and the local origin to zero, so coordinates inside a
-# band are screen pixels. the stack grows with nesting; if it cannot, oom is
-# set, the parent is not saved and depth still balances.
+# band are screen pixels. the band is a root for wheel routing: claims made
+# in it never count as inside a scroll region opened outside it. the stack
+# grows with nesting; if it cannot, oom is set, the parent is not saved and
+# depth still balances.
 # ---
 # ctx:  context
 # b:    the band's index, such as band.POPUPS
 # slot: the slot in an ordered band, such as a window's z, ignored otherwise
 pub fun push_band(ctx: *Context, b: u32, slot: u32) {
-    ctx.layers = room[u32](ctx, ctx.layers, ?ctx.layers_cap, ctx.layer_sp + 1, CLIP_DEPTH);
-    if (ctx.layer_sp < ctx.layers_cap) { ctx.layers[ctx.layer_sp] = ctx.layer; }
+    ctx.layers = room[Root](ctx, ctx.layers, ?ctx.layers_cap, ctx.layer_sp + 1, CLIP_DEPTH);
+    if (ctx.layer_sp < ctx.layers_cap) { ctx.layers[ctx.layer_sp] = Root{layer: ctx.layer, seen: ctx.hover_seen}; }
     ctx.layer_sp = ctx.layer_sp + 1;
     ctx.layer    = band.open(b, slot, ctx.layer);
 
@@ -2043,7 +2057,7 @@ pub fun push_band(ctx: *Context, b: u32, slot: u32) {
     push_origin(ctx, 0.0::f32, 0.0::f32);
 }
 
-# return to the layer, clip and origin saved by the matching push_band
+# return to the layer, clip, origin and hover count saved by the matching push_band
 # ---
 # ctx: context
 pub fun pop_band(ctx: *Context) {
@@ -2051,8 +2065,11 @@ pub fun pop_band(ctx: *Context) {
     pop_origin(ctx);
     pop_clip(ctx);
     ctx.layer_sp = ctx.layer_sp - 1;
-    if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
-    or                                 { ctx.layer = band.layer(band.BASE, 0); }
+    if (ctx.layer_sp < ctx.layers_cap) {
+        ctx.layer      = ctx.layers[ctx.layer_sp].layer;
+        ctx.hover_seen = ctx.layers[ctx.layer_sp].seen;
+    }
+    or { ctx.layer = band.layer(band.BASE, 0); }
 }
 
 # the layer subsequent geometry and claims land on
