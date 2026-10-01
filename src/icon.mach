@@ -1,0 +1,705 @@
+# icons: shapes drawn from path data, so they scale to any size and take any
+# color, with no font or image behind them
+#
+# an icon is path data (see blit.path: a flat f32 stream of commands) and the
+# box it was drawn in, so it is filled by the nonzero rule at whatever size it
+# is drawn, scaled from its box. the built-in set is drawn on a box of BOX
+# units, its contours meeting without overlapping so no hidden edge shows its
+# feather, and an app registers its own icons in the same form, in any box.
+#
+# icons have ids. the built-ins are the constants below, from 0, and an app's
+# icons take ids from APP_FIRST up, in the order they are added, so adding a
+# built-in never moves an app's icon. a Set holds the app's icons, copying
+# their data, so the caller need not keep it.
+#
+# every id is also a codepoint, CODEPOINT_BASE plus the id, in supplementary
+# private use area A, so an icon sits inline in any text: a label holding an
+# icon's codepoint draws the icon in place, sized to the line and tinted like
+# the text (see blit.context.text_at). STR_* are the built-ins' codepoints as
+# utf-8 strings, and encode writes any id's.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit.path;
+use allo: std.allocator;
+use std.allocator.page;
+use vec: std.collections.vector;
+use std.text.utf8;
+
+# the side of the square box the built-in icons are drawn on
+pub val BOX: f32 = 16.0;
+
+# the codepoint of icon 0
+pub val CODEPOINT_BASE: u32 = 0xF0000;
+
+# the first id an app's icon takes
+pub val APP_FIRST: u32 = 0x1000;
+
+# the last id an icon can take, so its codepoint stays a character
+pub val ID_LAST: u32 = 0xFFFD;
+
+# how many built-in icons there are, their ids running from 0
+pub val BUILTIN_COUNT: u32 = 20;
+
+# a triangle pointing right
+pub val PLAY: u32 = 0;
+
+# two upright bars
+pub val PAUSE: u32 = 1;
+
+# a triangle pointing right against a bar
+pub val STEP: u32 = 2;
+
+# a square
+pub val STOP: u32 = 3;
+
+# a diagonal cross
+pub val CLOSE: u32 = 4;
+
+# a chevron pointing right
+pub val CHEVRON_RIGHT: u32 = 5;
+
+# a chevron pointing left
+pub val CHEVRON_LEFT: u32 = 6;
+
+# a chevron pointing down
+pub val CHEVRON_DOWN: u32 = 7;
+
+# a chevron pointing up
+pub val CHEVRON_UP: u32 = 8;
+
+# a plus sign
+pub val PLUS: u32 = 9;
+
+# a minus sign
+pub val MINUS: u32 = 10;
+
+# a magnifying glass, its lens a ring and its handle running down to the right
+pub val SEARCH: u32 = 11;
+
+# a gear of eight teeth around a hole
+pub val SETTINGS: u32 = 12;
+
+# a question mark in a ring
+pub val HELP: u32 = 13;
+
+# a push pin, point down
+pub val PIN: u32 = 14;
+
+# a drop target that docks as a tab: a frame filled whole
+pub val DOCK_CENTER: u32 = 15;
+
+# a drop target that docks to the left: a frame with its left half filled
+pub val DOCK_LEFT: u32 = 16;
+
+# a drop target that docks to the right: a frame with its right half filled
+pub val DOCK_RIGHT: u32 = 17;
+
+# a drop target that docks to the top: a frame with its top half filled
+pub val DOCK_TOP: u32 = 18;
+
+# a drop target that docks to the bottom: a frame with its bottom half filled
+pub val DOCK_BOTTOM: u32 = 19;
+
+# each built-in's codepoint as a utf-8 string, for a label
+pub val STR_PLAY:          str = "\xF3\xB0\x80\x80";
+pub val STR_PAUSE:         str = "\xF3\xB0\x80\x81";
+pub val STR_STEP:          str = "\xF3\xB0\x80\x82";
+pub val STR_STOP:          str = "\xF3\xB0\x80\x83";
+pub val STR_CLOSE:         str = "\xF3\xB0\x80\x84";
+pub val STR_CHEVRON_RIGHT: str = "\xF3\xB0\x80\x85";
+pub val STR_CHEVRON_LEFT:  str = "\xF3\xB0\x80\x86";
+pub val STR_CHEVRON_DOWN:  str = "\xF3\xB0\x80\x87";
+pub val STR_CHEVRON_UP:    str = "\xF3\xB0\x80\x88";
+pub val STR_PLUS:          str = "\xF3\xB0\x80\x89";
+pub val STR_MINUS:         str = "\xF3\xB0\x80\x8A";
+pub val STR_SEARCH:        str = "\xF3\xB0\x80\x8B";
+pub val STR_SETTINGS:      str = "\xF3\xB0\x80\x8C";
+pub val STR_HELP:          str = "\xF3\xB0\x80\x8D";
+pub val STR_PIN:           str = "\xF3\xB0\x80\x8E";
+pub val STR_DOCK_CENTER:   str = "\xF3\xB0\x80\x8F";
+pub val STR_DOCK_LEFT:     str = "\xF3\xB0\x80\x90";
+pub val STR_DOCK_RIGHT:    str = "\xF3\xB0\x80\x91";
+pub val STR_DOCK_TOP:      str = "\xF3\xB0\x80\x92";
+pub val STR_DOCK_BOTTOM:   str = "\xF3\xB0\x80\x93";
+
+# an icon: path data and the box it was drawn in
+# ---
+# data: the path data, a stream of commands (see blit.path)
+# n:    floats in data
+# w:    width of the box the data was drawn in, above zero
+# h:    height of the box, above zero, which the drawn size scales to
+pub rec Icon {
+    data: *f32;
+    n:    usize;
+    w:    f32;
+    h:    f32;
+}
+
+# where an app's icon lives in a set's pool
+# ---
+# off: offset of its data in the pool
+# n:   floats in its data
+# w:   box width
+# h:   box height
+rec Entry {
+    off: usize;
+    n:   usize;
+    w:   f32;
+    h:   f32;
+}
+
+# the icons an app registered, their data copied into one pool
+# ---
+# pool:    every icon's data, end to end
+# entries: each icon, by id less APP_FIRST
+pub rec Set {
+    pool:    vec.Vector[f32];
+    entries: vec.Vector[Entry];
+}
+
+# an empty set whose icons grow from a
+# ---
+# a:   allocator backing the set
+# ret: the set, owning nothing until the first icon
+pub fun init(a: *allo.Allocator) Set {
+    ret Set{pool: vec.init[f32](a), entries: vec.init[Entry](a)};
+}
+
+# release the set's icons
+# ---
+# set: set to free
+# ret: ok, or the allocator's refusal
+pub fun free(set: *Set) err[allo.Error] {
+    val ep: err[allo.Error] = vec.dnit[f32](?set.pool);
+    if (sel ep.err) { ret ep; }
+    ret vec.dnit[Entry](?set.entries);
+}
+
+# whether an icon can be drawn: whole path data in a box of positive size
+# ---
+# ic:  icon
+# ret: true when it is well formed
+pub fun valid(ic: Icon) bool {
+    ret ic.w > 0.0::f32 && ic.h > 0.0::f32 && path.valid(ic.data, ic.n);
+}
+
+# register an icon, copying its data
+# ---
+# set: set
+# ic:  the icon
+# ret: its id, or none for an icon that is not valid, once every id is taken or when the set cannot grow
+pub fun add(set: *Set, ic: Icon) opt[u32] {
+    if (!valid(ic))                                          { ret opt[u32].none{}; }
+    if (set.entries.len >= (ID_LAST - APP_FIRST + 1)::usize) { ret opt[u32].none{}; }
+    val off:  usize                  = set.pool.len;
+    val room: res[usize, allo.Error] = vec.reserve[f32](?set.pool, ic.n);
+    if (sel room.err) { ret opt[u32].none{}; }
+    var i: usize = 0;
+    for (i < ic.n) {
+        val r: res[usize, allo.Error] = vec.push[f32](?set.pool, ic.data[i]);
+        i = i + 1;
+    }
+    val e: res[usize, allo.Error] = vec.push[Entry](?set.entries, Entry{off: off, n: ic.n, w: ic.w, h: ic.h});
+    if (sel e.err) {
+        set.pool.len = off;
+        ret opt[u32].none{};
+    }
+    ret opt[u32].some{APP_FIRST + (set.entries.len - 1)::u32};
+}
+
+# a built-in icon on the BOX square
+fun box(data: *f32, n: usize) opt[Icon] {
+    ret opt[Icon].some{Icon{data: data, n: n, w: BOX, h: BOX}};
+}
+
+# a built-in icon by id
+# ---
+# id:  icon id
+# ret: the icon, or none for an id that is not a built-in
+pub fun builtin(id: u32) opt[Icon] {
+    if (id == PLAY)          { ret box(?D_PLAY[0], $length_of([10]f32)); }
+    if (id == PAUSE)         { ret box(?D_PAUSE[0], $length_of([26]f32)); }
+    if (id == STEP)          { ret box(?D_STEP[0], $length_of([23]f32)); }
+    if (id == STOP)          { ret box(?D_STOP[0], $length_of([13]f32)); }
+    if (id == CLOSE)         { ret box(?D_CLOSE[0], $length_of([37]f32)); }
+    if (id == CHEVRON_RIGHT) { ret box(?D_CHEVRON_RIGHT[0], $length_of([19]f32)); }
+    if (id == CHEVRON_LEFT)  { ret box(?D_CHEVRON_LEFT[0], $length_of([19]f32)); }
+    if (id == CHEVRON_DOWN)  { ret box(?D_CHEVRON_DOWN[0], $length_of([19]f32)); }
+    if (id == CHEVRON_UP)    { ret box(?D_CHEVRON_UP[0], $length_of([19]f32)); }
+    if (id == PLUS)          { ret box(?D_PLUS[0], $length_of([37]f32)); }
+    if (id == MINUS)         { ret box(?D_MINUS[0], $length_of([13]f32)); }
+    if (id == SEARCH)        { ret box(?D_SEARCH[0], $length_of([70]f32)); }
+    if (id == SETTINGS)      { ret box(?D_SETTINGS[0], $length_of([164]f32)); }
+    if (id == HELP)          { ret box(?D_HELP[0], $length_of([157]f32)); }
+    if (id == PIN)           { ret box(?D_PIN[0], $length_of([46]f32)); }
+    if (id == DOCK_CENTER)   { ret box(?D_DOCK_CENTER[0], $length_of([39]f32)); }
+    if (id == DOCK_LEFT)     { ret box(?D_DOCK_LEFT[0], $length_of([39]f32)); }
+    if (id == DOCK_RIGHT)    { ret box(?D_DOCK_RIGHT[0], $length_of([39]f32)); }
+    if (id == DOCK_TOP)      { ret box(?D_DOCK_TOP[0], $length_of([39]f32)); }
+    if (id == DOCK_BOTTOM)   { ret box(?D_DOCK_BOTTOM[0], $length_of([39]f32)); }
+    ret opt[Icon].none{};
+}
+
+# an icon by id, built in or registered
+#
+# a registered icon's data lives in the set's pool, valid until the next add.
+# ---
+# set: set
+# id:  icon id
+# ret: the icon, or none for an id neither built in nor registered
+pub fun get(set: *Set, id: u32) opt[Icon] {
+    if (id < APP_FIRST) { ret builtin(id); }
+    val k: usize = (id - APP_FIRST)::usize;
+    if (k >= set.entries.len) { ret opt[Icon].none{}; }
+    val e: Entry = set.entries.data[k];
+    ret opt[Icon].some{Icon{data: ?set.pool.data[e.off], n: e.n, w: e.w, h: e.h}};
+}
+
+# the codepoint that stands for an icon in text
+# ---
+# id:  icon id, at most ID_LAST
+# ret: CODEPOINT_BASE plus the id
+pub fun codepoint(id: u32) u32 {
+    ret CODEPOINT_BASE + id;
+}
+
+# the icon a codepoint stands for
+# ---
+# cp:  codepoint
+# ret: its icon id, or none for a codepoint outside the icon range
+pub fun id_of(cp: u32) opt[u32] {
+    if (cp < CODEPOINT_BASE || cp > CODEPOINT_BASE + ID_LAST) { ret opt[u32].none{}; }
+    ret opt[u32].some{cp - CODEPOINT_BASE};
+}
+
+# write an icon's codepoint as utf-8, to build text holding an app's icon
+# ---
+# id:  icon id, at most ID_LAST
+# buf: destination
+# cap: bytes buf holds, 4 for any icon
+# ret: bytes written, 0 when buf is too small or the id out of range
+pub fun encode(id: u32, buf: *u8, cap: usize) usize {
+    if (id > ID_LAST) { ret 0; }
+    ret utf8.encode(codepoint(id), buf, cap);
+}
+
+# the built-ins' path data, on the BOX square
+val M: f32 = path.MOVE::f32;
+val L: f32 = path.LINE::f32;
+val C: f32 = path.CUBIC::f32;
+val Z: f32 = path.CLOSE::f32;
+
+# a triangle pointing right
+val D_PLAY: [10]f32 = [10]f32{
+    M, 4.0, 2.0,
+    L, 14.0, 8.0,
+    L, 4.0, 14.0,
+    Z
+};
+
+# two upright bars
+val D_PAUSE: [26]f32 = [26]f32{
+    M, 3.0, 2.0,
+    L, 6.5, 2.0,
+    L, 6.5, 14.0,
+    L, 3.0, 14.0,
+    Z,
+    M, 9.5, 2.0,
+    L, 13.0, 2.0,
+    L, 13.0, 14.0,
+    L, 9.5, 14.0,
+    Z
+};
+
+# a triangle pointing right against a bar
+val D_STEP: [23]f32 = [23]f32{
+    M, 3.0, 2.0,
+    L, 10.5, 8.0,
+    L, 3.0, 14.0,
+    Z,
+    M, 11.0, 2.0,
+    L, 13.5, 2.0,
+    L, 13.5, 14.0,
+    L, 11.0, 14.0,
+    Z
+};
+
+# a square
+val D_STOP: [13]f32 = [13]f32{
+    M, 3.0, 3.0,
+    L, 13.0, 3.0,
+    L, 13.0, 13.0,
+    L, 3.0, 13.0,
+    Z
+};
+
+# a diagonal cross
+val D_CLOSE: [37]f32 = [37]f32{
+    M, 8.0, 6.303,
+    L, 12.151, 2.151,
+    L, 13.849, 3.849,
+    L, 9.697, 8.0,
+    L, 13.849, 12.151,
+    L, 12.151, 13.849,
+    L, 8.0, 9.697,
+    L, 3.849, 13.849,
+    L, 2.151, 12.151,
+    L, 6.303, 8.0,
+    L, 2.151, 3.849,
+    L, 3.849, 2.151,
+    Z
+};
+
+# a chevron pointing right
+val D_CHEVRON_RIGHT: [19]f32 = [19]f32{
+    M, 4.75, 4.5,
+    L, 6.25, 3.0,
+    L, 11.25, 8.0,
+    L, 6.25, 13.0,
+    L, 4.75, 11.5,
+    L, 8.25, 8.0,
+    Z
+};
+
+# a chevron pointing left
+val D_CHEVRON_LEFT: [19]f32 = [19]f32{
+    M, 7.75, 8.0,
+    L, 11.25, 11.5,
+    L, 9.75, 13.0,
+    L, 4.75, 8.0,
+    L, 9.75, 3.0,
+    L, 11.25, 4.5,
+    Z
+};
+
+# a chevron pointing down
+val D_CHEVRON_DOWN: [19]f32 = [19]f32{
+    M, 11.5, 4.75,
+    L, 13.0, 6.25,
+    L, 8.0, 11.25,
+    L, 3.0, 6.25,
+    L, 4.5, 4.75,
+    L, 8.0, 8.25,
+    Z
+};
+
+# a chevron pointing up
+val D_CHEVRON_UP: [19]f32 = [19]f32{
+    M, 4.5, 11.25,
+    L, 3.0, 9.75,
+    L, 8.0, 4.75,
+    L, 13.0, 9.75,
+    L, 11.5, 11.25,
+    L, 8.0, 7.75,
+    Z
+};
+
+# a plus sign
+val D_PLUS: [37]f32 = [37]f32{
+    M, 7.0, 2.0,
+    L, 9.0, 2.0,
+    L, 9.0, 7.0,
+    L, 14.0, 7.0,
+    L, 14.0, 9.0,
+    L, 9.0, 9.0,
+    L, 9.0, 14.0,
+    L, 7.0, 14.0,
+    L, 7.0, 9.0,
+    L, 2.0, 9.0,
+    L, 2.0, 7.0,
+    L, 7.0, 7.0,
+    Z
+};
+
+# a minus sign
+val D_MINUS: [13]f32 = [13]f32{
+    M, 2.0, 7.0,
+    L, 14.0, 7.0,
+    L, 14.0, 9.0,
+    L, 2.0, 9.0,
+    Z
+};
+
+# a magnifying glass, its lens a ring and its handle running down to the right
+val D_SEARCH: [70]f32 = [70]f32{
+    M, 9.171, 10.727,
+    C, 7.018, 12.088, 4.186, 11.612, 2.595, 9.622,
+    C, 1.004, 7.633, 1.163, 4.766, 2.964, 2.964,
+    C, 4.766, 1.163, 7.633, 1.004, 9.622, 2.595,
+    C, 11.612, 4.186, 12.088, 7.018, 10.727, 9.171,
+    L, 15.763, 14.207,
+    L, 14.207, 15.763,
+    Z,
+    M, 6.5, 3.1,
+    C, 4.622, 3.1, 3.1, 4.622, 3.1, 6.5,
+    C, 3.1, 8.378, 4.622, 9.9, 6.5, 9.9,
+    C, 8.378, 9.9, 9.9, 8.378, 9.9, 6.5,
+    C, 9.9, 4.622, 8.378, 3.1, 6.5, 3.1,
+    Z
+};
+
+# a gear of eight teeth around a hole
+val D_SETTINGS: [164]f32 = [164]f32{
+    M, 6.808, 2.836,
+    L, 6.842, 0.691,
+    L, 9.158, 0.691,
+    L, 9.192, 2.836,
+    C, 9.764, 2.968, 10.311, 3.194, 10.809, 3.505,
+    L, 12.35, 2.013,
+    L, 13.987, 3.65,
+    L, 12.495, 5.191,
+    C, 12.806, 5.689, 13.032, 6.236, 13.164, 6.808,
+    L, 15.309, 6.842,
+    L, 15.309, 9.158,
+    L, 13.164, 9.192,
+    C, 13.032, 9.764, 12.806, 10.311, 12.495, 10.809,
+    L, 13.987, 12.35,
+    L, 12.35, 13.987,
+    L, 10.809, 12.495,
+    C, 10.311, 12.806, 9.764, 13.032, 9.192, 13.164,
+    L, 9.158, 15.309,
+    L, 6.842, 15.309,
+    L, 6.808, 13.164,
+    C, 6.236, 13.032, 5.689, 12.806, 5.191, 12.495,
+    L, 3.65, 13.987,
+    L, 2.013, 12.35,
+    L, 3.505, 10.809,
+    C, 3.194, 10.311, 2.968, 9.764, 2.836, 9.192,
+    L, 0.691, 9.158,
+    L, 0.691, 6.842,
+    L, 2.836, 6.808,
+    C, 2.968, 6.236, 3.194, 5.689, 3.505, 5.191,
+    L, 2.013, 3.65,
+    L, 3.65, 2.013,
+    L, 5.191, 3.505,
+    C, 5.689, 3.194, 6.236, 2.968, 6.808, 2.836,
+    Z,
+    M, 8.0, 5.6,
+    C, 6.675, 5.6, 5.6, 6.675, 5.6, 8.0,
+    C, 5.6, 9.325, 6.675, 10.4, 8.0, 10.4,
+    C, 9.325, 10.4, 10.4, 9.325, 10.4, 8.0,
+    C, 10.4, 6.675, 9.325, 5.6, 8.0, 5.6,
+    Z
+};
+
+# a question mark in a ring
+val D_HELP: [157]f32 = [157]f32{
+    M, 8.0, 0.5,
+    C, 12.142, 0.5, 15.5, 3.858, 15.5, 8.0,
+    C, 15.5, 12.142, 12.142, 15.5, 8.0, 15.5,
+    C, 3.858, 15.5, 0.5, 12.142, 0.5, 8.0,
+    C, 0.5, 3.858, 3.858, 0.5, 8.0, 0.5,
+    Z,
+    M, 8.0, 1.8,
+    C, 4.576, 1.8, 1.8, 4.576, 1.8, 8.0,
+    C, 1.8, 11.424, 4.576, 14.2, 8.0, 14.2,
+    C, 11.424, 14.2, 14.2, 11.424, 14.2, 8.0,
+    C, 14.2, 4.576, 11.424, 1.8, 8.0, 1.8,
+    Z,
+    M, 5.489, 6.873,
+    C, 5.162, 5.654, 5.758, 4.377, 6.901, 3.844,
+    C, 8.045, 3.31, 9.406, 3.675, 10.13, 4.709,
+    C, 10.854, 5.742, 10.731, 7.146, 9.838, 8.038,
+    L, 8.65, 9.2,
+    L, 8.65, 10.3,
+    L, 7.35, 10.3,
+    L, 7.35, 8.6,
+    L, 8.919, 7.119,
+    C, 9.365, 6.673, 9.427, 5.971, 9.065, 5.454,
+    C, 8.703, 4.938, 8.022, 4.755, 7.451, 5.022,
+    C, 6.879, 5.288, 6.581, 5.927, 6.744, 6.536,
+    Z,
+    M, 8.0, 11.45,
+    C, 8.469, 11.45, 8.85, 11.831, 8.85, 12.3,
+    C, 8.85, 12.769, 8.469, 13.15, 8.0, 13.15,
+    C, 7.531, 13.15, 7.15, 12.769, 7.15, 12.3,
+    C, 7.15, 11.831, 7.531, 11.45, 8.0, 11.45,
+    Z
+};
+
+# a push pin, point down
+val D_PIN: [46]f32 = [46]f32{
+    M, 5.0, 1.5,
+    L, 11.0, 1.5,
+    L, 11.0, 3.0,
+    L, 9.5, 3.0,
+    L, 9.5, 8.0,
+    L, 12.0, 8.0,
+    L, 12.0, 9.5,
+    L, 8.6, 9.5,
+    L, 8.0, 15.0,
+    L, 7.4, 9.5,
+    L, 4.0, 9.5,
+    L, 4.0, 8.0,
+    L, 6.5, 8.0,
+    L, 6.5, 3.0,
+    L, 5.0, 3.0,
+    Z
+};
+
+# a drop target that docks as a tab: a frame filled whole
+val D_DOCK_CENTER: [39]f32 = [39]f32{
+    M, 1.5, 1.5,
+    L, 14.5, 1.5,
+    L, 14.5, 14.5,
+    L, 1.5, 14.5,
+    Z,
+    M, 2.75, 13.25,
+    L, 13.25, 13.25,
+    L, 13.25, 2.75,
+    L, 2.75, 2.75,
+    Z,
+    M, 3.75, 3.75,
+    L, 12.25, 3.75,
+    L, 12.25, 12.25,
+    L, 3.75, 12.25,
+    Z
+};
+
+# a drop target that docks to the left: a frame with its left half filled
+val D_DOCK_LEFT: [39]f32 = [39]f32{
+    M, 1.5, 1.5,
+    L, 14.5, 1.5,
+    L, 14.5, 14.5,
+    L, 1.5, 14.5,
+    Z,
+    M, 2.75, 13.25,
+    L, 13.25, 13.25,
+    L, 13.25, 2.75,
+    L, 2.75, 2.75,
+    Z,
+    M, 3.75, 3.75,
+    L, 8.0, 3.75,
+    L, 8.0, 12.25,
+    L, 3.75, 12.25,
+    Z
+};
+
+# a drop target that docks to the right: a frame with its right half filled
+val D_DOCK_RIGHT: [39]f32 = [39]f32{
+    M, 1.5, 1.5,
+    L, 14.5, 1.5,
+    L, 14.5, 14.5,
+    L, 1.5, 14.5,
+    Z,
+    M, 2.75, 13.25,
+    L, 13.25, 13.25,
+    L, 13.25, 2.75,
+    L, 2.75, 2.75,
+    Z,
+    M, 8.0, 3.75,
+    L, 12.25, 3.75,
+    L, 12.25, 12.25,
+    L, 8.0, 12.25,
+    Z
+};
+
+# a drop target that docks to the top: a frame with its top half filled
+val D_DOCK_TOP: [39]f32 = [39]f32{
+    M, 1.5, 1.5,
+    L, 14.5, 1.5,
+    L, 14.5, 14.5,
+    L, 1.5, 14.5,
+    Z,
+    M, 2.75, 13.25,
+    L, 13.25, 13.25,
+    L, 13.25, 2.75,
+    L, 2.75, 2.75,
+    Z,
+    M, 3.75, 3.75,
+    L, 12.25, 3.75,
+    L, 12.25, 8.0,
+    L, 3.75, 8.0,
+    Z
+};
+
+# a drop target that docks to the bottom: a frame with its bottom half filled
+val D_DOCK_BOTTOM: [39]f32 = [39]f32{
+    M, 1.5, 1.5,
+    L, 14.5, 1.5,
+    L, 14.5, 14.5,
+    L, 1.5, 14.5,
+    Z,
+    M, 2.75, 13.25,
+    L, 13.25, 13.25,
+    L, 13.25, 2.75,
+    L, 2.75, 2.75,
+    Z,
+    M, 3.75, 8.0,
+    L, 12.25, 8.0,
+    L, 12.25, 12.25,
+    L, 3.75, 12.25,
+    Z
+};
+
+test icon__builtins_are_whole {
+    var id: u32 = 0;
+    for (id < BUILTIN_COUNT) {
+        val ic: opt[Icon] = builtin(id);
+        if (sel ic.none)     { ret 1; }
+        if (!valid(ic.some)) { ret 2; }
+        # every point lies on the box
+        var i: usize = 0;
+        for (i < ic.some.n) {
+            var o:    path.Op;
+            val took: usize = path.decode(ic.some.data, ic.some.n, i, ?o);
+            if (o.verb != path.CLOSE && (o.x < 0.0::f32 || o.x > BOX || o.y < 0.0::f32 || o.y > BOX)) { ret 3; }
+            i = i + took;
+        }
+        id = id + 1;
+    }
+    val past: opt[Icon] = builtin(BUILTIN_COUNT);
+    if (sel past.some) { ret 4; }
+    ret 0;
+}
+
+test icon__apps_register_their_own {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var set: Set = init(?a);
+
+    var tri: [10]f32  = [10]f32{M, 0.0, 0.0, L, 24.0, 12.0, L, 0.0, 24.0, Z};
+    val one: opt[u32] = add(?set, Icon{data: ?tri[0], n: 10, w: 24.0::f32, h: 24.0::f32});
+    if (sel one.none)          { ret 2; }
+    if (one.some != APP_FIRST) { ret 2; }
+    # the set keeps its own copy
+    tri[4] = 99.0::f32;
+    val got: opt[Icon] = get(?set, one.some);
+    if (sel got.none)                                       { ret 3; }
+    if (got.some.n != 10 || got.some.data[4] != 24.0::f32)  { ret 4; }
+    if (got.some.w != 24.0::f32 || got.some.h != 24.0::f32) { ret 5; }
+    # malformed data and an empty box are refused
+    val short: opt[u32]  = add(?set, Icon{data: ?tri[0], n: 8, w: 24.0::f32, h: 24.0::f32});
+    val flat:  opt[u32]  = add(?set, Icon{data: ?tri[0], n: 10, w: 0.0::f32, h: 24.0::f32});
+    val next:  opt[Icon] = get(?set, APP_FIRST + 1);
+    val play:  opt[Icon] = get(?set, PLAY);
+    if (sel short.some) { ret 6; }
+    if (sel flat.some)  { ret 7; }
+    if (sel next.some)  { ret 8; }
+    if (sel play.none)  { ret 9; }
+
+    # ids are codepoints, and STR_* their utf-8
+    var buf: [5]u8;
+    if (encode(PIN, ?buf[0], 4) != 4) { ret 10; }
+    var k: usize = 0;
+    for (k < 4) {
+        if (buf[k] != STR_PIN[k]::u8) { ret 11; }
+        k = k + 1;
+    }
+    val back:  opt[u32] = id_of(codepoint(one.some));
+    val plain: opt[u32] = id_of(0x41);
+    if (sel back.none)         { ret 12; }
+    if (back.some != one.some) { ret 12; }
+    if (sel plain.some)        { ret 13; }
+
+    val freed: err[allo.Error] = free(?set);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
