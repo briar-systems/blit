@@ -74,6 +74,8 @@ use blit.font;
 use gly: blit.glyph;
 use blit.hit;
 use blit.input;
+use blit.path;
+use blit.tess;
 use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
@@ -208,6 +210,7 @@ pub rec Area {
 # run_floor:     runs below this index are sealed and never reopened
 # oom:           1 if an allocation or a claim was refused this frame, else 0
 # order:         scratch index list end() composes runs into
+# sc:            scratch the painter builds and tessellates shapes in
 # claims:        this frame's claims, which route the next frame
 # prior:         the previous frame's claims, which route this frame
 # hover:         id of the topmost claimant under the cursor, resolved in begin (0 = none)
@@ -269,6 +272,7 @@ pub rec Context {
     run_floor:     usize;
     oom:           u8;
     order:         vec.Vector[u32];
+    sc:            tess.Scratch;
     claims:        hit.ClaimList;
     prior:         hit.ClaimList;
     hover:         u64;
@@ -325,6 +329,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.runs  = vec.init[Run](a);
     ctx.chans = vec.init[u32](a);
     ctx.order = vec.init[u32](a);
+    ctx.sc    = tess.init(a);
 
     ctx.in.mx        = 0.0::f32;
     ctx.in.my        = 0.0::f32;
@@ -399,6 +404,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel e4.err) { ret e4; }
     val e5: err[allo.Error] = vec.dnit[u32](?ctx.order);
     if (sel e5.err) { ret e5; }
+    val e6: err[allo.Error] = tess.free(?ctx.sc);
+    if (sel e6.err) { ret e6; }
     val e2: err[allo.Error] = hit.free(?ctx.claims);
     if (sel e2.err) { ret e2; }
     val e3: err[allo.Error] = hit.free(?ctx.prior);
@@ -1292,80 +1299,425 @@ pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, paint(ctx, c));
 }
 
-# how many quads a fill of radius r with these corners is made of
-#
-# one for the body and one per pixel row of each rounded end, so a square fill
-# is a single quad.
-fun fill_quads(r: f32, corners: u8) usize {
-    if (r <= 0.0::f32) { ret 1; }
-    var rows: usize = r::usize;
-    if (rows::f32 < r) { rows = rows + 1; }
-    var n: usize = 1;
-    if ((corners & CORNERS_TOP) != 0)    { n = n + rows; }
-    if ((corners & CORNERS_BOTTOM) != 0) { n = n + rows; }
-    ret n;
-}
-
-# the rect of quad k of a fill, empty when the radius left it no row
-#
-# quad 0 is the body between the rounded ends. then come the top end's pixel
-# rows from the edge inward, then the bottom end's, each inset from the sides
-# to follow a circle of the radius, clamped to what the rect can hold.
-fun fill_part(x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, k: usize) Area {
-    val top:    bool = (corners & CORNERS_TOP) != 0 && r > 0.0::f32;
-    val bottom: bool = (corners & CORNERS_BOTTOM) != 0 && r > 0.0::f32;
-    var rr:     f32  = minf(r, (x1 - x0) / 2.0::f32);
-    if (top && bottom) { rr = minf(rr, (y1 - y0) / 2.0::f32); }
-    or (top || bottom) { rr = minf(rr, y1 - y0); }
-    rr = maxf(rr, 0.0::f32);
-
-    if (k == 0) {
-        var b: Area = Area{x0: x0, y0: y0, x1: x1, y1: y1};
-        if (top)    { b.y0 = y0 + rr; }
-        if (bottom) { b.y1 = y1 - rr; }
-        ret b;
-    }
-    val empty:  Area  = Area{x0: x0, y0: y0, x1: x0, y1: y0};
-    val rows:   usize = fill_quads(r, CORNERS_TOP) - 1;
-    var i:      usize = k - 1;
-    var at_top: bool  = top;
-    if (!top || i >= rows) {
-        at_top = false;
-        if (top) { i = i - rows; }
-    }
-    val a: f32 = i::f32;
-    if (a >= rr) { ret empty; }
-    val b:     f32 = minf(a + 1.0::f32, rr);
-    val d:     f32 = rr - (a + b) / 2.0::f32;
-    val inset: f32 = rr - sqrt_f32(maxf(rr * rr - d * d, 0.0::f32));
-    if (at_top) { ret Area{x0: x0 + inset, y0: y0 + a, x1: x1 - inset, y1: y0 + b}; }
-    ret Area{x0: x0 + inset, y0: y1 - b, x1: x1 - inset, y1: y1 - a};
-}
-
 # fill a rectangle with its chosen corners rounded to radius r
 #
-# the rounding is built from quads, one per pixel row of each rounded end, so
-# it needs nothing of the renderer and clips like any quad. a radius of zero
-# or less, or no corners, is one quad, the same as quad.
+# the same as rounded_rect with r on the corners named and square corners
+# elsewhere. a radius of zero or less, or no corners, is one quad, the same as
+# quad.
 # ---
 # ctx:     context
 # x0:      left x in pixels
 # y0:      top y in pixels
 # x1:      right x in pixels
 # y1:      bottom y in pixels
-# r:       corner radius in pixels, clamped to what the rect can hold
+# r:       corner radius in pixels
 # corners: which corners are rounded, CORNERS_* combined with |
 # c:       fill color
 pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, c: draw.Color) {
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    val n: usize = fill_quads(rad, corners);
-    var k: usize = 0;
-    for (k < n) {
-        val q: Area = fill_part(x0, y0, x1, y1, rad, corners, k);
-        if (q.x1 > q.x0 && q.y1 > q.y0) { quad(ctx, q.x0, q.y0, q.x1, q.y1, c); }
-        k = k + 1;
+    var rr: draw.Radii = draw.radii(0.0::f32);
+    if ((corners & CORNERS_TOP) != 0) {
+        rr.tl = r;
+        rr.tr = r;
     }
+    if ((corners & CORNERS_BOTTOM) != 0) {
+        rr.br = r;
+        rr.bl = r;
+    }
+    rounded_rect(ctx, x0, y0, x1, y1, rr, c);
+}
+
+# a brush of one color, as emitted, on the atlas white block
+fun solid(ctx: *Context, c: draw.Color) tess.Brush {
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    ret tess.solid(paint(ctx, c), wu, wv);
+}
+
+# a brush of a gradient in local space, as emitted, on the atlas white block
+fun shaded(ctx: *Context, g: draw.Gradient) tess.Brush {
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    ret tess.linear(g.x0 + ctx.lx, g.y0 + ctx.ly, paint(ctx, g.c0), g.x1 + ctx.lx, g.y1 + ctx.ly, paint(ctx, g.c1), wu, wv);
+}
+
+# whether a local box, grown by m on every side, lies wholly outside the clip
+fun hidden(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, m: f32) bool {
+    ret culled(ctx, minf(x0, x1) + ctx.lx - m, minf(y0, y1) + ctx.ly - m, maxf(x0, x1) + ctx.lx + m, maxf(y0, y1) + ctx.ly + m);
+}
+
+# whether the shape built in the scratch, grown by m, lies wholly outside the clip
+fun hidden_shape(ctx: *Context, m: f32) bool {
+    var x0: f32;
+    var y0: f32;
+    var x1: f32;
+    var y1: f32;
+    if (!tess.bounds(?ctx.sc, ?x0, ?y0, ?x1, ?y1)) { ret true; }
+    ret culled(ctx, x0 - m, y0 - m, x1 + m, y1 + m);
+}
+
+# fill the convex shape built in the scratch with a brush
+fun put_convex(ctx: *Context, b: tess.Brush) {
+    if (hidden_shape(ctx, tess.FEATHER)) { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.fill_convex(?ctx.dl, ?ctx.sc, ?br));
+}
+
+# stroke the contours built in the scratch with a brush
+fun put_stroke(ctx: *Context, w: f32, join: u8, b: tess.Brush) {
+    var m: f32 = w * 0.5::f32 + tess.FEATHER;
+    if (join == draw.JOIN_MITER) { m = m * tess.MITER_LIMIT; }
+    if (hidden_shape(ctx, m))    { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.stroke(?ctx.dl, ?ctx.sc, w, join, ?br));
+}
+
+# fill a rectangle with a linear gradient
+#
+# the rect is one quad, not feathered, like quad.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# g:   the gradient, in local pixels
+pub fun quad_gradient(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, g: draw.Gradient) {
+    if (hidden(ctx, x0, y0, x1, y1, 0.0::f32)) { ret; }
+    var b: tess.Brush = shaded(ctx, g);
+    open_run(ctx);
+    record(ctx, tess.rect(?ctx.dl, x0 + ctx.lx, y0 + ctx.ly, x1 + ctx.lx, y1 + ctx.ly, b.u, b.v, b.u, b.v, ?b));
+}
+
+# outline a rectangle with a band w pixels wide inside its edges
+#
+# four quads, not feathered, so a frame on whole pixels is crisp. a band
+# reaching the middle fills the rect.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# w:   band width in pixels
+# c:   color
+pub fun frame(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: draw.Color) {
+    if (w <= 0.0::f32) { ret; }
+    if (w * 2.0::f32 >= x1 - x0 || w * 2.0::f32 >= y1 - y0) {
+        quad(ctx, x0, y0, x1, y1, c);
+        ret;
+    }
+    quad(ctx, x0, y0, x1, y0 + w, c);
+    quad(ctx, x0, y1 - w, x1, y1, c);
+    quad(ctx, x0, y0 + w, x0 + w, y1 - w, c);
+    quad(ctx, x1 - w, y0 + w, x1, y1 - w, c);
+}
+
+# fill a triangle, feathered
+# ---
+# ctx: context
+# x0:  first corner x in pixels
+# y0:  first corner y in pixels
+# x1:  second corner x in pixels
+# y1:  second corner y in pixels
+# x2:  third corner x in pixels
+# y2:  third corner y in pixels
+# c:   color
+pub fun tri(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.point(?ctx.sc, x0 + ctx.lx, y0 + ctx.ly);
+    tess.point(?ctx.sc, x1 + ctx.lx, y1 + ctx.ly);
+    tess.point(?ctx.sc, x2 + ctx.lx, y2 + ctx.ly);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# a line w pixels wide from (x0, y0) to (x1, y1), feathered, its ends square
+# at the points
+# ---
+# ctx: context
+# x0:  start x in pixels
+# y0:  start y in pixels
+# x1:  end x in pixels
+# y1:  end y in pixels
+# w:   width in pixels
+# c:   color
+pub fun line(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.point(?ctx.sc, x0 + ctx.lx, y0 + ctx.ly);
+    tess.point(?ctx.sc, x1 + ctx.lx, y1 + ctx.ly);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# a line w pixels wide through n points, feathered, turning each corner with
+# a join
+#
+# a closed polyline joins its last point back to its first, and an open one
+# ends square at its ends. a miter longer than tess.MITER_LIMIT half widths
+# bevels.
+# ---
+# ctx:    context
+# pts:    n points in local pixels
+# n:      point count
+# closed: true to join the last point back to the first
+# w:      width in pixels
+# join:   draw.JOIN_MITER, JOIN_BEVEL or JOIN_ROUND
+# c:      color
+pub fun polyline(ctx: *Context, pts: *draw.Point, n: usize, closed: bool, w: f32, join: u8, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, closed);
+    var i: usize = 0;
+    for (i < n) {
+        tess.point(?ctx.sc, pts[i].x + ctx.lx, pts[i].y + ctx.ly);
+        i = i + 1;
+    }
+    put_stroke(ctx, w, join, solid(ctx, c));
+}
+
+# radii scaled down together until adjacent corners fit along every side
+fun fit_radii(x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii) draw.Radii {
+    var o: draw.Radii = draw.Radii{
+        tl: maxf(r.tl, 0.0::f32), tr: maxf(r.tr, 0.0::f32), br: maxf(r.br, 0.0::f32), bl: maxf(r.bl, 0.0::f32)
+    };
+    val w: f32 = maxf(x1 - x0, 0.0::f32);
+    val h: f32 = maxf(y1 - y0, 0.0::f32);
+    var f: f32 = 1.0::f32;
+    if (o.tl + o.tr > w * f) { f = w / (o.tl + o.tr); }
+    if (o.bl + o.br > w * f) { f = w / (o.bl + o.br); }
+    if (o.tl + o.bl > h * f) { f = h / (o.tl + o.bl); }
+    if (o.tr + o.br > h * f) { f = h / (o.tr + o.br); }
+    if (f < 1.0::f32) {
+        o.tl = o.tl * f;
+        o.tr = o.tr * f;
+        o.br = o.br * f;
+        o.bl = o.bl * f;
+    }
+    ret o;
+}
+
+# build a rounded rect's outline in the scratch, in screen pixels, clockwise
+fun build_rounded(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, closed: u8) {
+    val f:  draw.Radii = fit_radii(x0, y0, x1, y1, r);
+    val sx: f32        = x0 + ctx.lx;
+    val sy: f32        = y0 + ctx.ly;
+    val ex: f32        = x1 + ctx.lx;
+    val ey: f32        = y1 + ctx.ly;
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, closed);
+    tess.quarter(?ctx.sc, sx + f.tl, sy + f.tl, f.tl, 2);
+    tess.quarter(?ctx.sc, ex - f.tr, sy + f.tr, f.tr, 3);
+    tess.quarter(?ctx.sc, ex - f.br, ey - f.br, f.br, 0);
+    tess.quarter(?ctx.sc, sx + f.bl, ey - f.bl, f.bl, 1);
+}
+
+# whether every radius is zero or less
+fun square(r: draw.Radii) bool {
+    ret r.tl <= 0.0::f32 && r.tr <= 0.0::f32 && r.br <= 0.0::f32 && r.bl <= 0.0::f32;
+}
+
+# fill a rectangle with a radius per corner, its curved edges feathered
+#
+# radii are scaled down together when adjacent corners would overlap. a rect
+# with every radius zero is one quad, not feathered, the same as quad.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the corner radii in pixels
+# c:   color
+pub fun rounded_rect(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, c: draw.Color) {
+    if (x1 <= x0 || y1 <= y0) { ret; }
+    if (square(r)) {
+        quad(ctx, x0, y0, x1, y1, c);
+        ret;
+    }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    build_rounded(ctx, x0, y0, x1, y1, r, 1);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# fill a rectangle with a radius per corner in a linear gradient
+#
+# as rounded_rect, with every vertex taking the gradient's color where it lies.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the corner radii in pixels
+# g:   the gradient, in local pixels
+pub fun rounded_rect_gradient(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, g: draw.Gradient) {
+    if (x1 <= x0 || y1 <= y0) { ret; }
+    if (square(r)) {
+        quad_gradient(ctx, x0, y0, x1, y1, g);
+        ret;
+    }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    build_rounded(ctx, x0, y0, x1, y1, r, 1);
+    put_convex(ctx, shaded(ctx, g));
+}
+
+# outline a rectangle with a radius per corner, the band w pixels wide inside
+# its edges, feathered
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the outer corner radii in pixels
+# w:   band width in pixels
+# c:   color
+pub fun stroke_rounded_rect(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, w: f32, c: draw.Color) {
+    if (w <= 0.0::f32 || x1 <= x0 || y1 <= y0)     { ret; }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    val h:  f32        = w * 0.5::f32;
+    val f:  draw.Radii = fit_radii(x0, y0, x1, y1, r);
+    val in: draw.Radii = draw.Radii{
+        tl: maxf(f.tl - h, 0.0::f32), tr: maxf(f.tr - h, 0.0::f32), br: maxf(f.br - h, 0.0::f32),
+        bl: maxf(f.bl - h, 0.0::f32)
+    };
+    build_rounded(ctx, x0 + h, y0 + h, x1 - h, y1 - h, in, 1);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# build a circle's outline in the scratch, in screen pixels
+fun build_circle(ctx: *Context, cx: f32, cy: f32, r: f32) {
+    val sx: f32 = cx + ctx.lx;
+    val sy: f32 = cy + ctx.ly;
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, 1);
+    tess.quarter(?ctx.sc, sx, sy, r, 0);
+    tess.quarter(?ctx.sc, sx, sy, r, 1);
+    tess.quarter(?ctx.sc, sx, sy, r, 2);
+    tess.quarter(?ctx.sc, sx, sy, r, 3);
+}
+
+# fill a circle, feathered
+#
+# its segment count follows its radius in pixels, so it stays round at any
+# interface scale.
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   radius in pixels
+# c:   color
+pub fun circle(ctx: *Context, cx: f32, cy: f32, r: f32, c: draw.Color) {
+    if (r <= 0.0::f32)                                             { ret; }
+    if (hidden(ctx, cx - r, cy - r, cx + r, cy + r, tess.FEATHER)) { ret; }
+    build_circle(ctx, cx, cy, r);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# outline a circle with a ring w pixels wide inside its radius, feathered
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   outer radius in pixels
+# w:   ring width in pixels
+# c:   color
+pub fun stroke_circle(ctx: *Context, cx: f32, cy: f32, r: f32, w: f32, c: draw.Color) {
+    if (r <= 0.0::f32 || w <= 0.0::f32)                            { ret; }
+    if (hidden(ctx, cx - r, cy - r, cx + r, cy + r, tess.FEATHER)) { ret; }
+    var mid: f32 = r - w * 0.5::f32;
+    if (mid <= 0.0::f32) {
+        circle(ctx, cx, cy, r, c);
+        ret;
+    }
+    build_circle(ctx, cx, cy, mid);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# an arc of radius r around (cx, cy) from angle a0 to a1, w pixels wide,
+# centred on the radius and feathered, its ends square
+#
+# angles are in radians from +x, increasing clockwise on screen since y runs
+# down, and a1 below a0 sweeps the other way.
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   radius in pixels
+# a0:  start angle in radians
+# a1:  end angle in radians
+# w:   width in pixels
+# c:   color
+pub fun arc(ctx: *Context, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, w: f32, c: draw.Color) {
+    if (r <= 0.0::f32 || w <= 0.0::f32) { ret; }
+    val m: f32 = r + w * 0.5::f32;
+    if (hidden(ctx, cx - m, cy - m, cx + m, cy + m, tess.FEATHER)) { ret; }
+    tess.begin(?ctx.sc);
+    tess.arc(?ctx.sc, cx + ctx.lx, cy + ctx.ly, r, a0, a1);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# build a path's contours in the scratch, in screen pixels, and say whether
+# it can be drawn, setting oom when the path or the scratch ran out
+fun build_path(ctx: *Context, p: *path.Path) bool {
+    if (p.oom != 0) {
+        ctx.oom = 1;
+        ret false;
+    }
+    tess.begin(?ctx.sc);
+    tess.flatten(?ctx.sc, p, ctx.lx, ctx.ly, 1.0::f32);
+    if (ctx.sc.bad != 0) {
+        ctx.oom = 1;
+        ret false;
+    }
+    ret true;
+}
+
+# fill a path by the nonzero rule, feathered
+#
+# every contour is filled as if closed. a hole is a contour wound against its
+# outline. contours that overlap fill their union, though the feathers of the
+# edges they hide still show faintly, so an icon is cleanest drawn as contours
+# that meet without overlapping.
+# ---
+# ctx: context
+# p:   the path, in local pixels
+# c:   color
+pub fun fill_path(ctx: *Context, p: *path.Path, c: draw.Color) {
+    fill_path_brush(ctx, p, solid(ctx, c));
+}
+
+# fill a path by the nonzero rule in a linear gradient, as fill_path
+# ---
+# ctx: context
+# p:   the path, in local pixels
+# g:   the gradient, in local pixels
+pub fun fill_path_gradient(ctx: *Context, p: *path.Path, g: draw.Gradient) {
+    fill_path_brush(ctx, p, shaded(ctx, g));
+}
+
+# fill a path with a brush
+fun fill_path_brush(ctx: *Context, p: *path.Path, b: tess.Brush) {
+    if (!build_path(ctx, p))             { ret; }
+    if (hidden_shape(ctx, tess.FEATHER)) { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.fill(?ctx.dl, ?ctx.sc, ?br));
+}
+
+# stroke a path w pixels wide, centred on it and feathered
+#
+# a closed contour joins back to its start, and an open one ends square.
+# ---
+# ctx:  context
+# p:    the path, in local pixels
+# w:    width in pixels
+# join: draw.JOIN_MITER, JOIN_BEVEL or JOIN_ROUND
+# c:    color
+pub fun stroke_path(ctx: *Context, p: *path.Path, w: f32, join: u8, c: draw.Color) {
+    if (!build_path(ctx, p)) { ret; }
+    put_stroke(ctx, w, join, solid(ctx, c));
 }
 
 # emit one glyph with its pen at x on the baseline, sampling its atlas page
@@ -2052,22 +2404,150 @@ test fill__rounds_corners {
     var ctx: Context;
     val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
-    start_at(?ctx, 0.0::f32, 0.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     # a square fill is one quad
+    start_at(?ctx, 0.0::f32, 0.0::f32);
     fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
     if (draw_count(?ctx) != 4) { ret 2; }
 
-    # radius 4 on every corner: the body plus four rows at each end
+    # radius 4 on every corner covers the rect less four corners of 16 - 4 pi,
+    # less what the chords within tolerance cut off
+    start_at(?ctx, 0.0::f32, 0.0::f32);
     fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
-    if (draw_count(?ctx) != 40) { ret 3; }
-    val p: *draw.Vert = draw_verts(?ctx);
-    if (p[4].y != 4.0::f32 || p[6].y != 16.0::f32 || p[4].x != 0.0::f32) { ret 4; }
-    # the outermost top row is inset from both sides, the innermost barely
-    if (p[8].y != 0.0::f32 || p[8].x <= 1.0::f32 || p[9].x >= 19.0::f32) { ret 5; }
-    if (p[20].y != 3.0::f32 || p[20].x >= 0.5::f32)                      { ret 6; }
+    val all: f32 = tess.coverage(?ctx.dl);
+    if (all < 383.0::f32 || all > 387.0::f32) { ret 3; }
+    # rounding the top alone cuts two
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_TOP, white);
+    val top: f32 = tess.coverage(?ctx.dl);
+    if (top < 391.0::f32 || top > 394.0::f32) { ret 4; }
 
+    # radii that cannot fit are scaled down together into a circle
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    rounded_rect(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, draw.radii(50.0::f32), white);
+    val disc: f32 = tess.coverage(?ctx.dl);
+    if (disc < 304.0::f32 || disc > 315.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test primitives__clip_to_their_run_scissor {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.hex(0xFFFFFF, 1.0::f32);
+    var icon:  path.Path  = path.init(?a);
+    path.move(?icon, 20.0::f32, 20.0::f32);
+    path.cubic(?icon, 30.0::f32, 0.0::f32, 50.0::f32, 40.0::f32, 60.0::f32, 20.0::f32);
+    path.line(?icon, 40.0::f32, 60.0::f32);
+    path.close(?icon);
+    var pts: [3]draw.Point = [3]draw.Point{
+        draw.Point{x: 0.0::f32, y: 0.0::f32}, draw.Point{x: 40.0::f32, y: 20.0::f32},
+        draw.Point{x: 0.0::f32, y: 45.0::f32}
+    };
+
+    push_clip(?ctx, 10.0::f32, 10.0::f32, 50.0::f32, 50.0::f32);
+    # every shape here crosses the clip and is drawn whole
+    circle(?ctx, 30.0::f32, 30.0::f32, 30.0::f32, white);
+    stroke_circle(?ctx, 30.0::f32, 30.0::f32, 25.0::f32, 2.0::f32, white);
+    line(?ctx, 0.0::f32, 30.0::f32, 100.0::f32, 30.0::f32, 2.0::f32, white);
+    polyline(?ctx, ?pts[0], 3, false, 3.0::f32, draw.JOIN_ROUND, white);
+    arc(?ctx, 30.0::f32, 30.0::f32, 22.0::f32, 0.0::f32, 3.0::f32, 2.0::f32, white);
+    tri(?ctx, 0.0::f32, 0.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 40.0::f32, white);
+    frame(?ctx, 5.0::f32, 5.0::f32, 45.0::f32, 45.0::f32, 2.0::f32, white);
+    stroke_rounded_rect(?ctx, 5.0::f32, 5.0::f32, 45.0::f32, 45.0::f32, draw.radii(6.0::f32), 2.0::f32, white);
+    fill_path(?ctx, ?icon, white);
+    stroke_path(?ctx, ?icon, 1.5::f32, draw.JOIN_BEVEL, white);
+    val drawn: usize = draw_count(?ctx);
+    # shapes wholly outside the clip are culled
+    circle(?ctx, 80.0::f32, 80.0::f32, 5.0::f32, white);
+    line(?ctx, 60.0::f32, 60.0::f32, 90.0::f32, 90.0::f32, 2.0::f32, white);
+    rounded_rect(?ctx, 60.0::f32, 0.0::f32, 90.0::f32, 8.0::f32, draw.radii(2.0::f32), white);
+    if (draw_count(?ctx) != drawn) { ret 2; }
+    pop_clip(?ctx);
+    end(?ctx);
+
+    # one run carries the clip as its scissor, and geometry reaches past it
+    if (run_count(?ctx) != 1 || ok(?ctx) != 1) { ret 3; }
+    val r: Run = run_at(?ctx, 0);
+    if (r.clip_x0 != 10.0::f32 || r.clip_y0 != 10.0::f32 || r.clip_x1 != 50.0::f32 || r.clip_y1 != 50.0::f32) { ret 4; }
+    if (r.count != index_count(?ctx))                                                                         { ret 5; }
+    val p:    *draw.Vert = draw_verts(?ctx);
+    var past: u8         = 0;
+    var i:    usize      = 0;
+    for (i < draw_count(?ctx)) {
+        if (p[i].x < 10.0::f32 || p[i].x > 50.0::f32) { past = 1; }
+        i = i + 1;
+    }
+    if (past == 0) { ret 6; }
+
+    val fp:    err[allo.Error] = path.free(?icon);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test gradients__shade_quads_rounded_rects_and_paths {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val black: draw.Color    = draw.hex(0x000000, 1.0::f32);
+    val clear: draw.Color    = draw.hex(0xFFFFFF, 0.0::f32);
+    val g:     draw.Gradient = draw.gradient(0.0::f32, 0.0::f32, black, 10.0::f32, 0.0::f32, draw.hex(0xFFFFFF, 1.0::f32));
+    # across a quad, each corner takes the gradient where it lies
+    quad_gradient(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, g);
+    var p: *draw.Vert = draw_verts(?ctx);
+    if (p[0].r != 0.0::f32 || p[1].r != 1.0::f32 || p[2].r != 1.0::f32 || p[3].r != 0.0::f32) { ret 2; }
+
+    # a vertical fade to clear on a rounded rect: premultiplied, top opaque
+    # and bottom gone
+    val fade: draw.Gradient = draw.gradient(0.0::f32, 20.0::f32, black, 0.0::f32, 40.0::f32, clear);
+    rounded_rect_gradient(?ctx, 0.0::f32, 20.0::f32, 10.0::f32, 40.0::f32, draw.radii(3.0::f32), fade);
+    p = draw_verts(?ctx);
+    var top: u8    = 0;
+    var bot: u8    = 0;
+    var i:   usize = 4;
+    for (i < draw_count(?ctx)) {
+        if (p[i].y < 22.0::f32 && p[i].a > 0.9::f32) { top = 1; }
+        if (p[i].y > 38.0::f32 && p[i].a > 0.1::f32) { bot = 1; }
+        i = i + 1;
+    }
+    if (top == 0 || bot != 0) { ret 3; }
+
+    # a path takes the gradient in its own local space, moved with the origin
+    val before: usize     = draw_count(?ctx);
+    var tri:    path.Path = path.init(?a);
+    path.move(?tri, 0.0::f32, 0.0::f32);
+    path.line(?tri, 10.0::f32, 0.0::f32);
+    path.line(?tri, 0.0::f32, 10.0::f32);
+    val s: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 40.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    fill_path_gradient(?ctx, ?tri, g);
+    end_surface(?ctx, s);
+    p = draw_verts(?ctx);
+    var dark:  u8 = 0;
+    var light: u8 = 0;
+    i = before;
+    for (i < draw_count(?ctx)) {
+        if (p[i].x < 52.0::f32 && p[i].a > 0.9::f32 && p[i].r < 0.2::f32) { dark = 1; }
+        if (p[i].x > 57.0::f32 && p[i].a > 0.9::f32 && p[i].r > 0.7::f32) { light = 1; }
+        i = i + 1;
+    }
+    if (dark == 0 || light == 0) { ret 4; }
+
+    val fp:    err[allo.Error] = path.free(?tri);
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;

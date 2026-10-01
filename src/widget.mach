@@ -1946,6 +1946,22 @@ fun vert_at(ctx: *context.Context, x: f32, y: f32) usize {
     ret n;
 }
 
+# where in paint order a solid vertex of color c is first drawn, or the index
+# count when none is
+#[testing]
+fun paint_of(ctx: *context.Context, c: draw.Color) usize {
+    val p:  *draw.Vert = context.draw_verts(ctx);
+    val ix: *u32       = context.draw_indices(ctx);
+    val n:  usize      = context.index_count(ctx);
+    var i:  usize      = 0;
+    for (i < n) {
+        val v: draw.Vert = p[ix[i]];
+        if (v.r == c.r && v.g == c.g && v.b == c.b && v.a == c.a) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
 test routing__open_dropdown_beats_later_window {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -2491,19 +2507,25 @@ test theme__drives_colors_and_corners {
     context.set_theme(?ctx, t);
     if (context.theme_of(?ctx).corner != 4.0::f32) { ret 2; }
 
-    # the button's rounded face: its body starts 4 down, in the theme's control color
+    # the button's face is rounded in the theme's control color: no solid
+    # vertex of it sits in its top-left corner
     frame_button(?ctx, input_at(150.0::f32, 150.0::f32, 0));
-    val p:     *draw.Vert = context.draw_verts(?ctx);
-    val n:     usize      = context.draw_count(?ctx);
-    var faced: u8         = 0;
-    var i:     usize      = 0;
+    val p:      *draw.Vert = context.draw_verts(?ctx);
+    val n:      usize      = context.draw_count(?ctx);
+    var faced:  u8         = 0;
+    var corner: u8         = 0;
+    var i:      usize      = 0;
     for (i < n) {
-        if (p[i].x == 0.0::f32 && p[i].y == 4.0::f32 && p[i].r == 0.9::f32) { faced = 1; }
+        if (p[i].r == 0.9::f32 && p[i].a == 1.0::f32) {
+            faced = 1;
+            if (p[i].x < 1.0::f32 && p[i].y < 1.0::f32) { corner = 1; }
+        }
         i = i + 1;
     }
-    if (faced == 0) { ret 3; }
-    # the panel's grown background body ends 4 above its bottom at 24
-    if (vert_at(?ctx, 0.0::f32, 20.0::f32) >= context.index_count(?ctx)) { ret 4; }
+    if (faced == 0 || corner != 0) { ret 3; }
+    # the panel's background, drawn at end_panel, paints beneath the button
+    val bg: draw.Color = draw.premultiply(t.panel);
+    if (paint_of(?ctx, bg) >= paint_of(?ctx, draw.premultiply(t.control))) { ret 4; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
