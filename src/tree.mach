@@ -50,6 +50,8 @@ use std.allocator.page;
 use blit.context;
 use blit.draw;
 use blit.driver;
+use blit.font;
+use gly: blit.glyph;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
@@ -205,7 +207,9 @@ rec Fold {
 # lo:     first row in view
 # hi:     row past the last in view
 # rh:     row height in pixels
-# lh:     line height in pixels, the indent of one level and the caret's side
+# lh:     line height in pixels, the indent of one level
+# asc:    the caption's ascent in pixels
+# k:      the caret's side in pixels, see widget.caret_size
 # x0:     left of the rows in the region's local pixels
 # x1:     right of the rows
 # y:      top of the first row
@@ -227,6 +231,8 @@ rec Walk {
     hi:     usize;
     rh:     f32;
     lh:     f32;
+    asc:    f32;
+    k:      f32;
     x0:     f32;
     x1:     f32;
     y:      f32;
@@ -309,7 +315,7 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool, up:
     val y0:  f32              = w.y + row::f32 * w.rh;
     val y1:  f32              = y0 + w.rh;
     val cx:  f32              = x0 + pad + depth::f32 * w.lh;
-    val tx:  f32              = cx + w.lh + pad;
+    val tx:  f32              = cx + w.k + pad;
 
     val h:    interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
     var flip: bool         = false;
@@ -358,7 +364,8 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool, up:
     val ink: *theme.Paint = context.paint_of(ctx, theme.TREE_ITEM, st);
     context.box(ctx, theme.TREE_ITEM, st, x0, y0, x1, y1);
     val ty: f32 = y0 + (w.rh - w.lh) / 2.0::f32;
-    if (!it.leaf)                    { widget.caret(ctx, cx, ty, w.lh, open, ink.mark); }
+    # the caret centred on the caption between its line's top and its baseline
+    if (!it.leaf)                    { widget.caret(ctx, cx, ty + (w.asc - w.k) / 2.0::f32, w.k, open, ink.mark); }
     if (it.label != nil)             { context.text_at(ctx, it.label, tx, ty, ink.text); }
     if (w.keyed && id == w.t.cursor) { context.box(ctx, theme.FOCUS_RING, theme.NORMAL, x0, y0, x1, y1); }
 
@@ -586,6 +593,9 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.stamp = t.epoch + 1;
     w.want  = NO_ROW;
     w.lh    = context.line_height(ctx);
+    val m: gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
+    w.asc = m.ascent;
+    w.k   = widget.caret_size(ctx, theme.TREE_ITEM, m.ascent);
     val ts: *theme.Style = context.look_of(ctx, theme.TREE_ITEM);
     w.rh = context.px(ctx, ts.min_h);
     val fit: f32 = w.lh + context.px(ctx, ts.inset.t + ts.inset.b);

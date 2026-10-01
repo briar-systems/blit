@@ -2545,10 +2545,15 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     ret @open != 0;
 }
 
-# the side of a section's caret: the section style's min_w, or with none the
+# the side of a caret beside a caption: the kind's min_w, or with none the
 # caption's ascent, so it follows the caption's text style and never the line
-fun caret_size(ctx: *context.Context, ascent: f32) f32 {
-    val k: f32 = look(ctx, theme.SECTION).min_w;
+# ---
+# ctx:    context
+# kind:   the style kind that owns the caret
+# ascent: the caption's ascent in pixels
+# ret:    the caret's side in pixels
+pub fun caret_size(ctx: *context.Context, kind: u32, ascent: f32) f32 {
+    val k: f32 = look(ctx, kind).min_w;
     if (k > 0.0::f32) { ret context.px(ctx, k); }
     ret ascent;
 }
@@ -2558,7 +2563,7 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     val id: u64             = context.id_of(ctx, title);
     val lh: f32             = context.line_height(ctx);
     val m:  gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
-    val k:  f32             = caret_size(ctx, m.ascent);
+    val k:  f32             = caret_size(ctx, theme.SECTION, m.ascent);
     val in: theme.Edges     = inset(ctx, theme.SECTION);
     val r:  context.Area    = place(ctx, wide(), layout.fit(), label_width(ctx, title) + k + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
     val x0: f32             = r.x0;
