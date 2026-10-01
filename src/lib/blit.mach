@@ -21,12 +21,15 @@ fwd blit.band;
 fwd blit.interact;
 fwd blit.id;
 fwd blit.field;
+fwd blit.edit;
 fwd blit.theme;
 fwd blit.context;
 fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
+fwd blit.textarea;
 fwd blit.chart;
+fwd blit.controls;
 fwd blit.driver;
 
 # blit library version

@@ -1,0 +1,587 @@
+# a multi-line text area over a blit.field.Field
+#
+# text_area edits a field the way widget.text_field does (see blit.edit for
+# the clicks, drags, keyboard, clipboard and caret it shares) and adds what
+# many lines need: the text wraps at word boundaries to the area's width, up
+# and down move the caret by a wrapped row toward the column it started in,
+# page up and page down by the rows the area shows, and the area scrolls by
+# wheel and scrollbar (see widget.begin_scroll) and to keep the caret in view.
+# a field drawn as a text area is made LINES, so enter types a newline.
+#
+# a TextArea is the area's view of its field: its scroll, the column up and
+# down aim for, and the start of every wrapped row. the rows are laid out
+# again only when the field's text (see field.Field.rev), the width, the style
+# or the scale changes, and a frame draws only the rows in view, so a long
+# text costs a binary search per frame rather than a pass over its lines.
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use blit.context;
+use blit.draw;
+use blit.edit;
+use blit.field;
+use blit.font;
+use blit.input;
+use blit.interact;
+use blit.widget;
+
+# rows a TextArea first allocates, doubled whenever they fill
+pub val ROWS_INIT_CAP: usize = 64;
+
+# a text area's view of its field
+# ---
+# scroll: the area's scroll region
+# goal:   x in pixels up and down aim the caret at
+# aiming: 1 while a run of up and down keeps goal, else 0
+# rows:   byte offset each wrapped row starts at, in order
+# count:  rows laid out
+# cap:    rows the storage holds
+# a:      allocator backing rows, bound by init
+# built:  1 once rows describe the field under the key below
+# text:   the field's buffer the rows were laid out over
+# rev:    the field's revision they were laid out at
+# wide:   the text width without a scrollbar they were laid out for
+# box:    the area's height they were laid out for
+# flags:  the field's flags they were laid out under
+# style:  the context's style they were measured in
+# scale:  the context's scale they were measured at
+# width:  the text width they wrap at, narrower than wide when they overflow
+pub rec TextArea {
+    scroll: widget.Scroll;
+    goal:   f32;
+    aiming: u8;
+    rows:   *usize;
+    count:  usize;
+    cap:    usize;
+    a:      *allo.Allocator;
+    built:  u8;
+    text:   *u8;
+    rev:    u64;
+    wide:   f32;
+    box:    f32;
+    flags:  u8;
+    style:  u32;
+    scale:  f32;
+    width:  f32;
+}
+
+# make a text area's view, with nothing allocated until it is first drawn
+# ---
+# t: the view
+# a: allocator backing its rows
+pub fun init(t: *TextArea, a: *allo.Allocator) {
+    var none: TextArea;
+    @t  = none;
+    t.a = a;
+}
+
+# release a text area's rows
+# ---
+# t:   the view
+# ret: ok, or the allocator's refusal with the rows still owned
+pub fun free(t: *TextArea) err[allo.Error] {
+    if (t.rows == nil) { ret err[allo.Error].ok{}; }
+    val freed: err[allo.Error] = allo.deallocate[usize](t.a, t.rows, t.cap);
+    if (sel freed.err) { ret freed; }
+    t.rows  = nil;
+    t.count = 0;
+    t.cap   = 0;
+    t.built = 0;
+    ret err[allo.Error].ok{};
+}
+
+# the wrapped rows laid out when the area was last drawn
+# ---
+# t:   the view
+# ret: row count
+pub fun rows(t: *TextArea) usize {
+    ret t.count;
+}
+
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# add a row starting at byte offset at
+fun push_row(t: *TextArea, at: usize) bool {
+    if (t.count >= t.cap) {
+        var cap: usize = t.cap * 2;
+        if (cap == 0) { cap = ROWS_INIT_CAP; }
+        val r: res[*usize, allo.Error] = allo.reallocate[usize](t.a, t.rows, t.cap, cap);
+        if (sel r.err) { ret false; }
+        t.rows = r.ok;
+        t.cap  = cap;
+    }
+    t.rows[t.count] = at;
+    t.count         = t.count + 1;
+    ret true;
+}
+
+# wrap the field's text into rows no wider than w, breaking after the last
+# blank that fits or, in a word longer than the row, before the character
+# that does not
+fun wrap(ctx: *context.Context, t: *TextArea, f: *field.Field, w: f32) bool {
+    t.count = 0;
+    if (!push_row(t, 0)) { ret false; }
+    val masked: bool  = field.has(f, field.MASKED);
+    val n:      usize = f.len;
+    var i:      usize = 0;
+    var start:  usize = 0;
+    var brk:    usize = 0;
+    var x:      f32   = 0.0::f32;
+    var prev:   u32   = 0;
+    for (i < n) {
+        val b: u8 = f.buf[i];
+        if (b == '\n') {
+            i = i + 1;
+            if (!push_row(t, i)) { ret false; }
+            start = i;
+            brk   = 0;
+            x     = 0.0::f32;
+            prev  = 0;
+            cnt;
+        }
+        var cp: u32   = 0;
+        val k:  usize = font.next(f.buf, i, n, ?cp);
+        if (masked) { cp = edit.MASK_GLYPH::u32; }
+        val adv: f32 = context.glyph_advance(ctx, prev, cp);
+        if (b != ' ' && b != '\t' && x + adv > w && i > start) {
+            var cut: usize = i;
+            if (brk > start)       { cut = brk; }
+            if (!push_row(t, cut)) { ret false; }
+            start = cut;
+            i     = cut;
+            brk   = 0;
+            x     = 0.0::f32;
+            prev  = 0;
+            cnt;
+        }
+        x    = x + adv;
+        prev = cp;
+        i    = i + k;
+        if (b == ' ' || b == '\t') { brk = i; }
+    }
+    ret true;
+}
+
+# lay the field out for an area h tall whose text is wide pixels across, or
+# narrow beside a scrollbar when it overflows, unless the rows are current
+fun lay_out(ctx: *context.Context, t: *TextArea, f: *field.Field, wide: f32, narrow: f32, h: f32, p: f32) {
+    val style: u32 = context.style_of(ctx);
+    val scale: f32 = context.scale_of(ctx);
+    if (t.built != 0 && t.text == f.buf && t.rev == f.rev && t.wide == wide && t.box == h && t.flags == f.flags && t.style == style && t.scale == scale) { ret; }
+    t.built = 1;
+    t.text  = f.buf;
+    t.rev   = f.rev;
+    t.wide  = wide;
+    t.box   = h;
+    t.flags = f.flags;
+    t.style = style;
+    t.scale = scale;
+    t.width = wide;
+    if (!wrap(ctx, t, f, wide)) {
+        ctx.oom = 1;
+        ret;
+    }
+    if (t.count::f32 * context.line_height(ctx) + p * 2.0::f32 > h) {
+        t.width = narrow;
+        if (!wrap(ctx, t, f, narrow)) { ctx.oom = 1; }
+    }
+}
+
+# the row holding byte offset i, a row boundary belonging to the row it starts
+fun row_of(t: *TextArea, i: usize) usize {
+    if (t.count == 0) { ret 0; }
+    var lo: usize = 0;
+    var hi: usize = t.count - 1;
+    for (lo < hi) {
+        val mid: usize = (lo + hi + 1) / 2;
+        if (t.rows[mid] <= i) { lo = mid; }
+        or                    { hi = mid - 1; }
+    }
+    ret lo;
+}
+
+# the end of row r's text, before the newline that ends it
+fun row_end(t: *TextArea, f: *field.Field, r: usize) usize {
+    var e: usize = f.len;
+    if (r + 1 < t.count)                       { e = t.rows[r + 1]; }
+    if (e > t.rows[r] && f.buf[e - 1] == '\n') { e = e - 1; }
+    ret e;
+}
+
+# the boundary in row r nearest x pixels right of its start
+fun offset_in(ctx: *context.Context, t: *TextArea, f: *field.Field, r: usize, x: f32) usize {
+    if (t.count == 0) { ret 0; }
+    val e:  usize = row_end(t, f, r);
+    var at: f32   = 0.0::f32;
+    var i:  usize = t.rows[r];
+    for (i < e) {
+        val n: usize = field.after(f, i);
+        val w: f32   = edit.width(ctx, f, i, n);
+        if (x < at + w / 2.0::f32) { brk; }
+        at = at + w;
+        i  = n;
+    }
+    ret i;
+}
+
+# move the caret by rows, toward the goal column, as up, down, page up and
+# page down do
+fun vertical(ctx: *context.Context, t: *TextArea, f: *field.Field, k: input.Key, page: usize, lh: f32) {
+    if (t.count == 0) { ret; }
+    val shift: bool  = (k.mods & input.MOD_SHIFT) != 0;
+    val r:     usize = row_of(t, f.caret);
+    if (t.aiming == 0) {
+        t.goal   = edit.width(ctx, f, t.rows[r], f.caret);
+        t.aiming = 1;
+    }
+    var step: usize = 1;
+    if (k.code == input.KEY_PAGE_UP || k.code == input.KEY_PAGE_DOWN) { step = page; }
+    if (k.code == input.KEY_UP || k.code == input.KEY_PAGE_UP) {
+        if (r == 0) {
+            field.move(f, 0, shift);
+            ret;
+        }
+        var to: usize = 0;
+        if (r > step)                    { to = r - step; }
+        if (k.code == input.KEY_PAGE_UP) { t.scroll.offset = t.scroll.offset - (r - to)::f32 * lh; }
+        field.move(f, offset_in(ctx, t, f, to, t.goal), shift);
+        ret;
+    }
+    if (r + 1 >= t.count) {
+        field.move(f, f.len, shift);
+        ret;
+    }
+    var to: usize = r + step;
+    if (to >= t.count)                 { to = t.count - 1; }
+    if (k.code == input.KEY_PAGE_DOWN) { t.scroll.offset = t.scroll.offset + (to - r)::f32 * lh; }
+    field.move(f, offset_in(ctx, t, f, to, t.goal), shift);
+}
+
+# scroll so the caret's row is in view in an area h tall
+fun reveal(t: *TextArea, f: *field.Field, lh: f32, p: f32, h: f32) {
+    val cy: f32 = row_of(t, f.caret)::f32 * lh;
+    if (cy < t.scroll.offset)                         { t.scroll.offset = cy; }
+    if (cy + lh + p * 2.0::f32 > t.scroll.offset + h) { t.scroll.offset = cy + lh + p * 2.0::f32 - h; }
+}
+
+# whether a key moves the caret by rows
+fun is_vertical(code: u32) bool {
+    ret code == input.KEY_UP || code == input.KEY_DOWN || code == input.KEY_PAGE_UP || code == input.KEY_PAGE_DOWN;
+}
+
+# a full-width text area h tall editing @f through the view @t
+#
+# it takes the keyboard, the pointer and the clipboard as widget.text_field
+# does, with enter typing a newline and escape ending the edit, and adds up,
+# down, page up and page down, which move the caret by wrapped rows. the text
+# wraps to the area's width and scrolls by wheel and scrollbar, and the area
+# scrolls to keep the caret in view after it moves. only the rows in view are
+# drawn. a COUNT field shows its length (see edit.count_text) on a row below
+# the area.
+# ---
+# ctx: context
+# key: the area's key in the current id scope, so id_of(ctx, key) gives it
+#      the keyboard with context.focus
+# f:   the field's state, edited in place
+# t:   the area's view of it, bound with init
+# h:   the area's height in pixels
+# ret: this frame's outcome bits: field.EDITED, field.ESCAPED
+pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea, h: f32) u8 {
+    val id:     u64   = context.id_of(ctx, key);
+    val x0:     f32   = ctx.cx;
+    val y0:     f32   = ctx.cy;
+    val w:      f32   = ctx.pw;
+    val bh:     f32   = maxf(h, 0.0::f32);
+    val p:      f32   = context.px(ctx, ctx.theme.pad);
+    val lh:     f32   = context.line_height(ctx);
+    val wide:   f32   = maxf(w - p * 2.0::f32, 0.0::f32);
+    val narrow: f32   = maxf(w - context.px(ctx, ctx.theme.bar_w) - p * 3.0::f32, 0.0::f32);
+    var page:   usize = 1;
+    if (bh - p * 2.0::f32 > lh) { page = ((bh - p * 2.0::f32) / lh)::usize; }
+
+    f.flags = f.flags | field.LINES;
+    lay_out(ctx, t, f, wide, narrow, bh, p);
+
+    var moved: bool = false;
+    val rev:   u64  = f.rev;
+    var out:   u8   = 0;
+    if (context.focused(ctx, id)) {
+        if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
+        var i: usize = 0;
+        for (i < ctx.in.events.len) {
+            val e: input.Event = ctx.in.events.data[i];
+            i     = i + 1;
+            moved = true;
+            if (sel e.key) {
+                if (is_vertical(e.key.code)) {
+                    lay_out(ctx, t, f, wide, narrow, bh, p);
+                    vertical(ctx, t, f, e.key, page, lh);
+                    cnt;
+                }
+            }
+            if (sel e.preedit || sel e.release) { cnt; }
+            t.aiming = 0;
+            val r: u8 = edit.event(ctx, f, e);
+            out = out | r;
+            if ((r & (field.ENTERED | field.ESCAPED)) != 0) { brk; }
+        }
+        if (ctx.in.events.len > 0 || ctx.in.paste != nil) { edit.touch(ctx, id); }
+    }
+    lay_out(ctx, t, f, wide, narrow, bh, p);
+
+    val content: f32 = t.count::f32 * lh + p * 2.0::f32;
+    if (moved || f.rev != rev) { reveal(t, f, lh, p, bh); }
+    t.scroll.content = content;
+
+    val on:    bool       = ctx.focus == id;
+    val quiet: bool       = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
+    var bg:    draw.Color = ctx.theme.track;
+    if (ctx.hover == id && !on) { bg = ctx.theme.control_hot; }
+    val corner: f32 = context.px(ctx, ctx.theme.corner);
+    if (on) {
+        val ew: f32 = context.px(ctx, ctx.theme.edge_w);
+        context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, ctx.theme.accent);
+        context.fill(ctx, x0 + ew, y0 + ew, x0 + w - ew, y0 + bh - ew, corner, context.CORNERS_ALL, bg);
+    }
+    or { context.fill(ctx, x0, y0, x0 + w, y0 + bh, corner, context.CORNERS_ALL, bg); }
+
+    context.push_id(ctx, id);
+    val r:  widget.ScrollArea = widget.begin_scroll(ctx, "#scroll", ?t.scroll, bh);
+    val hf: interact.Hit      = interact.hit(ctx, id, 0.0::f32, 0.0::f32, ctx.pw, maxf(content, bh), input.BUTTON_LEFT);
+    if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
+    if (hf.pressed || (hf.held && ctx.focus == id)) {
+        var pr: usize = 0;
+        if (hf.my > p)                       { pr = ((hf.my - p) / lh)::usize; }
+        if (pr + 1 > t.count && t.count > 0) { pr = t.count - 1; }
+        val at: usize = offset_in(ctx, t, f, pr, hf.mx - p);
+        if (hf.pressed) {
+            context.focus(ctx, id);
+            edit.press(ctx, id, f, at, hf.clicks);
+        }
+        or { edit.drag(ctx, id, f, at); }
+        t.aiming = 0;
+        reveal(t, f, lh, p, bh);
+    }
+
+    var pre: str = nil;
+    if (on && !quiet) { pre = context.preedit(ctx, id); }
+    var pw: f32 = 0.0::f32;
+    if (pre != nil) { pw = context.text_width(ctx, pre); }
+    val cr:    usize = row_of(t, f.caret);
+    var first: usize = 0;
+    if (t.scroll.offset > p) { first = ((t.scroll.offset - p) / lh)::usize; }
+    var last: usize = ((t.scroll.offset + bh - p) / lh)::usize + 1;
+    if (last > t.count) { last = t.count; }
+    val lo: usize = field.sel_lo(f);
+    val hi: usize = field.sel_hi(f);
+    var k:  usize = first;
+    for (k < last) {
+        val s: usize = t.rows[k];
+        val e: usize = row_end(t, f, k);
+        val y: f32   = p + k::f32 * lh;
+        if (on && lo < hi && lo <= e && hi > s) {
+            var a: usize = lo;
+            var b: usize = hi;
+            if (a < s) { a = s; }
+            if (b > e) { b = e; }
+            var x1: f32 = p + edit.width(ctx, f, s, b);
+            if (hi > e && e < f.len && f.buf[e] == '\n') { x1 = x1 + context.glyph_advance(ctx, 0, ' '); }
+            context.quad(ctx, p + edit.width(ctx, f, s, a), y, x1, y + lh, ctx.theme.select);
+        }
+        if (pre != nil && k == cr) {
+            val cx: f32 = p + edit.width(ctx, f, s, f.caret);
+            edit.draw_text(ctx, f, s, f.caret, p, y, ctx.theme.text);
+            context.text_at(ctx, pre, cx, y, ctx.theme.text);
+            context.quad(ctx, cx, y + lh - context.px(ctx, ctx.theme.caret_w), cx + pw, y + lh, ctx.theme.text);
+            edit.draw_text(ctx, f, f.caret, e, cx + pw, y, ctx.theme.text);
+        }
+        or { edit.draw_text(ctx, f, s, e, p, y, ctx.theme.text); }
+        k = k + 1;
+    }
+    if (on && t.count > 0) {
+        val cw: f32 = context.px(ctx, ctx.theme.caret_w);
+        val y:  f32 = p + cr::f32 * lh;
+        var cx: f32 = p + edit.width(ctx, f, t.rows[cr], f.caret);
+        if (pre != nil)             { cx = cx + context.text_width_n(ctx, pre, context.preedit_caret(ctx)); }
+        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, y, cx + cw, y + lh, ctx.theme.text); }
+        if (!quiet)                 { context.set_ime_rect(ctx, cx, y, cx + cw, y + lh); }
+    }
+    ctx.cy = content;
+    widget.end_scroll(ctx, ?t.scroll, r);
+    context.pop_id(ctx);
+
+    if (field.has(f, field.COUNT)) {
+        var counted: [42]u8;
+        val label:   str = edit.count_text(f, ?counted[0]);
+        context.text_at(ctx, label, x0 + w - p - context.text_width(ctx, label), ctx.cy, ctx.theme.text_faint);
+        widget.advance(ctx, lh);
+    }
+    ret out;
+}
+
+# a frame holding a 100 wide panel with one text area h tall, reporting the
+# area's top
+#[testing]
+fun frame_area(ctx: *context.Context, in: input.Input, f: *field.Field, t: *TextArea, h: f32, top: *f32) u8 {
+    context.begin(ctx, in, 200.0::f32, 400.0::f32);
+    val p: widget.Block = widget.begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    @top = ctx.cy;
+    val out: u8 = text_area(ctx, "notes", f, t, h);
+    widget.end_panel(ctx, p);
+    context.end(ctx);
+    ret out;
+}
+
+# one frame's input with the cursor at (mx, my), the button in state down
+#[testing]
+fun pointer_at(in: *input.Input, mx: f32, my: f32, down: u8, t: f64) {
+    input.clear_keys(in);
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
+    in.down    = down;
+    in.time    = t;
+}
+
+test text_area__wraps_moves_by_rows_and_selects {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [64]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 64, 0, nil);
+    f.flags = field.LINES;
+    field.set(?f, "aaaa bbbb cccc dddd\nxy");
+    var t: TextArea;
+    init(?t, ?a);
+    var in: input.Input;
+    input.init(?in, ?a);
+    var top: f32 = 0.0::f32;
+
+    # 92 pixels of text take 11 of the bitmap font's 8 wide cells, so the
+    # first row breaks after its last blank
+    pointer_at(?in, 150.0::f32, 300.0::f32, 0, 1.0::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (rows(?t) != 3 || t.rows[1] != 10 || t.rows[2] != 20) { ret 2; }
+
+    # a click lands on the row and column under it
+    val lh: f32 = context.line_height(?ctx);
+    val y1: f32 = top + 4.0::f32 + lh * 1.5::f32;
+    pointer_at(?in, 22.0::f32, y1, 0, 1.0::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    pointer_at(?in, 22.0::f32, y1, 1, 1.0::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    pointer_at(?in, 22.0::f32, y1, 0, 1.05::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (f.caret != 12 || !context.typing(?ctx)) { ret 4; }
+
+    # down and up keep the column they started from
+    pointer_at(?in, 22.0::f32, y1, 0, 2.0::f64);
+    input.press_key(?in, input.KEY_DOWN, 0);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (f.caret != 22) { ret 5; }
+    pointer_at(?in, 22.0::f32, y1, 0, 2.1::f64);
+    input.press_key(?in, input.KEY_UP, 0);
+    input.press_key(?in, input.KEY_UP, input.MOD_SHIFT);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (f.caret != 2 || f.anchor != 12) { ret 6; }
+    pointer_at(?in, 22.0::f32, y1, 0, 2.2::f64);
+    input.press_key(?in, input.KEY_UP, 0);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (f.caret != 0 || field.selected(?f)) { ret 7; }
+
+    # dragging across rows extends the selection
+    val y0: f32 = top + 4.0::f32 + lh * 0.5::f32;
+    pointer_at(?in, 14.0::f32, y0, 1, 4.0::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    pointer_at(?in, 30.0::f32, y1, 1, 4.1::f64);
+    frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top);
+    if (field.sel_lo(?f) != 1 || field.sel_hi(?f) != 13) { ret 8; }
+
+    # enter types a newline, and the rows follow the edit
+    pointer_at(?in, 30.0::f32, y1, 0, 4.2::f64);
+    input.press_key(?in, input.KEY_ENTER, 0);
+    if (frame_area(?ctx, in, ?f, ?t, 60.0::f32, ?top) != field.EDITED) { ret 9; }
+    if (!str_equals(field.text(?f), "a\nc dddd\nxy") || rows(?t) != 3) { ret 10; }
+
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
+    val tf: err[allo.Error] = free(?t);
+    if (sel tf.err) { ret 1; }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test text_area__draws_only_the_rows_in_view_of_10000_lines {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    val n: usize                = 10000 * 5 + 1;
+    val r: res[*u8, allo.Error] = allo.allocate[u8](?a, n);
+    if (sel r.err) { ret 1; }
+    var f: field.Field;
+    field.init(?f, r.ok, n, 0, nil);
+    f.flags = field.LINES;
+    var i: usize = 0;
+    for (i < 10000) {
+        field.paste(?f, "line\n");
+        i = i + 1;
+    }
+    if (f.len != n - 1) { ret 2; }
+    var t: TextArea;
+    init(?t, ?a);
+    var in: input.Input;
+    input.init(?in, ?a);
+    var top: f32 = 0.0::f32;
+
+    pointer_at(?in, 150.0::f32, 300.0::f32, 0, 1.0::f64);
+    frame_area(?ctx, in, ?f, ?t, 80.0::f32, ?top);
+    if (rows(?t) != 10001)               { ret 3; }
+    if (context.draw_count(?ctx) > 2000) { ret 4; }
+
+    # the end of the text scrolls into view, and still only it is drawn
+    context.focus(?ctx, context.id_of(?ctx, "notes"));
+    input.press_key(?in, input.KEY_END, input.MOD_WORD);
+    frame_area(?ctx, in, ?f, ?t, 80.0::f32, ?top);
+    if (f.caret != f.len)                                          { ret 5; }
+    if (t.scroll.offset < t.scroll.content - 80.0::f32 - 1.0::f32) { ret 6; }
+    if (context.draw_count(?ctx) > 2000)                           { ret 7; }
+
+    # page up moves the caret and the view by a page of rows
+    pointer_at(?in, 150.0::f32, 300.0::f32, 0, 1.1::f64);
+    input.press_key(?in, input.KEY_PAGE_UP, 0);
+    frame_area(?ctx, in, ?f, ?t, 80.0::f32, ?top);
+    val lh:   f32   = context.line_height(?ctx);
+    val page: usize = ((80.0::f32 - 8.0::f32) / lh)::usize;
+    if (f.caret != (10000 - page) * 5) { ret 8; }
+
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
+    val tf: err[allo.Error] = free(?t);
+    if (sel tf.err) { ret 1; }
+    val fb: err[allo.Error] = allo.deallocate[u8](?a, r.ok, n);
+    if (sel fb.err) { ret 1; }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
