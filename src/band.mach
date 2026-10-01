@@ -23,8 +23,11 @@ pub val SLOT_MAX: u32 = 0xFFFFFF;
 #
 # flat:  every opening shares slot 0, ordered among themselves by call order
 # nest:  an opening inside another of the same band is one slot above it,
-#        otherwise slot 0, so a child always stacks above its parent
+#        and so is one inside a higher band, in that band, so a popup opened
+#        in a modal stacks above the modal; otherwise slot 0. a child always
+#        stacks above its parent
 # order: the caller names the slot, such as a window's place in the z order
+#        or an overlay's order among overlays
 pub val RULE_FLAT:  u8 = 0;
 pub val RULE_NEST:  u8 = 1;
 pub val RULE_ORDER: u8 = 2;
@@ -59,7 +62,7 @@ val TABLE: [8]Band = [8]Band{
     Band{name: "base", rule: RULE_FLAT, trap: 0},
     Band{name: "docked", rule: RULE_FLAT, trap: 0},
     Band{name: "windows", rule: RULE_ORDER, trap: 0},
-    Band{name: "overlays", rule: RULE_FLAT, trap: 0},
+    Band{name: "overlays", rule: RULE_ORDER, trap: 0},
     Band{name: "popups", rule: RULE_NEST, trap: 0},
     Band{name: "modals", rule: RULE_NEST, trap: 1},
     Band{name: "tooltips", rule: RULE_FLAT, trap: 0},
@@ -112,7 +115,7 @@ pub fun slot_of(l: u32) u32 {
 pub fun open(b: u32, slot: u32, parent: u32) u32 {
     val r: u8 = band(b).rule;
     if (r == RULE_ORDER)                        { ret layer(b, slot); }
-    if (r == RULE_NEST && band_of(parent) == b) { ret layer(b, slot_of(parent) + 1); }
+    if (r == RULE_NEST && band_of(parent) >= b) { ret layer(band_of(parent), slot_of(parent) + 1); }
     ret layer(b, 0);
 }
 
@@ -132,8 +135,11 @@ test open__follows_each_rule {
     if (open(POPUPS, 9, layer(BASE, 0)) != layer(POPUPS, 0))    { ret 1; }
     if (open(POPUPS, 9, layer(WINDOWS, 3)) != layer(POPUPS, 0)) { ret 2; }
     if (open(POPUPS, 0, layer(POPUPS, 2)) != layer(POPUPS, 3))  { ret 3; }
-    # a window takes the slot it names wherever it opens
-    if (open(WINDOWS, 5, layer(POPUPS, 1)) != layer(WINDOWS, 5)) { ret 4; }
+    # a window or an overlay takes the slot it names wherever it opens
+    if (open(WINDOWS, 5, layer(POPUPS, 1)) != layer(WINDOWS, 5))    { ret 4; }
+    if (open(OVERLAYS, 2, layer(WINDOWS, 9)) != layer(OVERLAYS, 2)) { ret 7; }
+    # a popup opened in a modal nests above it, in the modals band
+    if (open(POPUPS, 0, layer(MODALS, 1)) != layer(MODALS, 2)) { ret 6; }
     # a flat band never nests
     if (open(DRAG, 4, layer(DRAG, 0)) != layer(DRAG, 0)) { ret 5; }
     ret 0;

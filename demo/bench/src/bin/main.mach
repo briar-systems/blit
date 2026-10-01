@@ -90,7 +90,7 @@ fun count_deallocate(self: ptr, p: ptr, size: usize, align: usize) i64 {
 # wopen:   each window's section is open
 # shape:   the filled path scene's path
 rec State {
-    dock:    blit.widget.Dock;
+    dock:    blit.dock.Dock;
     open:    [8]u8;
     toggles: [8]u8;
     checks:  [8]u8;
@@ -126,8 +126,8 @@ fun dense(ctx: *blit.context.Context, s: *State) {
     modes[2] = "Age";
     modes[3] = "Heat";
 
-    val area: blit.widget.DockArea = blit.widget.begin_dock(ctx, "dock", ?s.dock);
-    var k:    usize                = 0;
+    val area: blit.dock.DockArea = blit.dock.begin_dock(ctx, "dock", ?s.dock);
+    var k:    usize              = 0;
     for (k < SECTIONS) {
         blit.context.push_id_int(ctx, k::u64);
         if (blit.widget.section(ctx, titles[k], ?s.open[k])) {
@@ -142,7 +142,7 @@ fun dense(ctx: *blit.context.Context, s: *State) {
         blit.context.pop_id(ctx);
         k = k + 1;
     }
-    blit.widget.end_dock(ctx, ?s.dock, area);
+    blit.dock.end_dock(ctx, ?s.dock, area);
 }
 
 # a panel holding a list of ROWS items

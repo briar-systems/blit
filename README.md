@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -158,21 +158,94 @@ blit.context.set_scale(?ctx, 2.0::f32);
   `blit.context.fill`, a feathered rounded rect (see Shapes & paths). The
   default is square, one quad per rect.
 
-## Docked containers
+## Docking
 
-Alongside floating windows, `blit.widget.begin_dock(?ctx, key, ?d)`/`end_dock`
-attach a panel to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
-takes a strip from the frame's free area, so docks opened in turn stack inward,
-and `blit.context.free_area` reports what they leave for the rest of the screen,
-such as a world view. Call docks at the root.
+`blit.dock` docks windows into a dock space, Dear ImGui style: a space fills
+a rect with a tree of splits and tab stacks, windows dragged over it dock
+into it, and tabs dragged out of it float again.
 
-A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
+```mach
+# once: the layout saves and loads with the windows
+blit.dock.persist(?ctx);
+blit.widget.persist_windows(?ctx);
+
+# per frame: a default layout while there is none, such as before a load
+val sid: u64 = blit.context.id_of(?ctx, "main");
+if (blit.dock.empty(?ctx, sid)) {
+    val root: u64 = blit.dock.root(?ctx, sid);
+    val left: u64 = blit.dock.split(?ctx, root, blit.context.Side.left{}, 0.25);
+    blit.dock.add(?ctx, left, blit.context.id_of(?ctx, "Scene"));
+    blit.dock.add(?ctx, root, blit.context.id_of(?ctx, "Viewport"));
+}
+# the space first, then its windows, exactly as they are drawn floating
+blit.dock.space(?ctx, "main", blit.context.free_area(?ctx));
+val w: blit.widget.WindowArea = blit.widget.begin_window(?ctx, scene);
+if (w.body != 0) { ... }
+blit.widget.end_window(?ctx, w);
+```
+
+- **The tree.** A split node divides its rect between two children along an
+  axis by a ratio, and a leaf is a tab stack of windows. `root`, `split` (a
+  new empty leaf on one side of a node, taking a share of it), `add` (dock a
+  window as a leaf's last tab), `remove` (float it again) and `node_of` build
+  and read it in code. A window is its title's id. The tree lives in the
+  state store, one small entry per space, node and docked window, so a layout
+  of any size fits, and everything in it is pinned.
+- **Drawing.** `space(?ctx, key, area)` lays the tree out over the rect, in
+  the docked band, and draws a splitter between the children of every split
+  and a tab bar (`blit.tabs`) across the top of every leaf. Each docked window
+  learns where its body goes through `blit.widget.Docked`, and its own
+  `begin_window` draws it there without chrome, only while its tab is
+  selected. Its content code, its ids, its scroll and every widget's state are
+  the same as when it floats. Draw the space before its windows, or they lag
+  it by a frame.
+- **Splitters.** Dragging a splitter moves its split, keeping each side at
+  least a few rows, or a docked window's declared `min_w` and `min_h`.
+- **Tabs.** A leaf's tab bar selects, reorders by drag, closes (the window's
+  `WindowState.closed`) and tears off its windows: a tab released over no
+  target floats there. A tab dragged onto another leaf's tab bar joins it. A
+  leaf whose windows are all closed or not drawn gives its room to its
+  sibling, and comes back when they do.
+- **Docking by drag.** A window's titlebar is a drag source of
+  `widget.WINDOW_KIND` carrying its id. While it, or a docked window's tab, is
+  dragged over a space, the space shows drop zones over the leaf under the
+  pointer (the centre docks as a tab, four edges split the leaf) and near its
+  own outer edges (splitting the whole space), with a preview of where the
+  window would land. A window released over a leaf's tab bar docks as a tab.
+  Holding shift, or the modifiers `set_suppress` picks, shows no zones and
+  docks nothing.
+- **Persistence.** `persist` registers the spaces, nodes and docked windows
+  as `[dock.<id>]`, `[docknode.<id>]` and `[docked.<id>]` tables, loaded
+  pinned, so a loaded layout waits for its space however late it is drawn.
+  `empty` tells a space with no layout yet, to build a default one only then.
+- **Look.** The chrome draws from the theme: the `dock` background, `handle`
+  and `handle_on` splitters, `control` and `accent` zones, and the `select`
+  tint for the preview.
+
+### Side panels
+
+`blit.dock.begin_dock(?ctx, key, ?d)`/`end_dock` attach a side panel to a
+screen edge (`blit.context.Side`: left, right, top or bottom) in one call. Each
+panel takes a strip from the frame's free area, so panels opened in turn stack
+inward, and `blit.context.free_area` reports what they leave for the rest of
+the screen, such as a world view. Call them at the root.
+
+The strip is a dock space whose root holds the panel's own content. Alone it
+looks like a plain panel, with no tab bar. Windows dragged over it dock
+beside it or as tabs with it, and then its key labels its tab. The panel
+itself never floats, and while another tab is selected its widgets lay out
+without drawing or claiming, so the caller places them every frame either way.
+
+A panel's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
 open one as the next item of the layout on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
+
+This is a breaking change: `begin_dock`, `end_dock`, `Dock` and `DockArea`
+moved from `blit.widget` to `blit.dock`, unchanged otherwise.
 
 ## Input & the host contract
 
@@ -458,7 +531,10 @@ if (t.dropped) { move_layer(@(t.data::*u64), here); }
   window, dock, popup or surface: the claim order that routes every hover
   decides which target is under the pointer. `carried(?ctx, kind)` peeks at a
   drag in flight, for a widget that shows where a drag would land before it
-  is over a target.
+  is over a target, with `released` set on the frame its button comes up.
+  `take(?ctx)` then takes it as dropped, for a target that works out where it
+  lands from the pointer, such as a dock whose zones lie under the window
+  being dragged.
 
 ## Widgets & layout
 
@@ -621,6 +697,11 @@ blit.widget.window_state(?ctx, "tools").closed = 0;
   popups. A press anywhere on a window brings it to the front, whatever order
   the windows are called in, and a pinned window stays in front of every
   unpinned one.
+- **Docking.** The titlebar is a drag source of `WINDOW_KIND` carrying the
+  window's id, which a dock space takes in (see Docking). A docked window
+  draws in the rect its dock lays out, with no chrome and no grips, its body a
+  scroll region as when it floats (`WINDOW_AUTO_SIZE` does not apply there),
+  and has no body while another tab of its stack is selected.
 - **Flags.** `WINDOW_NO_TITLE`, `WINDOW_NO_RESIZE`, `WINDOW_NO_MOVE`,
   `WINDOW_NO_BACKGROUND` (the body still stops input), `WINDOW_NO_CLOSE` and
   `WINDOW_AUTO_SIZE`, combined with `|`.
@@ -657,6 +738,104 @@ layout cursor across the column like `blit.widget`'s:
   scroll live in the state store under its id, and its parts are reached by
   path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
   each option an index under it.
+
+## Tables
+
+`blit.table` lays rows of any widgets out under columns the user can resize,
+reorder, sort and hide, with frozen leading columns and rows, and draws only
+the rows in view, so a table of a million rows costs what one of a screenful
+does. The caller describes its columns and runs its rows:
+
+```mach
+var cols: [3]blit.table.Column;
+cols[0] = blit.table.Column{label: "Name", width: 160.0::f32};
+cols[1] = blit.table.Column{label: "Size", width: 60.0::f32};
+cols[2] = blit.table.Column{label: "Done", flags: blit.table.NO_SORT};
+
+# per frame:
+var o: blit.table.Options = blit.table.options(count, 300.0::f32);
+o.freeze_cols = 1;
+var t: blit.table.Table = blit.table.begin(?ctx, "files", ?cols[0], 3, o);
+if (t.sorted) { order_rows(t.sort, t.dir); }
+for (blit.table.next_row(?ctx, ?t)) {
+    val f: *File = ?files[order[t.row]];
+    if (blit.table.cell(?ctx, ?t, 0)) { blit.widget.text(?ctx, f.name); }
+    if (blit.table.cell(?ctx, ?t, 1)) { blit.widget.text(?ctx, f.size_text); }
+    if (blit.table.cell(?ctx, ?t, 2)) { blit.widget.checkbox(?ctx, "done", ?f.done); }
+}
+blit.table.end(?ctx, ?t);
+```
+
+- **Rows in view.** `next_row` yields the frozen rows, then only the rows the
+  view shows, setting `t.row`. Rows are one height (`Options.row_h`, a control
+  row by default), so the first row in view is found by arithmetic and a frame
+  never walks the rows above it.
+- **Cells.** `cell(?ctx, ?t, c)` opens column `c`'s cell in the current row
+  and returns false for a hidden column or one scrolled out of view. A cell
+  is a horizontal stack across the column, its widgets centred down the row
+  and clipped to the cell.
+- **Ids.** A row is an id scope keyed by its key under the table's id, its
+  index unless `Options.key` maps it (a caller that sorts keys rows by their
+  data), and a cell a scope keyed by its column's label under the row. A
+  widget in a cell keeps its id and its state however the rows scroll.
+  `cell_id(?t, key, c)` is a cell's scope, the parent of its widgets' ids.
+- **The header.** Dragging the grip at a header cell's right edge resizes the
+  column. A click sorts by the column, ascending and then descending, and the
+  table reports it as `t.sort` (the column's index, the column count for
+  none) and `t.dir`, with `t.sorted` set on the frame it changed: the table
+  never sorts, the caller orders its rows. Dragging a header drops the column
+  on another's place through `blit.dnd`, and a right click opens a context
+  menu (`blit.menu`, under `MENU_KEY`) whose checked items show and hide
+  columns. `NO_RESIZE`, `NO_REORDER`, `NO_HIDE` and `NO_SORT`
+  turn each off per column and `HIDDEN` starts a column hidden.
+- **Frozen columns and rows.** The header, the first `freeze_cols` shown
+  columns and the first `freeze_rows` rows stay put while the rest scrolls,
+  by the wheels and by scrollbars that appear when the content outgrows the
+  table. Frozen and scrolled parts are clipped to rects that do not overlap.
+- **Column state.** Each column's width, place and visibility live in the
+  state store under the column's id (its label under the table's id), and
+  the sort and scroll under the table's. A change the user makes pins them,
+  so a table not drawn for a while keeps its layout.
+  `blit.table.register(?ctx)` makes the layout and sort persist through
+  `blit.state.save` and `load`, as `table_column` and `table` tables.
+- **Where things went.** `begin` fills each `Column`'s `id`, `shown`,
+  `frozen`, `pos` (its place in the display order), `x` and `w`, and `order`,
+  the index of the column shown at that record's own place.
+
+## Value editors & the colour picker
+
+`blit.value` edits numbers of any of `i8` to `i64`, `u8` to `u64`, `f32` and
+`f64` without loss: nothing passes a 64-bit integer through a float or an
+`f64` through anything narrower, a value shows as the shortest text that
+reads back as exactly that value, and typed text is read exactly.
+
+- **Drag.** `drag[T](?ctx, label, ?v, speed, lo, hi)` moves `@v` by `speed`
+  per pixel dragged across it, `FINE` times as far while shift is held. An
+  integer moves by whole steps and keeps the fraction for the next pixel, and
+  a float lands on the decimals of its value at the press or of the speed, so
+  dragging 1.5 by 0.01 a pixel gives 1.6. A double click turns it into a text
+  field with the value selected: enter or a press elsewhere commits, escape
+  leaves the value. `drag_n[T](?ctx, label, ?vec[0], n, speed, lo, hi)` edits
+  2 to 4 values in one row, and `drag_range[T](?ctx, label, ?a, ?b, speed, lo,
+  hi)` a low and a high value that never cross.
+- **Typed numbers.** `number[T](?ctx, label, ?v, step, lo, hi)` is a text
+  field with `-` and `+` steppers, committing as a double-clicked drag does.
+- **Bounds.** `lo < hi` clamps dragged, stepped and typed values, and equal
+  bounds leave a value to its type's range. Typed text that is no number of
+  the type leaves the value as it was.
+
+Each value's cell is a part of its editor keyed `#0` to `#3`, so a driver
+reaches the first cell of `speed` as `speed/#0`, and a number's steppers as
+`speed/-` and `speed/+`. `drag_scalars`, `range_scalars` and `number_scalar`
+take a kind (`I8` to `F64`) and a pointer for values typed at run time, and
+`value.entry` is the typed text cell under them all.
+
+`blit.color.picker(?ctx, label, ?c, flags)` edits a colour in hue, saturation
+and value: a square of saturation and value beside a hue bar, or inside a hue
+ring with `RING`, an alpha bar over a checkerboard with `ALPHA`, and beneath
+them a swatch, the label and hex text (`#RRGGBB`, `#RRGGBBAA` with alpha)
+typed in like a value. The picker keeps its hue across greys and black, and
+hex text read back shows as the same text.
 
 ## Widget ids
 
@@ -714,7 +893,9 @@ entry, so a widget never reads another's bytes.
   0 keeps everything), so state for widgets that stopped drawing does not pile
   up. A `get` between frames counts toward the next frame.
   `pin[T](?ctx, id, 1)` keeps an entry however long it goes untouched, and
-  `pin[T](?ctx, id, 0)` lets it age out again.
+  `pin[T](?ctx, id, 0)` lets it age out again. `find[T](?ctx, id)` looks an
+  entry up without making or reaching it, nil when there is none, and
+  `drop[T](?ctx, id)` drops it at once.
 - **Failure.** Entries are allocator-backed and the store grows. When it cannot,
   `get` sets the context's oom (see `context.ok`) and hands back zeroed scratch
   state that every refused entry shares, never a dangling pointer. A state type
@@ -727,6 +908,8 @@ entry, so a widget never reads another's bytes.
   through `std.data.toml`, zeroes each entry and runs the kind's load hook over
   its table. Tables of unregistered kinds are skipped. A load hook copies any
   string it keeps, since the parsed document is freed when `load` returns.
+  `keep[T](?ctx, 1)` loads a registered kind's entries pinned, for state that
+  must wait for whatever reaches it.
 
 The store is one owner, not the only one. Widgets that take a caller-owned
 record (`Scroll`, `List`, `Field`) keep taking it, so an app can own
@@ -778,6 +961,154 @@ blit.menu.end_menu(?ctx, ?cm);
   a press of any button outside it, which is consumed.
 - **Ids.** A bar's key, then each header and submenu label, then the item's
   label: `driver.find(?d, "main/File/Recent/notes.txt")`.
+
+## Modals
+
+`blit.modal` puts up a dialog that blocks everything beneath it until it
+closes. Its open state lives in the state store under its title's id, so
+`open` and `close` take it up and down from anywhere in the same id scope,
+and `begin_modal` and `end_modal` run every frame, open or not:
+
+```mach
+if (blit.widget.button(?ctx, "Delete")) { blit.modal.open(?ctx, "Delete file"); }
+
+val m: blit.modal.ModalArea = blit.modal.begin_modal(?ctx, blit.modal.dialog("Delete file"));
+if (m.shown != 0) {
+    blit.widget.text(?ctx, "notes.txt goes for good.");
+    if (blit.widget.button(?ctx, "Delete")) { ...; blit.modal.close(?ctx, "Delete file"); }
+}
+blit.modal.end_modal(?ctx, m);
+
+var labels: [2]str = [2]str{"Save", "Discard"};
+val c: usize = blit.modal.confirm(?ctx, "Unsaved", "Save the changes first?", ?labels[0], 2);
+if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
+```
+
+- **Blocking.** A modal paints and claims in the modals band, above docks,
+  windows, overlays and popups, behind a scrim over the whole screen. The scrim
+  claims every button, so nothing beneath it is hovered, pressed or scrolled,
+  while the widgets inside the modal work as usual. Popups, dropdowns and menus
+  opened inside a modal stack above it.
+- **Placement.** A `Modal` declares a title, a width (0 to fit its widgets),
+  a greatest width and `MODAL_*` flags. It opens centred, or with its top left
+  at `x`, `y` under `MODAL_ANCHORED`, and stays on the screen. Its size is
+  measured as it is drawn, so the frame it opens lays out hidden behind a scrim
+  that already blocks.
+- **Closing.** Escape closes the top modal while it holds the keyboard itself
+  (escape in a text field inside it ends the edit first), and so does the close
+  button in its titlebar (`MODAL_NO_CLOSE`, `MODAL_NO_TITLE`). A press on the
+  scrim closes it only with `MODAL_SCRIM_CLOSES`. `ModalArea.closed` and `why`
+  report the frame it closed.
+- **Stacking.** A modal opened inside another's body nests above it, and
+  modals called one after another stack by call order. Only the top one takes
+  the pointer and escape.
+- **Focus.** A modal takes the keyboard the frame it opens, so a field beneath
+  stops seeing keys, and gives it back to the previous holder the frame after
+  it closes.
+- **Confirm.** `confirm` is a dialog with a message and a row of buttons. It
+  returns the index chosen, closing itself, `CANCELLED` on the frame it is
+  closed without a choice (escape, close button or scrim), and `NO_CHOICE`
+  otherwise.
+- **Ids.** A modal is the id scope of its widgets:
+  `driver.find(?d, "Delete file/Delete")`.
+
+## Overlays, toasts & tooltips
+
+`blit.overlay` places widgets that float above the interface without being
+windows: a HUD readout, a help button, the cursor's coordinates. An overlay is
+placed by an anchor, not by the layout, and sizes to its content:
+
+```mach
+# a readout in the top right corner of the surface
+var hud: blit.overlay.Overlay = blit.overlay.on_surface(blit.overlay.TOP_RIGHT);
+hud.dx = -8.0::f32;
+hud.dy = 8.0::f32;
+val s: blit.overlay.Shown = blit.overlay.begin(?ctx, "hud", hud);
+blit.widget.text(?ctx, "fps 60");
+blit.overlay.end(?ctx, s);
+
+# a note just below a rect, flipped above it and clamped where it would run off
+var o: blit.overlay.Overlay = blit.overlay.on_rect(r, blit.overlay.BOTTOM_LEFT, blit.overlay.TOP_LEFT);
+o.keep = 1;
+```
+
+- **Anchors.** An `Anchor` is a point of a rect as fractions of its size:
+  `TOP_LEFT`, `TOP`, `TOP_RIGHT`, `LEFT`, `CENTER`, `RIGHT`, `BOTTOM_LEFT`,
+  `BOTTOM` and `BOTTOM_RIGHT`, or any other. `at` is the point of the target
+  (the surface, or `target` in the caller's local pixels with `to_rect` 1),
+  `pivot` the point of the overlay put there, and `dx`/`dy` an offset in
+  pixels. `on_surface(a)` puts the overlay's own `a` at the surface's, so a
+  corner anchor sits in that corner. `keep` keeps it on the surface: an
+  overlay running off an edge flips to the far side of its anchor on that
+  axis, then is clamped.
+- **Size.** Its widgets lay out down a column it fits to them, measured into
+  the state store under its id. A placement that reads the size (any pivot
+  but the top left, or `keep`) uses last frame's measure, and an overlay never
+  measured spends its first frame hidden, only measuring, and asks for the
+  next at once, as a fitted stack does.
+- **No chrome, no claim.** A bare overlay draws no title, frame or
+  background, and claims nothing itself: input stops only where its widgets
+  claim, so the world under its empty space and its text stays interactive.
+- **Order.** Overlays paint and take input in the overlays band, above docks
+  and windows and beneath popups, menus and modals. `order` places one among
+  the others, higher above, and call order breaks a tie.
+- **Fade.** `fade` (a `Fade` of `dist`, `near` and `far`) runs the overlay's
+  opacity from `near`, with the pointer on it, to `far`, with the pointer
+  `dist` pixels away or more or off the surface: near 0.2 and far 1 lets a
+  HUD get out of the way, near 1 and far 0 shows it only as the pointer
+  nears. It fades everything it holds through `blit.context.push_alpha(?ctx,
+  a)`/`pop_alpha`, an opacity scope every color the painter emits passes
+  through, which nests by multiplying. A consumer span is drawn by the
+  consumer and is not faded.
+
+`blit.toast` stacks timed notifications at an anchor of the surface:
+
+```mach
+var toasts: blit.toast.Toasts;
+blit.toast.init(?toasts, ?a);                     # once
+val posted: err[allo.Error] = blit.toast.post(?toasts, "saved", 0.0); # anywhere: 0 for SECONDS
+blit.toast.show(?ctx, "toasts", ?toasts, blit.overlay.BOTTOM_RIGHT); # per frame
+```
+
+- **Life.** A toast's clock starts the first frame `show` draws it. It fades
+  in over its first `FADE` seconds and out over its last, and is dropped once
+  its time is up. `post` copies the text into storage the `Toasts` owns, and
+  `free` releases it.
+- **Stack.** The cards stack away from the anchor's edge, up from a bottom
+  anchor and down from any other, the newest nearest the anchor, lined up on
+  its side and kept off the edges by twice the theme's padding.
+- **Frames.** `show` asks for frames only while a toast fades, and otherwise
+  for the moment the next one starts to fade out, so once they are gone
+  `next_frame` is `none` again.
+
+`blit.tooltip` shows an overlay over a widget once the pointer has rested on
+it, named by id after the widget is drawn:
+
+```mach
+blit.widget.button(?ctx, "Save");
+blit.tooltip.text(?ctx, blit.context.id_of(?ctx, "Save"), "write the file");
+
+var t: blit.tooltip.Tip = blit.tooltip.tip();
+t.follow = 0;                                     # below the widget, not the pointer
+val tip: blit.tooltip.Shown = blit.tooltip.begin(?ctx, id, t);
+if (tip.open != 0) { blit.widget.text(?ctx, "any widgets"); }
+blit.tooltip.end(?ctx, tip);
+```
+
+- **Delay.** It shows once the widget has been the hovered claimant for
+  `delay` seconds (`DELAY`, 0.5 s), asking for that frame through `wake_at`
+  while it waits and for nothing once shown. A held button hides it and
+  starts the delay over.
+- **Placement.** Below and right of the pointer, clear of the cursor by
+  `CURSOR_GAP`, or below the widget with `follow` 0, in the tooltips band
+  above everything but a drag preview, and always kept on the surface.
+- **Pass-through.** A tooltip claims nothing, so the widget under it keeps the
+  pointer. Its content is for reading: a widget in it that claims would take
+  the hover from the widget it describes.
+
+Toasts and tooltips draw their cards with the window surface, the edge line,
+the text colour, the padding and the corner radius of the theme, read through
+`blit.overlay.chrome(?ctx, kind)`.
 
 ## Charts
 
@@ -861,8 +1192,9 @@ click is always the one visibly on top.
   on a layer of band `b`, in screen coordinates with the clip reset to the
   screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
   band shares one slot, a nesting band (popups, modals) stacks a child one
-  slot above a parent of the same band, and an ordered band (windows) takes
-  the slot given, a window's z. `end()` composes the draw list by layer,
+  slot above a parent of the same band or, opened inside a higher band, one
+  slot above its parent in that band, and an ordered band (windows,
+  overlays) takes the slot given, a window's z or an overlay's order. `end()` composes the draw list by layer,
   keeping call order within a layer, so a popup opened early in the frame
   still paints over a window called after it, and sibling popups share a
   layer. `run_at` reports each run's `layer`. `push_layer` and `pop_layer`
