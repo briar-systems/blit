@@ -76,6 +76,11 @@
 # widgets. id_of hands out the id a key gets in the current scope. two claims
 # with one id in a frame are recorded as collisions, readable until the next
 # begin.
+#
+# the frame's claims double as a record of where each widget was drawn:
+# rect_of, widget_at and widget_in read them back for tests and tools (see
+# blit.driver). set_trace asks the context to keep each line of text it
+# draws as well, off by default so ordinary frames pay nothing for it.
 
 use std.types.error.err;
 use std.types.option.opt;

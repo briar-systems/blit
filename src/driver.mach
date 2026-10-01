@@ -10,7 +10,7 @@
 # the frames that input takes, and queries what the last frame did: whether a
 # widget was drawn, its rect, whether it is hot, active or focused, and the
 # text drawn in a rect. a snapshot is a stable text dump of the frame's draw
-# runs and quads for golden comparison.
+# runs, quads and triangles for golden comparison.
 #
 # routing is the context's own: a widget is reached through the claims of the
 # frame before, so every action first moves the pointer onto the widget in a
@@ -252,22 +252,43 @@ pub fun leave(d: *Driver) {
     step(d);
 }
 
-# hold buttons down and run a frame
+# hold buttons down at the pointer and run a frame
+#
+# each button is sent as a press event at the pointer and held in down, as a
+# host that sees every event does (see blit.input.press_button).
 # ---
 # d:       driver
 # buttons: input.BUTTON_* bits to press
 pub fun press(d: *Driver, buttons: u8) {
-    d.in.down = d.in.down | buttons;
+    buttons_at(d, buttons, 1);
     step(d);
 }
 
-# let buttons go and run a frame
+# let buttons go at the pointer and run a frame
 # ---
 # d:       driver
 # buttons: input.BUTTON_* bits to release
 pub fun release(d: *Driver, buttons: u8) {
-    d.in.down = d.in.down & ~buttons;
+    buttons_at(d, buttons, 0);
     step(d);
+}
+
+# send a press or release event at the pointer for each button whose state
+# changes, and update down
+fun buttons_at(d: *Driver, buttons: u8, down: u8) {
+    var b: u8 = 1;
+    for (b <= input.BUTTON_X2) {
+        val held: bool = (d.in.down & b) != 0;
+        if ((buttons & b) != 0 && down != 0 && !held) {
+            input.press_button(?d.in, b, d.in.mx, d.in.my);
+            d.in.down = d.in.down | b;
+        }
+        or ((buttons & b) != 0 && down == 0 && held) {
+            input.release_button(?d.in, b, d.in.mx, d.in.my);
+            d.in.down = d.in.down & ~b;
+        }
+        b = b << 1;
+    }
 }
 
 # the centre of the rect the last frame drew a widget in
@@ -561,12 +582,57 @@ pub fun text_of(d: *Driver, id: u64) str {
     ret text_in(d, r.some.x0, r.some.y0, r.some.x1, r.some.y1);
 }
 
+# a vertex's position, uv and colour, as the snapshot writes them
+fun out_vert(d: *Driver, v: draw.Vert) {
+    out_fixed(d, v.x, 2);
+    out_byte(d, ' ');
+    out_fixed(d, v.y, 2);
+    out_str(d, " uv ");
+    out_fixed(d, v.u, 4);
+    out_byte(d, ' ');
+    out_fixed(d, v.v, 4);
+    out_str(d, " rgba ");
+    out_rgba(d, v);
+}
+
+fun out_rgba(d: *Driver, v: draw.Vert) {
+    out_channel(d, v.r);
+    out_byte(d, ' ');
+    out_channel(d, v.g);
+    out_byte(d, ' ');
+    out_channel(d, v.b);
+    out_byte(d, ' ');
+    out_channel(d, v.a);
+}
+
+fun same_rgba(a: draw.Vert, b: draw.Vert) bool {
+    ret a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+
+# whether triangles (a, b, c) and (a, c, d) make one flat-coloured,
+# axis-aligned rect from corner a to corner c, as draw.push_quad emits it
+fun is_quad(vs: *draw.Vert, ix: *u32, k: usize) bool {
+    if (ix[k + 3] != ix[k] || ix[k + 4] != ix[k + 2]) { ret false; }
+    val a: draw.Vert = vs[ix[k]];
+    val b: draw.Vert = vs[ix[k + 1]];
+    val c: draw.Vert = vs[ix[k + 2]];
+    val e: draw.Vert = vs[ix[k + 5]];
+    if (b.x != c.x || b.y != a.y || e.x != a.x || e.y != c.y) { ret false; }
+    if (b.u != c.u || b.v != a.v || e.u != a.u || e.v != c.v) { ret false; }
+    ret same_rgba(a, b) && same_rgba(a, c) && same_rgba(a, e);
+}
+
 # a stable text dump of the last frame's draw list, for golden comparison
 #
 # one header line with the screen size, then each run in paint order with its
-# texture, atlas page, layer and filter, followed by its quads, one a line:
-# the screen rect to two decimals, the uv rect to four and the rgba colour in
-# 0 to 255. the same interface driven the same way gives the same text.
+# kind, texture, atlas page, layer, filter, scissor and triangle count,
+# followed by its geometry, one shape a line. two triangles that make a
+# flat-coloured, axis-aligned rect are written as one quad, its corners'
+# position and uv, then its colour; any other triangle is written as its
+# three vertices, each a position, uv and colour. positions and the scissor
+# are written to two decimals, uvs to four, and colours as the premultiplied
+# channels emitted, in 0 to 255. the same interface driven the same way gives
+# the same text.
 # ---
 # d:   driver
 # ret: the dump, valid until the next text query or snapshot, "" if it could
@@ -579,12 +645,15 @@ pub fun snapshot(d: *Driver) str {
     out_fixed(d, d.sh, 0);
     out_byte(d, '\n');
     val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    val ix: *u32       = context.draw_indices(?d.ctx);
     val nr: usize      = context.run_count(?d.ctx);
     var i:  usize      = 0;
     for (i < nr) {
         val r: context.Run = context.run_at(?d.ctx, i);
         out_str(d, "run ");
         out_u64(d, i::u64);
+        out_str(d, " kind ");
+        out_u64(d, r.kind::u64);
         out_str(d, " tex ");
         out_u64(d, r.tex);
         out_str(d, " page ");
@@ -593,43 +662,70 @@ pub fun snapshot(d: *Driver) str {
         out_u64(d, r.layer::u64);
         out_str(d, " filter ");
         out_u64(d, r.filter::u64);
-        out_str(d, " quads ");
-        out_u64(d, (r.count / 6)::u64);
+        out_str(d, " clip ");
+        out_fixed(d, r.clip_x0, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_y0, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_x1, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_y1, 2);
+        out_str(d, " tris ");
+        out_u64(d, (r.count / 3)::u64);
         out_byte(d, '\n');
-        var q: usize = r.start;
-        for (q + 6 <= r.start + r.count) {
-            val tl: draw.Vert = vs[q];
-            val br: draw.Vert = vs[q + 2];
-            out_str(d, "  quad ");
-            out_fixed(d, tl.x, 2);
-            out_byte(d, ' ');
-            out_fixed(d, tl.y, 2);
-            out_byte(d, ' ');
-            out_fixed(d, br.x, 2);
-            out_byte(d, ' ');
-            out_fixed(d, br.y, 2);
-            out_str(d, " uv ");
-            out_fixed(d, tl.u, 4);
-            out_byte(d, ' ');
-            out_fixed(d, tl.v, 4);
-            out_byte(d, ' ');
-            out_fixed(d, br.u, 4);
-            out_byte(d, ' ');
-            out_fixed(d, br.v, 4);
-            out_str(d, " rgba ");
-            out_channel(d, tl.r);
-            out_byte(d, ' ');
-            out_channel(d, tl.g);
-            out_byte(d, ' ');
-            out_channel(d, tl.b);
-            out_byte(d, ' ');
-            out_channel(d, tl.a);
+        val end: usize = r.start + r.count;
+        var k:   usize = r.start;
+        for (k + 3 <= end) {
+            if (k + 6 <= end && is_quad(vs, ix, k)) {
+                val a: draw.Vert = vs[ix[k]];
+                val c: draw.Vert = vs[ix[k + 2]];
+                out_str(d, "  quad ");
+                out_fixed(d, a.x, 2);
+                out_byte(d, ' ');
+                out_fixed(d, a.y, 2);
+                out_byte(d, ' ');
+                out_fixed(d, c.x, 2);
+                out_byte(d, ' ');
+                out_fixed(d, c.y, 2);
+                out_str(d, " uv ");
+                out_fixed(d, a.u, 4);
+                out_byte(d, ' ');
+                out_fixed(d, a.v, 4);
+                out_byte(d, ' ');
+                out_fixed(d, c.u, 4);
+                out_byte(d, ' ');
+                out_fixed(d, c.v, 4);
+                out_str(d, " rgba ");
+                out_rgba(d, a);
+                out_byte(d, '\n');
+                k = k + 6;
+                cnt;
+            }
+            out_str(d, "  tri ");
+            out_vert(d, vs[ix[k]]);
+            out_str(d, " / ");
+            out_vert(d, vs[ix[k + 1]]);
+            out_str(d, " / ");
+            out_vert(d, vs[ix[k + 2]]);
             out_byte(d, '\n');
-            q = q + 6;
+            k = k + 3;
         }
         i = i + 1;
     }
     ret out_text(d);
+}
+
+# whether needle occurs in s
+#[testing]
+fun has(s: str, needle: str) bool {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        var k: usize = 0;
+        for (needle[k] != 0 && s[i + k] == needle[k]) { k = k + 1; }
+        if (needle[k] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # a quad and a claim, then text in runs along one row and onto the next
@@ -643,6 +739,7 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
     context.text_at(ctx, "ef", 60.0::f32, 0.0::f32, ink);
     context.text_at(ctx, "gh\nij", 20.0::f32, 20.0::f32, ink);
     context.claim(ctx, bid.of_path(bid.ROOT, "box"), 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32);
+    context.line(ctx, 0.0::f32, 40.0::f32, 10.0::f32, 48.0::f32, 1.0::f32, ink);
 }
 
 test text_in__joins_rows_and_lines {
@@ -660,14 +757,13 @@ test text_in__joins_rows_and_lines {
     if (!str_equals(text_of(?d, find(?d, "none")), ""))                                         { ret 5; }
     if (at(?d, 5.0::f32, 5.0::f32) != find(?d, "box") || at(?d, 50.0::f32, 40.0::f32) != 0)     { ret 6; }
 
-    # the dump is stable text: runs, then each quad's rect, uv and colour
-    val head: str   = "screen 100 50\nrun 0 tex 0 page 0 layer 0 filter 0 quads 11\n  quad 0.00 0.00 10.00 10.00 uv 0.0039 0.0039 0.0039 0.0039 rgba 255 128 0 255\n  quad 20.00 0.00 28.00 8.00 uv ";
-    val dump: str   = snapshot(?d);
-    var k:    usize = 0;
-    for (head[k] != 0) {
-        if (dump[k] != head[k]) { ret 7; }
-        k = k + 1;
-    }
+    # the dump is stable text: runs, then quads and triangles
+    val dump: str = snapshot(?d);
+    if (!has(dump, "screen 100 50\nrun 0 kind 0 tex 0 page 0 layer 0 filter 0 clip 0.00 0.00 100.00 50.00 tris ")) { ret 7; }
+    if (!has(dump, "\n  quad 0.00 0.00 10.00 10.00 uv 0.0039 0.0039 0.0039 0.0039 rgba 255 128 0 255\n"))          { ret 8; }
+    if (!has(dump, "\n  quad 20.00 0.00 28.00 8.00 uv "))                                                          { ret 9; }
+    if (!has(dump, "\n  tri "))                                                                                    { ret 10; }
+
     val freed: err[allo.Error] = free(?d);
     if (sel freed.err) { ret 1; }
     ret 0;
