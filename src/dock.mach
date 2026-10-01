@@ -491,7 +491,7 @@ fun leave(ctx: *context.Context, dk: *widget.Docked) {
 # leaf:   the leaf, from root or split
 # window: the window's id
 pub fun add(ctx: *context.Context, leaf: u64, window: u64) {
-    place(ctx, leaf, window, LAST);
+    insert(ctx, leaf, window, LAST::usize);
 }
 
 # gathers the windows docked in one leaf, leaving one out
@@ -767,10 +767,10 @@ fun alive(ctx: *context.Context, dk: *widget.Docked, stamp: u64) bool {
     ret dk.drawn == 0 || dk.drawn + 1 >= stamp;
 }
 
-# whether member a sorts before member b: by leaf, then by rank
+# whether member a sorts before member b: by leaf, then as their tabs go
 fun before(a: *Member, b: *Member) bool {
     if (a.dk.node != b.dk.node) { ret a.dk.node < b.dk.node; }
-    ret a.dk.rank < b.dk.rank;
+    ret ahead(a.dk, b.dk);
 }
 
 # gather the space's windows into the pass, sorted by leaf and rank
@@ -1532,6 +1532,7 @@ fun docked_load(dk: *widget.Docked, t: *toml.Table) {
 # sid:   the space's id
 # build: true to build the default layout while the space is empty
 # stack: true to build it as one tab stack, by position, instead
+# tail:  true to build it as one tab stack of C, A and B, each added last
 # hide:  true to draw nothing
 #[testing]
 rec App {
@@ -1539,6 +1540,7 @@ rec App {
     sid:   u64;
     build: bool;
     stack: bool;
+    tail:  bool;
     hide:  bool;
 }
 
@@ -1553,6 +1555,12 @@ fun app_ui(ctx: *context.Context, user: ptr) {
         insert(ctx, r, context.id_of(ctx, "B"), 0);
         insert(ctx, r, context.id_of(ctx, "C"), 1);
         select(ctx, context.id_of(ctx, "B"));
+    }
+    if (ap.tail && empty(ctx, sid)) {
+        val r: u64 = root(ctx, sid);
+        add(ctx, r, context.id_of(ctx, "C"));
+        add(ctx, r, context.id_of(ctx, "A"));
+        add(ctx, r, context.id_of(ctx, "B"));
     }
     if (ap.build && empty(ctx, sid)) {
         val r: u64 = root(ctx, sid);
@@ -1731,6 +1739,40 @@ test space__places_tabs_by_position_and_selects_the_front {
     ret 0;
 }
 
+test space__keeps_tabs_in_the_order_they_were_added {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.tail = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val a: u64 = win(?d, "A");
+    val b: u64 = win(?d, "B");
+    val c: u64 = win(?d, "C");
+    val r: u64 = node_of(?d.ctx, a);
+
+    # added before the first draw, the tabs go C, A, B, with B, added last, in
+    # front
+    if (r == 0 || node_of(?d.ctx, b) != r || node_of(?d.ctx, c) != r) { ret 2; }
+    val cx: f32 = tab_x(?d, r, c);
+    val ax: f32 = tab_x(?d, r, a);
+    val bx: f32 = tab_x(?d, r, b);
+    if (cx < 0.0::f32 || ax <= cx || bx <= ax)                           { ret 3; }
+    if (left_of(?d, "B/b") < 0.0::f32 || left_of(?d, "A/b") >= 0.0::f32) { ret 4; }
+
+    # added again once drawn, a tab moves after the rest, in front
+    add(?d.ctx, r, c);
+    driver.steps(?d, 2);
+    if (tab_x(?d, r, a) != cx || tab_x(?d, r, b) <= cx)                  { ret 5; }
+    if (tab_x(?d, r, c) <= tab_x(?d, r, b))                              { ret 6; }
+    if (left_of(?d, "C/b") < 0.0::f32 || left_of(?d, "B/b") >= 0.0::f32) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test space__keyboard_crosses_docked_tabs_in_focus_order {
     var al:   allo.Allocator;
     val made: err[allo.Error] = page.make(?al);
@@ -1754,7 +1796,7 @@ test space__keyboard_crosses_docked_tabs_in_focus_order {
     if (!driver.focused(?d, tabs.tab_id(bar_of(lr), c))) { ret 3; }
 
     # the arrows move along the bar, and enter selects the tab
-    driver.key(?d, input.KEY_RIGHT, 0);
+    driver.key(?d, input.KEY_LEFT, 0);
     if (!driver.focused(?d, tabs.tab_id(bar_of(lr), b))) { ret 4; }
     driver.key(?d, input.KEY_ENTER, 0);
     driver.step(?d);
