@@ -1,0 +1,1025 @@
+# an interface inspector: a window, built with blit, showing what the
+# context knows about the frame it is drawn in
+#
+# it shows the frame's hovered, hot, active and focused ids, its claims by
+# layer band, its id collisions, its draw list's counts and runs, the
+# windows and their z order, every dock space's tree, and every entry of
+# the state store, as a tree (see blit.tree). hovering an entry outlines its
+# rect on the surface, in the tooltips band above everything but a drag.
+#
+# it records nothing: everything it shows is what the context already keeps
+# for routing, drawing and its store. call show last in a frame, after every
+# other widget, so the claims, collisions and runs it reads are the app's
+# whole frame, read before it draws itself. the Inspector is the caller's,
+# like a List or a Field: toggle opens and closes it, and while closed show
+# returns at once, so an app pays one branch a frame for keeping it around.
+# while open it copies the frame's claims by band, its runs and the store's
+# entries into storage it owns, so drawing itself never moves what it reads.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use allo: std.allocator;
+use std.allocator.page;
+use vec: std.collections.vector;
+
+use blit.band;
+use blit.context;
+use blit.dock;
+use blit.draw;
+use blit.driver;
+use blit.hit;
+use bid: blit.id;
+use blit.state;
+use blit.store;
+use blit.theme;
+use blit.tree;
+use blit.widget;
+
+# the inspector window's title and key
+pub val TITLE: str = "Inspector";
+
+# the kind an entry's rect is outlined in on the surface while the entry is
+# hovered: fill, border and border_w
+pub val KIND_OUTLINE: str = "inspect_outline";
+
+# what a tree node of the inspector stands for, in a handle's top byte
+val ROOT:      u64 = 0;
+val SECTION:   u64 = 1;
+val FACT:      u64 = 2;
+val BAND:      u64 = 3;
+val CLAIM:     u64 = 4;
+val COLLISION: u64 = 5;
+val RUN:       u64 = 6;
+val WINDOW:    u64 = 7;
+val SPACE:     u64 = 8;
+val NODE:      u64 = 9;
+val DOCKED:    u64 = 10;
+val ENTRY:     u64 = 11;
+
+# the top level, in order
+val SEC_FRAME:      u64   = 0;
+val SEC_LAYERS:     u64   = 1;
+val SEC_COLLISIONS: u64   = 2;
+val SEC_DRAW:       u64   = 3;
+val SEC_WINDOWS:    u64   = 4;
+val SEC_DOCK:       u64   = 5;
+val SEC_STORE:      u64   = 6;
+val SECTIONS:       usize = 7;
+
+# the frame's facts, in order
+val FACT_SCREEN: u64   = 0;
+val FACT_HOVER:  u64   = 1;
+val FACT_HOT:    u64   = 2;
+val FACT_ACTIVE: u64   = 3;
+val FACT_FOCUS:  u64   = 4;
+val FACT_OOM:    u64   = 5;
+val FACTS:       usize = 6;
+
+# bytes a row's label holds
+val LINE: usize = 160;
+
+# one state store entry, as the inspector read it at the start of show
+# ---
+# id:     the widget id it belongs to
+# kind:   type id of its state
+# size:   bytes of its state
+# age:    frames since a frame last reached it
+# pinned: 1 if it never ages out
+rec Kept {
+    id:     u64;
+    kind:   u64;
+    size:   usize;
+    age:    u64;
+    pinned: u8;
+}
+
+# caller-owned state of an inspector, kept across frames
+# ---
+# open:   1 while it shows, flipped by toggle
+# tree:   the tree its entries are shown in
+# a:      allocator backing what it copies while open
+# ctx:    the context being shown, during show
+# claims: claims the app made before show, this frame
+# hits:   indices of those claims grouped by band
+# starts: where each band's claims begin in hits, COUNT + 1 of them
+# runs:   the app's runs before show, the one still accumulating last
+# verts:  vertices the app drew before show
+# idx:    indices the app drew before show
+# coll:   collisions recorded before show
+# wins:   ids of the windows the store keeps
+# spaces: ids of the dock spaces the store keeps
+# docked: ids of the windows docked in a space
+# kept:   the store's entries
+# vals:   this frame's handle payloads, a handle's low bytes indexing it
+# line:   the label of the row being drawn
+pub rec Inspector {
+    open:   u8;
+    tree:   tree.Tree;
+    a:      *allo.Allocator;
+    ctx:    *context.Context;
+    claims: usize;
+    hits:   vec.Vector[u32];
+    starts: [9]usize;
+    runs:   vec.Vector[context.Run];
+    verts:  usize;
+    idx:    usize;
+    coll:   usize;
+    wins:   vec.Vector[u64];
+    spaces: vec.Vector[u64];
+    docked: vec.Vector[u64];
+    kept:   vec.Vector[Kept];
+    vals:   vec.Vector[u64];
+    line:   [160]u8;
+}
+
+# set an inspector up closed; it allocates only while open
+# ---
+# i: the inspector
+# a: allocator backing what it copies from each frame it shows
+pub fun init(i: *Inspector, a: *allo.Allocator) {
+    i.open      = 0;
+    i.a         = a;
+    i.tree.root = 0;
+    i.tree.mode = tree.SELECT_NONE;
+    i.hits      = vec.init[u32](a);
+    i.runs      = vec.init[context.Run](a);
+    i.wins      = vec.init[u64](a);
+    i.spaces    = vec.init[u64](a);
+    i.docked    = vec.init[u64](a);
+    i.kept      = vec.init[Kept](a);
+    i.vals      = vec.init[u64](a);
+}
+
+# release what an inspector copied
+# ---
+# i:   the inspector
+# ret: ok, or the first refusal; the inspector holds nothing either way
+pub fun free(i: *Inspector) err[allo.Error] {
+    var first: err[allo.Error] = err[allo.Error].ok{};
+    val a:     err[allo.Error] = vec.dnit[u32](?i.hits);
+    if (sel a.err) { first = a; }
+    val b: err[allo.Error] = vec.dnit[context.Run](?i.runs);
+    if (sel b.err) { first = b; }
+    val c: err[allo.Error] = vec.dnit[u64](?i.wins);
+    if (sel c.err) { first = c; }
+    val d: err[allo.Error] = vec.dnit[u64](?i.spaces);
+    if (sel d.err) { first = d; }
+    val e: err[allo.Error] = vec.dnit[u64](?i.docked);
+    if (sel e.err) { first = e; }
+    val f: err[allo.Error] = vec.dnit[Kept](?i.kept);
+    if (sel f.err) { first = f; }
+    val g: err[allo.Error] = vec.dnit[u64](?i.vals);
+    if (sel g.err) { first = g; }
+    ret first;
+}
+
+# open a closed inspector or close an open one, the one call an app binds
+# to a key or a button
+# ---
+# i: the inspector
+pub fun toggle(i: *Inspector) {
+    i.open = 1 - i.open;
+}
+
+# register the inspector's kind on a theme: inspect_outline
+#
+# show registers it on the context's theme the first time it draws; a host
+# that loads a theme file styling it registers it first, so the file can
+# name it.
+# ---
+# t:   the theme
+# ret: ok, or the allocator's refusal
+pub fun register_kinds(t: *theme.Theme) err[allo.Error] {
+    val k: res[u32, allo.Error] = theme.register_kind(t, KIND_OUTLINE, "the inspector's outline of a hovered entry's rect on the surface: fill, border and border_w", outline_style);
+    if (sel k.err) { ret err[allo.Error].err{k.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# a hovered entry's outline: a faint fill of the selection color inside an
+# accent border
+fun outline_style(t: *theme.Theme, k: u32, s: *theme.Style) {
+    s.radius = draw.radii(0.0::f32);
+    theme.fill_all(s, t.select);
+    theme.outline_all(s, t.accent, 2.0::f32);
+}
+
+# the outline kind's handle, registering it when the theme lacks it
+fun outline_kind(ctx: *context.Context) u32 {
+    val t:    *theme.Theme = context.theme_of(ctx);
+    val have: opt[u32]     = theme.kind_of(t, KIND_OUTLINE);
+    if (sel have.some) { ret have.some; }
+    val e: err[allo.Error] = register_kinds(t);
+    if (sel e.err) { ctx.oom = 1; }
+    val k: opt[u32] = theme.kind_of(t, KIND_OUTLINE);
+    if (sel k.some) { ret k.some; }
+    ret theme.TOOLTIP;
+}
+
+# push onto a vector, noting a refusal as the context's oom
+fun keep[T](ctx: *context.Context, v: *vec.Vector[T], x: T) {
+    val r: res[usize, allo.Error] = vec.push[T](v, x);
+    if (sel r.err) { ctx.oom = 1; }
+}
+
+# copy what the app drew this frame before show, and what the store keeps
+fun snapshot(ctx: *context.Context, i: *Inspector) {
+    i.claims = ctx.claims.len;
+    i.verts  = context.draw_count(ctx);
+    i.idx    = context.index_count(ctx);
+    i.coll   = context.collisions(ctx);
+
+    # the claims, grouped by band in claim order
+    vec.clear[u32](?i.hits);
+    var b: u32 = 0;
+    for (b < band.COUNT) {
+        i.starts[b] = i.hits.len;
+        var k: usize = 0;
+        for (k < i.claims) {
+            val l: u32 = (ctx.claims.items[k].key >> 32)::u32;
+            if (band.band_of(l) == b) { keep[u32](ctx, ?i.hits, k::u32); }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    i.starts[band.COUNT] = i.hits.len;
+
+    # the closed runs, then the one still accumulating
+    vec.clear[context.Run](?i.runs);
+    var r: usize = 0;
+    for (r < ctx.run_len) {
+        keep[context.Run](ctx, ?i.runs, ctx.runs[r]);
+        r = r + 1;
+    }
+    if (i.idx > ctx.run_start) {
+        var p: context.Run = ctx.pend;
+        p.start = ctx.run_start;
+        p.count = i.idx - ctx.run_start;
+        keep[context.Run](ctx, ?i.runs, p);
+    }
+
+    vec.clear[u64](?i.wins);
+    vec.clear[u64](?i.spaces);
+    vec.clear[u64](?i.docked);
+    vec.clear[Kept](?i.kept);
+    val s:  *store.Store = ?ctx.store;
+    var at: usize        = 0;
+    for (at < s.cap) {
+        val e: store.Entry = s.slots[at];
+        at = at + 1;
+        if (e.used == 0)                            { cnt; }
+        if (e.kind == $type_id(widget.WindowState)) { keep[u64](ctx, ?i.wins, e.id); }
+        if (e.kind == $type_id(dock.SpaceState))    { keep[u64](ctx, ?i.spaces, e.id); }
+        if (e.kind == $type_id(widget.Docked))      { keep[u64](ctx, ?i.docked, e.id); }
+        keep[Kept](ctx, ?i.kept, Kept{id: e.id, kind: e.kind, size: e.size, age: s.frame - e.seen, pinned: e.pinned});
+    }
+}
+
+# a handle for a node: what it stands for in the top byte, an index into
+# this frame's payloads below
+fun handle(i: *Inspector, what: u64, v: u64) u64 {
+    keep[u64](i.ctx, ?i.vals, v);
+    ret (what << 56) | (i.vals.len - 1)::u64;
+}
+
+# what a handle stands for
+fun what_of(h: u64) u64 {
+    ret h >> 56;
+}
+
+# the payload a handle carries
+fun val_of(i: *Inspector, h: u64) u64 {
+    val k: usize = (h & 0xFFFFFFFFFFFFFF)::usize;
+    if (k >= i.vals.len) { ret 0; }
+    ret i.vals.data[k];
+}
+
+# a dock node, nil when there is none
+fun node(ctx: *context.Context, id: u64) *dock.Node {
+    if (id == 0) { ret nil; }
+    ret state.find[dock.Node](ctx, id);
+}
+
+# how many of the copied docked windows sit in a leaf
+fun docked_in(i: *Inspector, leaf: u64) usize {
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < i.docked.len) {
+        if (dock.node_of(i.ctx, i.docked.data[k]) == leaf) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
+# the id of the k-th copied docked window in a leaf
+fun docked_at(i: *Inspector, leaf: u64, at: usize) u64 {
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < i.docked.len) {
+        val id: u64 = i.docked.data[k];
+        if (dock.node_of(i.ctx, id) == leaf) {
+            if (n == at) { ret id; }
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# how many children the node with a handle has
+fun count(user: ptr, h: u64) usize {
+    val i: *Inspector = user::*Inspector;
+    val w: u64        = what_of(h);
+    if (w == ROOT) { ret SECTIONS; }
+    if (w == SECTION) {
+        val s: u64 = val_of(i, h);
+        if (s == SEC_FRAME)      { ret FACTS; }
+        if (s == SEC_LAYERS)     { ret band.COUNT::usize; }
+        if (s == SEC_COLLISIONS) { ret i.coll; }
+        if (s == SEC_DRAW)       { ret i.runs.len; }
+        if (s == SEC_WINDOWS)    { ret i.wins.len; }
+        if (s == SEC_DOCK)       { ret i.spaces.len; }
+        ret i.kept.len;
+    }
+    if (w == BAND) {
+        val b: usize = val_of(i, h)::usize;
+        ret i.starts[b + 1] - i.starts[b];
+    }
+    if (w == SPACE) { ret 1; }
+    if (w == NODE) {
+        val n: *dock.Node = node(i.ctx, val_of(i, h));
+        if (n == nil) { ret 0; }
+        if (n.a != 0) { ret 2; }
+        ret docked_in(i, val_of(i, h));
+    }
+    ret 0;
+}
+
+# a line of text being written into the inspector's label buffer
+# ---
+# i: the inspector whose buffer it is
+# n: bytes written
+rec Out {
+    i: *Inspector;
+    n: usize;
+}
+
+# start a label
+fun out(i: *Inspector) Out {
+    i.line[0] = 0;
+    ret Out{i: i, n: 0};
+}
+
+# add one byte, keeping room for the terminator
+fun put_c(o: *Out, c: u8) {
+    if (o.n + 1 >= LINE) { ret; }
+    o.i.line[o.n] = c;
+    o.n           = o.n + 1;
+    o.i.line[o.n] = 0;
+}
+
+# add a string, up to its "##" when it is a label
+fun put_s(o: *Out, s: str) {
+    if (s == nil) { ret; }
+    var k: usize = 0;
+    for (s[k] != 0) {
+        put_c(o, s[k]);
+        k = k + 1;
+    }
+}
+
+# add a number in decimal
+fun put_u(o: *Out, n: u64) {
+    var tmp: [20]u8;
+    var k:   usize = 0;
+    var v:   u64   = n;
+    for {
+        tmp[k] = ('0'::u64 + v % 10)::u8;
+        k      = k + 1;
+        v      = v / 10;
+        if (v == 0) { brk; }
+    }
+    for (k > 0) {
+        k = k - 1;
+        put_c(o, tmp[k]);
+    }
+}
+
+# add a number in sixteen hex digits, as ids show
+fun put_x(o: *Out, n: u64) {
+    var s: u32 = 64;
+    for (s > 0) {
+        s = s - 4;
+        val d: u64 = (n >> s::u64) & 15;
+        if (d < 10) { put_c(o, ('0'::u64 + d)::u8); }
+        or          { put_c(o, ('a'::u64 + d - 10)::u8); }
+    }
+}
+
+# add a length rounded to whole pixels, signed
+fun put_px(o: *Out, v: f32) {
+    var x: f32 = v;
+    if (x < 0.0::f32) {
+        put_c(o, '-');
+        x = 0.0::f32 - x;
+    }
+    put_u(o, (x + 0.5::f32)::u64);
+}
+
+# add a fraction with two decimals
+fun put_f2(o: *Out, v: f32) {
+    var x: f32 = v;
+    if (x < 0.0::f32) {
+        put_c(o, '-');
+        x = 0.0::f32 - x;
+    }
+    val c: u64 = (x * 100.0::f32 + 0.5::f32)::u64;
+    put_u(o, c / 100);
+    put_c(o, '.');
+    put_c(o, ('0'::u64 + c / 10 % 10)::u8);
+    put_c(o, ('0'::u64 + c % 10)::u8);
+}
+
+# add a rect as x0,y0 x1,y1
+fun put_rect(o: *Out, x0: f32, y0: f32, x1: f32, y1: f32) {
+    put_px(o, x0);
+    put_c(o, ',');
+    put_px(o, y0);
+    put_c(o, ' ');
+    put_px(o, x1);
+    put_c(o, ',');
+    put_px(o, y1);
+}
+
+# add a layer as its band's name and its slot
+fun put_layer(o: *Out, l: u32) {
+    put_s(o, band.band(band.band_of(l)).name);
+    put_c(o, ':');
+    put_u(o, band.slot_of(l)::u64);
+}
+
+# add an id, or "none" for 0
+fun put_id(o: *Out, id: u64) {
+    if (id == 0) { put_s(o, "none"); }
+    or           { put_x(o, id); }
+}
+
+# the name the store's entry kind goes by: a registered kind's, a known
+# type's, or its type id
+fun put_kind(o: *Out, ctx: *context.Context, kind: u64) {
+    val s: *store.Store = ?ctx.store;
+    var k: usize        = 0;
+    for (k < s.kind_len) {
+        if (s.kinds[k].kind == kind) {
+            put_s(o, s.kinds[k].name);
+            ret;
+        }
+        k = k + 1;
+    }
+    if (kind == $type_id(widget.WindowState)) { put_s(o, "window"); }
+    or (kind == $type_id(widget.Docked))      { put_s(o, "docked"); }
+    or (kind == $type_id(dock.SpaceState))    { put_s(o, "dock space"); }
+    or (kind == $type_id(dock.Node))          { put_s(o, "dock node"); }
+    or (kind == $type_id(widget.Scroll))      { put_s(o, "scroll"); }
+    or {
+        put_s(o, "type ");
+        put_x(o, kind);
+    }
+}
+
+# the label of a top level section
+fun section_label(o: *Out, i: *Inspector, s: u64) {
+    if (s == SEC_FRAME) {
+        put_s(o, "Frame");
+        ret;
+    }
+    if (s == SEC_LAYERS) {
+        put_s(o, "Layers and claims (");
+        put_u(o, i.claims::u64);
+    }
+    or (s == SEC_COLLISIONS) {
+        put_s(o, "Collisions (");
+        put_u(o, i.coll::u64);
+    }
+    or (s == SEC_DRAW) {
+        put_s(o, "Draw list (");
+        put_u(o, i.verts::u64);
+        put_s(o, " verts, ");
+        put_u(o, i.idx::u64);
+        put_s(o, " indices, ");
+        put_u(o, i.runs.len::u64);
+        put_s(o, " runs");
+    }
+    or (s == SEC_WINDOWS) {
+        put_s(o, "Windows (");
+        put_u(o, i.wins.len::u64);
+    }
+    or (s == SEC_DOCK) {
+        put_s(o, "Dock spaces (");
+        put_u(o, i.spaces.len::u64);
+    }
+    or {
+        put_s(o, "State store (");
+        put_u(o, i.kept.len::u64);
+    }
+    put_c(o, ')');
+}
+
+# the label of one of the frame's facts
+fun fact_label(o: *Out, ctx: *context.Context, f: u64) {
+    if (f == FACT_SCREEN) {
+        put_s(o, "screen ");
+        put_px(o, ctx.sw);
+        put_s(o, " x ");
+        put_px(o, ctx.sh);
+        put_s(o, ", scale ");
+        put_f2(o, context.scale_of(ctx));
+        put_s(o, ", dt ");
+        put_f2(o, (context.dt(ctx) * 1000.0::f64)::f32);
+        put_s(o, " ms");
+    }
+    or (f == FACT_HOVER) {
+        put_s(o, "hover  ");
+        put_id(o, ctx.hover);
+        if (ctx.hover != 0) {
+            put_s(o, "  ");
+            put_layer(o, ctx.hover_layer);
+        }
+    }
+    or (f == FACT_HOT) {
+        put_s(o, "hot    ");
+        put_id(o, ctx.hot);
+    }
+    or (f == FACT_ACTIVE) {
+        put_s(o, "active ");
+        put_id(o, ctx.active);
+    }
+    or (f == FACT_FOCUS) {
+        put_s(o, "focus  ");
+        put_id(o, ctx.focus);
+    }
+    or {
+        put_s(o, "complete ");
+        if (context.ok(ctx) != 0) { put_s(o, "yes"); }
+        or                        { put_s(o, "no, an allocation failed"); }
+    }
+}
+
+# the id a fact names, 0 for none
+fun fact_id(ctx: *context.Context, f: u64) u64 {
+    if (f == FACT_HOVER)  { ret ctx.hover; }
+    if (f == FACT_HOT)    { ret ctx.hot; }
+    if (f == FACT_ACTIVE) { ret ctx.active; }
+    if (f == FACT_FOCUS)  { ret ctx.focus; }
+    ret 0;
+}
+
+# the label of one band
+fun band_label(o: *Out, i: *Inspector, b: u32) {
+    val bd: band.Band = band.band(b);
+    put_s(o, bd.name);
+    if (bd.rule == band.RULE_NEST)  { put_s(o, " (nesting)"); }
+    if (bd.rule == band.RULE_ORDER) { put_s(o, " (ordered)"); }
+    put_s(o, ": ");
+    put_u(o, (i.starts[b + 1] - i.starts[b])::u64);
+    put_s(o, " claims, ");
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < i.runs.len) {
+        if (band.band_of(i.runs.data[k].layer) == b) { n = n + 1; }
+        k = k + 1;
+    }
+    put_u(o, n::u64);
+    put_s(o, " runs");
+}
+
+# the label of one claim
+fun claim_label(o: *Out, c: hit.Claim) {
+    put_id(o, c.id);
+    put_s(o, "  ");
+    put_layer(o, (c.key >> 32)::u32);
+    put_s(o, "  ");
+    put_rect(o, c.x0, c.y0, c.x1, c.y1);
+}
+
+# the label of one run
+fun run_label(o: *Out, k: usize, r: context.Run) {
+    put_s(o, "run ");
+    put_u(o, k::u64);
+    put_s(o, "  ");
+    put_layer(o, r.layer);
+    if (r.kind == context.RUN_CUSTOM) {
+        put_s(o, "  span ");
+        put_u(o, r.id);
+        put_s(o, " at ");
+        put_rect(o, r.x0, r.y0, r.x1, r.y1);
+        ret;
+    }
+    if (r.tex == draw.ATLAS) {
+        put_s(o, "  atlas ");
+        put_u(o, r.page::u64);
+    }
+    or {
+        put_s(o, "  tex ");
+        put_u(o, r.tex);
+    }
+    put_s(o, "  ");
+    put_u(o, (r.count / 3)::u64);
+    put_s(o, " tris  clip ");
+    put_rect(o, r.clip_x0, r.clip_y0, r.clip_x1, r.clip_y1);
+}
+
+# the label of one window
+fun window_label(o: *Out, ctx: *context.Context, id: u64) {
+    put_id(o, id);
+    val st: *widget.WindowState = state.find[widget.WindowState](ctx, id);
+    if (st == nil) { ret; }
+    put_s(o, "  ");
+    put_rect(o, st.x, st.y, st.x + st.w, st.y + st.h);
+    put_s(o, "  z ");
+    put_u(o, st.z);
+    if (st.closed != 0)             { put_s(o, " closed"); }
+    if (st.collapsed != 0)          { put_s(o, " collapsed"); }
+    if (st.pinned != 0)             { put_s(o, " pinned"); }
+    if (st.locked != 0)             { put_s(o, " locked"); }
+    if (dock.node_of(ctx, id) != 0) { put_s(o, " docked"); }
+}
+
+# the label of one dock node
+fun node_label(o: *Out, i: *Inspector, id: u64) {
+    val n: *dock.Node = node(i.ctx, id);
+    if (n == nil) {
+        put_s(o, "node ");
+        put_id(o, id);
+        put_s(o, " (gone)");
+        ret;
+    }
+    if (n.a != 0) {
+        put_s(o, "split ");
+        if (n.axis == dock.AXIS_X) { put_s(o, "across "); }
+        or                         { put_s(o, "down "); }
+        put_f2(o, n.ratio);
+    }
+    or {
+        put_s(o, "leaf, ");
+        put_u(o, docked_in(i, id)::u64);
+        put_s(o, " windows");
+    }
+    put_s(o, "  ");
+    put_rect(o, n.x0, n.y0, n.x1, n.y1);
+}
+
+# the label of one docked window
+fun docked_label(o: *Out, ctx: *context.Context, id: u64) {
+    val dk: *widget.Docked = state.find[widget.Docked](ctx, id);
+    put_s(o, "window ");
+    if (dk != nil && dk.label[0] != 0) {
+        put_s(o, ?dk.label[0]);
+        put_s(o, "  ");
+    }
+    put_id(o, id);
+    if (dk != nil && dk.front != 0) { put_s(o, " front"); }
+}
+
+# the label of one store entry
+fun entry_label(o: *Out, ctx: *context.Context, e: Kept) {
+    put_id(o, e.id);
+    put_s(o, "  ");
+    put_kind(o, ctx, e.kind);
+    put_s(o, "  ");
+    put_u(o, e.size::u64);
+    put_s(o, " B, age ");
+    put_u(o, e.age);
+    if (e.pinned != 0) { put_s(o, ", pinned"); }
+}
+
+# fill the item of the k-th child of the node with a handle
+fun child(user: ptr, h: u64, k: usize, it: *tree.Item) {
+    val i:   *Inspector       = user::*Inspector;
+    val ctx: *context.Context = i.ctx;
+    var o:   Out              = out(i);
+    val w:   u64              = what_of(h);
+    it.key      = k::u64;
+    it.leaf     = true;
+    it.selected = false;
+    it.label    = ?i.line[0];
+
+    if (w == ROOT) {
+        it.handle = handle(i, SECTION, k::u64);
+        it.leaf   = false;
+        section_label(?o, i, k::u64);
+        ret;
+    }
+    if (w == SECTION) {
+        val s: u64 = val_of(i, h);
+        if (s == SEC_FRAME) {
+            it.handle = handle(i, FACT, k::u64);
+            fact_label(?o, ctx, k::u64);
+        }
+        or (s == SEC_LAYERS) {
+            it.handle = handle(i, BAND, k::u64);
+            it.leaf   = false;
+            band_label(?o, i, k::u32);
+        }
+        or (s == SEC_COLLISIONS) {
+            val id: u64 = context.collision_at(ctx, k);
+            it.handle = handle(i, COLLISION, id);
+            put_id(?o, id);
+            put_s(?o, "  claimed again");
+        }
+        or (s == SEC_DRAW) {
+            it.handle = handle(i, RUN, k::u64);
+            run_label(?o, k, i.runs.data[k]);
+        }
+        or (s == SEC_WINDOWS) {
+            val id: u64 = i.wins.data[k];
+            it.key    = id;
+            it.handle = handle(i, WINDOW, id);
+            window_label(?o, ctx, id);
+        }
+        or (s == SEC_DOCK) {
+            val id: u64 = i.spaces.data[k];
+            it.key    = id;
+            it.handle = handle(i, SPACE, id);
+            it.leaf   = false;
+            put_s(?o, "space ");
+            put_id(?o, id);
+        }
+        or {
+            val e: Kept = i.kept.data[k];
+            it.handle = handle(i, ENTRY, e.id);
+            entry_label(?o, ctx, e);
+        }
+        ret;
+    }
+    if (w == BAND) {
+        val at: u32 = i.hits.data[i.starts[val_of(i, h)::usize] + k];
+        it.handle = handle(i, CLAIM, at::u64);
+        claim_label(?o, ctx.claims.items[at]);
+        ret;
+    }
+    if (w == SPACE) {
+        val sp:   *dock.SpaceState = state.find[dock.SpaceState](ctx, val_of(i, h));
+        var root: u64              = 0;
+        if (sp != nil) { root = sp.root; }
+        it.key    = root;
+        it.handle = handle(i, NODE, root);
+        it.leaf   = false;
+        node_label(?o, i, root);
+        ret;
+    }
+    if (w == NODE) {
+        val pid: u64        = val_of(i, h);
+        val n:   *dock.Node = node(ctx, pid);
+        if (n != nil && n.a != 0) {
+            var id: u64 = n.a;
+            if (k == 1) { id = n.b; }
+            it.key    = id;
+            it.handle = handle(i, NODE, id);
+            it.leaf   = false;
+            node_label(?o, i, id);
+            ret;
+        }
+        val id: u64 = docked_at(i, pid, k);
+        it.key    = id;
+        it.handle = handle(i, DOCKED, id);
+        docked_label(?o, ctx, id);
+    }
+}
+
+# the rect on the surface an entry stands for, none when it has none
+fun rect_for(i: *Inspector, h: u64) opt[context.Area] {
+    val ctx: *context.Context = i.ctx;
+    val w:   u64              = what_of(h);
+    val v:   u64              = val_of(i, h);
+    if (w == FACT)                    { ret context.rect_of(ctx, fact_id(ctx, v)); }
+    if (w == COLLISION || w == ENTRY) { ret context.rect_of(ctx, v); }
+    if (w == CLAIM) {
+        val c: hit.Claim = ctx.claims.items[v::usize];
+        ret opt[context.Area].some{context.Area{x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1}};
+    }
+    if (w == BAND) {
+        # every claim of the band at once
+        var found: bool  = false;
+        var r:     context.Area;
+        var k:     usize = i.starts[v::usize];
+        for (k < i.starts[v::usize + 1]) {
+            val c: hit.Claim = ctx.claims.items[i.hits.data[k]];
+            k = k + 1;
+            if (c.x1 <= c.x0 || c.y1 <= c.y0) { cnt; }
+            if (!found) {
+                r     = context.Area{x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1};
+                found = true;
+                cnt;
+            }
+            if (c.x0 < r.x0) { r.x0 = c.x0; }
+            if (c.y0 < r.y0) { r.y0 = c.y0; }
+            if (c.x1 > r.x1) { r.x1 = c.x1; }
+            if (c.y1 > r.y1) { r.y1 = c.y1; }
+        }
+        if (!found) { ret opt[context.Area].none{}; }
+        ret opt[context.Area].some{r};
+    }
+    if (w == RUN) {
+        val r: context.Run = i.runs.data[v::usize];
+        if (r.kind == context.RUN_CUSTOM) { ret opt[context.Area].some{context.Area{x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1}}; }
+        ret opt[context.Area].some{context.Area{x0: r.clip_x0, y0: r.clip_y0, x1: r.clip_x1, y1: r.clip_y1}};
+    }
+    if (w == WINDOW || w == DOCKED) {
+        val dk: *widget.Docked = state.find[widget.Docked](ctx, v);
+        if (dk != nil && dk.node != 0) { ret opt[context.Area].some{context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1}}; }
+        val st: *widget.WindowState = state.find[widget.WindowState](ctx, v);
+        if (st == nil || st.closed != 0) { ret opt[context.Area].none{}; }
+        ret opt[context.Area].some{context.Area{x0: st.x, y0: st.y, x1: st.x + st.w, y1: st.y + st.h}};
+    }
+    if (w == NODE) {
+        val n: *dock.Node = node(ctx, v);
+        if (n == nil) { ret opt[context.Area].none{}; }
+        ret opt[context.Area].some{context.Area{x0: n.x0, y0: n.y0, x1: n.x1, y1: n.y1}};
+    }
+    if (w == SPACE) {
+        val sp: *dock.SpaceState = state.find[dock.SpaceState](ctx, v);
+        if (sp == nil) { ret opt[context.Area].none{}; }
+        val n: *dock.Node = node(ctx, sp.root);
+        if (n == nil) { ret opt[context.Area].none{}; }
+        ret opt[context.Area].some{context.Area{x0: n.x0, y0: n.y0, x1: n.x1, y1: n.y1}};
+    }
+    ret opt[context.Area].none{};
+}
+
+# outline a hovered row's rect on the surface, above everything but a drag
+fun row_hook(user: ptr, r: *tree.Row) {
+    val i: *Inspector = user::*Inspector;
+    if (!r.hit.hot) { ret; }
+    val a: opt[context.Area] = rect_for(i, r.item.handle);
+    if (sel a.none) { ret; }
+    val ctx: *context.Context = i.ctx;
+    val k:   u32              = outline_kind(ctx);
+    context.push_band(ctx, band.TOOLTIPS, 0);
+    context.box(ctx, k, theme.NORMAL, a.some.x0, a.some.y0, a.some.x1, a.some.y1);
+    context.pop_band(ctx);
+}
+
+# draw the inspector window over the frame, if it is open
+#
+# call it last in a frame, after every other widget: it reads the claims,
+# collisions and runs the frame made before it, then draws itself as a
+# window titled TITLE. closing the window closes the inspector. while closed
+# it returns at once and reads nothing.
+# ---
+# ctx: context
+# i:   the inspector
+pub fun show(ctx: *context.Context, i: *Inspector) {
+    if (i.open == 0) { ret; }
+    i.ctx = ctx;
+    snapshot(ctx, i);
+    vec.clear[u64](?i.vals);
+
+    val w:   f32           = context.px(ctx, 420.0::f32);
+    var win: widget.Window = widget.window(TITLE, ctx.sw - w - 8.0::f32, 8.0::f32, w, context.px(ctx, 520.0::f32));
+    win.min_w = context.px(ctx, 240.0::f32);
+    win.min_h = context.px(ctx, 160.0::f32);
+    val wa: widget.WindowArea = widget.begin_window(ctx, win);
+    if (wa.shown == 0) {
+        # its close button closed it: close the inspector and leave the
+        # window ready to open again
+        wa.st.closed = 0;
+        i.open       = 0;
+        widget.end_window(ctx, wa);
+        ret;
+    }
+    if (wa.body != 0) {
+        var src: tree.Source;
+        src.user  = i::ptr;
+        src.count = count;
+        src.child = child;
+        src.row   = row_hook;
+        # the frame changes under it every frame, so it measures every frame
+        tree.invalidate(?i.tree);
+        var h: f32 = wa.scroll.h;
+        if (h < widget.control_row_height(ctx) * 3.0::f32) { h = widget.control_row_height(ctx) * 3.0::f32; }
+        tree.tree(ctx, "entries", ?i.tree, ?src, h);
+    }
+    widget.end_window(ctx, wa);
+}
+
+# an app frame for the tests: a window holding a button and a repeated label,
+# so the frame has a collision, then the inspector over it
+# ---
+# i:      the inspector
+# claims: the frame's claims before show
+# after:  its claims after show
+# verts:  its vertices before show
+# drawn:  its vertices after show
+#[testing]
+rec Probe {
+    i:      Inspector;
+    claims: usize;
+    after:  usize;
+    verts:  usize;
+    drawn:  usize;
+}
+
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p:  *Probe            = user::*Probe;
+    val wa: widget.WindowArea = widget.begin_window(ctx, widget.window("Tools", 10.0::f32, 10.0::f32, 200.0::f32, 150.0::f32));
+    if (wa.body != 0) {
+        widget.button(ctx, "go");
+        widget.button(ctx, "same");
+        widget.button(ctx, "same");
+    }
+    widget.end_window(ctx, wa);
+    p.claims = ctx.claims.len;
+    p.verts  = context.draw_count(ctx);
+    show(ctx, ?p.i);
+    p.after = ctx.claims.len;
+    p.drawn = context.draw_count(ctx);
+}
+
+test show__closed_reads_and_draws_nothing {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    init(?p.i, ?a);
+    var d: driver.Driver;
+    val e: err[allo.Error] = driver.init(?d, ?a, 800.0::f32, 600.0::f32, probe_ui, (?p)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+    if (p.after != p.claims || p.drawn != p.verts)    { ret 2; }
+    if (p.i.vals.data != nil || p.i.kept.data != nil) { ret 3; }
+    if (driver.drawn(?d, driver.find(?d, TITLE)))     { ret 4; }
+    val fd: err[allo.Error] = driver.free(?d);
+    if (sel fd.err) { ret 1; }
+    val fi: err[allo.Error] = free(?p.i);
+    if (sel fi.err) { ret 1; }
+    ret 0;
+}
+
+test show__lists_the_frame_and_outlines_a_hovered_entry {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    init(?p.i, ?a);
+    toggle(?p.i);
+    var d: driver.Driver;
+    val e: err[allo.Error] = driver.init(?d, ?a, 800.0::f32, 600.0::f32, probe_ui, (?p)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+
+    # the window and its tree are drawn, the sections closed
+    val t:    u64 = driver.find(?d, "Inspector/entries");
+    val coll: u64 = tree.node_id(t, SEC_COLLISIONS);
+    if (!driver.drawn(?d, coll))                                 { ret 2; }
+    if (!str_equals(driver.text_of(?d, coll), "Collisions (1)")) { ret 3; }
+
+    # open the collisions: its one row names the repeated id
+    tree.set_open(?d.ctx, ?p.i.tree, coll, true);
+    driver.step(?d);
+    val row:  u64 = tree.node_id(coll, 0);
+    val same: u64 = driver.find(?d, "Tools/same");
+    var want: Out = out(?p.i);
+    put_id(?want, same);
+    put_s(?want, "  claimed again");
+    var line: [160]u8;
+    var k:    usize = 0;
+    for (k <= want.n) {
+        line[k] = p.i.line[k];
+        k       = k + 1;
+    }
+    if (!str_equals(driver.text_of(?d, row), ?line[0])) { ret 4; }
+
+    # hovering it outlines the button's rect in the tooltips band
+    if (!driver.hover(?d, row)) { ret 5; }
+    driver.step(?d);
+    var found: bool  = false;
+    var r:     usize = 0;
+    for (r < context.run_count(?d.ctx)) {
+        if (band.band_of(context.run_at(?d.ctx, r).layer) == band.TOOLTIPS) { found = true; }
+        r = r + 1;
+    }
+    if (!found) { ret 6; }
+
+    # the window's close button closes the inspector, ready to open again
+    if (!driver.click(?d, bid.child(driver.find(?d, TITLE), "#close"))) { ret 7; }
+    driver.step(?d);
+    if (p.i.open != 0) { ret 8; }
+    toggle(?p.i);
+    driver.step(?d);
+    if (!driver.drawn(?d, coll)) { ret 9; }
+
+    val fd: err[allo.Error] = driver.free(?d);
+    if (sel fd.err) { ret 1; }
+    val fi: err[allo.Error] = free(?p.i);
+    if (sel fi.err) { ret 1; }
+    ret 0;
+}
