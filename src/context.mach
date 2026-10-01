@@ -19,7 +19,8 @@
 # in which case they are converted to linear light first.
 #
 # the look is data: the context holds a theme (see blit.theme), the default
-# one until set_theme swaps in another, and one interface scale (set_scale)
+# one until set_theme copies in another or it is changed in place through
+# theme_of, and one interface scale (set_scale)
 # that multiplies every theme metric widgets read through px and the size
 # text is laid out and rasterised at, so a scale of 2.0 doubles the interface
 # without any widget knowing.
@@ -562,6 +563,16 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         val f9: err[allo.Error] = font.free(?ctx.font);
         ret ep;
     }
+    var bare: th.Theme;
+    ctx.theme = bare;
+    val et: err[allo.Error] = th.init(?ctx.theme, a);
+    if (sel et.err) {
+        val f10: err[allo.Error] = hit.free(?ctx.prior);
+        val f11: err[allo.Error] = hit.free(?ctx.claims);
+        val f12: err[allo.Error] = draw.free(?ctx.dl);
+        val f13: err[allo.Error] = font.free(?ctx.font);
+        ret et;
+    }
 
     var none: input.Input;
     ctx.in = none;
@@ -624,7 +635,6 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.alphas       = nil;
     ctx.alphas_cap   = 0;
     ctx.scale        = 1.0::f32;
-    ctx.theme        = th.default();
     ctx.srgb         = 0;
     ctx.lin          = draw.LinearCache{};
     ctx.wheel_taken  = 0;
@@ -688,6 +698,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
     sheet.unwind(?ctx.sheet, ?ctx.theme);
     val esh: err[allo.Error] = sheet.free(?ctx.sheet);
     if (sel esh.err) { ret esh; }
+    val eth: err[allo.Error] = th.free(?ctx.theme);
+    if (sel eth.err) { ret eth; }
     val ex: err[allo.Error] = payload.free(?ctx.drag);
     if (sel ex.err) { ret ex; }
     val eic: err[allo.Error] = ico.free(?ctx.icons);
@@ -2520,12 +2532,28 @@ pub fun glyph_advance(ctx: *Context, left: u32, cp: u32) f32 {
 }
 
 # draw widgets with another theme from now on
+#
+# the theme is copied, its kinds with it, so the caller keeps and frees its
+# own. open overrides are dropped with the old theme.
 # ---
 # ctx: context
-# t:   the theme, copied into the context
-pub fun set_theme(ctx: *Context, t: th.Theme) {
+# t:   the theme
+# ret: ok, or the allocator's refusal with the context's theme unchanged
+pub fun set_theme(ctx: *Context, t: *th.Theme) err[allo.Error] {
+    if (t == ?ctx.theme) { ret err[allo.Error].ok{}; }
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
+    val e: err[allo.Error] = th.copy(?ctx.theme, t);
+    if (sel e.ok) { sheet.forget(?ctx.sheet); }
+    ret e;
+}
+
+# forget the overrides open on the context's theme without restoring them,
+# for a caller that has just replaced the theme in place, such as with a
+# built-in look (see theme.set_builtin)
+# ---
+# ctx: context
+pub fun theme_replaced(ctx: *Context) {
     sheet.forget(?ctx.sheet);
-    ctx.theme = t;
 }
 
 # the theme widgets draw with, to read or adjust in place

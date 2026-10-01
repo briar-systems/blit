@@ -41,12 +41,20 @@ rec Saved {
 }
 
 # one setting of a class: a path and the value its fields take
+#
+# the path is kept as text and resolved against the theme each time the
+# class is pushed, so it names kinds by their registered names whatever
+# theme the context holds then.
 # ---
-# p: the path, naming one field or, through wildcards, several
-# v: the value
+# text: the path, NUL-terminated, owned
+# cap:  bytes allocated at text
+# unit: the unit of the fields it names
+# v:    the value
 pub rec Setting {
-    p: th.Path;
-    v: th.Value;
+    text: *u8;
+    cap:  usize;
+    unit: u8;
+    v:    th.Value;
 }
 
 # a named list of settings
@@ -102,6 +110,7 @@ pub fun free(s: *Sheet) err[allo.Error] {
     for (i < s.classes.len) {
         val c: *Class = ?s.classes.data[i];
         keep_first(?first, allo.deallocate[u8](s.a, c.name, c.cap));
+        clear_sets(s, c);
         keep_first(?first, vec.dnit[Setting](?c.sets));
         i = i + 1;
     }
@@ -114,7 +123,7 @@ pub fun free(s: *Sheet) err[allo.Error] {
 
 # write every field a path names and save what it replaced, without a mark
 fun write(s: *Sheet, t: *th.Theme, p: th.Path, v: th.Value) bool {
-    val n:    usize                  = th.span(p);
+    val n:    usize                  = th.span(t, p);
     val room: res[usize, allo.Error] = vec.reserve[Saved](?s.saved, n);
     if (sel room.err) { ret false; }
     var i: usize = 0;
@@ -268,31 +277,45 @@ pub fun class_name(s: *Sheet, id: u32) str {
     ret s.classes.data[id].name::str;
 }
 
-# whether two paths name the same fields
-fun same_path(a: th.Path, b: th.Path) bool {
-    ret a.field == b.field && a.kind == b.kind && a.state == b.state && a.elem == b.elem;
+# release the text of every setting of a class and empty it
+fun clear_sets(s: *Sheet, c: *Class) {
+    var i: usize = 0;
+    for (i < c.sets.len) {
+        val e: err[allo.Error] = allo.deallocate[u8](s.a, c.sets.data[i].text, c.sets.data[i].cap);
+        i = i + 1;
+    }
+    c.sets.len = 0;
 }
 
 # set a class's value for a path, replacing its earlier value for that path
 # ---
-# s:   sheet
-# id:  the class
-# p:   the path
-# v:   the value
-# ret: ok, also for no class, which is left alone, or the allocator's refusal
-pub fun class_set(s: *Sheet, id: u32, p: th.Path, v: th.Value) err[allo.Error] {
+# s:    sheet
+# id:   the class
+# path: the path's text, copied, such as "button.*.fill"
+# unit: the unit of the fields it names
+# v:    the value
+# ret:  ok, also for no class, which is left alone, or the allocator's refusal
+pub fun class_set(s: *Sheet, id: u32, path: str, unit: u8, v: th.Value) err[allo.Error] {
     if (id::usize >= s.classes.len) { ret err[allo.Error].ok{}; }
     val c: *Class = ?s.classes.data[id];
     var i: usize  = 0;
     for (i < c.sets.len) {
-        if (same_path(c.sets.data[i].p, p)) {
-            c.sets.data[i].v = v;
+        if (str_equals(c.sets.data[i].text::str, path)) {
+            c.sets.data[i].v    = v;
+            c.sets.data[i].unit = unit;
             ret err[allo.Error].ok{};
         }
         i = i + 1;
     }
-    val pushed: res[usize, allo.Error] = vec.push[Setting](?c.sets, Setting{p: p, v: v});
-    if (sel pushed.err) { ret err[allo.Error].err{pushed.err}; }
+    val n: usize                = str_len(path) + 1;
+    val b: res[*u8, allo.Error] = allo.allocate[u8](s.a, n);
+    if (sel b.err) { ret err[allo.Error].err{b.err}; }
+    memory.raw_copy(b.ok::ptr, path::ptr, n);
+    val pushed: res[usize, allo.Error] = vec.push[Setting](?c.sets, Setting{text: b.ok, cap: n, unit: unit, v: v});
+    if (sel pushed.err) {
+        val d: err[allo.Error] = allo.deallocate[u8](s.a, b.ok, n);
+        ret err[allo.Error].err{pushed.err};
+    }
     ret err[allo.Error].ok{};
 }
 
@@ -302,10 +325,14 @@ pub fun class_set(s: *Sheet, id: u32, p: th.Path, v: th.Value) err[allo.Error] {
 # id: the class
 pub fun class_clear(s: *Sheet, id: u32) {
     if (id::usize >= s.classes.len) { ret; }
-    s.classes.data[id].sets.len = 0;
+    clear_sets(s, ?s.classes.data[id]);
 }
 
 # override a class's settings, in order, until the matching pop
+#
+# each setting's path is resolved against the theme now, and a setting
+# naming no field of it, such as a kind the theme has not registered, is
+# skipped.
 # ---
 # s:   sheet
 # t:   the theme it overrides
@@ -317,9 +344,12 @@ pub fun push_class(s: *Sheet, t: *th.Theme, id: u32) bool {
     val c: *Class = ?s.classes.data[id];
     var i: usize  = 0;
     for (i < c.sets.len) {
-        if (!write(s, t, c.sets.data[i].p, c.sets.data[i].v)) {
-            pop(s, t);
-            ret false;
+        val p: opt[th.Path] = th.path(t, c.sets.data[i].text::str);
+        if (sel p.some) {
+            if (th.FIELDS[p.some.field].unit == c.sets.data[i].unit && !write(s, t, p.some, c.sets.data[i].v)) {
+                pop(s, t);
+                ret false;
+            }
         }
         i = i + 1;
     }
@@ -330,9 +360,10 @@ pub fun push_class(s: *Sheet, t: *th.Theme, id: u32) bool {
 # table's keys paths and its values theirs; a class named again is replaced
 # ---
 # s:    sheet
+# t:    the theme the paths name fields of
 # root: the parsed document
 # ret:  ok, or why a class was refused, with the classes before it read
-pub fun read_classes(s: *Sheet, root: *toml.Table) err[th.LoadError] {
+pub fun read_classes(s: *Sheet, t: *th.Theme, root: *toml.Table) err[th.LoadError] {
     val co: opt[*toml.Value] = toml.get(root, "class");
     if (sel co.none) { ret err[th.LoadError].ok{}; }
     val cv: *toml.Value = co.some;
@@ -354,11 +385,12 @@ pub fun read_classes(s: *Sheet, root: *toml.Table) err[th.LoadError] {
             val v2: opt[*toml.Value] = toml.table_value(?v.data.table, j);
             if (sel k2.none) { brk; }
             if (sel v2.none) { brk; }
-            val p: opt[th.Path] = th.path(k2.some);
+            val p: opt[th.Path] = th.path(t, k2.some);
             if (sel p.none) { ret err[th.LoadError].err{th.LoadError.unknown{v2.some.key.at}}; }
-            val x: opt[th.Value] = th.read_value(th.FIELDS[p.some.field].unit, v2.some);
+            val unit: u8            = th.FIELDS[p.some.field].unit;
+            val x:    opt[th.Value] = th.read_value(unit, v2.some);
             if (sel x.none) { ret err[th.LoadError].err{th.LoadError.value{v2.some.span.at}}; }
-            val set: err[allo.Error] = class_set(s, id.ok, p.some, x.some);
+            val set: err[allo.Error] = class_set(s, id.ok, k2.some, unit, x.some);
             if (sel set.err) { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{set.err}}}; }
             j = j + 1;
         }
@@ -381,11 +413,9 @@ pub fun save_classes(s: *Sheet, w: *tw.Writer) {
         tw.put_table(w, ?keys[0], 2);
         var j: usize = 0;
         for (j < c.sets.len) {
-            var buf: [64]u8;
             val set: Setting = c.sets.data[j];
-            th.path_text(set.p, ?buf[0], 64);
-            tw.put_assign(w, ?buf[0]);
-            th.write_value(w, th.FIELDS[set.p.field].unit, set.v);
+            tw.put_assign(w, set.text::str);
+            th.write_value(w, set.unit, set.v);
             tw.end_line(w);
             j = j + 1;
         }

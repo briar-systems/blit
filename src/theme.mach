@@ -1,21 +1,27 @@
 # blit's look as data: the tokens a theme is authored from and the style
 # record every widget kind draws with
 #
-# a theme is a plain record, so a consumer can build one in code, load it
-# from TOML (see load and save) or fill it from another language, and any
-# renderer draws it the same way. the context holds one (see
-# context.set_theme), and a context that is never given one draws with
-# default(), so zero configuration still works.
+# a theme is built in code (init, then the built-in looks or token edits and
+# derive) or loaded from TOML (see load and save), and any renderer draws it
+# the same way. the context holds one (see context.theme_of), set up with the
+# default look, so zero configuration still works.
 #
 # a theme has two layers. the tokens are a palette of colors and a set of
 # metrics, the handful of values a look is designed in. the styles are one
-# Style per widget kind (see the kind constants): its corner radii, padding,
+# Style per registered widget kind: its corner radii, padding,
 # inset, margins, least sizes and shadow, and a Paint per state (normal, hot,
 # active, on, disabled, focused) with its fill, gradient, text, mark, border
 # and shadow colors. widgets draw from the styles alone. derive builds every
 # style from the tokens, and rederive moves the styles to new tokens while
 # keeping every style field that was set by hand, so changing the accent
 # recolors every widget that took its color from it and nothing else.
+#
+# kinds are a registry on the theme. register_kind adds one by name with the
+# derive that builds its style from the tokens, and returns its handle; the
+# built-in kinds are registered the same way by init, in the order of the
+# kind constants, which are their handles. a registered kind is addressable
+# by its name everywhere a built-in one is: paths, TOML, classes and the
+# editor.
 #
 # every field has a path, such as palette.accent, metrics.gap, plot.series.3,
 # button.radius or button.hot.fill, with * standing for every kind or every
@@ -51,8 +57,9 @@ use std.memory;
 # how many series colors a theme holds
 pub val SERIES: usize = 8;
 
-# how many widget kinds a theme styles
-pub val KINDS: u32 = 51;
+# how many built-in kinds init registers, the handles below; a kind
+# registered after them takes the next handle
+pub val BUILTIN_KINDS: u32 = 51;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -260,7 +267,17 @@ pub rec Style {
 # builds the styles from them, so after changing tokens in code call derive
 # (or rederive to keep styles set by hand). a consumer drawing its own content
 # reads them as its palette. the plot fields are read by charts as they are.
-# FIELDS documents every field.
+# FIELDS documents every field. the rest is the kind registry, owned by the
+# theme: init sets it up, register_kind grows it, copy duplicates it and free
+# releases it.
+# ---
+# a:       allocator backing the registry
+# names:   each kind's name, borrowed, by handle
+# docs:    each kind's meaning, borrowed, by handle
+# derives: each kind's derive, by handle
+# styles:  each kind's style, by handle
+# len:     kinds registered
+# cap:     kinds allocated
 pub rec Theme {
     panel:       draw.Color;
     window:      draw.Color;
@@ -296,7 +313,27 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
-    styles:      [51]Style;
+    a:           *allo.Allocator;
+    names:       *str;
+    docs:        *str;
+    derives:     *Hook;
+    styles:      *Style;
+    len:         u32;
+    cap:         u32;
+}
+
+# builds one kind's style from a theme's tokens
+#
+# called with the theme, the kind's handle and the style to adjust, which
+# arrives as base(t). a derive reads the tokens alone, never the styles, so
+# it builds the same style whenever the tokens are the same.
+pub def Derive: fun(*Theme, u32, *Style);
+
+# a kind's derive as the registry stores it
+# ---
+# f: the derive
+pub rec Hook {
+    f: Derive;
 }
 
 # a field holding a color, four floats
@@ -403,8 +440,8 @@ pub rec Name {
     doc:  str;
 }
 
-# every widget kind, indexed by the kind constants
-pub val KIND_NAMES: [51]Name = [51]Name{
+# every built-in kind, in handle order: the names and meanings init registers
+val KIND_INFO: [51]Name = [51]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -493,15 +530,17 @@ pub rec Path {
     elem:  usize;
 }
 
-# one field's place in a Theme
+# one field's place in a theme
 # ---
-# off:   byte offset in Theme
+# off:   byte offset in the Theme record for a token or plot field, else in the kind's Style
 # unit:  UNIT_*
 # group: GROUP_*
+# kind:  the kind's handle, for a style or paint field
 pub rec Ref {
     off:   usize;
     unit:  u8;
     group: u8;
+    kind:  u32;
 }
 
 # a field's value, the first one or four floats used by its unit: a color's
@@ -589,12 +628,12 @@ fun spells(seg: str, n: usize, s: str) bool {
     ret str_len(s) == n && same(seg, s, n);
 }
 
-# the kind a segment names, ANY_KIND for *, none for no kind
-fun kind_named(seg: str, n: usize) opt[u32] {
+# the kind a segment names in a theme's registry, ANY_KIND for *, none for no kind
+fun kind_named(t: *Theme, seg: str, n: usize) opt[u32] {
     if (spells(seg, n, WILD)) { ret opt[u32].some{ANY_KIND}; }
     var k: u32 = 0;
-    for (k < KINDS) {
-        if (spells(seg, n, KIND_NAMES[k].name)) { ret opt[u32].some{k}; }
+    for (k < t.len) {
+        if (spells(seg, n, t.names[k])) { ret opt[u32].some{k}; }
         k = k + 1;
     }
     ret opt[u32].none{};
@@ -602,13 +641,52 @@ fun kind_named(seg: str, n: usize) opt[u32] {
 
 # the kind a name names
 # ---
-# name: a kind's path segment, such as "button"
-# ret:  the kind, or none
-pub fun kind_of(name: str) opt[u32] {
+# t:    the theme whose registry is searched
+# name: a kind's name, such as "button"
+# ret:  its handle, or none
+pub fun kind_of(t: *Theme, name: str) opt[u32] {
     if (name == nil) { ret opt[u32].none{}; }
-    val k: opt[u32] = kind_named(name, str_len(name));
+    val k: opt[u32] = kind_named(t, name, str_len(name));
     if (sel k.some && k.some == ANY_KIND) { ret opt[u32].none{}; }
     ret k;
+}
+
+# how many kinds a theme has registered
+pub fun kind_count(t: *Theme) u32 {
+    ret t.len;
+}
+
+# a kind's name
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: its name
+pub fun kind_name(t: *Theme, k: u32) str {
+    ret t.names[k];
+}
+
+# a kind's meaning
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: what it styles
+pub fun kind_doc(t: *Theme, k: u32) str {
+    ret t.docs[k];
+}
+
+# the names of every kind, in handle order, kind_count of them, for a list
+# such as a dropdown's options
+pub fun kind_names(t: *Theme) *str {
+    ret t.names;
+}
+
+# a kind's style
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: its style, valid until the registry grows
+pub fun style(t: *Theme, k: u32) *Style {
+    ret ?t.styles[k];
 }
 
 # the state a segment names, ANY_STATE for *, none for no state
@@ -646,17 +724,19 @@ fun group_named(seg: str, n: usize) opt[u8] {
     ret opt[u8].none{};
 }
 
-# a path from up to three segments, each a pointer and a length
+# a path from up to three segments, each a pointer and a length, its kind
+# looked up in a theme's registry
 #
 # palette.<name>, metrics.<name> and plot.<name>[.<index>] name the tokens
 # and the chart fields, <kind>.<name> a style field and <kind>.<state>.<name>
 # a paint field, with * for every kind, state or element.
 # ---
+# t:    the theme whose kinds are named
 # segs: the segments' first bytes
 # lens: the segments' lengths
 # n:    how many segments
 # ret:  the path, or none when it names no field
-pub fun resolve(segs: *str, lens: *usize, n: usize) opt[Path] {
+pub fun resolve(t: *Theme, segs: *str, lens: *usize, n: usize) opt[Path] {
     var p: Path;
     p.kind  = 0;
     p.state = 0;
@@ -678,7 +758,7 @@ pub fun resolve(segs: *str, lens: *usize, n: usize) opt[Path] {
         p.elem = e.some;
         ret opt[Path].some{p};
     }
-    val k: opt[u32] = kind_named(segs[0], lens[0]);
+    val k: opt[u32] = kind_named(t, segs[0], lens[0]);
     if (sel k.none) { ret opt[Path].none{}; }
     p.kind = k.some;
     if (n == 2) {
@@ -698,9 +778,10 @@ pub fun resolve(segs: *str, lens: *usize, n: usize) opt[Path] {
 
 # a dotted path, such as "button.hot.fill" or "*.hot.border_w"
 # ---
+# t:   the theme whose kinds are named
 # s:   the path
 # ret: the path parsed, or none when it names no field
-pub fun path(s: str) opt[Path] {
+pub fun path(t: *Theme, s: str) opt[Path] {
     if (s == nil) { ret opt[Path].none{}; }
     var segs: [3]str;
     var lens: [3]usize;
@@ -719,18 +800,19 @@ pub fun path(s: str) opt[Path] {
         }
         i = i + 1;
     }
-    ret resolve(?segs[0], ?lens[0], n);
+    ret resolve(t, ?segs[0], ?lens[0], n);
 }
 
 # how many fields a path names
 # ---
+# t:   the theme
 # p:   the path
 # ret: 1, or the product of what its wildcards stand for
-pub fun span(p: Path) usize {
+pub fun span(t: *Theme, p: Path) usize {
     val f: Field = FIELDS[p.field];
     var n: usize = 1;
     if (f.group == GROUP_STYLE || f.group == GROUP_PAINT) {
-        if (p.kind == ANY_KIND) { n = n * KINDS::usize; }
+        if (p.kind == ANY_KIND) { n = n * t.len::usize; }
     }
     if (f.group == GROUP_PAINT && p.state == ANY_STATE) { n = n * STATES::usize; }
     if (f.count > 1 && p.elem == ANY_ELEM)              { n = n * f.count; }
@@ -740,11 +822,11 @@ pub fun span(p: Path) usize {
 # the i-th field a path names, in kind, then state, then element order
 # ---
 # p:   the path
-# i:   which, below span(p)
-# ret: where that field is in a Theme
+# i:   which, below span(t, p)
+# ret: where that field is in a theme
 pub fun ref_at(p: Path, i: usize) Ref {
     val f:    Field = FIELDS[p.field];
-    var r:    Ref   = Ref{off: 0, unit: f.unit, group: f.group};
+    var r:    Ref   = Ref{off: 0, unit: f.unit, group: f.group, kind: 0};
     var rest: usize = i;
     var elem: usize = p.elem;
     if (f.count > 1 && p.elem == ANY_ELEM) {
@@ -760,14 +842,13 @@ pub fun ref_at(p: Path, i: usize) Ref {
         state = (rest % STATES::usize)::u8;
         rest  = rest / STATES::usize;
     }
-    var kind: u32 = p.kind;
-    if (p.kind == ANY_KIND) { kind = rest::u32; }
-    r.off = $offset_of(Theme, styles) + kind::usize * $size_of(Style);
+    r.kind = p.kind;
+    if (p.kind == ANY_KIND) { r.kind = rest::u32; }
     if (f.group == GROUP_STYLE) {
-        r.off = r.off + f.off;
+        r.off = f.off;
         ret r;
     }
-    r.off = r.off + $offset_of(Style, states) + state::usize * $size_of(Paint) + f.off;
+    r.off = $offset_of(Style, states) + state::usize * $size_of(Paint) + f.off;
     ret r;
 }
 
@@ -797,11 +878,12 @@ fun put_seg(out: *u8, cap: usize, at: usize, s: str) usize {
 
 # a path's text, such as "button.hot.fill", NUL-terminated in out
 # ---
+# t:   the theme whose kinds are named
 # p:   the path
 # out: where to write it
 # cap: bytes at out, 64 holds every path
 # ret: bytes written, not counting the NUL
-pub fun path_text(p: Path, out: *u8, cap: usize) usize {
+pub fun path_text(t: *Theme, p: Path, out: *u8, cap: usize) usize {
     if (cap == 0) { ret 0; }
     val f: Field = FIELDS[p.field];
     var j: usize = 0;
@@ -811,7 +893,7 @@ pub fun path_text(p: Path, out: *u8, cap: usize) usize {
     or (f.group == GROUP_PLOT)    { j = put_seg(out, cap, j, "plot."); }
     or {
         if (p.kind == ANY_KIND) { j = put_seg(out, cap, j, WILD); }
-        or                      { j = put_seg(out, cap, j, KIND_NAMES[p.kind].name); }
+        or                      { j = put_seg(out, cap, j, t.names[p.kind]); }
         j = put_seg(out, cap, j, ".");
         if (f.group == GROUP_PAINT) {
             if (p.state == ANY_STATE) { j = put_seg(out, cap, j, WILD); }
@@ -843,6 +925,7 @@ pub fun path_text(p: Path, out: *u8, cap: usize) usize {
 
 # the floats of a field in a theme
 fun at(t: *Theme, r: Ref) *f32 {
+    if (r.group == GROUP_STYLE || r.group == GROUP_PAINT) { ret ((?t.styles[r.kind])::usize + r.off)::*f32; }
     ret (t::usize + r.off)::*f32;
 }
 
@@ -913,7 +996,7 @@ pub fun set(t: *Theme, r: Ref, v: Value) {
 # v:   the value, of the path's unit
 # ret: how many fields were written
 pub fun set_path(t: *Theme, p: Path, v: Value) usize {
-    val n:      usize = span(p);
+    val n:      usize = span(t, p);
     val before: Theme = @t;
     var i:      usize = 0;
     for (i < n) {
@@ -943,7 +1026,10 @@ fun clear() draw.Color {
 }
 
 # fill every state of a style with one color, keeping its inks
-fun fill_all(s: *Style, c: draw.Color) {
+# ---
+# s: the style
+# c: the color, flat
+pub fun fill_all(s: *Style, c: draw.Color) {
     var i: usize = 0;
     for (i < STATES::usize) {
         s.states[i].fill    = c;
@@ -959,16 +1045,41 @@ fun fill_one(s: *Style, state: u8, c: draw.Color) {
 }
 
 # a control's fills: at rest, hot, active and on, the rest as at rest
-fun fills(s: *Style, normal: draw.Color, hot: draw.Color, active: draw.Color, on: draw.Color) {
+# ---
+# s:      the style
+# normal: the fill at rest, and while disabled or focused
+# hot:    the fill under the cursor
+# active: the fill pressed
+# on:     the fill while set
+pub fun fills(s: *Style, normal: draw.Color, hot: draw.Color, active: draw.Color, on: draw.Color) {
     fill_all(s, normal);
     fill_one(s, HOT, hot);
     fill_one(s, ACTIVE, active);
     fill_one(s, ON, on);
 }
 
+# outline every state of a style
+# ---
+# s: the style
+# c: the outline's color
+# w: its width, unscaled
+pub fun outline_all(s: *Style, c: draw.Color, w: f32) {
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        s.states[i].border   = c;
+        s.states[i].border_w = w;
+        i                    = i + 1;
+    }
+}
+
 # the style every kind starts from: the theme's corner, pad, inset and gap,
 # its row height, transparent fills and its text inks, disabled text faint
-fun base(t: *Theme) Style {
+#
+# a kind's derive is handed this, built from the theme's tokens, to adjust.
+# ---
+# t:   the theme, its tokens read
+# ret: the style
+pub fun base(t: *Theme) Style {
     var s: Style;
     s.radius      = draw.radii(t.corner);
     s.pad         = edges(t.pad);
@@ -990,189 +1101,242 @@ fun base(t: *Theme) Style {
 }
 
 # a container whose padding sits below its content alone
-fun below(t: *Theme, fill: draw.Color) Style {
-    var s: Style = base(t);
+fun below(t: *Theme, s: *Style, fill: draw.Color) {
     s.pad = Edges{l: 0.0::f32, t: 0.0::f32, r: 0.0::f32, b: t.pad};
-    fill_all(?s, fill);
+    fill_all(s, fill);
+}
+
+# square every corner of a style
+fun square(s: *Style) {
+    s.radius = draw.radii(0.0::f32);
+}
+
+# a list row's style, which a tree row shares
+fun row_style(t: *Theme, s: *Style) {
+    fills(s, clear(), t.control_hot, t.control_on, t.accent);
+    s.states[ON].text = t.accent_text;
+    s.states[ON].mark = t.accent_text;
+}
+
+# a button's style, which a tab starts from
+fun button_style(t: *Theme, s: *Style) {
+    fills(s, t.control, t.control_hot, t.control_on, t.accent);
+    s.states[ON].text = t.accent_text;
+}
+
+# the derive every built-in kind registers: its style from the tokens alone
+#
+# s arrives as base(t). a derive reads the theme's tokens and nothing of its
+# styles, so it builds the same style whenever the tokens are the same.
+fun builtin_style(t: *Theme, k: u32, s: *Style) {
+    if (k == PANEL) { below(t, s, t.panel); }
+    or (k == WINDOW) {
+        below(t, s, t.window);
+        s.margin = edges(t.pad);
+    }
+    or (k == POPUP) { below(t, s, t.window); }
+    or (k == MENU) {
+        below(t, s, t.window);
+        s.pad.t = t.pad;
+        s.min_w = t.row * 8.0::f32;
+    }
+    or (k == MODAL) {
+        fill_all(s, t.window);
+    }
+    or (k == TOOLTIP) {
+        fill_all(s, t.window);
+        outline_all(s, t.edge, t.edge_w);
+        s.margin.t = t.gap;
+    }
+    or (k == TOAST) {
+        fill_all(s, t.window);
+        outline_all(s, t.edge, t.edge_w);
+        s.margin = edges(t.pad * 2.0::f32);
+    }
+    or (k == OVERLAY)      { s.pad = edges(0.0::f32); }
+    or (k == WINDOW_TITLE) { fills(s, t.header, t.header_hot, t.header_hot, t.header); }
+    or (k == DOCK) {
+        square(s);
+        fill_all(s, t.dock);
+        outline_all(s, t.edge, t.edge_w);
+    }
+    or (k == BUTTON) { button_style(t, s); }
+    or (k == TAB) {
+        button_style(t, s);
+        s.radius   = draw.Radii{tl: t.corner, tr: t.corner, br: 0.0::f32, bl: 0.0::f32};
+        s.margin.r = t.edge_w;
+    }
+    or (k == TAB_BAR) {
+        square(s);
+        fill_all(s, t.track);
+    }
+    or (k == TAB_CLOSE) {
+        fills(s, clear(), t.control_hot, t.control_hot, clear());
+        outline_all(s, clear(), t.edge_w);
+    }
+    or (k == CHECKBOX || k == RADIO)                                { fills(s, t.control, t.control_hot, t.control_hot, t.control); }
+    or (k == CHECKBOX_MARK || k == RADIO_MARK || k == PROGRESS_BAR) { fill_all(s, t.accent); }
+    or (k == TOGGLE) {
+        s.pad = Edges{l: 0.0::f32, t: t.pad / 2.0::f32, r: 0.0::f32, b: t.pad / 2.0::f32};
+        fills(s, t.track, t.control_hot, t.control_hot, t.accent);
+    }
+    or (k == TOGGLE_KNOB) {
+        s.margin = edges(t.pad / 2.0::f32);
+        fills(s, t.handle, t.handle_on, t.handle_on, t.accent_text);
+    }
+    or (k == SLIDER || k == PROGRESS) { fill_all(s, t.track); }
+    or (k == SLIDER_HANDLE) {
+        s.min_w = t.handle_w;
+        fills(s, t.handle, t.handle, t.handle_on, t.handle);
+    }
+    or (k == DROPDOWN) { fills(s, t.control, t.control_hot, t.control_hot, t.control_on); }
+    or (k == OPTION) {
+        fills(s, t.track, t.control_hot, t.control_hot, t.accent);
+        s.states[ON].text = t.accent_text;
+    }
+    or (k == MENU_BAR) {
+        square(s);
+        fill_all(s, t.header);
+    }
+    or (k == MENU_TITLE) {
+        square(s);
+        s.inset = Edges{l: t.inset * 2.0::f32, t: t.inset, r: t.inset * 2.0::f32, b: t.inset};
+        fills(s, clear(), t.header_hot, t.header_hot, t.control_on);
+    }
+    or (k == MENU_ITEM) {
+        square(s);
+        fills(s, clear(), t.control_hot, t.control_hot, t.control_hot);
+    }
+    or (k == FIELD) {
+        fills(s, t.track, t.control_hot, t.control_hot, t.track);
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark = t.text_faint;
+            i                = i + 1;
+        }
+        s.states[FOCUSED].border   = t.accent;
+        s.states[FOCUSED].border_w = t.edge_w;
+    }
+    or (k == FIELD_CARET) {
+        s.min_w = t.caret_w;
+        fill_all(s, t.text);
+    }
+    or (k == FIELD_SELECT) { fill_all(s, t.select); }
+    or (k == SECTION) {
+        fills(s, t.header, t.header_hot, t.header_hot, t.header);
+        s.states[HOT].mark    = t.text;
+        s.states[ACTIVE].mark = t.text;
+    }
+    or (k == SCROLLBAR) {
+        s.min_w  = t.bar_w;
+        s.margin = Edges{l: t.pad, t: 0.0::f32, r: 0.0::f32, b: t.gap};
+        fill_all(s, t.track);
+    }
+    or (k == SCROLLBAR_THUMB) {
+        s.min_h = t.thumb_min;
+        fills(s, t.handle, t.handle, t.handle_on, t.handle);
+    }
+    or (k == LIST_ITEM || k == TREE_ITEM) { row_style(t, s); }
+    or (k == CHART)                       { outline_all(s, t.grid, t.edge_w); }
+    or (k == SEPARATOR)                   { outline_all(s, t.edge, t.edge_w); }
+    or (k == DROP_TARGET) {
+        square(s);
+        fill_all(s, t.select);
+        outline_all(s, t.accent, t.edge_w);
+    }
+    or (k == DRAG_PREVIEW) {
+        square(s);
+        fill_all(s, t.control);
+    }
+    or (k == TABLE_HEADER) {
+        square(s);
+        s.min_w = t.row;
+        fills(s, t.header, t.header_hot, t.header_hot, t.header);
+    }
+    or (k == TABLE_CELL) { square(s); }
+    or (k == TABLE_RULE) {
+        s.min_w = t.pad * 2.0::f32;
+        outline_all(s, t.edge, t.edge_w);
+        s.states[HOT].border    = t.accent;
+        s.states[ACTIVE].border = t.accent;
+    }
+    or (k == VALUE) {
+        s.min_w = 48.0::f32;
+        fills(s, t.control, t.control_hot, t.control_on, t.control);
+    }
+    or (k == PICKER) {
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark   = t.text;
+            s.states[i].border = t.track;
+            i                  = i + 1;
+        }
+    }
+    or (k == CHECKER) {
+        fill_all(s, t.text_dim);
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark = t.control;
+            i                = i + 1;
+        }
+    }
+    or (k == SCRIM) {
+        square(s);
+        fill_all(s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
+    }
+}
+
+# the style a kind's derive builds from a theme's tokens
+fun built(t: *Theme, k: u32) Style {
+    var s: Style = base(t);
+    t.derives[k].f(t, k, ?s);
     ret s;
 }
 
 # build every style of a theme from its tokens
 #
-# the default theme is exactly what derive builds from its tokens, so a
-# theme's styles can always be rebuilt and a save writes only the fields that
-# differ from what derive builds.
+# each registered kind's derive builds its style from base(t). the built-in
+# themes are exactly what derive builds plus a few touches, so a save writes
+# only the fields that differ from what derive builds.
 # ---
 # t: the theme, its styles overwritten
 pub fun derive(t: *Theme) {
-    var i: usize = 0;
-    for (i < KINDS::usize) {
-        t.styles[i] = base(t);
-        i           = i + 1;
+    var k: u32 = 0;
+    for (k < t.len) {
+        t.styles[k] = built(t, k);
+        k           = k + 1;
     }
-
-    t.styles[PANEL]         = below(t, t.panel);
-    t.styles[WINDOW]        = below(t, t.window);
-    t.styles[WINDOW].margin = edges(t.pad);
-    t.styles[POPUP]         = below(t, t.window);
-    t.styles[MENU]          = below(t, t.window);
-    t.styles[MENU].pad.t    = t.pad;
-    t.styles[MENU].min_w    = t.row * 8.0::f32;
-    t.styles[MODAL]         = below(t, t.window);
-    t.styles[MODAL].pad     = edges(t.pad);
-    fill_all(?t.styles[TOOLTIP], t.window);
-    outline(t, TOOLTIP, t.edge, t.edge_w);
-    t.styles[TOOLTIP].margin.t = t.gap;
-    fill_all(?t.styles[TOAST], t.window);
-    outline(t, TOAST, t.edge, t.edge_w);
-    t.styles[TOAST].margin = edges(t.pad * 2.0::f32);
-    t.styles[OVERLAY].pad  = edges(0.0::f32);
-
-    fills(?t.styles[WINDOW_TITLE], t.header, t.header_hot, t.header_hot, t.header);
-
-    t.styles[DOCK].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[DOCK], t.dock);
-    outline(t, DOCK, t.edge, t.edge_w);
-
-    fills(?t.styles[BUTTON], t.control, t.control_hot, t.control_on, t.accent);
-    t.styles[BUTTON].states[ON].text = t.accent_text;
-
-    t.styles[TAB]            = t.styles[BUTTON];
-    t.styles[TAB].radius     = draw.Radii{tl: t.corner, tr: t.corner, br: 0.0::f32, bl: 0.0::f32};
-    t.styles[TAB].margin.r   = t.edge_w;
-    t.styles[TAB_BAR].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[TAB_BAR], t.track);
-    fills(?t.styles[TAB_CLOSE], clear(), t.control_hot, t.control_hot, clear());
-    i = 0;
-    for (i < STATES::usize) {
-        t.styles[TAB_CLOSE].states[i].border_w = t.edge_w;
-        i                                      = i + 1;
-    }
-
-    fills(?t.styles[CHECKBOX], t.control, t.control_hot, t.control_hot, t.control);
-    fill_all(?t.styles[CHECKBOX_MARK], t.accent);
-    fills(?t.styles[RADIO], t.control, t.control_hot, t.control_hot, t.control);
-    fill_all(?t.styles[RADIO_MARK], t.accent);
-
-    t.styles[TOGGLE].pad = Edges{l: 0.0::f32, t: t.pad / 2.0::f32, r: 0.0::f32, b: t.pad / 2.0::f32};
-    fills(?t.styles[TOGGLE], t.track, t.control_hot, t.control_hot, t.accent);
-    t.styles[TOGGLE_KNOB].margin = edges(t.pad / 2.0::f32);
-    fills(?t.styles[TOGGLE_KNOB], t.handle, t.handle_on, t.handle_on, t.accent_text);
-
-    fill_all(?t.styles[SLIDER], t.track);
-    t.styles[SLIDER_HANDLE].min_w = t.handle_w;
-    fills(?t.styles[SLIDER_HANDLE], t.handle, t.handle, t.handle_on, t.handle);
-
-    fills(?t.styles[DROPDOWN], t.control, t.control_hot, t.control_hot, t.control_on);
-    fills(?t.styles[OPTION], t.track, t.control_hot, t.control_hot, t.accent);
-    t.styles[OPTION].states[ON].text = t.accent_text;
-
-    t.styles[MENU_BAR].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[MENU_BAR], t.header);
-    t.styles[MENU_TITLE].radius = draw.radii(0.0::f32);
-    t.styles[MENU_TITLE].inset  = Edges{l: t.inset * 2.0::f32, t: t.inset, r: t.inset * 2.0::f32, b: t.inset};
-    fills(?t.styles[MENU_TITLE], clear(), t.header_hot, t.header_hot, t.control_on);
-    t.styles[MENU_ITEM].radius = draw.radii(0.0::f32);
-    fills(?t.styles[MENU_ITEM], clear(), t.control_hot, t.control_hot, t.control_hot);
-
-    fills(?t.styles[FIELD], t.track, t.control_hot, t.control_hot, t.track);
-    i = 0;
-    for (i < STATES::usize) {
-        t.styles[FIELD].states[i].mark = t.text_faint;
-        i                              = i + 1;
-    }
-    t.styles[FIELD].states[FOCUSED].border   = t.accent;
-    t.styles[FIELD].states[FOCUSED].border_w = t.edge_w;
-    t.styles[FIELD_CARET].min_w              = t.caret_w;
-    fill_all(?t.styles[FIELD_CARET], t.text);
-    fill_all(?t.styles[FIELD_SELECT], t.select);
-
-    fills(?t.styles[SECTION], t.header, t.header_hot, t.header_hot, t.header);
-    t.styles[SECTION].states[HOT].mark    = t.text;
-    t.styles[SECTION].states[ACTIVE].mark = t.text;
-
-    t.styles[SCROLLBAR].min_w  = t.bar_w;
-    t.styles[SCROLLBAR].margin = Edges{l: t.pad, t: 0.0::f32, r: 0.0::f32, b: t.gap};
-    fill_all(?t.styles[SCROLLBAR], t.track);
-    t.styles[SCROLLBAR_THUMB].min_h = t.thumb_min;
-    fills(?t.styles[SCROLLBAR_THUMB], t.handle, t.handle, t.handle_on, t.handle);
-
-    fills(?t.styles[LIST_ITEM], clear(), t.control_hot, t.control_on, t.accent);
-    t.styles[LIST_ITEM].states[ON].text = t.accent_text;
-    t.styles[LIST_ITEM].states[ON].mark = t.accent_text;
-    t.styles[TREE_ITEM]                 = t.styles[LIST_ITEM];
-
-    outline(t, CHART, t.grid, t.edge_w);
-
-    fill_all(?t.styles[PROGRESS], t.track);
-    fill_all(?t.styles[PROGRESS_BAR], t.accent);
-    outline(t, SEPARATOR, t.edge, t.edge_w);
-
-    t.styles[DROP_TARGET].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[DROP_TARGET], t.select);
-    outline(t, DROP_TARGET, t.accent, t.edge_w);
-    t.styles[DRAG_PREVIEW].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[DRAG_PREVIEW], t.control);
-
-    t.styles[TABLE_HEADER].radius = draw.radii(0.0::f32);
-    t.styles[TABLE_HEADER].min_w  = t.row;
-    fills(?t.styles[TABLE_HEADER], t.header, t.header_hot, t.header_hot, t.header);
-    t.styles[TABLE_CELL].radius = draw.radii(0.0::f32);
-    t.styles[TABLE_RULE].min_w  = t.pad * 2.0::f32;
-    outline(t, TABLE_RULE, t.edge, t.edge_w);
-    t.styles[TABLE_RULE].states[HOT].border    = t.accent;
-    t.styles[TABLE_RULE].states[ACTIVE].border = t.accent;
-
-    t.styles[VALUE].min_w = 48.0::f32;
-    fills(?t.styles[VALUE], t.control, t.control_hot, t.control_on, t.control);
-
-    i = 0;
-    for (i < STATES::usize) {
-        t.styles[PICKER].states[i].mark   = t.text;
-        t.styles[PICKER].states[i].border = t.track;
-        t.styles[CHECKER].states[i].mark  = t.control;
-        i                                 = i + 1;
-    }
-    fill_all(?t.styles[CHECKER], t.text_dim);
-
-    t.styles[SCRIM].radius = draw.radii(0.0::f32);
-    fill_all(?t.styles[SCRIM], draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
-}
-
-# the floats of a theme's styles
-fun style_floats(t: *Theme) *f32 {
-    ret (?t.styles[0])::ptr::*f32;
 }
 
 # move a theme's styles to its tokens, keeping style fields set by hand
 #
 # every style float that still holds what before's tokens derive takes what
 # t's tokens derive, and every other float, one set by hand, stays. call it
-# after changing tokens, with the theme as it was before.
+# after changing tokens, with a copy of the theme record as it was before:
+# only its tokens are read.
 # ---
 # t:      the theme, its tokens already changed
-# before: the theme as it was before the tokens changed
+# before: the theme record as it was before the tokens changed
 pub fun rederive(t: *Theme, before: *Theme) {
-    var old: Theme = @before;
-    derive(?old);
-    var neu: Theme = @t;
-    derive(?neu);
-    val now:  *f32  = style_floats(t);
-    val was:  *f32  = style_floats(?old);
-    val next: *f32  = style_floats(?neu);
-    val n:    usize = KINDS::usize * $size_of(Style) / 4;
-    var i:    usize = 0;
-    for (i < n) {
-        if (now[i] == was[i]) { now[i] = next[i]; }
-        i = i + 1;
+    val n: usize = $size_of(Style) / 4;
+    var k: u32   = 0;
+    for (k < t.len) {
+        var old: Style = built(before, k);
+        var neu: Style = built(t, k);
+        val now: *f32  = (?t.styles[k])::ptr::*f32;
+        val was: *f32  = (?old)::ptr::*f32;
+        val nxt: *f32  = (?neu)::ptr::*f32;
+        var i:   usize = 0;
+        for (i < n) {
+            if (now[i] == was[i]) { now[i] = nxt[i]; }
+            i = i + 1;
+        }
+        k = k + 1;
     }
 }
 
-# blit's own look: dark surfaces, square corners and 4 pixel spacing
-# ---
-# ret: the default theme
-pub fun default() Theme {
-    var t: Theme;
+# the tokens of blit's own look
+fun default_tokens(t: *Theme) {
     t.panel       = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.85::f32);
     t.window      = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.95::f32);
     t.dock        = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
@@ -1214,8 +1378,14 @@ pub fun default() Theme {
     t.line_w      = 2.0::f32;
     t.tick        = 4.0::f32;
     t.area        = 0.25::f32;
-    derive(?t);
-    ret t;
+}
+
+# blit's own look: dark surfaces, square corners and 4 pixel spacing
+# ---
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun default(t: *Theme) {
+    default_tokens(t);
+    derive(t);
 }
 
 # lift a kind off what lies beneath with a soft shadow below it
@@ -1242,20 +1412,15 @@ fun shade(t: *Theme, kind: u32, f: f32) {
 
 # outline a kind in every state
 fun outline(t: *Theme, kind: u32, c: draw.Color, w: f32) {
-    var i: usize = 0;
-    for (i < STATES::usize) {
-        t.styles[kind].states[i].border   = c;
-        t.styles[kind].states[i].border_w = w;
-        i                                 = i + 1;
-    }
+    outline_all(?t.styles[kind], c, w);
 }
 
 # a rounded dark look with raised controls and floating surfaces lifted by
 # shadows
 # ---
-# ret: the theme
-pub fun dark() Theme {
-    var t: Theme = default();
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun dark(t: *Theme) {
+    default_tokens(t);
     t.panel       = draw.hex(0x1B1D23, 0.92::f32);
     t.window      = draw.hex(0x1F2229, 0.98::f32);
     t.dock        = draw.hex(0x181A1F, 1.0::f32);
@@ -1278,22 +1443,21 @@ pub fun dark() Theme {
     t.row         = 18.0::f32;
     t.inset       = 5.0::f32;
     t.corner      = 4.0::f32;
-    derive(?t);
-    shade(?t, BUTTON, 0.85::f32);
+    derive(t);
+    shade(t, BUTTON, 0.85::f32);
     val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.35::f32);
-    elevate(?t, WINDOW, sh, 2.0::f32, 8.0::f32);
-    elevate(?t, POPUP, sh, 3.0::f32, 10.0::f32);
-    elevate(?t, MENU, sh, 3.0::f32, 10.0::f32);
-    elevate(?t, TOOLTIP, sh, 2.0::f32, 6.0::f32);
-    elevate(?t, MODAL, sh, 4.0::f32, 16.0::f32);
-    ret t;
+    elevate(t, WINDOW, sh, 2.0::f32, 8.0::f32);
+    elevate(t, POPUP, sh, 3.0::f32, 10.0::f32);
+    elevate(t, MENU, sh, 3.0::f32, 10.0::f32);
+    elevate(t, TOOLTIP, sh, 2.0::f32, 6.0::f32);
+    elevate(t, MODAL, sh, 4.0::f32, 16.0::f32);
 }
 
 # a rounded light look: pale surfaces, dark text, soft shadows
 # ---
-# ret: the theme
-pub fun light() Theme {
-    var t: Theme = default();
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun light(t: *Theme) {
+    default_tokens(t);
     t.panel       = draw.hex(0xF4F5F7, 0.95::f32);
     t.window      = draw.hex(0xFFFFFF, 0.98::f32);
     t.dock        = draw.hex(0xEEF0F3, 1.0::f32);
@@ -1317,24 +1481,23 @@ pub fun light() Theme {
     t.row         = 18.0::f32;
     t.inset       = 5.0::f32;
     t.corner      = 4.0::f32;
-    derive(?t);
-    outline(?t, FIELD, t.edge, 1.0::f32);
+    derive(t);
+    outline(t, FIELD, t.edge, 1.0::f32);
     t.styles[FIELD].states[FOCUSED].border = t.accent;
     val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.15::f32);
-    elevate(?t, WINDOW, sh, 1.0::f32, 6.0::f32);
-    elevate(?t, POPUP, sh, 2.0::f32, 8.0::f32);
-    elevate(?t, MENU, sh, 2.0::f32, 8.0::f32);
-    elevate(?t, TOOLTIP, sh, 1.0::f32, 4.0::f32);
-    elevate(?t, MODAL, sh, 4.0::f32, 16.0::f32);
-    ret t;
+    elevate(t, WINDOW, sh, 1.0::f32, 6.0::f32);
+    elevate(t, POPUP, sh, 2.0::f32, 8.0::f32);
+    elevate(t, MENU, sh, 2.0::f32, 8.0::f32);
+    elevate(t, TOOLTIP, sh, 1.0::f32, 4.0::f32);
+    elevate(t, MODAL, sh, 4.0::f32, 16.0::f32);
 }
 
 # a high-contrast look: black surfaces, white text and outlines, a yellow
 # accent and wide focus rings
 # ---
-# ret: the theme
-pub fun contrast() Theme {
-    var t:     Theme      = default();
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun contrast(t: *Theme) {
+    default_tokens(t);
     val black: draw.Color = draw.hex(0x000000, 1.0::f32);
     val white: draw.Color = draw.hex(0xFFFFFF, 1.0::f32);
     val gray:  draw.Color = draw.hex(0x303030, 1.0::f32);
@@ -1362,55 +1525,228 @@ pub fun contrast() Theme {
     t.inset       = 5.0::f32;
     t.edge_w      = 2.0::f32;
     t.caret_w     = 2.0::f32;
-    derive(?t);
-    outline(?t, BUTTON, white, 1.0::f32);
-    outline(?t, CHECKBOX, white, 1.0::f32);
-    outline(?t, TOGGLE, white, 1.0::f32);
-    outline(?t, SLIDER, white, 1.0::f32);
-    outline(?t, DROPDOWN, white, 1.0::f32);
-    outline(?t, FIELD, white, 1.0::f32);
-    outline(?t, TAB, white, 1.0::f32);
-    outline(?t, RADIO, white, 1.0::f32);
-    outline(?t, PROGRESS, white, 1.0::f32);
-    outline(?t, WINDOW_TITLE, white, 1.0::f32);
-    outline(?t, POPUP, white, 1.0::f32);
-    outline(?t, MENU, white, 1.0::f32);
-    outline(?t, TOOLTIP, white, 1.0::f32);
-    outline(?t, MODAL, white, 2.0::f32);
+    derive(t);
+    outline(t, BUTTON, white, 1.0::f32);
+    outline(t, CHECKBOX, white, 1.0::f32);
+    outline(t, TOGGLE, white, 1.0::f32);
+    outline(t, SLIDER, white, 1.0::f32);
+    outline(t, DROPDOWN, white, 1.0::f32);
+    outline(t, FIELD, white, 1.0::f32);
+    outline(t, TAB, white, 1.0::f32);
+    outline(t, RADIO, white, 1.0::f32);
+    outline(t, PROGRESS, white, 1.0::f32);
+    outline(t, WINDOW_TITLE, white, 1.0::f32);
+    outline(t, POPUP, white, 1.0::f32);
+    outline(t, MENU, white, 1.0::f32);
+    outline(t, TOOLTIP, white, 1.0::f32);
+    outline(t, MODAL, white, 2.0::f32);
     t.styles[FIELD].states[FOCUSED].border   = t.accent;
     t.styles[FIELD].states[FOCUSED].border_w = 2.0::f32;
     t.styles[BUTTON].states[HOT].border      = t.accent;
-    ret t;
 }
 
 # how many built-in themes there are
 pub val BUILTINS: usize = 4;
 
-# the built-in themes' names, in the order builtin_at takes them
+# the built-in themes' names, in the order set_builtin takes them
 pub val BUILTIN_NAMES: [4]str = [4]str{"default", "dark", "light", "contrast"};
 
-# a built-in theme by its index in BUILTIN_NAMES
+# give a theme a built-in look by its index in BUILTIN_NAMES, keeping its kinds
+#
+# a kind registered beyond the built-ins takes the look's tokens through its
+# derive.
 # ---
-# i:   the index, below BUILTINS
-# ret: the theme, default() past the last
-pub fun builtin_at(i: usize) Theme {
-    if (i == 1) { ret dark(); }
-    if (i == 2) { ret light(); }
-    if (i == 3) { ret contrast(); }
-    ret default();
+# t: the theme
+# i: the index, below BUILTINS; past the last, the default look
+pub fun set_builtin(t: *Theme, i: usize) {
+    if (i == 1) { dark(t); }
+    or (i == 2) { light(t); }
+    or (i == 3) { contrast(t); }
+    or          { default(t); }
 }
 
-# a built-in theme by name: default, dark, light or contrast
+# give a theme a built-in look by name: default, dark, light or contrast
 # ---
+# t:    the theme
 # name: the name
-# ret:  the theme, or none for no built-in
-pub fun builtin(name: str) opt[Theme] {
+# ret:  true, or false for no built-in, leaving the theme alone
+pub fun builtin(t: *Theme, name: str) bool {
     var i: usize = 0;
     for (i < BUILTINS) {
-        if (name != nil && str_equals(name, BUILTIN_NAMES[i])) { ret opt[Theme].some{builtin_at(i)}; }
+        if (name != nil && str_equals(name, BUILTIN_NAMES[i])) {
+            set_builtin(t, i);
+            ret true;
+        }
         i = i + 1;
     }
-    ret opt[Theme].none{};
+    ret false;
+}
+
+# kinds a registry allocates on its first growth
+val INIT_KINDS: u32 = 64;
+
+# set a theme up with the default look and every built-in kind registered
+# ---
+# t:   theme to initialize
+# a:   allocator backing its kind registry
+# ret: ok, or the allocator's refusal with nothing left allocated
+pub fun init(t: *Theme, a: *allo.Allocator) err[allo.Error] {
+    t.a       = a;
+    t.names   = nil;
+    t.docs    = nil;
+    t.derives = nil;
+    t.styles  = nil;
+    t.len     = 0;
+    t.cap     = 0;
+    default_tokens(t);
+    val g: err[allo.Error] = grow(t, BUILTIN_KINDS);
+    if (sel g.err) { ret g; }
+    var k: u32 = 0;
+    for (k < BUILTIN_KINDS) {
+        t.names[k]   = KIND_INFO[k].name;
+        t.docs[k]    = KIND_INFO[k].doc;
+        t.derives[k] = Hook{f: builtin_style};
+        k            = k + 1;
+    }
+    t.len = BUILTIN_KINDS;
+    derive(t);
+    ret err[allo.Error].ok{};
+}
+
+# release a theme's kind registry
+# ---
+# t:   theme to free
+# ret: ok, or the first refusal; the theme holds no kinds either way
+pub fun free(t: *Theme) err[allo.Error] {
+    var out: err[allo.Error] = err[allo.Error].ok{};
+    if (t.cap > 0) {
+        val n:  usize           = t.cap::usize;
+        val e0: err[allo.Error] = allo.deallocate[str](t.a, t.names, n);
+        val e1: err[allo.Error] = allo.deallocate[str](t.a, t.docs, n);
+        val e2: err[allo.Error] = allo.deallocate[Hook](t.a, t.derives, n);
+        val e3: err[allo.Error] = allo.deallocate[Style](t.a, t.styles, n);
+        if (sel e0.err) { out = e0; }
+        or (sel e1.err) { out = e1; }
+        or (sel e2.err) { out = e2; }
+        or (sel e3.err) { out = e3; }
+    }
+    t.names   = nil;
+    t.docs    = nil;
+    t.derives = nil;
+    t.styles  = nil;
+    t.len     = 0;
+    t.cap     = 0;
+    ret out;
+}
+
+# make room in a theme's registry for at least need kinds, moving every array
+# whole or none
+fun grow(t: *Theme, need: u32) err[allo.Error] {
+    if (need <= t.cap) { ret err[allo.Error].ok{}; }
+    var c: u32 = t.cap * 2;
+    if (c < INIT_KINDS) { c = INIT_KINDS; }
+    for (c < need) { c = c * 2; }
+    val n:  usize                 = c::usize;
+    val an: res[*str, allo.Error] = allo.allocate[str](t.a, n);
+    if (sel an.err) { ret err[allo.Error].err{an.err}; }
+    val ad: res[*str, allo.Error] = allo.allocate[str](t.a, n);
+    if (sel ad.err) {
+        val f0: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        ret err[allo.Error].err{ad.err};
+    }
+    val av: res[*Hook, allo.Error] = allo.allocate[Hook](t.a, n);
+    if (sel av.err) {
+        val f1: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        val f2: err[allo.Error] = allo.deallocate[str](t.a, ad.ok, n);
+        ret err[allo.Error].err{av.err};
+    }
+    val as: res[*Style, allo.Error] = allo.allocate[Style](t.a, n);
+    if (sel as.err) {
+        val f3: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        val f4: err[allo.Error] = allo.deallocate[str](t.a, ad.ok, n);
+        val f5: err[allo.Error] = allo.deallocate[Hook](t.a, av.ok, n);
+        ret err[allo.Error].err{as.err};
+    }
+    val len: usize = t.len::usize;
+    if (len > 0) {
+        memory.raw_copy(an.ok::ptr, t.names::ptr, len * $size_of(str));
+        memory.raw_copy(ad.ok::ptr, t.docs::ptr, len * $size_of(str));
+        memory.raw_copy(av.ok::ptr, t.derives::ptr, len * $size_of(Hook));
+        memory.raw_copy(as.ok::ptr, t.styles::ptr, len * $size_of(Style));
+    }
+    val keep: u32             = t.len;
+    val old:  err[allo.Error] = free(t);
+    t.names   = an.ok;
+    t.docs    = ad.ok;
+    t.derives = av.ok;
+    t.styles  = as.ok;
+    t.len     = keep;
+    t.cap     = c;
+    ret err[allo.Error].ok{};
+}
+
+# register a widget kind by name, or find the one registered by that name
+#
+# the kind's style is derived from the theme's tokens now, and again by every
+# derive, rederive and built-in look. a name registered before keeps its
+# handle and takes the new derive and meaning. name and doc are borrowed and
+# must outlive the theme and every copy of it.
+# ---
+# t:      the theme
+# name:   the kind's name, its path segment, such as "dock_space"
+# doc:    what it styles, for the field table and the editor
+# derive: builds its style from the tokens
+# ret:    the kind's handle, or the allocator's refusal with nothing changed
+pub fun register_kind(t: *Theme, name: str, doc: str, derive: Derive) res[u32, allo.Error] {
+    val have: opt[u32] = kind_of(t, name);
+    if (sel have.some) {
+        t.docs[have.some]    = doc;
+        t.derives[have.some] = Hook{f: derive};
+        t.styles[have.some]  = built(t, have.some);
+        ret res[u32, allo.Error].ok{have.some};
+    }
+    val g: err[allo.Error] = grow(t, t.len + 1);
+    if (sel g.err) { ret res[u32, allo.Error].err{g.err}; }
+    val k: u32 = t.len;
+    t.names[k]   = name;
+    t.docs[k]    = doc;
+    t.derives[k] = Hook{f: derive};
+    t.len        = k + 1;
+    t.styles[k]  = built(t, k);
+    ret res[u32, allo.Error].ok{k};
+}
+
+# make one theme the same as another: tokens, kinds and styles
+# ---
+# dst: the theme written, set up by init or zeroed, its registry reused
+# src: the theme read
+# ret: ok, or the allocator's refusal with dst unchanged
+pub fun copy(dst: *Theme, src: *Theme) err[allo.Error] {
+    if (dst == src)   { ret err[allo.Error].ok{}; }
+    if (dst.a == nil) { dst.a = src.a; }
+    val g: err[allo.Error] = grow(dst, src.len);
+    if (sel g.err) { ret g; }
+    val a:       *allo.Allocator = dst.a;
+    val names:   *str            = dst.names;
+    val docs:    *str            = dst.docs;
+    val derives: *Hook           = dst.derives;
+    val styles:  *Style          = dst.styles;
+    val cap:     u32             = dst.cap;
+    @dst        = @src;
+    dst.a       = a;
+    dst.names   = names;
+    dst.docs    = docs;
+    dst.derives = derives;
+    dst.styles  = styles;
+    dst.cap     = cap;
+    val len: usize = src.len::usize;
+    if (len > 0) {
+        memory.raw_copy(names::ptr, src.names::ptr, len * $size_of(str));
+        memory.raw_copy(docs::ptr, src.docs::ptr, len * $size_of(str));
+        memory.raw_copy(derives::ptr, src.derives::ptr, len * $size_of(Hook));
+        memory.raw_copy(styles::ptr, src.styles::ptr, len * $size_of(Style));
+    }
+    ret err[allo.Error].ok{};
 }
 
 # why a theme document was refused, each at a byte offset into it
@@ -1557,7 +1893,7 @@ fun apply(t: *Theme, p: Path, v: *toml.Value) err[LoadError] {
     }
     val x: opt[Value] = read_value(f.unit, v);
     if (sel x.none) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
-    val n: usize = span(p);
+    val n: usize = span(t, p);
     var i: usize = 0;
     for (i < n) {
         put(t, ref_at(p, i), x.some);
@@ -1602,7 +1938,7 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError
                 if (!entry(?v.data.table, j, ?k2, ?v2)) { brk; }
                 segs[2] = k2;
                 lens[2] = str_len(k2);
-                val p: opt[Path] = resolve(?segs[0], ?lens[0], 3);
+                val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 3);
                 if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v2.key.at}}; }
                 val e: err[LoadError] = apply(t, p.some, v2);
                 if (sel e.err) { ret e; }
@@ -1610,7 +1946,7 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError
             }
         }
         or {
-            val p: opt[Path] = resolve(?segs[0], ?lens[0], 2);
+            val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 2);
             if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
             val e: err[LoadError] = apply(t, p.some, v);
             if (sel e.err) { ret e; }
@@ -1620,29 +1956,44 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError
     ret err[LoadError].ok{};
 }
 
-# the theme a parsed document describes
+# the theme a parsed document describes, read into a theme keeping its kinds
 #
 # the document starts from the built-in named by its base key (default when
 # it has none). its palette and metrics tables set tokens and move the styles
 # with them (see rederive), then its plot table and kind tables set fields as
 # they are: [<kind>] for style fields and [<kind>.<state>] for paint fields,
-# with "*" for every kind or state. a class table is left for the context
-# (see context.load_theme). a key that names nothing is refused.
+# with "*" for every kind or state, a kind named by its registered name. a
+# class table is left for the context (see style.load_theme). a key that
+# names nothing, an unregistered kind among them, is refused.
 # ---
+# t:    the theme, replaced only when the document is accepted
 # root: the parsed document
-# out:  the theme, written only when the document is accepted
 # ret:  ok, or why the document was refused
-pub fun read(root: *toml.Table, out: *Theme) err[LoadError] {
-    var t:  Theme            = default();
+pub fun read(t: *Theme, root: *toml.Table) err[LoadError] {
+    var w: Theme;
+    w.a = t.a;
+    val c: err[allo.Error] = copy(?w, t);
+    if (sel c.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{c.err}}}; }
+    val e: err[LoadError] = read_into(?w, root);
+    if (sel e.ok) {
+        val keep: Theme = @t;
+        @t = w;
+        w  = keep;
+    }
+    val f: err[allo.Error] = free(?w);
+    ret e;
+}
+
+# read a document into a working theme
+fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
+    default(t);
     val bo: opt[*toml.Value] = toml.get(root, "base");
     if (sel bo.some) {
         val bv: *toml.Value = bo.some;
-        if (bv.tag != toml.TYPE_STRING) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
-        val b: opt[Theme] = builtin(bv.data.string);
-        if (sel b.none) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
-        t = b.some;
+        if (bv.tag != toml.TYPE_STRING)  { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
+        if (!builtin(t, bv.data.string)) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
     }
-    val before: Theme = t;
+    val before: Theme = @t;
     var pass:   u8    = 0;
     for (pass < 2) {
         var i: usize = 0;
@@ -1654,33 +2005,31 @@ pub fun read(root: *toml.Table, out: *Theme) err[LoadError] {
             if (str_equals(key, "base") || str_equals(key, "class")) { cnt; }
             if (v.tag != toml.TYPE_TABLE)                            { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
             val g:  opt[u8]  = group_named(key, str_len(key));
-            val ko: opt[u32] = kind_named(key, str_len(key));
+            val ko: opt[u32] = kind_named(t, key, str_len(key));
             if (sel g.none && sel ko.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
-            val e: err[LoadError] = read_table(?t, key, ?v.data.table, pass == 0);
+            val e: err[LoadError] = read_table(t, key, ?v.data.table, pass == 0);
             if (sel e.err) { ret e; }
         }
-        if (pass == 0) { rederive(?t, ?before); }
+        if (pass == 0) { rederive(t, ?before); }
         pass = pass + 1;
     }
-    @out = t;
     ret err[LoadError].ok{};
 }
 
-# the theme a TOML document describes (see read)
+# read a TOML document into a theme (see read)
 # ---
+# t:    the theme, replaced only when the document is accepted
 # text: the document
-# a:    allocator the parse borrows, released before returning
-# ret:  the theme, or why the document was refused
-pub fun load(text: str, a: *allo.Allocator) res[Theme, LoadError] {
-    val pr: res[toml.Table, toml.TomlError] = toml.parse(a, text);
-    if (sel pr.err) { ret res[Theme, LoadError].err{LoadError.toml{pr.err}}; }
+# ret:  ok, or why the document was refused
+pub fun load(t: *Theme, text: str) err[LoadError] {
+    val pr: res[toml.Table, toml.TomlError] = toml.parse(t.a, text);
+    if (sel pr.err) { ret err[LoadError].err{LoadError.toml{pr.err}}; }
     var root: toml.Table      = pr.ok;
-    var t:    Theme;
-    val e:    err[LoadError]  = read(?root, ?t);
-    val d:    err[allo.Error] = toml.dnit(a, ?root);
-    if (sel e.err) { ret res[Theme, LoadError].err{e.err}; }
-    if (sel d.err) { ret res[Theme, LoadError].err{LoadError.toml{toml.TomlError.alloc{d.err}}}; }
-    ret res[Theme, LoadError].ok{t};
+    val e:    err[LoadError]  = read(t, ?root);
+    val d:    err[allo.Error] = toml.dnit(t.a, ?root);
+    if (sel e.err) { ret e; }
+    if (sel d.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{d.err}}}; }
+    ret err[LoadError].ok{};
 }
 
 # whether a channel is a whole number of 255ths, so hex holds it exactly
@@ -1762,9 +2111,9 @@ fun save_group(w: *tw.Writer, t: *Theme, group: u8, name: str) {
 }
 
 # write the fields of one group of a kind (style fields, or one state's paint
-# fields) that differ from what the tokens derive, under a table header when
+# fields) that differ from what its derive builds, under a table header when
 # any do
-fun save_diff(w: *tw.Writer, t: *Theme, d: *Theme, kind: u32, state: u8, group: u8) {
+fun save_diff(w: *tw.Writer, t: *Theme, d: *Style, kind: u32, state: u8, group: u8) {
     var header: bool  = false;
     var i:      usize = 0;
     for (i < FIELD_COUNT) {
@@ -1772,10 +2121,17 @@ fun save_diff(w: *tw.Writer, t: *Theme, d: *Theme, kind: u32, state: u8, group: 
         if (f.group == group) {
             val r:   Ref   = ref_at(exact(i, kind, state, 0), 0);
             val now: Value = get(t, r);
-            if (!same_value(f.unit, now, get(d, r))) {
+            var off: usize = r.off;
+            var was: Value;
+            var j:   usize = 0;
+            for (j < unit_floats(f.unit)) {
+                was.v[j] = ((d::usize + off)::*f32)[j];
+                j        = j + 1;
+            }
+            if (!same_value(f.unit, now, was)) {
                 if (!header) {
                     var keys: [2]str;
-                    keys[0] = KIND_NAMES[kind].name;
+                    keys[0] = t.names[kind];
                     keys[1] = STATE_NAMES[state].name;
                     var n: usize = 1;
                     if (group == GROUP_PAINT) { n = 2; }
@@ -1795,19 +2151,18 @@ fun save_diff(w: *tw.Writer, t: *Theme, d: *Theme, kind: u32, state: u8, group: 
 # write a theme as TOML into a writer
 #
 # the tokens and the plot fields are written in full, and each style field
-# only where it differs from what the tokens derive, so the document is short
-# and load reads back the same theme exactly.
+# only where it differs from what its kind's derive builds, so the document
+# is short and load reads back the same theme exactly.
 # ---
 # w: writer, past reset; the document is appended
 # t: the theme
 pub fun save(w: *tw.Writer, t: *Theme) {
-    var d: Theme = @t;
-    derive(?d);
     save_group(w, t, GROUP_PALETTE, "palette");
     save_group(w, t, GROUP_METRICS, "metrics");
     save_group(w, t, GROUP_PLOT, "plot");
     var k: u32 = 0;
-    for (k < KINDS) {
+    for (k < t.len) {
+        var d: Style = built(t, k);
         save_diff(w, t, ?d, k, 0, GROUP_STYLE);
         var s: u8 = 0;
         for (s < STATES) {
@@ -1830,7 +2185,8 @@ fun unit_name(unit: u8) str {
 # documents themes with
 # ---
 # w: writer, past reset; the tables are appended
-pub fun document(w: *tw.Writer) {
+# t: the theme whose registered kinds are listed
+pub fun document(w: *tw.Writer, t: *Theme) {
     tw.put_text(w, "| path | unit | meaning |\n|---|---|---|\n");
     var i: usize = 0;
     for (i < FIELD_COUNT) {
@@ -1852,11 +2208,11 @@ pub fun document(w: *tw.Writer) {
     }
     tw.put_text(w, "\n| kind | what it styles |\n|---|---|\n");
     var k: u32 = 0;
-    for (k < KINDS) {
+    for (k < t.len) {
         tw.put_text(w, "| `");
-        tw.put_text(w, KIND_NAMES[k].name);
+        tw.put_text(w, t.names[k]);
         tw.put_text(w, "` | ");
-        tw.put_text(w, KIND_NAMES[k].doc);
+        tw.put_text(w, t.docs[k]);
         tw.put_text(w, " |\n");
         k = k + 1;
     }
@@ -1885,19 +2241,42 @@ fun has_row(group: u8, name: str, off: usize) bool {
     ret FIELDS[r.some].off == off;
 }
 
-# whether a path names a field
+# a theme over a page allocator, for a test
 #[testing]
-fun names(s: str) bool {
-    val p: opt[Path] = path(s);
+fun made(t: *Theme, a: *allo.Allocator) bool {
+    val m: err[allo.Error] = page.make(a);
+    if (sel m.err) { ret false; }
+    val e: err[allo.Error] = init(t, a);
+    ret sel e.ok;
+}
+
+# whether a path names a field in the default kinds
+#[testing]
+fun names(t: *Theme, s: str) bool {
+    val p: opt[Path] = path(t, s);
     ret sel p.some;
+}
+
+# whether two themes have the same tokens, kinds and styles, byte for byte
+#[testing]
+fun same_theme(x: *Theme, y: *Theme) bool {
+    if (!memory.equal[u8](x::*u8, y::*u8, $offset_of(Theme, a))) { ret false; }
+    if (x.len != y.len)                                          { ret false; }
+    ret memory.equal[u8](x.styles::*u8, y.styles::*u8, x.len::usize * $size_of(Style));
+}
+
+# a kind registered by a test: a gold face, its border the accent
+#[testing]
+fun badge_style(t: *Theme, k: u32, s: *Style) {
+    fill_all(s, draw.hex(0xC8A000, 1.0::f32));
+    outline_all(s, t.accent, 1.0::f32);
 }
 
 test table__names_every_field_of_every_record {
     var rows: usize = 0;
     var bad:  u8    = 0;
     $each f in $fields(Theme) {
-        if (str_equals(f.name, "styles") && $size_of(f.type) != KINDS::usize * $size_of(Style)) { bad = 4; }
-        if (!str_equals(f.name, "styles")) {
+        if (f.offset < $offset_of(Theme, a)) {
             var ok: bool = has_row(GROUP_PALETTE, f.name, f.offset) || has_row(GROUP_METRICS, f.name, f.offset);
             ok = ok || has_row(GROUP_PLOT, f.name, f.offset);
             if (!ok) { bad = 1; }
@@ -1919,126 +2298,207 @@ test table__names_every_field_of_every_record {
     ret 0;
 }
 
+test registry__holds_the_builtins_and_grows_by_name {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a))                                  { ret 1; }
+    if (kind_count(?t) != BUILTIN_KINDS)                { ret 2; }
+    if (!str_equals(kind_name(?t, TOOLTIP), "tooltip")) { ret 3; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err)                                                    { ret 4; }
+    if (k.ok != BUILTIN_KINDS)                                        { ret 5; }
+    if (style(?t, k.ok).states[HOT].fill.g != 0xA0::f32 / 255.0::f32) { ret 6; }
+    val again: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel again.err)    { ret 7; }
+    if (again.ok != k.ok) { ret 7; }
+    # a hundred more grow the registry past its first allocation
+    var n:         usize = 0;
+    var names_buf: [100][8]u8;
+    for (n < 100) {
+        names_buf[n][0] = 'k';
+        names_buf[n][1] = '0' + (n / 10)::u8;
+        names_buf[n][2] = '0' + (n % 10)::u8;
+        names_buf[n][3] = 0;
+        val r: res[u32, allo.Error] = register_kind(?t, (?names_buf[n][0])::str, "more", badge_style);
+        if (sel r.err) { ret 8; }
+        n = n + 1;
+    }
+    if (kind_count(?t) != BUILTIN_KINDS + 101)          { ret 9; }
+    if (!str_equals(kind_name(?t, TOOLTIP), "tooltip")) { ret 10; }
+    val kk: opt[u32] = kind_of(?t, "badge");
+    if (sel kk.none)                                              { ret 11; }
+    if (style(?t, kk.some).states[NORMAL].border.r != t.accent.r) { ret 12; }
+
+    # a copy holds the same, in storage of its own
+    var c:  Theme;
+    val ce: err[allo.Error] = copy(?c, ?t);
+    if (sel ce.err)          { ret 13; }
+    if (!same_theme(?c, ?t)) { ret 14; }
+    style(?c, BUTTON).min_w = 99.0::f32;
+    if (style(?t, BUTTON).min_w == 99.0::f32) { ret 15; }
+    val f1: err[allo.Error] = free(?c);
+    val f2: err[allo.Error] = free(?t);
+    ret 0;
+}
+
 test path__resolves_wildcards_and_writes_back {
-    var t: Theme     = default();
-    val p: opt[Path] = path("button.hot.fill");
-    if (sel p.none)        { ret 1; }
-    if (span(p.some) != 1) { ret 2; }
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val p: opt[Path] = path(?t, "button.hot.fill");
+    if (sel p.none)            { ret 1; }
+    if (span(?t, p.some) != 1) { ret 2; }
     val r: Ref = ref_at(p.some, 0);
-    if (r.off != $offset_of(Theme, styles) + BUTTON::usize * $size_of(Style) + $offset_of(Style, states) + HOT::usize * $size_of(Paint)) { ret 3; }
+    if (r.kind != BUTTON || r.off != $offset_of(Style, states) + HOT::usize * $size_of(Paint)) { ret 3; }
     val c: draw.Color = color_of(get(?t, r));
     if (c.r != t.control_hot.r || c.a != t.control_hot.a) { ret 4; }
 
     var buf: [64]u8;
-    path_text(p.some, ?buf[0], 64);
+    path_text(?t, p.some, ?buf[0], 64);
     if (!str_equals(?buf[0], "button.hot.fill")) { ret 5; }
 
-    val all: opt[Path] = path("*.*.border_w");
-    if (sel all.none)                                   { ret 6; }
-    if (span(all.some) != KINDS::usize * STATES::usize) { ret 6; }
-    val series: opt[Path] = path("plot.series");
-    if (sel series.none)             { ret 7; }
-    if (span(series.some) != SERIES) { ret 7; }
-    val one: opt[Path] = path("plot.series.3");
+    val all: opt[Path] = path(?t, "*.*.border_w");
+    if (sel all.none)                                       { ret 6; }
+    if (span(?t, all.some) != t.len::usize * STATES::usize) { ret 6; }
+    val series: opt[Path] = path(?t, "plot.series");
+    if (sel series.none)                 { ret 7; }
+    if (span(?t, series.some) != SERIES) { ret 7; }
+    val one: opt[Path] = path(?t, "plot.series.3");
     if (sel one.none)                                              { ret 8; }
     if (ref_at(one.some, 0).off != $offset_of(Theme, series) + 48) { ret 8; }
-    path_text(one.some, ?buf[0], 64);
+    path_text(?t, one.some, ?buf[0], 64);
     if (!str_equals(?buf[0], "plot.series.3")) { ret 9; }
-    if (names("button.hot"))                   { ret 10; }
-    if (names("button.warm.fill"))             { ret 11; }
-    if (names("palette.nope"))                 { ret 12; }
-    if (names("plot.series.8"))                { ret 13; }
-    if (names("knob.radius"))                  { ret 14; }
+    if (names(?t, "button.hot"))               { ret 10; }
+    if (names(?t, "button.warm.fill"))         { ret 11; }
+    if (names(?t, "palette.nope"))             { ret 12; }
+    if (names(?t, "plot.series.8"))            { ret 13; }
+    if (names(?t, "badge.radius"))             { ret 14; }
 
+    # a registered kind is addressable by its name, wildcards included
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err)                    { ret 15; }
+    if (!names(?t, "badge.hot.fill")) { ret 16; }
+    # a wildcard stands for every kind registered when it is applied
     val n: usize = set_path(?t, all.some, of_length(2.0::f32));
-    if (n != KINDS::usize * STATES::usize || t.styles[SCRIM].states[FOCUSED].border_w != 2.0::f32) { ret 15; }
+    if (n != t.len::usize * STATES::usize)                    { ret 17; }
+    if (style(?t, k.ok).states[FOCUSED].border_w != 2.0::f32) { ret 18; }
+    val f: err[allo.Error] = free(?t);
     ret 0;
 }
 
 test rederive__moves_derived_fields_and_keeps_hand_set_ones {
-    var t: Theme = default();
-    t.styles[LIST_ITEM].states[ON].fill = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
-    val acc: opt[Path] = path("palette.accent");
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    style(?t, LIST_ITEM).states[ON].fill = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val acc: opt[Path] = path(?t, "palette.accent");
     if (sel acc.none) { ret 1; }
     set(?t, ref_at(acc.some, 0), of_color(draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32)));
-    if (t.accent.b != 1.0::f32)                                    { ret 2; }
-    if (t.styles[BUTTON].states[ON].fill.b != 1.0::f32)            { ret 3; }
-    if (t.styles[CHECKBOX_MARK].states[NORMAL].fill.b != 1.0::f32) { ret 4; }
-    if (t.styles[LIST_ITEM].states[ON].fill.r != 1.0::f32)         { ret 5; }
-    if (t.styles[BUTTON].states[NORMAL].fill.r != t.control.r)     { ret 6; }
+    if (t.accent.b != 1.0::f32)                                     { ret 2; }
+    if (style(?t, BUTTON).states[ON].fill.b != 1.0::f32)            { ret 3; }
+    if (style(?t, CHECKBOX_MARK).states[NORMAL].fill.b != 1.0::f32) { ret 4; }
+    if (style(?t, LIST_ITEM).states[ON].fill.r != 1.0::f32)         { ret 5; }
+    if (style(?t, BUTTON).states[NORMAL].fill.r != t.control.r)     { ret 6; }
 
-    val gap: opt[Path] = path("metrics.gap");
+    val gap: opt[Path] = path(?t, "metrics.gap");
     if (sel gap.none) { ret 7; }
     set(?t, ref_at(gap.some, 0), of_length(9.0::f32));
-    if (t.styles[BUTTON].margin.b != 9.0::f32) { ret 8; }
+    if (style(?t, BUTTON).margin.b != 9.0::f32) { ret 8; }
+    val f: err[allo.Error] = free(?t);
     ret 0;
 }
 
 test toml__every_builtin_round_trips_exactly {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err) { ret 1; }
     var w: tw.Writer;
     tw.init(?w, ?a);
     var i: usize = 0;
     for (i < BUILTINS) {
-        var t: Theme = builtin_at(i);
-        t.styles[SLIDER].radius        = draw.Radii{tl: 1.0::f32, tr: 2.0::f32, br: 3.0::f32, bl: 4.0::f32};
-        t.styles[TAB].states[HOT].fill = draw.rgba(0.1::f32, 0.2::f32, 0.3::f32, 0.4::f32);
+        set_builtin(?t, i);
+        style(?t, SLIDER).radius        = draw.Radii{tl: 1.0::f32, tr: 2.0::f32, br: 3.0::f32, bl: 4.0::f32};
+        style(?t, TAB).states[HOT].fill = draw.rgba(0.1::f32, 0.2::f32, 0.3::f32, 0.4::f32);
+        style(?t, k.ok).min_h           = 33.0::f32;
         tw.reset(?w);
         save(?w, ?t);
         val text: res[str, allo.Error] = tw.text(?w);
         if (sel text.err) { ret 2; }
-        val back: res[Theme, LoadError] = load(text.ok, ?a);
-        if (sel back.err) { ret 3; }
-        var got: Theme = back.ok;
-        if (!memory.equal[u8]((?got)::*u8, (?t)::*u8, $size_of(Theme))) { ret 4 + i::i32; }
+        var got: Theme;
+        got.a = ?a;
+        val ce: err[allo.Error] = copy(?got, ?t);
+        if (sel ce.err) { ret 3; }
+        default(?got);
+        val back: err[LoadError] = load(?got, text.ok);
+        if (sel back.err)          { ret 3; }
+        if (!same_theme(?got, ?t)) { ret 4 + i::i32; }
+        val fg: err[allo.Error] = free(?got);
         i = i + 1;
     }
-    val f: err[allo.Error] = tw.free(?w);
+    val f:  err[allo.Error] = tw.free(?w);
+    val ft: err[allo.Error] = free(?t);
     ret 0;
 }
 
 test load__reads_base_tokens_and_tables_and_refuses_unknown_keys {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    val doc: str                   = "base = \"light\"\n[palette]\naccent = \"#ff0000\"\n[metrics]\ncorner = 6\n[plot]\nseries = [\"#00ff00\", [0.0, 0.0, 1.0]]\n[button]\ninset = [1, 2, 3, 4]\n[button.hot]\nfill = \"#123\"\n[\"*\".focused]\nborder_w = 3.0\n";
-    val r:   res[Theme, LoadError] = load(doc, ?a);
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val doc: str            = "base = \"light\"\n[palette]\naccent = \"#ff0000\"\n[metrics]\ncorner = 6\n[plot]\nseries = [\"#00ff00\", [0.0, 0.0, 1.0]]\n[button]\ninset = [1, 2, 3, 4]\n[button.hot]\nfill = \"#123\"\n[\"*\".focused]\nborder_w = 3.0\n";
+    val r:   err[LoadError] = load(?t, doc);
     if (sel r.err) { ret 2; }
-    val t: Theme = r.ok;
-    val l: Theme = light();
-    if (t.text.r != l.text.r)                                          { ret 3; }
-    if (t.accent.r != 1.0::f32 || t.accent.g != 0.0::f32)              { ret 4; }
-    if (t.styles[BUTTON].states[ON].fill.r != 1.0::f32)                { ret 5; }
-    if (t.styles[PANEL].radius.tl != 6.0::f32)                         { ret 6; }
-    if (t.series[0].g != 1.0::f32 || t.series[1].b != 1.0::f32)        { ret 7; }
-    if (t.series[2].r != l.series[2].r)                                { ret 8; }
-    if (t.styles[BUTTON].inset.t != 2.0::f32)                          { ret 9; }
-    if (t.styles[BUTTON].states[HOT].fill.b != 0x33::f32 / 255.0::f32) { ret 10; }
-    if (t.styles[LABEL].states[FOCUSED].border_w != 3.0::f32)          { ret 11; }
+    var l: Theme;
+    if (!made(?l, ?a)) { ret 1; }
+    light(?l);
+    if (t.text.r != l.text.r)                                           { ret 3; }
+    if (t.accent.r != 1.0::f32 || t.accent.g != 0.0::f32)               { ret 4; }
+    if (style(?t, BUTTON).states[ON].fill.r != 1.0::f32)                { ret 5; }
+    if (style(?t, PANEL).radius.tl != 6.0::f32)                         { ret 6; }
+    if (t.series[0].g != 1.0::f32 || t.series[1].b != 1.0::f32)         { ret 7; }
+    if (t.series[2].r != l.series[2].r)                                 { ret 8; }
+    if (style(?t, BUTTON).inset.t != 2.0::f32)                          { ret 9; }
+    if (style(?t, BUTTON).states[HOT].fill.b != 0x33::f32 / 255.0::f32) { ret 10; }
+    if (style(?t, LABEL).states[FOCUSED].border_w != 3.0::f32)          { ret 11; }
 
-    val bad: res[Theme, LoadError] = load("[button]\nfil = 1.0\n", ?a);
-    if (sel bad.ok)           { ret 12; }
-    if (!sel bad.err.unknown) { ret 12; }
-    if (bad.err.unknown != 9) { ret 12; }
-    val worse: res[Theme, LoadError] = load("[button.hot]\nfill = 3\n", ?a);
+    # a refused document leaves the theme as it was
+    val bad: err[LoadError] = load(?t, "[button]\nfil = 1.0\n");
+    if (sel bad.ok)             { ret 12; }
+    if (!sel bad.err.unknown)   { ret 12; }
+    if (bad.err.unknown != 9)   { ret 12; }
+    if (t.accent.r != 1.0::f32) { ret 12; }
+    val worse: err[LoadError] = load(?t, "[button.hot]\nfill = 3\n");
     if (!(sel worse.err && sel worse.err.value)) { ret 13; }
-    val base: res[Theme, LoadError] = load("base = \"pink\"\n", ?a);
+    val base: err[LoadError] = load(?t, "base = \"pink\"\n");
     if (!(sel base.err && sel base.err.base)) { ret 14; }
-    val syntax: res[Theme, LoadError] = load("[button\n", ?a);
+    val syntax: err[LoadError] = load(?t, "[button\n");
     if (!(sel syntax.err && sel syntax.err.toml)) { ret 15; }
+
+    # a kind is a table only once it is registered
+    val unknown: err[LoadError] = load(?t, "[badge.hot]\nfill = \"#00ff00\"\n");
+    if (sel unknown.ok)           { ret 16; }
+    if (!sel unknown.err.unknown) { ret 16; }
+    if (unknown.err.unknown != 1) { ret 16; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err) { ret 17; }
+    val known: err[LoadError] = load(?t, "[badge.hot]\nfill = \"#00ff00\"\n");
+    if (sel known.err)                                                   { ret 18; }
+    if (style(?t, k.ok).states[HOT].fill.g != 1.0::f32)                  { ret 19; }
+    if (style(?t, k.ok).states[NORMAL].fill.g != 0xA0::f32 / 255.0::f32) { ret 20; }
+    val f1: err[allo.Error] = free(?t);
+    val f2: err[allo.Error] = free(?l);
     ret 0;
 }
 
 test document__is_the_readme_field_table {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
     var w: tw.Writer;
     tw.init(?w, ?a);
     tw.reset(?w);
-    document(?w);
+    document(?w, ?t);
     val text: res[str, allo.Error] = tw.text(?w);
     if (sel text.err) { ret 2; }
     val doc:   str   = text.ok;

@@ -164,7 +164,7 @@ pub fun row_gap(ctx: *context.Context) f32 {
 # spacing between adjacent layout rows in the default theme at scale 1.0
 #[deprecated("use row_gap(ctx), which follows the theme and scale")]
 pub fun layout_gap() f32 {
-    ret theme.default().gap;
+    ret 4.0::f32;
 }
 
 # the top of a line of text centered in a row from y, h tall
@@ -3961,11 +3961,15 @@ test theme__drives_colors_and_corners {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var t: theme.Theme = theme.default();
+    var t:  theme.Theme;
+    val te: err[allo.Error] = theme.init(?t, ?a);
+    if (sel te.err) { ret 1; }
     t.control = draw.rgba(0.9::f32, 0.1::f32, 0.1::f32, 1.0::f32);
     t.corner  = 4.0::f32;
     theme.derive(?t);
-    context.set_theme(?ctx, t);
+    val se: err[allo.Error] = context.set_theme(?ctx, ?t);
+    if (sel se.err) { ret 1; }
+    val tf: err[allo.Error] = theme.free(?t);
     if (context.theme_of(?ctx).corner != 4.0::f32) { ret 2; }
 
     # the button's face is rounded in the theme's control color: no solid

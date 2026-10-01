@@ -32,19 +32,25 @@ pub val EDITED: u8 = 1;
 # save was pressed this frame: write style.save_theme's text out
 pub val SAVE: u8 = 2;
 
-# the groups before the kinds in the group list
-val GROUPS: usize = 3;
+# the groups the editor shows: the palette, the metrics, the chart fields and
+# a widget kind
+val GROUPS: usize = 4;
+
+# the group showing a widget kind
+val GROUP_KIND: usize = 3;
 
 # the longest a length slider reaches, unscaled
 val LENGTH_MAX: f32 = 48.0;
 
 # what the editor keeps in the context's store under its id
 # ---
-# group:  the group shown: 0 palette, 1 metrics, 2 plot, then each kind
+# group:  the group shown: 0 palette, 1 metrics, 2 plot, 3 a widget kind
+# kind:   the kind shown, by handle, any kind the theme has registered
 # state:  the state a kind's paint fields are shown for
 # scroll: the field list's scroll state
 pub rec EditorState {
     group:  usize;
+    kind:   usize;
     state:  usize;
     scroll: widget.Scroll;
 }
@@ -140,15 +146,16 @@ fun field(ctx: *context.Context, row: usize, p: th.Path, name: str) u8 {
 }
 
 # a field's path text, NUL-terminated in buf
-fun named(p: th.Path, buf: *u8) str {
-    th.path_text(p, buf, 64);
+fun named(t: *th.Theme, p: th.Path, buf: *u8) str {
+    th.path_text(t, p, buf, 64);
     ret buf::str;
 }
 
 # a theme editor across the column, editing the context's live theme
 #
-# a row of built-in themes replaces the theme with one, a dropdown picks the
-# group shown and, for a widget kind, another its state, and the group's
+# a row of built-in themes gives the theme one of their looks, a dropdown
+# picks the group shown and, for a widget kind, others pick any registered
+# kind and its state, and the group's
 # fields follow in a scrolling list h pixels tall, each with its meaning and
 # a slider per float. a save button closes it. the editor is an id scope of
 # its own and keeps its choices in the context's store under its key.
@@ -163,25 +170,26 @@ pub fun theme_editor(ctx: *context.Context, key: str, h: f32) u8 {
     context.push_id(ctx, id);
     var out: u8 = 0;
 
-    val b: usize = widget.buttons(ctx, ?th.BUILTIN_NAMES[0], th.BUILTINS);
+    val t: *th.Theme = context.theme_of(ctx);
+    val b: usize     = widget.buttons(ctx, ?th.BUILTIN_NAMES[0], th.BUILTINS);
     if (b < th.BUILTINS) {
-        context.set_theme(ctx, th.builtin_at(b));
+        context.theme_replaced(ctx);
+        th.set_builtin(t, b);
         out = out | EDITED;
     }
 
-    var groups: [54]str;
+    var groups: [4]str;
     groups[0] = "palette";
     groups[1] = "metrics";
     groups[2] = "plot";
-    var k: usize = 0;
-    for (k < th.KINDS::usize) {
-        groups[GROUPS + k] = th.KIND_NAMES[k].name;
-        k                  = k + 1;
-    }
-    if (st.group >= GROUPS + th.KINDS::usize) { st.group = 0; }
-    widget.dropdown(ctx, "group", ?st.group, ?groups[0], GROUPS + th.KINDS::usize);
-    var kind: bool = st.group >= GROUPS;
+    groups[3] = "kind";
+    if (st.group >= GROUPS) { st.group = 0; }
+    widget.dropdown(ctx, "group", ?st.group, ?groups[0], GROUPS);
+    val kind: bool = st.group == GROUP_KIND;
     if (kind) {
+        val n: usize = th.kind_count(t)::usize;
+        if (st.kind >= n) { st.kind = 0; }
+        widget.dropdown(ctx, "kind", ?st.kind, th.kind_names(t), n);
         var states: [6]str;
         var s:      usize = 0;
         for (s < th.STATES::usize) {
@@ -201,13 +209,13 @@ pub fun theme_editor(ctx: *context.Context, key: str, h: f32) u8 {
             var e: usize = 0;
             for (e < f.count) {
                 val p: th.Path = th.exact(row, 0, 0, e);
-                out = out | field(ctx, row, p, named(p, ?buf[0]));
+                out = out | field(ctx, row, p, named(t, p, ?buf[0]));
                 e   = e + 1;
             }
         }
         if (kind && (f.group == th.GROUP_STYLE || f.group == th.GROUP_PAINT)) {
-            val p: th.Path = th.exact(row, (st.group - GROUPS)::u32, st.state::u8, 0);
-            out = out | field(ctx, row, p, named(p, ?buf[0]));
+            val p: th.Path = th.exact(row, st.kind::u32, st.state::u8, 0);
+            out = out | field(ctx, row, p, named(t, p, ?buf[0]));
         }
         row = row + 1;
     }
@@ -232,11 +240,6 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
     widget.end_panel(ctx, b);
 }
 
-test editor__group_list_holds_every_group_and_kind {
-    if (GROUPS + th.KINDS::usize != 54) { ret 1; }
-    ret 0;
-}
-
 test editor__switches_edits_and_asks_to_save {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -247,9 +250,9 @@ test editor__switches_edits_and_asks_to_save {
     if (sel e.err) { ret 1; }
     driver.steps(?d, 2);
 
-    if (!driver.click(?d, driver.find(?d, "theme/dark"))) { ret 2; }
-    if (d.ctx.theme.text.r != th.dark().text.r)           { ret 3; }
-    if ((p.bits & EDITED) == 0)                           { ret 4; }
+    if (!driver.click(?d, driver.find(?d, "theme/dark")))     { ret 2; }
+    if (d.ctx.theme.text.r != draw.hex(0xE6E8EE, 1.0::f32).r) { ret 3; }
+    if ((p.bits & EDITED) == 0)                               { ret 4; }
 
     # the palette shows first: drag panel's red to the left end
     p.bits = 0;
