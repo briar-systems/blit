@@ -1,0 +1,1767 @@
+# docking: windows dock into a dock space, split it, stack as tabs and float
+# out again, with the layout kept in the context's store
+#
+# a dock space fills a rect, the whole screen or any region of it, with a tree
+# of nodes. a split node divides its rect between two children along an axis
+# by a ratio, and a leaf is a tab stack of windows. the tree lives in the
+# state store, a SpaceState under the space's id and a Node under each node's
+# id, and each docked window keeps a widget.Docked under its own id naming its
+# leaf. none of it outgrows a store entry however large the layout gets, every
+# part is pinned, and persist makes all of it save and load with the rest of
+# the store, the windows' own state included.
+#
+# space(ctx, key, area) draws a space once a frame: it lays the tree out, draws
+# a splitter between the two children of every split, a tab bar (blit.tabs)
+# across the top of every leaf, and tells each docked window where its body
+# goes (widget.Docked). the windows draw themselves with begin_window as when
+# they float, with the same content code and the same ids, so their scroll and
+# every widget's state carry over. draw the space before its windows, or they
+# draw one frame behind it. a leaf whose windows are all closed or not drawn
+# gives its room to its sibling, so closing a window leaves no hole, and its
+# place comes back when it opens again.
+#
+# a splitter drags the ratio of its split, keeping each side at least the
+# least size of what it holds: a few rows for a leaf, or more when a window
+# docked there declares a larger min_w or min_h. a tab bar selects, reorders,
+# closes (the window's WindowState.closed) and tears off its windows, and a tab
+# torn off floats again where it was released.
+#
+# while a window's titlebar (widget.WINDOW_KIND) or a docked window's tab
+# (tabs.KIND) is dragged over a space, the space shows its drop zones: over
+# the leaf under the pointer a centre zone, docking as a tab, and four edge
+# zones, splitting the leaf, and near the space's outer edges four zones
+# splitting the whole space. the zone under the pointer shows where the window
+# would land, and releasing over it docks the window there. a floating window
+# dragged over a leaf's tab bar docks as a tab too. holding the space's
+# suppress modifiers (shift by default, see set_suppress) shows no zones and
+# docks nothing, so a window can be moved across a space freely.
+#
+# a layout is built in code with root, split and add, typically once while
+# empty says the space holds nothing, such as before a saved layout was
+# loaded. begin_dock is the one-call side panel: a space carved from a screen
+# edge whose root holds the panel's own content, which other windows dock
+# beside or tab with like any leaf.
+#
+# the chrome draws its colours and lengths through look alone, the one place
+# a style system maps the dock's look from the theme.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+
+use blit.band;
+use blit.context;
+use blit.dnd;
+use blit.draw;
+use blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.tabs;
+use blit.theme;
+use blit.widget;
+
+# the share of a leaf a window docked at one of its edges takes
+pub val SHARE: f32 = 0.5;
+
+# the share of the whole space a window docked at one of its outer edges takes
+pub val OUTER: f32 = 0.25;
+
+# the modifiers that, held, keep a drag from docking, unless set_suppress
+# says otherwise
+pub val SUPPRESS: u8 = 1;
+
+# the axes a split divides along
+#
+# AXIS_X: a left of b
+# AXIS_Y: a above b
+pub val AXIS_X: u8 = 0;
+pub val AXIS_Y: u8 = 1;
+
+# the drop zones: none, a leaf's centre and edges, the space's outer edges
+val ZONE_NONE:    u8 = 0;
+val ZONE_CENTER:  u8 = 1;
+val ZONE_LEFT:    u8 = 2;
+val ZONE_RIGHT:   u8 = 3;
+val ZONE_TOP:     u8 = 4;
+val ZONE_BOTTOM:  u8 = 5;
+val OUTER_LEFT:   u8 = 6;
+val OUTER_RIGHT:  u8 = 7;
+val OUTER_TOP:    u8 = 8;
+val OUTER_BOTTOM: u8 = 9;
+
+# what a frame asks the tree to do once the space is drawn
+val ACT_NONE:  u8 = 0;
+val ACT_FLOAT: u8 = 1;
+val ACT_MOVE:  u8 = 2;
+val ACT_DOCK:  u8 = 3;
+
+# rank a window docked at the end of a stack takes, past any real index
+val LAST: f64 = 1.0e9;
+
+# what a dock space keeps in the store under its id
+# ---
+# root:     the root node, 0 before the first is made
+# next:     node ids handed out so far
+# suppress: the MOD_* bits that, held, keep a drag from docking
+# custom:   1 once set_suppress chose them, else SUPPRESS applies
+pub rec SpaceState {
+    root:     u64;
+    next:     u64;
+    suppress: u8;
+    custom:   u8;
+}
+
+# what a node keeps in the store under its id
+#
+# a leaf has no children. the rest is this frame's layout, written as the
+# space draws.
+# ---
+# space:  the space it belongs to
+# parent: its parent, 0 for the root
+# a:      its first child, 0 for a leaf
+# b:      its second child
+# axis:   AXIS_X or AXIS_Y
+# ratio:  a's share of the split
+# front:  a leaf's selected window, 0 for none
+# live:   1 when it holds a window drawn this frame or the last
+# laid:   the stamp it was last laid out in
+# mw:     least width it can take
+# mh:     least height it can take
+# x0:     its rect, in screen pixels
+# y0:     top
+# x1:     right
+# y1:     bottom
+# strip:  bottom of a leaf's tab bar, y0 when it shows none
+pub rec Node {
+    space:  u64;
+    parent: u64;
+    a:      u64;
+    b:      u64;
+    axis:   u8;
+    ratio:  f32;
+    front:  u64;
+    live:   u8;
+    laid:   u64;
+    mw:     f32;
+    mh:     f32;
+    x0:     f32;
+    y0:     f32;
+    x1:     f32;
+    y1:     f32;
+    strip:  f32;
+}
+
+# where a splitter's ratio stood at the press that drags it
+rec Hold {
+    at: f32;
+}
+
+# the colours and lengths the dock's chrome draws with
+# ---
+# bg:       the space's background, behind empty leaves and between nodes
+# edge:     the line on a side panel's inner side
+# edge_w:   its width
+# split:    a splitter under the pointer
+# split_on: a splitter being dragged
+# split_w:  a splitter's thickness
+# zone:     a drop zone at rest
+# zone_on:  the drop zone under the pointer
+# rim:      a drop zone's outline
+# preview:  where a window would land
+# zone_w:   a drop zone's side
+pub rec Look {
+    bg:       draw.Color;
+    edge:     draw.Color;
+    edge_w:   f32;
+    split:    draw.Color;
+    split_on: draw.Color;
+    split_w:  f32;
+    zone:     draw.Color;
+    zone_on:  draw.Color;
+    rim:      draw.Color;
+    preview:  draw.Color;
+    zone_w:   f32;
+}
+
+# the dock's look at the context's theme and scale
+fun look(ctx: *context.Context) Look {
+    val t: *theme.Theme = context.theme_of(ctx);
+    var l: Look;
+    l.bg       = t.dock;
+    l.edge     = t.edge;
+    l.edge_w   = context.px(ctx, t.edge_w);
+    l.split    = t.handle;
+    l.split_on = t.handle_on;
+    l.split_w  = context.px(ctx, t.gap);
+    l.zone     = t.control;
+    l.zone_on  = t.accent;
+    l.rim      = t.edge;
+    l.preview  = t.select;
+    l.zone_w   = widget.control_height(ctx) * 1.5::f32;
+    ret l;
+}
+
+# the smaller of two f32 values
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# clamp v to [lo, hi]
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# a space's state, made and pinned the first time it is asked for
+fun space_of(ctx: *context.Context, sid: u64) *SpaceState {
+    val have: *SpaceState = state.find[SpaceState](ctx, sid);
+    if (have != nil) { ret have; }
+    val sp: *SpaceState = state.get[SpaceState](ctx, sid);
+    state.pin[SpaceState](ctx, sid, 1);
+    ret sp;
+}
+
+# a new, pinned leaf of a space
+fun new_node(ctx: *context.Context, sid: u64) u64 {
+    val sp: *SpaceState = space_of(ctx, sid);
+    var id: u64         = 0;
+    for (id == 0 || state.find[Node](ctx, id) != nil) {
+        sp.next = sp.next + 1;
+        id      = bid.child_int(sid, sp.next);
+    }
+    val n: *Node = state.get[Node](ctx, id);
+    state.pin[Node](ctx, id, 1);
+    n.space = sid;
+    n.ratio = 0.5::f32;
+    ret id;
+}
+
+# the node with an id, nil when there is none
+fun node(ctx: *context.Context, id: u64) *Node {
+    if (id == 0) { ret nil; }
+    ret state.find[Node](ctx, id);
+}
+
+# the root node of a dock space, made as an empty leaf when it has none
+#
+# start a layout in code here, and split and add from it.
+# ---
+# ctx:   context
+# space: the space's id, its key's id (see context.id_of)
+# ret:   the root's id
+pub fun root(ctx: *context.Context, space: u64) u64 {
+    val sp: *SpaceState = space_of(ctx, space);
+    if (sp.root == 0 || node(ctx, sp.root) == nil) { sp.root = new_node(ctx, space); }
+    ret sp.root;
+}
+
+# put node to where old stood: its parent's child, or the space's root
+fun replace(ctx: *context.Context, old: u64, to: u64) {
+    val o: *Node = node(ctx, old);
+    val t: *Node = node(ctx, to);
+    if (o == nil || t == nil) { ret; }
+    t.parent = o.parent;
+    val p: *Node = node(ctx, o.parent);
+    if (p == nil) {
+        space_of(ctx, o.space).root = to;
+        ret;
+    }
+    if (p.a == old) { p.a = to; }
+    or              { p.b = to; }
+}
+
+# split a node, making a new empty leaf on one side of it
+#
+# the node keeps its id and everything it holds, and takes what the new leaf
+# leaves. a new split node takes its place in the tree, holding both.
+# ---
+# ctx:   context
+# id:    the node to split, a leaf or a split
+# side:  the side the new leaf goes on
+# share: the new leaf's share of the node's rect, in (0, 1)
+# ret:   the new leaf's id, 0 when id is no node
+pub fun split(ctx: *context.Context, id: u64, side: context.Side, share: f32) u64 {
+    val n: *Node = node(ctx, id);
+    if (n == nil) { ret 0; }
+    val sid: u64   = n.space;
+    val s:   u64   = new_node(ctx, sid);
+    val f:   u64   = new_node(ctx, sid);
+    val sn:  *Node = node(ctx, s);
+    replace(ctx, id, s);
+    var sh: f32 = clampf(share, 0.05::f32, 0.95::f32);
+    sn.axis = AXIS_X;
+    if ((sel side.top) || (sel side.bottom)) { sn.axis = AXIS_Y; }
+    if ((sel side.left) || (sel side.top)) {
+        sn.a     = f;
+        sn.b     = id;
+        sn.ratio = sh;
+    }
+    or {
+        sn.a     = id;
+        sn.b     = f;
+        sn.ratio = 1.0::f32 - sh;
+    }
+    n.parent            = s;
+    node(ctx, f).parent = s;
+    ret f;
+}
+
+# counts the windows docked in one node, leaving one out
+# ---
+# node: the node
+# skip: the window left out
+# n:    windows counted
+rec Count {
+    node: u64;
+    skip: u64;
+    n:    usize;
+}
+
+fun count_one(dk: *widget.Docked, user: ptr) {
+    val c: *Count = user::*Count;
+    if (dk.node == c.node && dk.id != c.skip) { c.n = c.n + 1; }
+}
+
+# windows docked in a node, but one
+fun held(ctx: *context.Context, id: u64, skip: u64) usize {
+    var c: Count = Count{node: id, skip: skip, n: 0};
+    state.each[widget.Docked](ctx, count_one, (?c)::ptr);
+    ret c.n;
+}
+
+# take an empty leaf out of the tree, its sibling taking its parent's place
+#
+# the root stays, as an empty leaf.
+fun collapse(ctx: *context.Context, id: u64) {
+    val n: *Node = node(ctx, id);
+    if (n == nil) { ret; }
+    val p: *Node = node(ctx, n.parent);
+    if (p == nil) { ret; }
+    val pid: u64 = n.parent;
+    var sib: u64 = p.a;
+    if (sib == id) { sib = p.b; }
+    replace(ctx, pid, sib);
+    state.drop[Node](ctx, id);
+    state.drop[Node](ctx, pid);
+}
+
+# unlink a docked window from its leaf, which collapses when it held only it
+fun leave(ctx: *context.Context, dk: *widget.Docked) {
+    val old: u64 = dk.node;
+    dk.node  = 0;
+    dk.front = 0;
+    val n: *Node = node(ctx, old);
+    if (n == nil)                   { ret; }
+    if (n.front == dk.id)           { n.front = 0; }
+    if (held(ctx, old, dk.id) == 0) { collapse(ctx, old); }
+}
+
+# dock a window into a leaf as its last tab, selected
+#
+# a window docked elsewhere moves, and the leaf it left collapses when it
+# held only it. a window is its title's id (see context.id_of).
+# ---
+# ctx:    context
+# leaf:   the leaf, from root or split
+# window: the window's id
+pub fun add(ctx: *context.Context, leaf: u64, window: u64) {
+    place(ctx, leaf, window, LAST);
+}
+
+# dock a window into a leaf at a rank
+fun place(ctx: *context.Context, leaf: u64, window: u64, rank: f64) {
+    val n: *Node = node(ctx, leaf);
+    if (n == nil || n.a != 0 || window == 0) { ret; }
+    var dk: *widget.Docked = state.find[widget.Docked](ctx, window);
+    if (dk == nil) {
+        dk = state.get[widget.Docked](ctx, window);
+        state.pin[widget.Docked](ctx, window, 1);
+    }
+    dk.id = window;
+    if (dk.node != leaf) {
+        if (dk.node != 0) { leave(ctx, dk); }
+        dk.node = leaf;
+    }
+    dk.rank = rank;
+    n.front = window;
+}
+
+# float a docked window again
+#
+# the leaf it leaves collapses when it held only it. the window opens where
+# its state says, as it last floated.
+# ---
+# ctx:    context
+# window: the window's id
+pub fun remove(ctx: *context.Context, window: u64) {
+    val dk: *widget.Docked = state.find[widget.Docked](ctx, window);
+    if (dk == nil)    { ret; }
+    if (dk.node != 0) { leave(ctx, dk); }
+    state.drop[widget.Docked](ctx, window);
+}
+
+# the leaf a window is docked in
+# ---
+# ctx:    context
+# window: the window's id
+# ret:    the leaf's id, 0 while it floats
+pub fun node_of(ctx: *context.Context, window: u64) u64 {
+    val dk: *widget.Docked = state.find[widget.Docked](ctx, window);
+    if (dk == nil) { ret 0; }
+    ret dk.node;
+}
+
+# whether a space holds no layout yet: no split and no window, as before a
+# default layout is built or a saved one loaded
+# ---
+# ctx:   context
+# space: the space's id
+# ret:   true while it is empty
+pub fun empty(ctx: *context.Context, space: u64) bool {
+    val sp: *SpaceState = state.find[SpaceState](ctx, space);
+    if (sp == nil) { ret true; }
+    val r: *Node = node(ctx, sp.root);
+    if (r == nil) { ret true; }
+    ret r.a == 0 && held(ctx, sp.root, 0) == 0;
+}
+
+# choose the modifiers that, held while dragging, keep a drag from docking
+# into a space
+# ---
+# ctx:   context
+# space: the space's id
+# mods:  input.MOD_* bits, 0 for none, so docking is never suppressed
+pub fun set_suppress(ctx: *context.Context, space: u64, mods: u8) {
+    val sp: *SpaceState = space_of(ctx, space);
+    sp.suppress = mods;
+    sp.custom   = 1;
+}
+
+# the id of a leaf's tab bar
+fun bar_of(leaf: u64) u64 {
+    ret bid.of_label(leaf, "#tabs");
+}
+
+# the id of a split's splitter
+fun splitter(id: u64) u64 {
+    ret bid.child(id, "#split");
+}
+
+# a window docked in the space being drawn
+# ---
+# dk:   its Docked
+# live: true when it was drawn this frame or the last and is open
+rec Member {
+    dk:   *widget.Docked;
+    live: bool;
+}
+
+# what the tree is asked to do once the space is drawn
+# ---
+# kind:   ACT_*
+# window: the window it moves
+# node:   the leaf it goes to
+# zone:   where in the leaf, or the space, for ACT_DOCK
+# rank:   its rank there, for ACT_MOVE
+# x:      where it floats, for ACT_FLOAT
+# y:      where it floats
+# w:      the size it floats at when it never floated
+# h:      the height
+rec Act {
+    kind:   u8;
+    window: u64;
+    node:   u64;
+    zone:   u8;
+    rank:   f64;
+    x:      f32;
+    y:      f32;
+    w:      f32;
+    h:      f32;
+}
+
+# one frame's drawing of a space
+# ---
+# sid:   the space's id
+# sp:    its state
+# lk:    the look
+# stamp: this frame's stamp (see widget.dock_stamp)
+# rh:    a tab bar's height
+# m:     the windows docked in it, by leaf and rank
+# n:     how many
+# tabs:  scratch for one leaf's tabs, n long
+# act:   what to do once drawn
+# x0:    the space's rect
+# y0:    top
+# x1:    right
+# y1:    bottom
+rec Pass {
+    sid:   u64;
+    sp:    *SpaceState;
+    lk:    Look;
+    stamp: u64;
+    rh:    f32;
+    m:     *Member;
+    n:     usize;
+    tabs:  *tabs.Tab;
+    act:   Act;
+    x0:    f32;
+    y0:    f32;
+    x1:    f32;
+    y1:    f32;
+}
+
+# gathers the windows docked in one space
+# ---
+# ctx:   context
+# sid:   the space
+# items: where they go, nil while counting
+# n:     windows counted or gathered
+rec Gather {
+    ctx:   *context.Context;
+    sid:   u64;
+    items: *Member;
+    n:     usize;
+}
+
+fun gather_one(dk: *widget.Docked, user: ptr) {
+    val g: *Gather = user::*Gather;
+    val n: *Node   = node(g.ctx, dk.node);
+    if (n == nil || n.space != g.sid) { ret; }
+    if (g.items != nil)               { g.items[g.n].dk = dk; }
+    g.n = g.n + 1;
+}
+
+# whether a docked window shows: open, and drawn this frame or the last, or
+# not drawn yet at all, as right after a layout is built or loaded
+fun alive(ctx: *context.Context, dk: *widget.Docked, stamp: u64) bool {
+    val st: *widget.WindowState = state.find[widget.WindowState](ctx, dk.id);
+    if (st != nil && st.closed != 0 && dk.anchored == 0) { ret false; }
+    ret dk.drawn == 0 || dk.drawn + 1 >= stamp;
+}
+
+# whether member a sorts before member b: by leaf, then by rank
+fun before(a: *Member, b: *Member) bool {
+    if (a.dk.node != b.dk.node) { ret a.dk.node < b.dk.node; }
+    ret a.dk.rank < b.dk.rank;
+}
+
+# gather the space's windows into the pass, sorted by leaf and rank
+fun members(ctx: *context.Context, p: *Pass) bool {
+    var g: Gather = Gather{ctx: ctx, sid: p.sid, items: nil, n: 0};
+    state.each[widget.Docked](ctx, gather_one, (?g)::ptr);
+    p.n = g.n;
+    if (g.n == 0) { ret true; }
+    val got: res[*Member, allo.Error] = allo.allocate[Member](ctx.a, g.n);
+    if (sel got.err) { ret false; }
+    val tb: res[*tabs.Tab, allo.Error] = allo.allocate[tabs.Tab](ctx.a, g.n);
+    if (sel tb.err) {
+        val f: err[allo.Error] = allo.deallocate[Member](ctx.a, got.ok, g.n);
+        ret false;
+    }
+    p.m     = got.ok;
+    p.tabs  = tb.ok;
+    g.items = got.ok;
+    g.n     = 0;
+    state.each[widget.Docked](ctx, gather_one, (?g)::ptr);
+    var i: usize = 0;
+    for (i < p.n) {
+        p.m[i].live = alive(ctx, p.m[i].dk, p.stamp);
+        i           = i + 1;
+    }
+    i = 1;
+    for (i < p.n) {
+        val it: Member = p.m[i];
+        var j:  usize  = i;
+        for (j > 0 && before(?it, ?p.m[j - 1])) {
+            p.m[j] = p.m[j - 1];
+            j      = j - 1;
+        }
+        p.m[j] = it;
+        i      = i + 1;
+    }
+    ret true;
+}
+
+# release the pass's scratch
+fun release(ctx: *context.Context, p: *Pass) {
+    if (p.m == nil) { ret; }
+    val a: err[allo.Error] = allo.deallocate[Member](ctx.a, p.m, p.n);
+    val b: err[allo.Error] = allo.deallocate[tabs.Tab](ctx.a, p.tabs, p.n);
+    if ((sel a.err) || (sel b.err)) { ctx.oom = 1; }
+    p.m = nil;
+}
+
+# the first member docked in a leaf, n when none is
+fun first_of(p: *Pass, leaf: u64) usize {
+    var i: usize = 0;
+    for (i < p.n) {
+        if (p.m[i].dk.node == leaf) { ret i; }
+        i = i + 1;
+    }
+    ret p.n;
+}
+
+# work out which nodes hold a live window and the least size each can take
+fun measure(ctx: *context.Context, p: *Pass, id: u64) {
+    val n: *Node = node(ctx, id);
+    if (n == nil) { ret; }
+    val base: f32 = p.rh * 3.0::f32;
+    if (n.a == 0) {
+        n.live = 0;
+        n.mw   = base;
+        n.mh   = p.rh * 2.0::f32;
+        var i: usize = first_of(p, id);
+        for (i < p.n && p.m[i].dk.node == id) {
+            if (p.m[i].live) {
+                n.live = 1;
+                n.mw   = maxf(n.mw, p.m[i].dk.min_w);
+                n.mh   = maxf(n.mh, p.m[i].dk.min_h);
+            }
+            i = i + 1;
+        }
+        ret;
+    }
+    measure(ctx, p, n.a);
+    measure(ctx, p, n.b);
+    val a: *Node = node(ctx, n.a);
+    val b: *Node = node(ctx, n.b);
+    n.live = 0;
+    n.mw   = 0.0::f32;
+    n.mh   = 0.0::f32;
+    if (a == nil || b == nil) { ret; }
+    n.live = a.live | b.live;
+    if (a.live != 0 && b.live != 0) {
+        if (n.axis == AXIS_X) {
+            n.mw = a.mw + b.mw + p.lk.split_w;
+            n.mh = maxf(a.mh, b.mh);
+        }
+        or {
+            n.mw = maxf(a.mw, b.mw);
+            n.mh = a.mh + b.mh + p.lk.split_w;
+        }
+    }
+    or (a.live != 0) {
+        n.mw = a.mw;
+        n.mh = a.mh;
+    }
+    or {
+        n.mw = b.mw;
+        n.mh = b.mh;
+    }
+}
+
+# a's share of a split, kept so each side gets at least its least size
+fun fair(ratio: f32, avail: f32, amin: f32, bmin: f32) f32 {
+    if (avail <= 0.0::f32) { ret ratio; }
+    var lo: f32 = amin / avail;
+    var hi: f32 = 1.0::f32 - bmin / avail;
+    if (lo > hi) {
+        lo = amin / maxf(amin + bmin, 1.0::f32);
+        hi = lo;
+    }
+    ret clampf(ratio, lo, hi);
+}
+
+# lay a node out over a rect and draw it: a split's splitter, a leaf's tabs
+fun lay(ctx: *context.Context, p: *Pass, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) {
+    val n: *Node = node(ctx, id);
+    if (n == nil) { ret; }
+    n.x0    = x0;
+    n.y0    = y0;
+    n.x1    = x1;
+    n.y1    = y1;
+    n.strip = y0;
+    n.laid  = p.stamp;
+    if (n.a == 0) {
+        leaf(ctx, p, id, n);
+        ret;
+    }
+    val a: *Node = node(ctx, n.a);
+    val b: *Node = node(ctx, n.b);
+    if (a == nil || b == nil) { ret; }
+    if (a.live == 0 || b.live == 0) {
+        if (b.live == 0) { lay(ctx, p, n.a, x0, y0, x1, y1); }
+        or               { lay(ctx, p, n.b, x0, y0, x1, y1); }
+        ret;
+    }
+
+    val t:     f32  = p.lk.split_w;
+    val along: bool = n.axis == AXIS_X;
+    var avail: f32  = y1 - y0 - t;
+    var amin:  f32  = a.mh;
+    var bmin:  f32  = b.mh;
+    if (along) {
+        avail = x1 - x0 - t;
+        amin  = a.mw;
+        bmin  = b.mw;
+    }
+    val sid: u64 = splitter(id);
+    var dx:  f32;
+    var dy:  f32;
+    if (interact.drag(ctx, sid, ?dx, ?dy) && avail > 0.0::f32) {
+        val h: *Hold = state.get[Hold](ctx, sid);
+        var d: f32   = dy;
+        if (along) { d = dx; }
+        n.ratio = fair(h.at + d / avail, avail, amin, bmin);
+    }
+    val r:   f32 = fair(n.ratio, avail, amin, bmin);
+    val cut: f32 = maxf(avail, 0.0::f32) * r;
+
+    var sx0: f32 = x0;
+    var sy0: f32 = y0 + cut;
+    var sx1: f32 = x1;
+    var sy1: f32 = sy0 + t;
+    if (along) {
+        sx0 = x0 + cut;
+        sy0 = y0;
+        sx1 = sx0 + t;
+        sy1 = y1;
+    }
+    val hs: interact.Hit = interact.hit(ctx, sid, sx0, sy0, sx1, sy1, input.BUTTON_LEFT);
+    if (hs.pressed) { state.get[Hold](ctx, sid).at = r; }
+    if (hs.hot || hs.active) {
+        if (along) { context.set_cursor(ctx, input.CURSOR_RESIZE_EW); }
+        or         { context.set_cursor(ctx, input.CURSOR_RESIZE_NS); }
+        var c: draw.Color = p.lk.split;
+        if (hs.active) { c = p.lk.split_on; }
+        context.quad(ctx, sx0, sy0, sx1, sy1, c);
+    }
+    if (along) {
+        lay(ctx, p, n.a, x0, y0, sx0, y1);
+        lay(ctx, p, n.b, sx1, y0, x1, y1);
+    }
+    or {
+        lay(ctx, p, n.a, x0, y0, x1, sy0);
+        lay(ctx, p, n.b, x0, sy1, x1, y1);
+    }
+}
+
+# the member of a leaf with a window's id, n when none
+fun member(p: *Pass, leaf: u64, window: u64) usize {
+    var i: usize = first_of(p, leaf);
+    for (i < p.n && p.m[i].dk.node == leaf) {
+        if (p.m[i].dk.id == window) { ret i; }
+        i = i + 1;
+    }
+    ret p.n;
+}
+
+# draw a leaf: its tab bar, unless it holds one window without a title, and
+# where its windows go
+fun leaf(ctx: *context.Context, p: *Pass, id: u64, n: *Node) {
+    val lo: usize = first_of(p, id);
+    var hi: usize = lo;
+    var k:  usize = 0;
+    for (hi < p.n && p.m[hi].dk.node == id) {
+        if (p.m[hi].live) {
+            p.tabs[k] = tabs.Tab{key: p.m[hi].dk.id, label: ?p.m[hi].dk.label[0], closable: p.m[hi].dk.closable != 0};
+            k         = k + 1;
+        }
+        hi = hi + 1;
+    }
+    if (k == 0) { ret; }
+
+    var front: u64  = p.tabs[0].key;
+    val alone: bool = k == 1 && p.m[member(p, id, front)].dk.bare != 0;
+    if (!alone) {
+        val bar: u64 = bar_of(id);
+        if (n.front != 0) {
+            val cur: opt[u64] = tabs.selected(ctx, bar);
+            if (!(sel cur.some && cur.some == n.front)) { tabs.select(ctx, bar, n.front); }
+        }
+        context.push_layout(ctx, layout.column(n.x0, n.y0, n.x1 - n.x0, 0.0::f32, widget.row_gap(ctx)));
+        context.push_id(ctx, id);
+        val ev: tabs.Event = tabs.bar(ctx, "#tabs", p.tabs, k);
+        context.pop_id(ctx);
+        context.pop_layout(ctx);
+        n.strip = minf(n.y0 + p.rh, n.y1);
+        front   = ev.selected;
+        var i: usize = 0;
+        for (i < k) {
+            val at: usize = member(p, id, p.tabs[i].key);
+            if (at < p.n) { p.m[at].dk.rank = i::f64; }
+            i = i + 1;
+        }
+        tab_event(ctx, p, id, n, ev);
+    }
+    n.front = front;
+
+    var j: usize = lo;
+    for (j < hi) {
+        val dk: *widget.Docked = p.m[j].dk;
+        dk.front = 0;
+        if (p.m[j].live) {
+            dk.placed = p.stamp;
+            dk.x0     = n.x0;
+            dk.y0     = n.strip;
+            dk.x1     = n.x1;
+            dk.y1     = n.y1;
+            if (dk.id == front) { dk.front = 1; }
+        }
+        j = j + 1;
+    }
+}
+
+# act on what a leaf's tab bar did
+fun tab_event(ctx: *context.Context, p: *Pass, id: u64, n: *Node, ev: tabs.Event) {
+    if (ev.closed) {
+        val st: *widget.WindowState = state.get[widget.WindowState](ctx, ev.key);
+        st.closed = 1;
+    }
+    if (ev.torn) {
+        val at: usize = member(p, id, ev.key);
+        if (at < p.n && p.m[at].dk.anchored == 0) {
+            p.act = Act{kind: ACT_FLOAT, window: ev.key, node: 0, zone: 0, rank: 0.0::f64, x: ctx.in.mx, y: ctx.in.my, w: n.x1 - n.x0, h: n.y1 - n.y0};
+        }
+    }
+    if (ev.arrived) {
+        val dk: *widget.Docked = state.find[widget.Docked](ctx, ev.key);
+        if (dk != nil && dk.node != 0 && bar_of(dk.node) == ev.from) {
+            p.act = Act{kind: ACT_MOVE, window: ev.key, node: id, zone: 0, rank: ev.at::f64 - 0.5::f64, x: 0.0::f32, y: 0.0::f32, w: 0.0::f32, h: 0.0::f32};
+        }
+    }
+}
+
+# the leaf under a point, among the nodes laid out this pass, 0 for none
+fun leaf_at(ctx: *context.Context, p: *Pass, id: u64, x: f32, y: f32) u64 {
+    val n: *Node = node(ctx, id);
+    if (n == nil || n.laid != p.stamp)                  { ret 0; }
+    if (x < n.x0 || x >= n.x1 || y < n.y0 || y >= n.y1) { ret 0; }
+    if (n.a == 0)                                       { ret id; }
+    val a: u64 = leaf_at(ctx, p, n.a, x, y);
+    if (a != 0) { ret a; }
+    ret leaf_at(ctx, p, n.b, x, y);
+}
+
+# whether a point lies in a rect
+fun inside(r: context.Area, x: f32, y: f32) bool {
+    ret x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
+}
+
+# the square of a leaf's zone: the centre, or one beside it towards an edge
+fun leaf_zone(lk: Look, n: *Node, z: u8) context.Area {
+    val s:  f32 = lk.zone_w;
+    val g:  f32 = s * 0.25::f32;
+    var cx: f32 = (n.x0 + n.x1) / 2.0::f32;
+    var cy: f32 = (n.y0 + n.y1) / 2.0::f32;
+    if (z == ZONE_LEFT)   { cx = cx - s - g; }
+    if (z == ZONE_RIGHT)  { cx = cx + s + g; }
+    if (z == ZONE_TOP)    { cy = cy - s - g; }
+    if (z == ZONE_BOTTOM) { cy = cy + s + g; }
+    val h: f32 = s / 2.0::f32;
+    ret context.Area{x0: cx - h, y0: cy - h, x1: cx + h, y1: cy + h};
+}
+
+# the square of an outer zone, by the middle of one of the space's edges
+fun outer_zone(lk: Look, p: *Pass, z: u8) context.Area {
+    val s:  f32 = lk.zone_w;
+    val g:  f32 = s * 0.25::f32;
+    var cx: f32 = (p.x0 + p.x1) / 2.0::f32;
+    var cy: f32 = (p.y0 + p.y1) / 2.0::f32;
+    if (z == OUTER_LEFT)   { cx = p.x0 + g + s / 2.0::f32; }
+    if (z == OUTER_RIGHT)  { cx = p.x1 - g - s / 2.0::f32; }
+    if (z == OUTER_TOP)    { cy = p.y0 + g + s / 2.0::f32; }
+    if (z == OUTER_BOTTOM) { cy = p.y1 - g - s / 2.0::f32; }
+    val h: f32 = s / 2.0::f32;
+    ret context.Area{x0: cx - h, y0: cy - h, x1: cx + h, y1: cy + h};
+}
+
+# the side a zone docks on
+fun side_of(z: u8) context.Side {
+    if (z == ZONE_LEFT || z == OUTER_LEFT)   { ret context.Side.left{}; }
+    if (z == ZONE_RIGHT || z == OUTER_RIGHT) { ret context.Side.right{}; }
+    if (z == ZONE_TOP || z == OUTER_TOP)     { ret context.Side.top{}; }
+    ret context.Side.bottom{};
+}
+
+# the part of a rect a share of it on one side takes
+fun part(r: context.Area, side: context.Side, share: f32) context.Area {
+    var o: context.Area = r;
+    if (sel side.left)  { o.x1 = r.x0 + (r.x1 - r.x0) * share; }
+    or (sel side.right) { o.x0 = r.x1 - (r.x1 - r.x0) * share; }
+    or (sel side.top)   { o.y1 = r.y0 + (r.y1 - r.y0) * share; }
+    or                  { o.y0 = r.y1 - (r.y1 - r.y0) * share; }
+    ret o;
+}
+
+# where a window docked at a zone lands
+fun preview(ctx: *context.Context, p: *Pass, leaf: u64, z: u8) context.Area {
+    val whole: context.Area = context.Area{x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1};
+    if (z >= OUTER_LEFT) { ret part(whole, side_of(z), OUTER); }
+    val n: *Node        = node(ctx, leaf);
+    val r: context.Area = context.Area{x0: n.x0, y0: n.y0, x1: n.x1, y1: n.y1};
+    if (z == ZONE_CENTER) { ret r; }
+    ret part(r, side_of(z), SHARE);
+}
+
+# draw a zone's square, lit when the pointer is over it
+fun zone_box(ctx: *context.Context, lk: Look, r: context.Area, on: bool) {
+    var c: draw.Color = lk.zone;
+    if (on) { c = lk.zone_on; }
+    context.quad(ctx, r.x0, r.y0, r.x1, r.y1, c);
+    context.frame(ctx, r.x0, r.y0, r.x1, r.y1, maxf(lk.edge_w, 1.0::f32), lk.rim);
+}
+
+# the window a drag in flight over the space would dock, 0 for none
+# ---
+# up:  set when its button came up this frame
+# tab: set when it is a docked window's tab rather than a titlebar
+fun dragged(ctx: *context.Context, up: *bool, tab: *bool) u64 {
+    @up  = false;
+    @tab = false;
+    val pw: opt[dnd.Payload] = dnd.carried(ctx, widget.WINDOW_KIND);
+    if (sel pw.some) {
+        if (pw.some.n != $size_of(u64)) { ret 0; }
+        @up = pw.some.released;
+        ret @(pw.some.data::*u64);
+    }
+    val pt: opt[dnd.Payload] = dnd.carried(ctx, tabs.KIND);
+    if (sel pt.some) {
+        if (pt.some.n != $size_of(tabs.Carried)) { ret 0; }
+        val c:  tabs.Carried   = @(pt.some.data::*tabs.Carried);
+        val dk: *widget.Docked = state.find[widget.Docked](ctx, c.key);
+        if (dk == nil || dk.node == 0 || bar_of(dk.node) != c.bar) { ret 0; }
+        @up  = pt.some.released;
+        @tab = true;
+        ret c.key;
+    }
+    ret 0;
+}
+
+# show the drop zones under a drag over the space, with where the window
+# would land, and dock it when it is released over one
+fun zones(ctx: *context.Context, p: *Pass, rid: u64) {
+    var up:  bool;
+    var tab: bool;
+    val wid: u64 = dragged(ctx, ?up, ?tab);
+    if (wid == 0) { ret; }
+    var mods: u8 = SUPPRESS;
+    if (p.sp.custom != 0)          { mods = p.sp.suppress; }
+    if ((ctx.in.mods & mods) != 0) { ret; }
+    val mx: f32 = ctx.in.mx;
+    val my: f32 = ctx.in.my;
+    if (mx < p.x0 || mx >= p.x1 || my < p.y0 || my >= p.y1) { ret; }
+
+    val t: u64   = leaf_at(ctx, p, rid, mx, my);
+    val n: *Node = node(ctx, t);
+    val r: *Node = node(ctx, rid);
+
+    # a leaf's own zones: the centre alone into an empty leaf, none over the
+    # leaf a tab is dragged from when it is the leaf's only window, and none
+    # over a tab bar a tab is dragged over, which takes it itself
+    val strip:  bool = n != nil && my < n.strip;
+    var centre: bool = n != nil;
+    var edges:  bool = n != nil && n.live != 0;
+    if (n != nil && tab && node_of(ctx, wid) == t) {
+        centre = false;
+        if (held(ctx, t, wid) == 0) { edges = false; }
+    }
+    if (strip && tab) {
+        centre = false;
+        edges  = false;
+    }
+    val outer: bool = r != nil && r.live != 0;
+
+    var hit: u8 = ZONE_NONE;
+    var z:   u8 = OUTER_LEFT;
+    for (outer && hit == ZONE_NONE && z <= OUTER_BOTTOM) {
+        if (inside(outer_zone(p.lk, p, z), mx, my)) { hit = z; }
+        z = z + 1;
+    }
+    if (hit == ZONE_NONE && centre && strip) { hit = ZONE_CENTER; }
+    z = ZONE_CENTER;
+    for (hit == ZONE_NONE && z <= ZONE_BOTTOM) {
+        val on: bool = (z == ZONE_CENTER && centre) || (z != ZONE_CENTER && edges);
+        if (on && inside(leaf_zone(p.lk, n, z), mx, my)) { hit = z; }
+        z = z + 1;
+    }
+
+    context.push_band(ctx, band.DRAG, 0);
+    if (hit != ZONE_NONE) {
+        val pv: context.Area = preview(ctx, p, t, hit);
+        context.quad(ctx, pv.x0, pv.y0, pv.x1, pv.y1, p.lk.preview);
+        context.frame(ctx, pv.x0, pv.y0, pv.x1, pv.y1, maxf(p.lk.edge_w, 1.0::f32), p.lk.zone_on);
+    }
+    z = ZONE_CENTER;
+    for (z <= ZONE_BOTTOM) {
+        val on: bool = (z == ZONE_CENTER && centre) || (z != ZONE_CENTER && edges);
+        if (on) { zone_box(ctx, p.lk, leaf_zone(p.lk, n, z), hit == z); }
+        z = z + 1;
+    }
+    z = OUTER_LEFT;
+    for (outer && z <= OUTER_BOTTOM) {
+        zone_box(ctx, p.lk, outer_zone(p.lk, p, z), hit == z);
+        z = z + 1;
+    }
+    context.pop_band(ctx);
+
+    if (hit != ZONE_NONE && up && dnd.take(ctx)) {
+        p.act = Act{kind: ACT_DOCK, window: wid, node: t, zone: hit, rank: LAST, x: 0.0::f32, y: 0.0::f32, w: 0.0::f32, h: 0.0::f32};
+    }
+}
+
+# float a torn off window at a point, its titlebar under it
+fun float_out(ctx: *context.Context, a: Act) {
+    remove(ctx, a.window);
+    val st: *widget.WindowState = state.get[widget.WindowState](ctx, a.window);
+    if (st.placed == 0 || st.w <= 0.0::f32) {
+        st.w      = a.w;
+        st.h      = a.h;
+        st.placed = 1;
+    }
+    st.x         = a.x - st.w / 2.0::f32;
+    st.y         = a.y - widget.control_height(ctx) / 2.0::f32;
+    st.closed    = 0;
+    st.collapsed = 0;
+    st.z         = context.raise(ctx);
+}
+
+# do what the pass asked of the tree, after drawing so nothing it drew moves
+fun apply(ctx: *context.Context, p: *Pass) {
+    val a: Act = p.act;
+    if (a.kind == ACT_FLOAT) {
+        float_out(ctx, a);
+        ret;
+    }
+    if (a.kind == ACT_MOVE) {
+        place(ctx, a.node, a.window, a.rank);
+        ret;
+    }
+    if (a.kind != ACT_DOCK) { ret; }
+    if (a.zone == ZONE_CENTER) {
+        add(ctx, a.node, a.window);
+        ret;
+    }
+    val dk: *widget.Docked = state.find[widget.Docked](ctx, a.window);
+    if (dk != nil && dk.node != 0) { leave(ctx, dk); }
+    var to: u64 = 0;
+    if (a.zone >= OUTER_LEFT) { to = split(ctx, root(ctx, p.sid), side_of(a.zone), OUTER); }
+    or                        { to = split(ctx, a.node, side_of(a.zone), SHARE); }
+    add(ctx, to, a.window);
+}
+
+# draw a dock space over a rect
+fun draw_space(ctx: *context.Context, sid: u64, a: context.Area) {
+    var p: Pass;
+    p.sid   = sid;
+    p.sp    = space_of(ctx, sid);
+    p.lk    = look(ctx);
+    p.stamp = widget.dock_stamp(ctx);
+    p.rh    = widget.control_height(ctx);
+    p.x0    = a.x0;
+    p.y0    = a.y0;
+    p.x1    = a.x1;
+    p.y1    = a.y1;
+    val rid: u64 = root(ctx, sid);
+
+    context.push_band(ctx, band.DOCKED, 0);
+    context.quad(ctx, a.x0, a.y0, a.x1, a.y1, p.lk.bg);
+    val bg: interact.Hit = interact.hit(ctx, 0, a.x0, a.y0, a.x1, a.y1, 0);
+    if (!members(ctx, ?p)) {
+        ctx.oom = 1;
+        context.pop_band(ctx);
+        ret;
+    }
+    measure(ctx, ?p, rid);
+    lay(ctx, ?p, rid, a.x0, a.y0, a.x1, a.y1);
+    zones(ctx, ?p, rid);
+    release(ctx, ?p);
+    context.pop_band(ctx);
+    apply(ctx, ?p);
+}
+
+# draw a dock space filling a rect, once a frame, before its windows
+#
+# the space paints and takes input in the docked band (see blit.band), above
+# the base content and beneath floating windows. it lays its tree out over
+# the rect, draws its splitters, its tab bars and, under a window being
+# dragged, its drop zones, and places every window docked in it for their
+# begin_window calls this frame.
+# ---
+# ctx: context
+# key: the space's key in the current id scope
+# a:   its rect in screen pixels, such as context.free_area
+# ret: the space's id, for root, empty and set_suppress
+pub fun space(ctx: *context.Context, key: str, a: context.Area) u64 {
+    val sid: u64 = context.id_of(ctx, key);
+    draw_space(ctx, sid, a);
+    ret sid;
+}
+
+# consumer-owned state of a side panel docked to a screen edge
+# ---
+# side:   the edge the panel attaches to
+# size:   width (left, right) or height (top, bottom) in pixels
+# scroll: the panel body's scroll state
+pub rec Dock {
+    side:   context.Side;
+    size:   f32;
+    scroll: widget.Scroll;
+}
+
+# the handle begin_dock returns for end_dock
+# ---
+# area:   the panel's strip in screen pixels
+# body:   the scroll region the panel's widgets are laid out in
+# hidden: 1 while another tab of its leaf is selected, so its widgets lay out
+#         without drawing or claiming
+pub rec DockArea {
+    area:   context.Area;
+    body:   widget.ScrollArea;
+    hidden: u8;
+}
+
+# attach a side panel to a screen edge and start its scrolling body column
+#
+# the panel takes a strip of the free area (see context.carve), so panels
+# opened in turn stack inward and context.free_area reports what they leave
+# for the rest of the screen. the strip is a dock space keyed under the
+# panel's key, whose root holds the panel's own content as an untitled tab:
+# alone it shows no tab bar, and windows dragged over it dock beside it or as
+# tabs with it like in any space, where it then shows its key as its tab. it
+# never floats. call it at the root, outside surfaces and bands, place its
+# widgets every frame, and pair it with end_dock. its body is the id scope of
+# its key, so a label path through it is "<key>/<label>".
+# ---
+# ctx: context
+# key: the panel's key in the current id scope
+# d:   the panel's state
+# ret: a handle for end_dock
+pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
+    var r:   DockArea;
+    val pid: u64 = context.id_of(ctx, key);
+    val sid: u64 = bid.child(pid, "#space");
+    r.area = context.carve(ctx, d.side, d.size);
+
+    var dk: *widget.Docked = state.find[widget.Docked](ctx, pid);
+    if (dk == nil || dk.node == 0) {
+        add(ctx, root(ctx, sid), pid);
+        dk = state.find[widget.Docked](ctx, pid);
+    }
+    dk.anchored = 1;
+    widget.dock_note(ctx, dk, key, 1, 0, 0.0::f32, 0.0::f32);
+    draw_space(ctx, sid, r.area);
+
+    val a:  context.Area = r.area;
+    val lk: Look         = look(ctx);
+    context.push_band(ctx, band.DOCKED, 0);
+    if (sel d.side.left)  { context.quad(ctx, a.x1 - lk.edge_w, a.y0, a.x1, a.y1, lk.edge); }
+    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + lk.edge_w, a.y1, lk.edge); }
+    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - lk.edge_w, a.x1, a.y1, lk.edge); }
+    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + lk.edge_w, lk.edge); }
+
+    var b: context.Area = context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1};
+    if (dk.front == 0 || !widget.dock_placed(ctx, dk)) {
+        r.hidden = 1;
+        b        = a;
+        context.push_measure(ctx);
+    }
+    val in: f32 = context.px(ctx, ctx.theme.pad);
+    val h:  f32 = maxf(b.y1 - b.y0 - in * 2.0::f32, 0.0::f32);
+    context.push_layout(ctx, layout.column(b.x0 + in, b.y0 + in, b.x1 - b.x0 - in * 2.0::f32, h, widget.row_gap(ctx)));
+    r.body = widget.begin_scroll(ctx, key, ?d.scroll, h);
+    ret r;
+}
+
+# close a side panel: end its body and close its column
+# ---
+# ctx: context
+# d:   the panel's state
+# r:   the value returned by begin_dock
+pub fun end_dock(ctx: *context.Context, d: *Dock, r: DockArea) {
+    widget.end_scroll(ctx, ?d.scroll, r.body);
+    context.pop_layout(ctx);
+    if (r.hidden != 0) { context.pop_measure(ctx); }
+    context.pop_band(ctx);
+}
+
+# save and load every dock space's layout and where every window is docked
+# with the context's store (see blit.state.save and load)
+#
+# spaces, nodes and docked windows are saved as [dock.<id>], [docknode.<id>]
+# and [docked.<id>] tables, and load pinned. persist the windows too (see
+# widget.persist_windows) for their floating places and open state.
+# ---
+# ctx: context
+# ret: ok, or the registry's refusal
+pub fun persist(ctx: *context.Context) err[state.Error] {
+    val a: err[state.Error] = state.register[SpaceState](ctx, "dock", space_save, space_load);
+    if (sel a.err) { ret a; }
+    val b: err[state.Error] = state.register[Node](ctx, "docknode", node_save, node_load);
+    if (sel b.err) { ret b; }
+    val c: err[state.Error] = state.register[widget.Docked](ctx, "docked", docked_save, docked_load);
+    if (sel c.err) { ret c; }
+    state.keep[SpaceState](ctx, 1);
+    state.keep[Node](ctx, 1);
+    state.keep[widget.Docked](ctx, 1);
+    ret err[state.Error].ok{};
+}
+
+# write an id, which TOML holds as a signed integer of the same bits
+fun put_id(w: *state.Writer, key: str, id: u64) {
+    state.put_int(w, key, id:~i64);
+}
+
+# read an id put_id wrote, 0 when there is none
+fun get_id(t: *toml.Table, key: str) u64 {
+    val v: opt[i64] = toml.get_int(t, key);
+    if (sel v.some) { ret v.some:~u64; }
+    ret 0;
+}
+
+fun space_save(sp: *SpaceState, w: *state.Writer) {
+    put_id(w, "root", sp.root);
+    state.put_int(w, "next", sp.next:~i64);
+}
+
+fun space_load(sp: *SpaceState, t: *toml.Table) {
+    sp.root = get_id(t, "root");
+    sp.next = get_id(t, "next");
+}
+
+fun node_save(n: *Node, w: *state.Writer) {
+    put_id(w, "space", n.space);
+    put_id(w, "parent", n.parent);
+    put_id(w, "a", n.a);
+    put_id(w, "b", n.b);
+    state.put_int(w, "axis", n.axis::i64);
+    state.put_float(w, "ratio", n.ratio::f64);
+    put_id(w, "front", n.front);
+}
+
+fun node_load(n: *Node, t: *toml.Table) {
+    n.space  = get_id(t, "space");
+    n.parent = get_id(t, "parent");
+    n.a      = get_id(t, "a");
+    n.b      = get_id(t, "b");
+    n.front  = get_id(t, "front");
+    val ax: opt[i64] = toml.get_int(t, "axis");
+    if (sel ax.some && ax.some == AXIS_Y::i64) { n.axis = AXIS_Y; }
+    n.ratio = 0.5::f32;
+    val r: opt[f64] = toml.get_float(t, "ratio");
+    if (sel r.some) { n.ratio = r.some::f32; }
+}
+
+fun docked_save(dk: *widget.Docked, w: *state.Writer) {
+    put_id(w, "id", dk.id);
+    put_id(w, "node", dk.node);
+    state.put_float(w, "rank", dk.rank);
+}
+
+fun docked_load(dk: *widget.Docked, t: *toml.Table) {
+    dk.id   = get_id(t, "id");
+    dk.node = get_id(t, "node");
+    val r: opt[f64] = toml.get_float(t, "rank");
+    if (sel r.some) { dk.rank = r.some; }
+}
+
+# a space over the whole screen and three windows, each holding a button
+# ---
+# wins:  the windows, "A", "B" and "C"
+# sid:   the space's id
+# build: true to build the default layout while the space is empty
+# hide:  true to draw nothing
+#[testing]
+rec App {
+    wins:  [3]widget.Window;
+    sid:   u64;
+    build: bool;
+    hide:  bool;
+}
+
+#[testing]
+fun app_ui(ctx: *context.Context, user: ptr) {
+    val ap:  *App = user::*App;
+    val sid: u64  = context.id_of(ctx, "main");
+    if (ap.hide) { ret; }
+    if (ap.build && empty(ctx, sid)) {
+        val r: u64 = root(ctx, sid);
+        val l: u64 = split(ctx, r, context.Side.left{}, 0.3::f32);
+        add(ctx, l, context.id_of(ctx, "A"));
+        add(ctx, r, context.id_of(ctx, "B"));
+        add(ctx, r, context.id_of(ctx, "C"));
+    }
+    ap.sid = space(ctx, "main", context.Area{x0: 0.0::f32, y0: 0.0::f32, x1: 400.0::f32, y1: 300.0::f32});
+    var i: usize = 0;
+    for (i < 3) {
+        val w: widget.WindowArea = widget.begin_window(ctx, ap.wins[i]);
+        if (w.body != 0) { widget.button(ctx, "b"); }
+        widget.end_window(ctx, w);
+        i = i + 1;
+    }
+}
+
+#[testing]
+fun app(d: *driver.Driver, a: *allo.Allocator, ap: *App) bool {
+    ap.wins[0] = widget.window("A", 20.0::f32, 20.0::f32, 120.0::f32, 100.0::f32);
+    ap.wins[1] = widget.window("B", 60.0::f32, 60.0::f32, 120.0::f32, 100.0::f32);
+    ap.wins[2] = widget.window("C", 100.0::f32, 100.0::f32, 120.0::f32, 100.0::f32);
+    val e: err[allo.Error] = driver.init(d, a, 400.0::f32, 300.0::f32, app_ui, ap::ptr);
+    if (sel e.err) { ret false; }
+    driver.steps(d, 2);
+    ret true;
+}
+
+# a window's id
+#[testing]
+fun win(d: *driver.Driver, title: str) u64 {
+    ret context.id_of(?d.ctx, title);
+}
+
+# the left edge of what a window's button was last drawn in, -1 when it was not
+#[testing]
+fun left_of(d: *driver.Driver, path: str) f32 {
+    val r: opt[context.Area] = driver.rect(d, driver.find(d, path));
+    if (sel r.none) { ret -1.0::f32; }
+    ret r.some.x0;
+}
+
+# the centre of a leaf's drop zone, or of the space's outer zone
+#[testing]
+fun zone_at(d: *driver.Driver, sid: u64, leaf: u64, z: u8, x: *f32, y: *f32) {
+    var p: Pass;
+    p.x0 = 0.0::f32;
+    p.y0 = 0.0::f32;
+    p.x1 = 400.0::f32;
+    p.y1 = 300.0::f32;
+    val lk: Look = look(?d.ctx);
+    var r:  context.Area;
+    if (z >= OUTER_LEFT) { r = outer_zone(lk, ?p, z); }
+    or                   { r = leaf_zone(lk, node(?d.ctx, leaf), z); }
+    @x = (r.x0 + r.x1) / 2.0::f32;
+    @y = (r.y0 + r.y1) / 2.0::f32;
+}
+
+# drag a window's titlebar onto a zone
+#[testing]
+fun drag_to(d: *driver.Driver, from: u64, sid: u64, leaf: u64, z: u8) bool {
+    var x: f32;
+    var y: f32;
+    zone_at(d, sid, leaf, z, ?x, ?y);
+    if (!driver.drag(d, from, x, y)) { ret false; }
+    driver.steps(d, 2);
+    ret true;
+}
+
+test space__builds_splits_tabs_and_resizes {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.build = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val a: u64 = win(?d, "A");
+    val b: u64 = win(?d, "B");
+    val c: u64 = win(?d, "C");
+
+    # A fills the left 30 percent, B and C are tabs on the right with C, added
+    # last, selected
+    val la: u64 = node_of(?d.ctx, a);
+    val lr: u64 = node_of(?d.ctx, b);
+    if (la == 0 || lr == 0 || node_of(?d.ctx, c) != lr) { ret 2; }
+    if (left_of(?d, "A/b") != 0.0::f32)                 { ret 3; }
+    if (left_of(?d, "B/b") >= 0.0::f32)                 { ret 4; }
+    val cx: f32 = left_of(?d, "C/b");
+    if (cx < 118.0::f32 || cx > 126.0::f32) { ret 5; }
+
+    # a click on B's tab selects it, and its content shows with its own ids
+    if (!driver.click(?d, tabs.tab_id(bar_of(lr), b))) { ret 6; }
+    driver.step(?d);
+    if (left_of(?d, "B/b") != cx || left_of(?d, "C/b") >= 0.0::f32) { ret 7; }
+
+    # the splitter drags the share, and stops at the least width of a leaf
+    val sp: u64 = node(?d.ctx, la).parent;
+    if (!driver.drag(?d, splitter(sp), 200.0::f32, 150.0::f32)) { ret 8; }
+    driver.step(?d);
+    val bx: f32 = left_of(?d, "B/b");
+    if (bx < 198.0::f32 || bx > 206.0::f32)                   { ret 9; }
+    if (!driver.drag(?d, splitter(sp), 2.0::f32, 150.0::f32)) { ret 10; }
+    driver.step(?d);
+    if (left_of(?d, "B/b") < widget.control_height(?d.ctx) * 3.0::f32) { ret 11; }
+
+    # closing a tab closes its window and its tab goes
+    if (!driver.click(?d, bid.child(tabs.tab_id(bar_of(lr), b), "#close"))) { ret 12; }
+    driver.steps(?d, 2);
+    if (widget.window_state(?d.ctx, "B").closed == 0) { ret 13; }
+    if (driver.drawn(?d, tabs.tab_id(bar_of(lr), b))) { ret 14; }
+    if (left_of(?d, "C/b") < 0.0::f32)                { ret 15; }
+
+    # with C's leaf the only one drawn, A's takes the whole space
+    widget.window_state(?d.ctx, "C").closed = 1;
+    driver.steps(?d, 2);
+    if (left_of(?d, "A/b") != 0.0::f32 || driver.drawn(?d, splitter(sp))) { ret 16; }
+    widget.window_state(?d.ctx, "B").closed = 0;
+    widget.window_state(?d.ctx, "C").closed = 0;
+    driver.steps(?d, 2);
+    if (!driver.drawn(?d, splitter(sp))) { ret 17; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test space__docks_by_drag_and_tears_off {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.build = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val a:  u64 = win(?d, "A");
+    val b:  u64 = win(?d, "B");
+    val c:  u64 = win(?d, "C");
+    val la: u64 = node_of(?d.ctx, a);
+    val lr: u64 = node_of(?d.ctx, b);
+
+    # a tab dragged out and released over no zone floats where it was let go
+    if (!driver.drag(?d, tabs.tab_id(bar_of(lr), b), 300.0::f32, 250.0::f32)) { ret 2; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, b) != 0) { ret 3; }
+    val st: *widget.WindowState = widget.window_state(?d.ctx, "B");
+    if (st.x > 300.0::f32 || st.x + st.w < 300.0::f32) { ret 4; }
+    val bx: f32 = left_of(?d, "B/b");
+    if (bx < st.x || bx > st.x + 10.0::f32) { ret 5; }
+
+    # its titlebar dragged onto A's centre zone docks it as A's tab, selected
+    val title: u64 = bid.child(b, "#drag");
+    if (!drag_to(?d, title, ap.sid, la, ZONE_CENTER))                     { ret 6; }
+    if (node_of(?d.ctx, b) != la)                                         { ret 7; }
+    if (left_of(?d, "B/b") != 0.0::f32 || left_of(?d, "A/b") >= 0.0::f32) { ret 8; }
+
+    # held shift keeps a drag from docking
+    if (!driver.drag(?d, tabs.tab_id(bar_of(la), b), 300.0::f32, 250.0::f32)) { ret 9; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, b) != 0) { ret 10; }
+    d.in.mods = input.MOD_SHIFT;
+    if (!drag_to(?d, title, ap.sid, la, ZONE_CENTER)) { ret 11; }
+    d.in.mods = 0;
+    if (node_of(?d.ctx, b) != 0) { ret 12; }
+
+    # onto the right zone of C's leaf it splits the leaf, taking its right half
+    if (!drag_to(?d, title, ap.sid, lr, ZONE_RIGHT)) { ret 13; }
+    val lb: u64 = node_of(?d.ctx, b);
+    if (lb == 0 || lb == lr || node(?d.ctx, lb).parent != node(?d.ctx, lr).parent) { ret 14; }
+    val n: *Node = node(?d.ctx, lr);
+    val m: *Node = node(?d.ctx, lb);
+    if (m.x0 < n.x1 || m.y0 != n.y0) { ret 15; }
+
+    # onto the outer bottom zone it spans the whole space at the bottom
+    if (!driver.drag(?d, tabs.tab_id(bar_of(lb), b), 200.0::f32, 290.0::f32)) { ret 16; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, b) == lb) { ret 17; }
+    val lo: *Node = node(?d.ctx, node_of(?d.ctx, b));
+    if (lo == nil || lo.x0 != 0.0::f32 || lo.x1 != 400.0::f32 || lo.y1 != 300.0::f32) { ret 18; }
+    # the leaf it left folded away: C's leaf is back to its full width
+    if (node(?d.ctx, lb) != nil) { ret 19; }
+
+    # and a tab dragged onto another leaf's tab bar joins it there
+    val lc: u64 = node_of(?d.ctx, c);
+    if (!driver.drag_onto(?d, tabs.tab_id(bar_of(node_of(?d.ctx, b)), b), tabs.tab_id(bar_of(lc), c))) { ret 20; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, b) != lc) { ret 21; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test space__layout_saves_and_loads {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.build = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val pe: err[state.Error] = persist(?d.ctx);
+    if (sel pe.err) { ret 2; }
+    widget.persist_windows(?d.ctx);
+    val sp: u64 = node(?d.ctx, node_of(?d.ctx, win(?d, "A"))).parent;
+    if (!driver.drag(?d, splitter(sp), 180.0::f32, 150.0::f32)) { ret 3; }
+    driver.step(?d);
+    val bx: f32 = left_of(?d, "C/b");
+
+    val doc: res[str, allo.Error] = state.save(?d.ctx);
+    if (sel doc.err) { ret 4; }
+
+    # a second app that never builds its layout takes it from the document,
+    # and keeps it through frames that do not draw the space
+    var bp: App;
+    var e:  driver.Driver;
+    if (!app(?e, ?al, ?bp)) { ret 1; }
+    persist(?e.ctx);
+    widget.persist_windows(?e.ctx);
+    val ld: err[toml.TomlError] = state.load(?e.ctx, doc.ok);
+    if (sel ld.err) { ret 5; }
+    state.set_max_age(?e.ctx, 1);
+    bp.hide = true;
+    driver.steps(?e, 3);
+    bp.hide = false;
+    driver.steps(?e, 2);
+    if (left_of(?e, "C/b") != bx || left_of(?e, "A/b") != 0.0::f32) { ret 6; }
+    if (left_of(?e, "B/b") >= 0.0::f32)                             { ret 7; }
+
+    val f1: err[allo.Error] = driver.free(?d);
+    if (sel f1.err) { ret 1; }
+    val f2: err[allo.Error] = driver.free(?e);
+    if (sel f2.err) { ret 1; }
+    ret 0;
+}
+
+# a frame with a left panel of 20 text rows and a right panel, holding a
+# slider and a section heading
+#[testing]
+fun frame_docks(ctx: *context.Context, in: input.Input, left: *Dock, right: *Dock, v: *f32, open: *u8) context.Area {
+    context.begin(ctx, in, 200.0::f32, 200.0::f32);
+    val l: DockArea = begin_dock(ctx, "left", left);
+    var i: usize    = 0;
+    for (i < 20) {
+        widget.text(ctx, "row");
+        i = i + 1;
+    }
+    end_dock(ctx, left, l);
+    val r: DockArea = begin_dock(ctx, "right", right);
+    if (widget.section(ctx, "sec", open)) { widget.slider_f(ctx, "v", v, 0.0::f32, 10.0::f32); }
+    end_dock(ctx, right, r);
+    val free: context.Area = context.free_area(ctx);
+    context.end(ctx);
+    ret free;
+}
+
+# one frame's input with the cursor at (mx, my) and the button in state down
+#[testing]
+fun input_at(mx: f32, my: f32, down: u8) input.Input {
+    var in: input.Input;
+    in.mx      = mx;
+    in.my      = my;
+    in.present = 1;
+    in.down    = down;
+    ret in;
+}
+
+test dock__carves_scrolls_and_sections {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var left:  Dock;
+    var right: Dock;
+    left.side  = context.Side.left{};
+    left.size  = 60.0::f32;
+    right.side = context.Side.right{};
+    right.size = 50.0::f32;
+    var v:    f32 = 0.0::f32;
+    var open: u8  = 0;
+
+    # the panels stack inward and leave the middle free
+    val free: context.Area = frame_docks(?ctx, input_at(30.0::f32, 100.0::f32, 0), ?left, ?right, ?v, ?open);
+    if (free.x0 != 60.0::f32 || free.x1 != 150.0::f32) { ret 2; }
+    if (free.y0 != 0.0::f32 || free.y1 != 200.0::f32)  { ret 3; }
+    # 20 rows of 12 pixels overflow the 192 pixel body
+    if (left.scroll.content != 240.0::f32) { ret 4; }
+
+    # a wheel turned towards the user over the left panel scrolls it, and clamps
+    var in: input.Input = input_at(30.0::f32, 100.0::f32, 0);
+    in.wheel = -30.0::f32;
+    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
+    if (left.scroll.offset != 30.0::f32) { ret 5; }
+    in.wheel = -1000.0::f32;
+    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
+    if (left.scroll.offset != 48.0::f32) { ret 6; }
+    # over the free area the wheel reaches no panel
+    in.mx    = 100.0::f32;
+    in.wheel = 30.0::f32;
+    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
+    if (left.scroll.offset != 48.0::f32 || right.scroll.offset != 0.0::f32) { ret 7; }
+
+    # clicking the right panel's heading opens its section, whose slider then
+    # maps the cursor in the panel's local space: its track spans x [154, 196)
+    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 0), ?left, ?right, ?v, ?open);
+    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 1), ?left, ?right, ?v, ?open);
+    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 0), ?left, ?right, ?v, ?open);
+    if (open != 1) { ret 8; }
+    frame_docks(?ctx, input_at(175.0::f32, 30.0::f32, 0), ?left, ?right, ?v, ?open);
+    frame_docks(?ctx, input_at(175.0::f32, 30.0::f32, 1), ?left, ?right, ?v, ?open);
+    if (v != 5.0::f32) { ret 9; }
+
+    # its body is the id scope of its key
+    if (context.id_of(?ctx, "v") == bid.of_label(context.id_of(?ctx, "right"), "v")) { ret 10; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a side panel holding a button, and a floating window holding another
+# ---
+# side: the panel
+# w:    the window
+#[testing]
+rec Side {
+    side: Dock;
+    w:    widget.Window;
+}
+
+#[testing]
+fun side_ui(ctx: *context.Context, user: ptr) {
+    val s:  *Side    = user::*Side;
+    val dk: DockArea = begin_dock(ctx, "panel", ?s.side);
+    widget.button(ctx, "p");
+    end_dock(ctx, ?s.side, dk);
+    val w: widget.WindowArea = widget.begin_window(ctx, s.w);
+    if (w.body != 0) { widget.button(ctx, "w"); }
+    widget.end_window(ctx, w);
+}
+
+test dock__panel_is_a_node_windows_dock_into {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var s: Side;
+    s.side.side = context.Side.left{};
+    s.side.size = 160.0::f32;
+    s.w         = widget.window("W", 200.0::f32, 40.0::f32, 120.0::f32, 100.0::f32);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?al, 400.0::f32, 300.0::f32, side_ui, (?s)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+    val pid:  u64 = win(?d, "panel");
+    val leaf: u64 = node_of(?d.ctx, pid);
+    val sid:  u64 = node(?d.ctx, leaf).space;
+    if (!driver.drawn(?d, driver.find(?d, "panel/p")))    { ret 2; }
+    if (driver.drawn(?d, tabs.tab_id(bar_of(leaf), pid))) { ret 3; }
+
+    # a window dropped on the panel's centre stacks with it: the panel shows
+    # its tabs, the window selected and the panel's content hidden
+    val w:  u64          = win(?d, "W");
+    var x:  f32;
+    var y:  f32;
+    val lk: Look         = look(?d.ctx);
+    val r:  context.Area = leaf_zone(lk, node(?d.ctx, leaf), ZONE_CENTER);
+    if (!driver.drag(?d, bid.child(w, "#drag"), (r.x0 + r.x1) / 2.0::f32, (r.y0 + r.y1) / 2.0::f32)) { ret 4; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, w) != leaf)                        { ret 5; }
+    if (!driver.drawn(?d, tabs.tab_id(bar_of(leaf), pid))) { ret 6; }
+    if (left_of(?d, "W/w") != 0.0::f32)                    { ret 7; }
+    if (driver.drawn(?d, driver.find(?d, "panel/p")))      { ret 8; }
+
+    # the panel's tab brings its content back; torn off, it stays put
+    if (!driver.click(?d, tabs.tab_id(bar_of(leaf), pid))) { ret 9; }
+    driver.step(?d);
+    if (!driver.drawn(?d, driver.find(?d, "panel/p")))                            { ret 10; }
+    if (!driver.drag(?d, tabs.tab_id(bar_of(leaf), pid), 300.0::f32, 250.0::f32)) { ret 11; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, pid) != leaf) { ret 12; }
+
+    # the window torn off floats, and the panel is alone again without tabs
+    if (!driver.drag(?d, tabs.tab_id(bar_of(leaf), w), 300.0::f32, 250.0::f32)) { ret 13; }
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, w) != 0 || left_of(?d, "W/w") < 200.0::f32) { ret 14; }
+    if (driver.drawn(?d, tabs.tab_id(bar_of(leaf), pid)))           { ret 15; }
+    if (sid == 0)                                                   { ret 16; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a scrolling dock holding a dropdown and a popup with a scroll region in it
+# ---
+# side: the dock
+# pick: the dropdown's selection
+# open: 1 to show the popup
+# rows: the popup's scroll region
+#[testing]
+rec Wheeled {
+    side: Dock;
+    pick: usize;
+    open: u8;
+    rows: widget.Scroll;
+}
+
+#[testing]
+fun wheeled_ui(ctx: *context.Context, user: ptr) {
+    val w:    *Wheeled = user::*Wheeled;
+    var opts: [3]str   = [3]str{"one", "two", "three"};
+    val dk:   DockArea = begin_dock(ctx, "side", ?w.side);
+    widget.dropdown(ctx, "pick", ?w.pick, ?opts[0], 3);
+    val p: widget.Popup = widget.begin_popup(ctx, "list", w.open, 0.0::f32, 40.0::f32, 100.0::f32);
+    if (p.open != 0) {
+        val sa: widget.ScrollArea = widget.begin_scroll(ctx, "rows", ?w.rows, 40.0::f32);
+        widget.button(ctx, "row");
+        widget.space(ctx, 200.0::f32);
+        widget.end_scroll(ctx, ?w.rows, sa);
+    }
+    widget.end_popup(ctx, p);
+    widget.space(ctx, 1000.0::f32);
+    end_dock(ctx, ?w.side, dk);
+}
+
+test scroll__wheel_stops_at_the_band_a_popup_opens {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var w: Wheeled;
+    w.side.side = context.Side.left{};
+    w.side.size = 120.0::f32;
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, wheeled_ui, (?w)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.step(?d);
+
+    # the wheel over an open dropdown's option leaves the dock beneath still
+    val pick: u64 = driver.find(?d, "side/pick");
+    if (!driver.click(?d, pick)) { ret 2; }
+    val opt: u64 = bid.child_int(bid.child(pick, "#popup"), 0);
+    if (!driver.drawn(?d, opt)) { ret 3; }
+    driver.scroll(?d, opt, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.side.scroll.offset != 0.0::f32) { ret 4; }
+
+    # a scroll region inside a popup scrolls, and the dock still does not
+    state.get[widget.DropdownState](?d.ctx, pick).open = 0;
+    w.open                                             = 1;
+    driver.steps(?d, 2);
+    val row: u64 = driver.find(?d, "side/list/rows/row");
+    if (!driver.drawn(?d, row)) { ret 5; }
+    driver.scroll(?d, row, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.rows.offset != 30.0::f32)       { ret 6; }
+    if (w.side.scroll.offset != 0.0::f32) { ret 7; }
+
+    # outside the popup the dock takes the wheel as before
+    w.open = 0;
+    driver.step(?d);
+    driver.scroll(?d, pick, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.side.scroll.offset != 30.0::f32) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

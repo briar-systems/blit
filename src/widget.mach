@@ -1,4 +1,4 @@
-# the widgets: panel, window, popup, dock, scroll region, section, text, note,
+# the widgets: panel, window, popup, scroll region, section, text, note,
 # button, button rows and grids, segmented choice, checkbox, toggle, slider,
 # dropdown, image, grid, text field
 #
@@ -45,13 +45,14 @@
 #
 # a window keeps its place, size, stack order and open and collapsed state in
 # the context's store under its title's id (see WindowState), and moves,
-# resizes, collapses and closes from its own chrome.
+# resizes, collapses and closes from its own chrome. its titlebar is a drag
+# source of WINDOW_KIND carrying its id, which is how a dock (see blit.dock)
+# takes it in. a docked window draws where its dock placed it (see Docked)
+# instead, with the same content and the same ids.
 #
-# alongside floating windows, a dock attaches a panel to a screen edge and
-# takes it from the free area (see context.carve) the rest of the screen is
-# laid out in. a dock's body is a scroll region, which clips its column and
-# scrolls it by wheel and scrollbar when it is taller than the region, and a
-# section is a collapsible heading that groups the rows beneath it.
+# a scroll region clips its column and scrolls it by wheel and scrollbar when
+# it is taller than the region, and a section is a collapsible heading that
+# groups the rows beneath it.
 #
 # every color and length a widget draws with comes from the context's theme
 # (see blit.theme), each length multiplied by the context's interface scale,
@@ -71,6 +72,7 @@ use std.types.string.str_len;
 
 use blit.band;
 use blit.context;
+use blit.dnd;
 use blit.draw;
 use blit.driver;
 use blit.edit;
@@ -1492,6 +1494,12 @@ pub val WINDOW_NO_BACKGROUND: u32 = 8;
 pub val WINDOW_NO_CLOSE:      u32 = 16;
 pub val WINDOW_AUTO_SIZE:     u32 = 32;
 
+# the payload type a window's titlebar drags, carrying the window's id as a u64
+pub val WINDOW_KIND: str = "window";
+
+# bytes of a docked window's title its tab keeps, the NUL included
+pub val DOCK_LABEL: usize = 64;
+
 # the edges a resize grip moves, combined with |
 val EDGE_L: u32 = 1;
 val EDGE_R: u32 = 2;
@@ -1594,6 +1602,97 @@ pub rec WindowState {
     slot:      u32;
 }
 
+# where a dock holds a window, kept in the store under the window's id while
+# it is docked (see blit.dock)
+#
+# the dock writes where the window goes and the window writes what its tab
+# shows, so neither reaches into the other: begin_window draws a window with a
+# Docked whose node is not 0 into the rect its dock last laid out, with no
+# chrome of its own, and only while its tab is the selected one.
+# ---
+# id:       the window's id
+# node:     the dock node, a tab stack, the window sits in
+# rank:     its place among the node's tabs, lowest first
+# anchored: 1 for a dock's own panel, which never floats (see blit.dock.begin_dock)
+# front:    1 while its tab is the node's selected one
+# placed:   the store frame plus one the dock last laid it out in, 0 before any
+# x0:       body left in screen pixels, as last laid out
+# y0:       body top
+# x1:       body right
+# y1:       body bottom
+# drawn:    the store frame plus one the window was last drawn in, 0 before any
+# min_w:    the least width its declaration asks for
+# min_h:    the least height its declaration asks for, titlebar included
+# bare:     1 when it is declared without a title, so a node holding it alone
+#           shows no tabs
+# closable: 1 when its tab may close it
+# label:    the drawn part of its title, cut to fit, NUL-terminated
+pub rec Docked {
+    id:       u64;
+    node:     u64;
+    rank:     f64;
+    anchored: u8;
+    front:    u8;
+    placed:   u64;
+    x0:       f32;
+    y0:       f32;
+    x1:       f32;
+    y1:       f32;
+    drawn:    u64;
+    min_w:    f32;
+    min_h:    f32;
+    bare:     u8;
+    closable: u8;
+    label:    [64]u8;
+}
+
+# the store frame plus one, the stamp Docked's placed and drawn take
+# ---
+# ctx: context
+# ret: nonzero, one more each frame
+pub fun dock_stamp(ctx: *context.Context) u64 {
+    ret ctx.store.frame + 1;
+}
+
+# record what a docked window's tab shows and how small its node may get
+# ---
+# ctx:   context
+# dk:    the window's Docked
+# label: its title or key, of which the part before "##" is kept
+# bare:  1 when it has no title
+# close: 1 when its tab may close it
+# min_w: least width
+# min_h: least height
+pub fun dock_note(ctx: *context.Context, dk: *Docked, label: str, bare: u8, close: u8, min_w: f32, min_h: f32) {
+    dk.drawn    = dock_stamp(ctx);
+    dk.bare     = bare;
+    dk.closable = close;
+    dk.min_w    = min_w;
+    dk.min_h    = min_h;
+    var n: usize = bid.shown(label);
+    if (n > DOCK_LABEL - 1) {
+        n = DOCK_LABEL - 1;
+        # never cut a utf-8 sequence in two
+        for (n > 0 && (label[n] & 0xC0u8) == 0x80u8) { n = n - 1; }
+    }
+    var i: usize = 0;
+    for (i < n) {
+        dk.label[i] = label[i];
+        i           = i + 1;
+    }
+    dk.label[n] = 0;
+}
+
+# whether a dock laid a docked window out this frame or the one before, so
+# the rect it holds is current
+# ---
+# ctx: context
+# dk:  the window's Docked
+# ret: true when its rect is current
+pub fun dock_placed(ctx: *context.Context, dk: *Docked) bool {
+    ret dk.placed != 0 && dk.placed + 1 >= dock_stamp(ctx);
+}
+
 # the handle begin_window returns for end_window
 # ---
 # id:     the window's id
@@ -1608,6 +1707,7 @@ pub rec WindowState {
 # sc:     the body's scroll state
 # hidden: 1 while an auto-sized window with no width yet lays out only to
 #         measure, drawing and claiming nothing
+# docked: 1 while it draws where its dock placed it
 # need_w: the width the titlebar needs
 # min_w:  least width
 # max_w:  greatest width
@@ -1625,6 +1725,7 @@ pub rec WindowArea {
     scroll: ScrollArea;
     sc:     *Scroll;
     hidden: u8;
+    docked: u8;
     need_w: f32;
     min_w:  f32;
     max_w:  f32;
@@ -1808,6 +1909,11 @@ fun bound(v: f32) f32 {
 # the frame before, and its height what its widgets take this frame. an
 # auto-sized window declared 0 wide lays out its first frame hidden, only to
 # measure.
+# the titlebar is a drag source of WINDOW_KIND carrying the window's id, which
+# a dock takes in (see blit.dock). a docked window instead draws in the rect
+# its dock last laid out (see Docked), in the docked band, with no chrome, its
+# body a scroll region whatever its flags, and has no body while another tab
+# of its stack is selected. its content and ids are the same either way.
 # widgets placed while the returned body is 1 fill it, in screen pixels. the
 # window is an id scope for them. pair every begin_window with an end_window,
 # closed or not.
@@ -1833,6 +1939,8 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     }
     context.note_z(ctx, st.z);
     if (st.closed != 0) { ret r; }
+    val dk: *Docked = state.find[Docked](ctx, r.id);
+    if (dk != nil && dk.node != 0) { ret begin_docked(ctx, win, r, dk); }
     r.shown = 1;
 
     var th: f32 = row_h(ctx);
@@ -1935,6 +2043,8 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
                 grab.y = st.y;
             }
             if (hd.hot || hd.active) { context.set_cursor(ctx, input.CURSOR_MOVE); }
+            var wid: u64      = r.id;
+            val dg:  dnd.Drag = dnd.source(ctx, hd, WINDOW_KIND, (?wid)::ptr, $size_of(u64), x0, y0, x1, ty1);
         }
 
         var tbg: draw.Color = ctx.theme.header;
@@ -1969,6 +2079,46 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     ret r;
 }
 
+# begin_window for a window its dock holds: no chrome, a scroll region over
+# the rect the dock laid out, and nothing at all while another tab is selected
+fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked) WindowArea {
+    var out:  WindowArea = r;
+    val bare: u8         = (win.flags & WINDOW_NO_TITLE) != 0;
+    val shut: u8         = (win.flags & WINDOW_NO_CLOSE) == 0;
+    var th:   f32        = row_h(ctx);
+    if (bare != 0) { th = 0.0::f32; }
+    dock_note(ctx, dk, win.title, bare, shut, maxf(win.min_w, th * 3.0::f32), maxf(win.min_h, th));
+    if (dk.front == 0 || !dock_placed(ctx, dk)) { ret out; }
+
+    out.shown  = 1;
+    out.docked = 1;
+    out.body   = 1;
+    context.push_band(ctx, band.DOCKED, 0);
+    context.push_id(ctx, out.id);
+    out.claim = context.reserve_claim(ctx, out.id);
+    out.ch    = context.split(ctx, 2);
+    context.set_channel(ctx, out.ch, 1);
+    val body_id: u64 = bid.child(out.id, "#body");
+    out.sc     = state.get[Scroll](ctx, body_id);
+    out.scroll = scroll_in(ctx, body_id, out.sc, context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1}, 0);
+    ret out;
+}
+
+# end_window for a window its dock holds
+fun end_docked(ctx: *context.Context, r: WindowArea) {
+    end_scroll(ctx, r.sc, r.scroll);
+    context.set_channel(ctx, r.ch, 0);
+    val x0: f32 = r.scroll.x;
+    val y0: f32 = r.scroll.y;
+    val x1: f32 = r.scroll.x + r.scroll.w;
+    val y1: f32 = r.scroll.y + r.scroll.h;
+    if ((r.flags & WINDOW_NO_BACKGROUND) == 0) { context.quad(ctx, x0, y0, x1, y1, ctx.theme.dock); }
+    context.merge(ctx, r.ch);
+    context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
+    context.pop_id(ctx);
+    context.pop_band(ctx);
+}
+
 # close a window: paint its body beneath its widgets, give its claim its rect
 # (the titlebar alone while collapsed), claim its resize grips above
 # everything in it and restore the caller's layout
@@ -1980,6 +2130,10 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
 # r:   the value returned by begin_window
 pub fun end_window(ctx: *context.Context, r: WindowArea) {
     if (r.shown == 0) { ret; }
+    if (r.docked != 0) {
+        end_docked(ctx, r);
+        ret;
+    }
     val st: *WindowState = r.st;
     val x0: f32          = st.x;
     val x1: f32          = st.x + st.w;
@@ -2291,77 +2445,6 @@ pub fun caret(ctx: *context.Context, x: f32, y: f32, k: f32, open: bool, c: draw
     }
 }
 
-# consumer-owned state of a panel docked to a screen edge
-# ---
-# side:   the edge the dock attaches to
-# size:   width (left, right) or height (top, bottom) in pixels
-# scroll: the dock body's scroll state
-pub rec Dock {
-    side:   context.Side;
-    size:   f32;
-    scroll: Scroll;
-}
-
-# the handle begin_dock returns for end_dock
-# ---
-# area:  the dock's rect in screen pixels
-# claim: the dock's claim, beneath its widgets
-# body:  the scroll region the dock's widgets are laid out in
-pub rec DockArea {
-    area:  context.Area;
-    claim: usize;
-    body:  ScrollArea;
-}
-
-# dock a panel to a screen edge and start its scrolling body column
-#
-# the dock takes a strip of the free area (see context.carve), so docks
-# opened in turn stack inward and context.free_area reports what they leave
-# for the rest of the screen. it paints and takes input in the docked band,
-# above the base content and beneath windows (see blit.band). its whole rect
-# stops input to what it covers, and its body scrolls when its widgets are
-# taller than it. call it at the root, outside surfaces and bands, and pair it
-# with end_dock. its body is the id scope of the dock's key, so a label path
-# through the dock is "<key>/<label>".
-# ---
-# ctx: context
-# key: the dock's key in the current id scope
-# d:   the dock's state
-# ret: a handle for end_dock
-pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
-    var r: DockArea;
-    context.push_band(ctx, band.DOCKED, 0);
-    r.area = context.carve(ctx, d.side, d.size);
-
-    val a: context.Area = r.area;
-    r.claim = context.reserve_claim(ctx, 0);
-    context.fill_claim(ctx, r.claim, a.x0, a.y0, a.x1, a.y1);
-
-    val ew: f32        = context.px(ctx, ctx.theme.edge_w);
-    val ec: draw.Color = ctx.theme.edge;
-    context.quad(ctx, a.x0, a.y0, a.x1, a.y1, ctx.theme.dock);
-    if (sel d.side.left)  { context.quad(ctx, a.x1 - ew, a.y0, a.x1, a.y1, ec); }
-    or (sel d.side.right) { context.quad(ctx, a.x0, a.y0, a.x0 + ew, a.y1, ec); }
-    or (sel d.side.top)   { context.quad(ctx, a.x0, a.y1 - ew, a.x1, a.y1, ec); }
-    or                    { context.quad(ctx, a.x0, a.y0, a.x1, a.y0 + ew, ec); }
-
-    val in: f32 = pad(ctx);
-    open_column(ctx, a.x0 + in, a.y0 + in, a.x1 - a.x0 - in * 2.0::f32, maxf(a.y1 - a.y0 - in * 2.0::f32, 0.0::f32));
-    r.body = scroll_at(ctx, context.id_of(ctx, key), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
-    ret r;
-}
-
-# close a dock: end its body and close its column
-# ---
-# ctx: context
-# d:   the dock's state
-# r:   the value returned by begin_dock
-pub fun end_dock(ctx: *context.Context, d: *Dock, r: DockArea) {
-    end_scroll(ctx, ?d.scroll, r.body);
-    context.pop_layout(ctx);
-    context.pop_band(ctx);
-}
-
 # an ascii letter folded to lower case, any other byte unchanged
 fun fold(b: u8) u8 {
     if (b >= 'A' && b <= 'Z') { ret b + 32; }
@@ -2659,25 +2742,25 @@ test dropdown__opens_and_selects {
     ret 0;
 }
 
-# a dock and a window, each holding a widget a label path names
+# a scroll region and a window, each holding a widget a label path names
 # ---
-# side: the dock, holding "ok" above more than it can show
+# side: the region's state, holding "ok" above more than it can show
 # win:  the "Settings" window, holding the "name" field
 # f:    the field's state
 #[testing]
 rec Nest {
-    side: Dock;
+    side: Scroll;
     win:  Window;
     f:    field.Field;
 }
 
 #[testing]
 fun nest_ui(ctx: *context.Context, user: ptr) {
-    val n:  *Nest    = user::*Nest;
-    val dk: DockArea = begin_dock(ctx, "side", ?n.side);
+    val n:  *Nest      = user::*Nest;
+    val sa: ScrollArea = begin_scroll_at(ctx, "side", ?n.side, context.Area{x0: 0.0::f32, y0: 0.0::f32, x1: 80.0::f32, y1: 200.0::f32});
     button(ctx, "ok");
     space(ctx, 1000.0::f32);
-    end_dock(ctx, ?n.side, dk);
+    end_scroll(ctx, ?n.side, sa);
     val b: WindowArea = begin_window(ctx, n.win);
     text_field(ctx, "name", ?n.f, nil);
     end_window(ctx, b);
@@ -2689,16 +2772,14 @@ test driver__paths_keys_and_wheel_reach_nested_widgets {
     if (sel made.err) { ret 1; }
     var buf: [64]u8;
     var n:   Nest;
-    n.side.side = context.Side.left{};
-    n.side.size = 80.0::f32;
-    n.win       = auto_window("Settings", 100.0::f32, 10.0::f32, 120.0::f32);
+    n.win = auto_window("Settings", 100.0::f32, 10.0::f32, 120.0::f32);
     field.init(?n.f, ?buf[0], 64, 0, nil);
     var d:  driver.Driver;
     val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, nest_ui, (?n)::ptr);
     if (sel ie.err) { ret 1; }
     driver.step(?d);
 
-    # a dock's and a window's widgets sit under their keys
+    # a region's and a window's widgets sit under their keys
     val ok:   u64 = driver.find(?d, "side/ok");
     val name: u64 = driver.find(?d, "Settings/name");
     if (!driver.drawn(?d, ok) || !driver.drawn(?d, name)) { ret 2; }
@@ -2718,86 +2799,10 @@ test driver__paths_keys_and_wheel_reach_nested_widgets {
     if (!str_equals(field.text(?n.f), "he"))         { ret 8; }
     if (!str_equals(driver.text_of(?d, name), "he")) { ret 9; }
 
-    # the wheel over the dock scrolls its body
+    # the wheel over the region scrolls it
     driver.scroll(?d, ok, 0.0::f32, -30.0::f32);
     driver.step(?d);
-    if (n.side.scroll.offset != 30.0::f32) { ret 10; }
-
-    val freed: err[allo.Error] = driver.free(?d);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a scrolling dock holding a dropdown and a popup with a scroll region in it
-# ---
-# side: the dock
-# pick: the dropdown's selection
-# open: 1 to show the popup
-# rows: the popup's scroll region
-#[testing]
-rec Wheeled {
-    side: Dock;
-    pick: usize;
-    open: u8;
-    rows: Scroll;
-}
-
-#[testing]
-fun wheeled_ui(ctx: *context.Context, user: ptr) {
-    val w:    *Wheeled = user::*Wheeled;
-    var opts: [3]str   = [3]str{"one", "two", "three"};
-    val dk:   DockArea = begin_dock(ctx, "side", ?w.side);
-    dropdown(ctx, "pick", ?w.pick, ?opts[0], 3);
-    val p: Popup = begin_popup(ctx, "list", w.open, 0.0::f32, 40.0::f32, 100.0::f32);
-    if (p.open != 0) {
-        val sa: ScrollArea = begin_scroll(ctx, "rows", ?w.rows, 40.0::f32);
-        button(ctx, "row");
-        space(ctx, 200.0::f32);
-        end_scroll(ctx, ?w.rows, sa);
-    }
-    end_popup(ctx, p);
-    space(ctx, 1000.0::f32);
-    end_dock(ctx, ?w.side, dk);
-}
-
-test scroll__wheel_stops_at_the_band_a_popup_opens {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var w: Wheeled;
-    w.side.side = context.Side.left{};
-    w.side.size = 120.0::f32;
-    var d:  driver.Driver;
-    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, wheeled_ui, (?w)::ptr);
-    if (sel ie.err) { ret 1; }
-    driver.step(?d);
-
-    # the wheel over an open dropdown's option leaves the dock beneath still
-    val pick: u64 = driver.find(?d, "side/pick");
-    if (!driver.click(?d, pick)) { ret 2; }
-    val opt: u64 = bid.child_int(bid.child(pick, "#popup"), 0);
-    if (!driver.drawn(?d, opt)) { ret 3; }
-    driver.scroll(?d, opt, 0.0::f32, -30.0::f32);
-    driver.step(?d);
-    if (w.side.scroll.offset != 0.0::f32) { ret 4; }
-
-    # a scroll region inside a popup scrolls, and the dock still does not
-    state.get[DropdownState](?d.ctx, pick).open = 0;
-    w.open                                      = 1;
-    driver.steps(?d, 2);
-    val row: u64 = driver.find(?d, "side/list/rows/row");
-    if (!driver.drawn(?d, row)) { ret 5; }
-    driver.scroll(?d, row, 0.0::f32, -30.0::f32);
-    driver.step(?d);
-    if (w.rows.offset != 30.0::f32)       { ret 6; }
-    if (w.side.scroll.offset != 0.0::f32) { ret 7; }
-
-    # outside the popup the dock takes the wheel as before
-    w.open = 0;
-    driver.step(?d);
-    driver.scroll(?d, pick, 0.0::f32, -30.0::f32);
-    driver.step(?d);
-    if (w.side.scroll.offset != 30.0::f32) { ret 8; }
+    if (n.side.offset != 30.0::f32) { ret 10; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
@@ -3735,79 +3740,6 @@ test surface__nested_widget_clicked_where_painted {
     frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 0));
     frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 1));
     if (frame_nested_region(?ctx, input_at(25.0::f32, 25.0::f32, 0)) != 0) { ret 3; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame with a left dock of 20 text rows and a right dock, holding a slider
-# and a section heading
-#[testing]
-fun frame_docks(ctx: *context.Context, in: input.Input, left: *Dock, right: *Dock, v: *f32, open: *u8) context.Area {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val l: DockArea = begin_dock(ctx, "left", left);
-    var i: usize    = 0;
-    for (i < 20) {
-        text(ctx, "row");
-        i = i + 1;
-    }
-    end_dock(ctx, left, l);
-    val r: DockArea = begin_dock(ctx, "right", right);
-    if (section(ctx, "sec", open)) { slider_f(ctx, "v", v, 0.0::f32, 10.0::f32); }
-    end_dock(ctx, right, r);
-    val free: context.Area = context.free_area(ctx);
-    context.end(ctx);
-    ret free;
-}
-
-test dock__carves_scrolls_and_sections {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var left:  Dock;
-    var right: Dock;
-    left.side  = context.Side.left{};
-    left.size  = 60.0::f32;
-    right.side = context.Side.right{};
-    right.size = 50.0::f32;
-    var v:    f32 = 0.0::f32;
-    var open: u8  = 0;
-
-    # the docks stack inward and leave the middle free
-    val free: context.Area = frame_docks(?ctx, input_at(30.0::f32, 100.0::f32, 0), ?left, ?right, ?v, ?open);
-    if (free.x0 != 60.0::f32 || free.x1 != 150.0::f32) { ret 2; }
-    if (free.y0 != 0.0::f32 || free.y1 != 200.0::f32)  { ret 3; }
-    # 20 rows of 12 pixels overflow the 192 pixel body
-    if (left.scroll.content != 240.0::f32) { ret 4; }
-
-    # a wheel turned towards the user over the left dock scrolls it, and clamps
-    var in: input.Input = input_at(30.0::f32, 100.0::f32, 0);
-    in.wheel = -30.0::f32;
-    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
-    if (left.scroll.offset != 30.0::f32) { ret 5; }
-    in.wheel = -1000.0::f32;
-    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
-    if (left.scroll.offset != 48.0::f32) { ret 6; }
-    # over the free area the wheel reaches no dock
-    in.mx    = 100.0::f32;
-    in.wheel = 30.0::f32;
-    frame_docks(?ctx, in, ?left, ?right, ?v, ?open);
-    if (left.scroll.offset != 48.0::f32 || right.scroll.offset != 0.0::f32) { ret 7; }
-
-    # clicking the right dock's heading opens its section, whose slider then
-    # maps the cursor in the dock's local space: its track spans x [154, 196)
-    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 0), ?left, ?right, ?v, ?open);
-    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 1), ?left, ?right, ?v, ?open);
-    frame_docks(?ctx, input_at(170.0::f32, 10.0::f32, 0), ?left, ?right, ?v, ?open);
-    if (open != 1) { ret 8; }
-    frame_docks(?ctx, input_at(175.0::f32, 30.0::f32, 0), ?left, ?right, ?v, ?open);
-    frame_docks(?ctx, input_at(175.0::f32, 30.0::f32, 1), ?left, ?right, ?v, ?open);
-    if (v != 5.0::f32) { ret 9; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -4782,20 +4714,13 @@ test ids__scopes_nest_through_containers {
     val w1: Window = auto_window("one", 0.0::f32, 0.0::f32, 100.0::f32);
     val w2: Window = auto_window("two", 0.0::f32, 0.0::f32, 100.0::f32);
     var s:  Scroll;
-    var d:  Dock;
-    d.side = context.Side.left{};
-    d.size = 40.0::f32;
 
     val root: u64 = context.id_of(?ctx, "ok");
     val one:  u64 = context.id_of(?ctx, "one");
     val pop:  u64 = bid.of_label(one, "pop");
     val reg:  u64 = bid.of_label(pop, "reg");
-    val body: u64 = context.id_of(?ctx, "dock");
 
     context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 400.0::f32, 400.0::f32);
-    val dk: DockArea = begin_dock(?ctx, "dock", ?d);
-    if (context.id_of(?ctx, "ok") != bid.of_label(body, "ok")) { ret 2; }
-    end_dock(?ctx, ?d, dk);
     val b1: WindowArea = begin_window(?ctx, w1);
     button(?ctx, "ok");
     if (context.id_of(?ctx, "ok") != bid.of_label(one, "ok")) { ret 3; }
@@ -4853,6 +4778,171 @@ test ids__same_frame_collisions_are_counted {
     if (context.collisions(?ctx) != 0) { ret 5; }
 
     val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# two windows side by side: a source row in the left, two target rows in the
+# right, one accepting the source's type and one another type
+# ---
+# left:    the "From" window
+# right:   the "To" window
+# value:   the payload the source drags
+# drag:    what the source's drag did this frame
+# ons:     frames the source's drag was on
+# got:     the payload the accepting row last took, 0 before any
+# drops:   drops the accepting row took
+# overs:   frames a drag was over the accepting row
+# others:  frames a drag was over the row accepting another type
+# preview: the last preview rect opened
+# px:      the pointer x the last preview opened at
+# py:      the pointer y the last preview opened at
+# layer:   the layer the last preview drew on
+#[testing]
+rec DndPair {
+    left:    Window;
+    right:   Window;
+    value:   u64;
+    drag:    dnd.Drag;
+    ons:     usize;
+    got:     u64;
+    drops:   usize;
+    overs:   usize;
+    others:  usize;
+    preview: dnd.Preview;
+    px:      f32;
+    py:      f32;
+    layer:   u32;
+}
+
+# a row in the current window, claimed for the left button
+#[testing]
+fun dnd_row(ctx: *context.Context, key: str, x0: *f32, y0: *f32, x1: *f32, y1: *f32) interact.Hit {
+    val r: context.Area = place(ctx, layout.fill(1.0::f32), layout.fixed(20.0::f32), 0.0::f32, 20.0::f32);
+    @x0 = r.x0;
+    @y0 = r.y0;
+    @x1 = r.x1;
+    @y1 = r.y1;
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, key), @x0, @y0, @x1, @y1, input.BUTTON_LEFT);
+    ret h;
+}
+
+#[testing]
+fun dnd_pair_ui(ctx: *context.Context, user: ptr) {
+    val p:  *DndPair = user::*DndPair;
+    var x0: f32;
+    var y0: f32;
+    var x1: f32;
+    var y1: f32;
+
+    val bl: WindowArea   = begin_window(ctx, p.left);
+    val hs: interact.Hit = dnd_row(ctx, "item", ?x0, ?y0, ?x1, ?y1);
+    p.drag = dnd.source(ctx, hs, "item", (?p.value)::ptr, $size_of(u64), x0, y0, x1, y1);
+    if (p.drag.on) {
+        p.ons = p.ons + 1;
+        val pv: dnd.Preview = dnd.begin_preview(ctx);
+        p.preview = pv;
+        p.px      = ctx.in.mx;
+        p.py      = ctx.in.my;
+        p.layer   = context.layer_of(ctx);
+        context.quad(ctx, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control);
+        dnd.end_preview(ctx, pv);
+    }
+    end_window(ctx, bl);
+
+    val br: WindowArea   = begin_window(ctx, p.right);
+    val ht: interact.Hit = dnd_row(ctx, "slot", ?x0, ?y0, ?x1, ?y1);
+    val d:  dnd.Drop     = dnd.target(ctx, ht, "item", x0, y0, x1, y1);
+    if (d.over) { p.overs = p.overs + 1; }
+    if (d.dropped && d.n == $size_of(u64)) {
+        p.got   = @(d.data::*u64);
+        p.drops = p.drops + 1;
+    }
+    val ho: interact.Hit = dnd_row(ctx, "other", ?x0, ?y0, ?x1, ?y1);
+    if (dnd.target(ctx, ho, "file", x0, y0, x1, y1).over) { p.others = p.others + 1; }
+    end_window(ctx, br);
+}
+
+#[testing]
+fun dnd_pair(d: *driver.Driver, a: *allo.Allocator, p: *DndPair) bool {
+    p.left        = window("From", 10.0::f32, 10.0::f32, 120.0::f32, 0.0::f32);
+    p.left.min_w  = 120.0::f32;
+    p.left.flags  = WINDOW_AUTO_SIZE;
+    p.right       = p.left;
+    p.right.title = "To";
+    p.right.x     = 200.0::f32;
+    p.value       = 42;
+    val e: err[allo.Error] = driver.init(d, a, 400.0::f32, 200.0::f32, dnd_pair_ui, p::ptr);
+    if (sel e.err) { ret false; }
+    driver.step(d);
+    ret true;
+}
+
+test dnd__drops_across_windows_and_cancels {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: DndPair;
+    var d: driver.Driver;
+    if (!dnd_pair(?d, ?a, ?p)) { ret 1; }
+    val item:  u64 = driver.find(?d, "From/item");
+    val slot:  u64 = driver.find(?d, "To/slot");
+    val other: u64 = driver.find(?d, "To/other");
+    if (!driver.drawn(?d, item) || !driver.drawn(?d, slot)) { ret 2; }
+
+    # a drag from one window onto a target in the other delivers the payload,
+    # and the source learns it was dropped in the frame after
+    if (!driver.drag_onto(?d, item, slot))         { ret 3; }
+    if (p.drops != 1 || p.got != 42 || p.ons == 0) { ret 4; }
+    if (p.overs == 0 || p.others != 0)             { ret 5; }
+    driver.step(?d);
+    if (!p.drag.dropped || p.drag.on) { ret 6; }
+    driver.step(?d);
+    if (p.drag.dropped) { ret 7; }
+
+    # the preview keeps the grabbed point under the pointer
+    if (!p.preview.on)                               { ret 8; }
+    if (p.preview.x1 - p.preview.x0 != 120.0::f32)   { ret 9; }
+    if (p.px < p.preview.x0 || p.px >= p.preview.x1) { ret 10; }
+    if (p.py < p.preview.y0 || p.py >= p.preview.y1) { ret 11; }
+    if (p.layer != band.layer(band.DRAG, 0))         { ret 11; }
+
+    # the other type's target never sees it, and a release over it misses
+    p.value = 7;
+    if (!driver.drag_onto(?d, item, other)) { ret 12; }
+    if (p.others != 0 || p.drops != 1)      { ret 13; }
+    driver.step(?d);
+    if (!p.drag.missed) { ret 14; }
+
+    # released over no target at all misses too
+    if (!driver.drag(?d, item, 380.0::f32, 190.0::f32)) { ret 15; }
+    driver.step(?d);
+    if (!p.drag.missed || p.drops != 1) { ret 16; }
+
+    # Escape cancels, and the same press does not start it again over a target
+    val r: opt[context.Area] = driver.rect(?d, slot);
+    if (sel r.none) { ret 17; }
+    driver.hover(?d, item);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, 150.0::f32, 40.0::f32);
+    if (!p.drag.on) { ret 18; }
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (!p.drag.cancelled || p.drag.on) { ret 19; }
+    driver.move(?d, (r.some.x0 + r.some.x1) / 2.0::f32, (r.some.y0 + r.some.y1) / 2.0::f32);
+    driver.move(?d, (r.some.x0 + r.some.x1) / 2.0::f32 + 1.0::f32, (r.some.y0 + r.some.y1) / 2.0::f32);
+    if (p.drag.on) { ret 20; }
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.drops != 1) { ret 21; }
+
+    # a press that moves less than the threshold is no drag
+    val ons: usize = p.ons;
+    driver.hover(?d, item);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, d.in.mx + 2.0::f32, d.in.my);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.ons != ons) { ret 22; }
+
+    val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
     ret 0;
 }

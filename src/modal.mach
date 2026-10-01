@@ -45,6 +45,7 @@ use std.allocator.page;
 
 use blit.band;
 use blit.context;
+use bdock: blit.dock;
 use blit.draw;
 use blit.driver;
 use blit.hit;
@@ -533,17 +534,17 @@ rec Probe {
     inner:  u32;
     outer:  u32;
     choice: usize;
-    dock:   widget.Dock;
+    dock:   bdock.Dock;
 }
 
 # a dock with a button, a button on the base, a modal "First" holding a
 # button and opening "Second" over it, and a confirm dialog
 #[testing]
 fun probe_ui(ctx: *context.Context, user: ptr) {
-    val pr: *Probe          = user::*Probe;
-    val da: widget.DockArea = widget.begin_dock(ctx, "side", ?pr.dock);
+    val pr: *Probe         = user::*Probe;
+    val da: bdock.DockArea = bdock.begin_dock(ctx, "side", ?pr.dock);
     if (widget.button(ctx, "docked")) { pr.docked = pr.docked + 1; }
-    widget.end_dock(ctx, ?pr.dock, da);
+    bdock.end_dock(ctx, ?pr.dock, da);
 
     val free: context.Area = context.free_area(ctx);
     if (widget.button_at(ctx, "under", free.x0, 0.0::f32, free.x1, 300.0::f32, false)) { pr.under = pr.under + 1; }
@@ -645,14 +646,14 @@ test modal__blocks_beneath_while_its_own_widgets_work {
 # ask:  1 to open the modal on the next frame
 #[testing]
 rec Deep {
-    dock: widget.Dock;
+    dock: bdock.Dock;
     ask:  u8;
 }
 
 #[testing]
 fun deep_ui(ctx: *context.Context, user: ptr) {
-    val dp: *Deep           = user::*Deep;
-    val da: widget.DockArea = widget.begin_dock(ctx, "side", ?dp.dock);
+    val dp: *Deep          = user::*Deep;
+    val da: bdock.DockArea = bdock.begin_dock(ctx, "side", ?dp.dock);
     widget.button(ctx, "top");
     if (dp.ask != 0) {
         open(ctx, "Inner");
@@ -662,7 +663,7 @@ fun deep_ui(ctx: *context.Context, user: ptr) {
     if (m.shown != 0) { widget.button(ctx, "Go"); }
     end_modal(ctx, m);
     widget.space(ctx, 1000.0::f32);
-    widget.end_dock(ctx, ?dp.dock, da);
+    bdock.end_dock(ctx, ?dp.dock, da);
 }
 
 test modal__wheel_over_it_leaves_the_region_beneath_still {

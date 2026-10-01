@@ -47,7 +47,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var win: blit.widget.Window = blit.widget.window("tools", 380.0::f32, 8.0::f32, 180.0::f32, 0.0::f32);
     win.flags = blit.widget.WINDOW_AUTO_SIZE;
 
-    var side: blit.widget.Dock;
+    var side: blit.dock.Dock;
     side.side = blit.context.Side.right{};
     side.size = blit.context.px(?ctx, 160.0::f32);
     var view_open: u8 = 1;
@@ -87,7 +87,7 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
 
     # a side panel docked to the right edge, in collapsible sections
-    val dock: blit.widget.DockArea = blit.widget.begin_dock(?ctx, "side", ?side);
+    val dock: blit.dock.DockArea = blit.dock.begin_dock(?ctx, "side", ?side);
     if (blit.widget.section(?ctx, "view", ?view_open)) {
         blit.widget.checkbox(?ctx, "grid", ?checked);
         blit.widget.slider_f(?ctx, "zoom", ?amount, 0.0::f32, 1.0::f32);
@@ -96,7 +96,7 @@ fun main(argc: i64, argv: **u8) i64 {
         # utf-8, with a codepoint the bitmap font lacks drawn as its replacement
         blit.widget.text(?ctx, "caf\xC3\xA9");
     }
-    blit.widget.end_dock(?ctx, ?side, dock);
+    blit.dock.end_dock(?ctx, ?side, dock);
     val panel: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
     blit.widget.text(?ctx, "blit headless smoke");
     blit.widget.button(?ctx, "step");
