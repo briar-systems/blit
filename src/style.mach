@@ -7,9 +7,12 @@
 #     blit.widget.button(?ctx, "delete");
 #     blit.style.pop(?ctx);
 #
-# draws one red button. a class is a named list of such settings, defined in
-# code with add_class and set, or in a theme document's [class.<name>]
-# tables, and push_class applies all of them to the widgets until its pop.
+# draws one solid red button: a fill pushed alone writes fill_to too, and
+# pushing fill_to as well, after it or in a class with it, makes the face a
+# gradient (see blit.theme.follower). a class is a named list of such
+# settings, defined in code with add_class and set, or in a theme document's
+# [class.<name>] tables, and push_class applies all of them to the widgets
+# until its pop.
 # pushes nest, and begin undoes any a frame left open.
 #
 # load_theme replaces the context's theme with one read from TOML and reads

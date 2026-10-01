@@ -29,6 +29,11 @@
 # meaning, and TOML, overrides (see context.push_color), classes and the
 # theme editor all address fields through it.
 #
+# a paint's fill_to follows its fill (see follower): every write through a
+# path, set, TOML or a class that writes a fill writes fill_to too, so a fill
+# alone is a flat face, and fill_to written with it or after it makes the
+# gradient. put writes one field as it is.
+#
 # motion is data too: how long hover and press transitions, sections opening
 # and scroll glides take and how they ease are the motion fields, at
 # motion.<name> (see Motion), which blit.anim reads through motion alone.
@@ -252,7 +257,8 @@ pub fun edges(v: f32) Edges {
 # how a style draws in one state
 # ---
 # fill:     the face, at its top when it is a gradient
-# fill_to:  the face at its bottom: the same as fill for a flat face, else a vertical gradient
+# fill_to:  the face at its bottom: the same as fill for a flat face, else a vertical gradient,
+#           following fill when fill is written through a path (see follower)
 # text:     text drawn on the face
 # mark:     secondary ink: a glyph, a caret, a reading or a hint
 # border:   the outline, transparent for none
@@ -473,7 +479,7 @@ pub val FIELDS: [58]Field = [58]Field{
     Field{group: GROUP_STYLE, name: "shadow_y", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_y), count: 1, doc: "shadow offset down"},
     Field{group: GROUP_STYLE, name: "shadow_blur", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_blur), count: 1, doc: "how far the shadow fades out, 0 for a hard edge"},
     Field{group: GROUP_PAINT, name: "fill", unit: UNIT_COLOR, off: $offset_of(Paint, fill), count: 1, doc: "the face, at its top when it is a gradient"},
-    Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, doc: "the face at its bottom: equal to fill for a flat face, else a vertical gradient"},
+    Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, doc: "the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat"},
     Field{group: GROUP_PAINT, name: "text", unit: UNIT_COLOR, off: $offset_of(Paint, text), count: 1, doc: "text drawn on the face"},
     Field{group: GROUP_PAINT, name: "mark", unit: UNIT_COLOR, off: $offset_of(Paint, mark), count: 1, doc: "secondary ink: a glyph, a caret, a reading or a hint"},
     Field{group: GROUP_PAINT, name: "border", unit: UNIT_COLOR, off: $offset_of(Paint, border), count: 1, doc: "the outline, transparent for none"},
@@ -1025,16 +1031,17 @@ pub fun is_token(r: Ref) bool {
 
 # write one field of a theme, moving the styles with a token
 #
-# a style or plot field is written as it is. a token is written and the
-# styles rederived, so every style field that took its value from the old
-# token takes the new one and fields set by hand stay as they are.
+# a style or plot field is written as it is, with the field that follows it
+# (see follower). a token is written and the styles rederived, so every style
+# field that took its value from the old token takes the new one and fields
+# set by hand stay as they are.
 # ---
 # t: the theme
 # r: the field, from ref_at
 # v: its new value
 pub fun set(t: *Theme, r: Ref, v: Value) {
     if (!is_token(r)) {
-        put(t, r, v);
+        write(t, r, v);
         ret;
     }
     val before: Theme = @t;
@@ -1042,7 +1049,7 @@ pub fun set(t: *Theme, r: Ref, v: Value) {
     rederive(t, ?before);
 }
 
-# write every field a path names
+# write every field a path names, each with the field that follows it
 # ---
 # t:   the theme
 # p:   the path
@@ -1053,11 +1060,45 @@ pub fun set_path(t: *Theme, p: Path, v: Value) usize {
     val before: Theme = @t;
     var i:      usize = 0;
     for (i < n) {
-        put(t, ref_at(p, i), v);
+        write(t, ref_at(p, i), v);
         i = i + 1;
     }
     if (n > 0 && is_token(ref_at(p, 0))) { rederive(t, ?before); }
     ret n;
+}
+
+# the field a write of a field writes too, with the same value
+#
+# a paint's fill_to follows its fill, so a fill written alone gives a flat
+# face and fill_to written with it or after it gives the gradient. a write
+# of several fields at once writes the following ones last (see follows), so
+# the result does not depend on the order they are listed in.
+# ---
+# r:   the field
+# ret: the fill_to of the same paint for a fill, else none
+pub fun follower(r: Ref) opt[Ref] {
+    if (r.group != GROUP_PAINT) { ret opt[Ref].none{}; }
+    val in: usize = (r.off - $offset_of(Style, states)) % $size_of(Paint);
+    if (in != $offset_of(Paint, fill)) { ret opt[Ref].none{}; }
+    var f: Ref = r;
+    f.off = r.off - $offset_of(Paint, fill) + $offset_of(Paint, fill_to);
+    ret opt[Ref].some{f};
+}
+
+# whether a field follows another (see follower)
+# ---
+# r:   the field
+# ret: true for a paint's fill_to
+pub fun follows(r: Ref) bool {
+    if (r.group != GROUP_PAINT) { ret false; }
+    ret (r.off - $offset_of(Style, states)) % $size_of(Paint) == $offset_of(Paint, fill_to);
+}
+
+# write one field and the field that follows it
+fun write(t: *Theme, r: Ref, v: Value) {
+    put(t, r, v);
+    val f: opt[Ref] = follower(r);
+    if (sel f.some) { put(t, f.some, v); }
 }
 
 # a style's paint with one fill and the theme's text inks
@@ -1990,7 +2031,7 @@ fun apply(t: *Theme, p: Path, v: *toml.Value) err[LoadError] {
     val n: usize = span(t, p);
     var i: usize = 0;
     for (i < n) {
-        put(t, ref_at(p, i), x.some);
+        write(t, ref_at(p, i), x.some);
         i = i + 1;
     }
     ret err[LoadError].ok{};
@@ -2007,16 +2048,21 @@ fun entry(tb: *toml.Table, i: usize, key: *str, v: **toml.Value) bool {
     ret true;
 }
 
-# apply every field of one top-level table: tokens when tokens is true, the
-# rest otherwise
-fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError] {
+# the passes a document is read in: tokens, then the other fields, then the
+# fields that follow another (see follower), so they win whatever the order
+val PASS_TOKENS:  u8 = 0;
+val PASS_FIELDS:  u8 = 1;
+val PASS_FOLLOWS: u8 = 2;
+
+# apply the fields of one top-level table that belong to a pass
+fun read_table(t: *Theme, top: str, tb: *toml.Table, pass: u8) err[LoadError] {
     var segs: [3]str;
     var lens: [3]usize;
     segs[0] = top;
     lens[0] = str_len(top);
     val g:      opt[u8] = group_named(top, lens[0]);
     val is_tok: bool    = sel g.some && (g.some == GROUP_PALETTE || g.some == GROUP_METRICS);
-    if (is_tok != tokens) { ret err[LoadError].ok{}; }
+    if (is_tok != (pass == PASS_TOKENS)) { ret err[LoadError].ok{}; }
     var i: usize = 0;
     for (i < toml.table_len(tb)) {
         var key: str;
@@ -2034,20 +2080,29 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError
                 lens[2] = str_len(k2);
                 val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 3);
                 if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v2.key.at}}; }
-                val e: err[LoadError] = apply(t, p.some, v2);
-                if (sel e.err) { ret e; }
+                if (in_pass(p.some, pass)) {
+                    val e: err[LoadError] = apply(t, p.some, v2);
+                    if (sel e.err) { ret e; }
+                }
                 j = j + 1;
             }
         }
         or {
             val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 2);
             if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
-            val e: err[LoadError] = apply(t, p.some, v);
-            if (sel e.err) { ret e; }
+            if (in_pass(p.some, pass)) {
+                val e: err[LoadError] = apply(t, p.some, v);
+                if (sel e.err) { ret e; }
+            }
         }
         i = i + 1;
     }
     ret err[LoadError].ok{};
+}
+
+# whether a path's fields are read in a pass past the tokens
+fun in_pass(p: Path, pass: u8) bool {
+    ret pass == PASS_TOKENS || follows(ref_at(p, 0)) == (pass == PASS_FOLLOWS);
 }
 
 # the theme a parsed document describes, read into a theme keeping its kinds
@@ -2056,7 +2111,8 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError
 # it has none). its palette and metrics tables set tokens and move the styles
 # with them (see rederive), then its plot table and kind tables set fields as
 # they are: [<kind>] for style fields and [<kind>.<state>] for paint fields,
-# with "*" for every kind or state, a kind named by its registered name. a
+# with "*" for every kind or state, a kind named by its registered name, and
+# fill_to after every fill (see follower) wherever it is listed. a
 # class table is left for the context (see style.load_theme). a key that
 # names nothing, an unregistered kind among them, is refused.
 # ---
@@ -2088,8 +2144,8 @@ fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
         if (!builtin(t, bv.data.string)) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
     }
     val before: Theme = @t;
-    var pass:   u8    = 0;
-    for (pass < 2) {
+    var pass:   u8    = PASS_TOKENS;
+    for (pass <= PASS_FOLLOWS) {
         var i: usize = 0;
         for (i < toml.table_len(root)) {
             var key: str;
@@ -2101,10 +2157,10 @@ fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
             val g:  opt[u8]  = group_named(key, str_len(key));
             val ko: opt[u32] = kind_named(t, key, str_len(key));
             if (sel g.none && sel ko.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
-            val e: err[LoadError] = read_table(t, key, ?v.data.table, pass == 0);
+            val e: err[LoadError] = read_table(t, key, ?v.data.table, pass);
             if (sel e.err) { ret e; }
         }
-        if (pass == 0) { rederive(t, ?before); }
+        if (pass == PASS_TOKENS) { rederive(t, ?before); }
         pass = pass + 1;
     }
     ret err[LoadError].ok{};
@@ -2206,9 +2262,12 @@ fun save_group(w: *tw.Writer, t: *Theme, group: u8, name: str) {
 
 # write the fields of one group of a kind (style fields, or one state's paint
 # fields) that differ from what its derive builds, under a table header when
-# any do
+# any do. a field that follows another (see follower) is written after it
+# when it differs from it, as reading the leader alone would make them equal.
 fun save_diff(w: *tw.Writer, t: *Theme, d: *Style, kind: u32, state: u8, group: u8) {
     var header: bool  = false;
+    var led:    bool  = false;
+    var lead:   Value;
     var i:      usize = 0;
     for (i < FIELD_COUNT) {
         val f: Field = FIELDS[i];
@@ -2222,7 +2281,14 @@ fun save_diff(w: *tw.Writer, t: *Theme, d: *Style, kind: u32, state: u8, group: 
                 was.v[j] = ((d::usize + off)::*f32)[j];
                 j        = j + 1;
             }
-            if (!same_value(f.unit, now, was)) {
+            var differs: bool = !same_value(f.unit, now, was);
+            if (follows(r) && led) { differs = !same_value(f.unit, now, lead); }
+            val fo: opt[Ref] = follower(r);
+            if (sel fo.some) {
+                led  = differs;
+                lead = now;
+            }
+            if (differs) {
                 if (!header) {
                     var keys: [2]str;
                     keys[0] = t.names[kind];
