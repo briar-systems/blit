@@ -169,6 +169,29 @@ pub rec Area {
     y1: f32;
 }
 
+# one line of text the frame drew, as the trace keeps it
+# ---
+# start: first byte of the line's text in the trace's bytes
+# len:   bytes of text
+# box:   the line box in screen pixels, before clipping
+rec Traced {
+    start: usize;
+    len:   usize;
+    box:   Area;
+}
+
+# one line of text the frame drew, read back from the trace (see set_trace)
+# ---
+# text: the line's utf-8 text, not NUL-terminated, valid until the next begin
+# len:  bytes of text
+# box:  the line box in screen pixels, from the pen's start to its end and
+#       from the line's top to its bottom, before clipping
+pub rec TextLine {
+    text: *u8;
+    len:  usize;
+    box:  Area;
+}
+
 # immediate-mode UI state for one consumer
 # ---
 # dl:           draw list accumulated each frame
@@ -252,6 +275,13 @@ pub rec Area {
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
+# trace_on:     1 if the frame's text lines are recorded (see set_trace), else 0
+# traced:       the frame's recorded text lines, grown on demand
+# traced_cap:   lines allocated for traced
+# traced_len:   lines recorded this frame
+# trace_bytes:  the recorded lines' text, back to back
+# trace_cap:    bytes allocated for trace_bytes
+# trace_len:    bytes recorded this frame
 pub rec Context {
     dl:           draw.DrawList;
     in:           input.Input;
@@ -334,6 +364,13 @@ pub rec Context {
     collided_cap: usize;
     collided_len: usize;
     store:        store.Store;
+    trace_on:     u8;
+    traced:       *Traced;
+    traced_cap:   usize;
+    traced_len:   usize;
+    trace_bytes:  *u8;
+    trace_cap:    usize;
+    trace_len:    usize;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -453,17 +490,34 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.collided_cap = 0;
     ctx.collided_len = 0;
     store.init(?ctx.store, a);
+    ctx.trace_on    = 0;
+    ctx.traced      = nil;
+    ctx.traced_cap  = 0;
+    ctx.traced_len  = 0;
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, state and id bookkeeping
+# composition, state, id bookkeeping and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    val el: err[allo.Error] = allo.deallocate[Traced](ctx.a, ctx.traced, ctx.traced_cap);
+    if (sel el.err) { ret el; }
+    ctx.traced     = nil;
+    ctx.traced_cap = 0;
+    ctx.traced_len = 0;
+    val eb: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.trace_bytes, ctx.trace_cap);
+    if (sel eb.err) { ret eb; }
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
     if (ctx.pre != nil) {
         val ep: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.pre, ctx.pre_cap);
         if (sel ep.err) { ret ep; }
@@ -597,6 +651,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.hover_seen   = 0;
     ctx.collided_len = 0;
     set.clear[u64](?ctx.seen);
+    ctx.traced_len = 0;
+    ctx.trace_len  = 0;
 
     draw.reset(?ctx.dl);
 }
@@ -941,6 +997,127 @@ pub fun collisions(ctx: *Context) usize {
 pub fun collision_at(ctx: *Context, index: usize) u64 {
     if (index >= ctx.collided_len) { ret 0; }
     ret ctx.collided[index];
+}
+
+# the screen rect a widget claimed this frame, the union of its visible claims
+#
+# while a frame is built it covers the claims made so far, and after end() the
+# whole frame's, until the next begin. a widget clipped out of sight or not
+# drawn has none, so this also says whether a widget was drawn.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: the rect in screen pixels, or none when the widget claimed nothing visible
+pub fun rect_of(ctx: *Context, id: u64) opt[Area] {
+    var found: u8    = 0;
+    var r:     Area;
+    var i:     usize = 0;
+    if (id == 0) { ret opt[Area].none{}; }
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id != id || c.x1 <= c.x0 || c.y1 <= c.y0) { cnt; }
+        if (found == 0) {
+            r     = Area{x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1};
+            found = 1;
+            cnt;
+        }
+        r.x0 = minf(r.x0, c.x0);
+        r.y0 = minf(r.y0, c.y0);
+        r.x1 = maxf(r.x1, c.x1);
+        r.y1 = maxf(r.y1, c.y1);
+    }
+    if (found == 0) { ret opt[Area].none{}; }
+    ret opt[Area].some{r};
+}
+
+# the widget a pointer at a screen point would reach next frame: the topmost
+# of this frame's claims holding it
+# ---
+# ctx: context
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the widget's id, 0 when nothing or only an anonymous container is there
+pub fun widget_at(ctx: *Context, x: f32, y: f32) u64 {
+    ret hit.resolve(?ctx.claims, x, y);
+}
+
+# the topmost widget whose claim this frame lies wholly inside a screen rect
+# ---
+# ctx: context
+# r:   the rect in screen pixels
+# ret: the widget's id, 0 when no widget's claim lies inside it
+pub fun widget_in(ctx: *Context, r: Area) u64 {
+    var found: u8    = 0;
+    var best:  u64   = 0;
+    var id:    u64   = 0;
+    var i:     usize = 0;
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id == 0 || c.x1 <= c.x0 || c.y1 <= c.y0)                { cnt; }
+        if (c.x0 < r.x0 || c.y0 < r.y0 || c.x1 > r.x1 || c.y1 > r.y1) { cnt; }
+        if (found == 0 || c.key > best) {
+            found = 1;
+            best  = c.key;
+            id    = c.id;
+        }
+    }
+    ret id;
+}
+
+# record the text each frame draws, line by line, for tests to read back
+#
+# off by default, so a frame pays nothing for it. while on, every line of text
+# drawn at least partly inside the clip is kept with its screen box until the
+# next begin (see traced_count and traced_at). a line the trace cannot grow to
+# hold sets oom and is left out.
+# ---
+# ctx: context
+# on:  1 to record, 0 to stop
+pub fun set_trace(ctx: *Context, on: u8) {
+    ctx.trace_on = on;
+}
+
+# how many lines of text the frame drew while tracing
+# ---
+# ctx: context
+# ret: the line count
+pub fun traced_count(ctx: *Context) usize {
+    ret ctx.traced_len;
+}
+
+# one line of text the frame drew while tracing, in drawing order
+# ---
+# ctx:   context
+# index: line index below traced_count()
+# ret:   the line, or an empty one for an index out of range
+pub fun traced_at(ctx: *Context, index: usize) TextLine {
+    var l: TextLine;
+    if (index >= ctx.traced_len) { ret l; }
+    val t: Traced = ctx.traced[index];
+    l.text = ?ctx.trace_bytes[t.start];
+    l.len  = t.len;
+    l.box  = t.box;
+    ret l;
+}
+
+# keep one drawn line of text in the trace, given in local coordinates
+fun trace_line(ctx: *Context, s: *u8, n: usize, x0: f32, y0: f32, x1: f32, y1: f32) {
+    val b: Area = Area{x0: x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly};
+    if (b.x1 <= ctx.clip_x0 || b.x0 >= ctx.clip_x1) { ret; }
+    if (b.y1 <= ctx.clip_y0 || b.y0 >= ctx.clip_y1) { ret; }
+    ctx.traced      = room[Traced](ctx, ctx.traced, ?ctx.traced_cap, ctx.traced_len + 1, RUN_DEPTH);
+    ctx.trace_bytes = room[u8](ctx, ctx.trace_bytes, ?ctx.trace_cap, ctx.trace_len + n, 1024);
+    if (ctx.traced_len >= ctx.traced_cap || ctx.trace_len + n > ctx.trace_cap) { ret; }
+    var k: usize = 0;
+    for (k < n) {
+        ctx.trace_bytes[ctx.trace_len + k] = s[k];
+        k                                  = k + 1;
+    }
+    ctx.traced[ctx.traced_len] = Traced{start: ctx.trace_len, len: n, box: b};
+    ctx.traced_len             = ctx.traced_len + 1;
+    ctx.trace_len              = ctx.trace_len + n;
 }
 
 # note a claim's id: a repeat within the frame is a collision, and a claim by
@@ -1895,7 +2072,9 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
 }
 
 # draw one line of shaped glyphs with the pen starting at x on the baseline
-fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) {
+#
+# ret: the pen's x after the line
+fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
     val g:  usize       = font.shape(?ctx.font, ctx.style, ctx.scale, s, n);
     val sh: *gly.Shaped = font.shaped(?ctx.font);
     var px: f32         = x;
@@ -1906,6 +2085,7 @@ fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color
         px = px + one.advance;
         k  = k + 1;
     }
+    ret px;
 }
 
 # draw the first n bytes of utf-8 text with its first line box's top-left at
@@ -1930,7 +2110,10 @@ pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color
     for (a <= n) {
         var b: usize = a;
         for (b < n && s[b] != '\n') { b = b + 1; }
-        if (b > a) { pen_line(ctx, ?s[a], b - a, x, base, ink); }
+        if (b > a) {
+            val end: f32 = pen_line(ctx, ?s[a], b - a, x, base, ink);
+            if (ctx.trace_on != 0) { trace_line(ctx, ?s[a], b - a, x, base - m.ascent, end, base - m.ascent + lh); }
+        }
         base = base + lh;
         a    = b + 1;
     }
