@@ -13,6 +13,7 @@ fwd blit.atlas;
 fwd blit.bitmap;
 fwd blit.draw;
 fwd blit.path;
+fwd blit.icon;
 fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;
@@ -33,12 +34,19 @@ fwd blit.textarea;
 fwd blit.list;
 fwd blit.chart;
 fwd blit.controls;
+fwd blit.table;
 fwd blit.payload;
 fwd blit.dnd;
 fwd blit.tabs;
 fwd blit.dock;
+fwd blit.value;
+fwd blit.color;
 fwd blit.driver;
 fwd blit.menu;
+fwd blit.modal;
+fwd blit.overlay;
+fwd blit.toast;
+fwd blit.tooltip;
 
 # blit library version
 pub val VERSION: str = "0.9.0";

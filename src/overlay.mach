@@ -1,0 +1,545 @@
+# overlays: floating widgets that are not windows
+#
+# an overlay is a column of widgets with no title, frame or background unless
+# its chrome gives one, placed by an anchor rather than by the layout: a point
+# of the surface or of a given rect, the point of the overlay put there, and
+# an offset. it sizes to its content, measured into the state store under its
+# id, so a placement that depends on its size reads last frame's measure, and
+# an overlay never measured lays out its first frame hidden, only to measure
+# (see context.push_measure), as a fitted stack does.
+#
+# overlays paint and take input in the overlays band (see blit.band), above
+# windows and docks, ordered among themselves by the order they name and then
+# by call order. an overlay claims nothing of its own: input stops only where
+# the widgets inside it claim, so the world under its empty space stays
+# interactive, as a HUD's readout over a simulation needs.
+#
+# an overlay can fade by the pointer's distance from it, to get out of the way
+# as the pointer nears or to show itself only then (see Fade). the fade is an
+# opacity scope (see context.push_alpha) over everything it holds.
+#
+# toasts (blit.toast) and tooltips (blit.tooltip) are built on overlays. what
+# their chrome draws with comes from chrome, the one place an overlay reads
+# its look from the theme.
+
+use std.math.float;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.string.str;
+
+use blit.band;
+use blit.context;
+use blit.draw;
+use drv: blit.driver;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.widget;
+use allo: std.allocator;
+use std.allocator.page;
+
+# a point of a rect, as fractions of its width and height from its top-left
+# corner
+# ---
+# x: 0 the left edge, 0.5 the centre, 1 the right edge
+# y: 0 the top edge, 0.5 the centre, 1 the bottom edge
+pub rec Anchor {
+    x: f32;
+    y: f32;
+}
+
+# the nine named points of a rect
+pub val TOP_LEFT:     Anchor = Anchor{x: 0.0::f32, y: 0.0::f32};
+pub val TOP:          Anchor = Anchor{x: 0.5::f32, y: 0.0::f32};
+pub val TOP_RIGHT:    Anchor = Anchor{x: 1.0::f32, y: 0.0::f32};
+pub val LEFT:         Anchor = Anchor{x: 0.0::f32, y: 0.5::f32};
+pub val CENTER:       Anchor = Anchor{x: 0.5::f32, y: 0.5::f32};
+pub val RIGHT:        Anchor = Anchor{x: 1.0::f32, y: 0.5::f32};
+pub val BOTTOM_LEFT:  Anchor = Anchor{x: 0.0::f32, y: 1.0::f32};
+pub val BOTTOM:       Anchor = Anchor{x: 0.5::f32, y: 1.0::f32};
+pub val BOTTOM_RIGHT: Anchor = Anchor{x: 1.0::f32, y: 1.0::f32};
+
+# how an overlay fades by the pointer's distance from its rect
+#
+# the opacity runs from near, with the pointer on the overlay, to far, with it
+# dist pixels away or more, or off the surface. near 1 and far 0 shows the
+# overlay as the pointer nears, near 0.2 and far 1 lets a HUD get out of the
+# way.
+# ---
+# dist: pixels over which the opacity runs, 0 for no fade
+# near: opacity with the pointer on the overlay, in [0, 1]
+# far:  opacity with the pointer dist pixels away or more, in [0, 1]
+pub rec Fade {
+    dist: f32;
+    near: f32;
+    far:  f32;
+}
+
+# what an overlay's chrome draws with
+pub val KIND_OVERLAY: u32 = 0;
+pub val KIND_TOAST:   u32 = 1;
+pub val KIND_TOOLTIP: u32 = 2;
+
+# an overlay's look, lengths at the context's scale
+# ---
+# fill:     background, transparent for none
+# border:   outline, transparent for none
+# border_w: outline width in pixels
+# text:     text drawn on it
+# pad:      space between its edges and its content, in pixels
+# corner:   corner radius in pixels
+pub rec Chrome {
+    fill:     draw.Color;
+    border:   draw.Color;
+    border_w: f32;
+    text:     draw.Color;
+    pad:      f32;
+    corner:   f32;
+}
+
+# what an overlay call declares
+# ---
+# target:  the rect it is anchored to, in the caller's local pixels, used when to_rect is 1
+# to_rect: 1 to anchor to target, 0 to anchor to the surface
+# at:      the point of the target it is anchored at
+# pivot:   the point of the overlay put there
+# dx:      offset right in pixels
+# dy:      offset down in pixels
+# order:   its place among overlays, higher above, ties by call order
+# keep:    1 to keep it on the surface: an overlay running off an edge flips to
+#          the far side of its anchor on that axis, then is clamped
+# fade:    how it fades by the pointer's distance
+# align:   where its widgets sit across its column
+# band:    the band it opens in, band.OVERLAYS unless it belongs in another
+# kind:    the chrome it draws with, KIND_OVERLAY for none
+pub rec Overlay {
+    target:  context.Area;
+    to_rect: u8;
+    at:      Anchor;
+    pivot:   Anchor;
+    dx:      f32;
+    dy:      f32;
+    order:   u32;
+    keep:    u8;
+    fade:    Fade;
+    align:   layout.Align;
+    band:    u32;
+    kind:    u32;
+}
+
+# the handle begin returns for end
+# ---
+# id:     the overlay's id, also the id scope of what it holds
+# x0:     left in screen pixels
+# y0:     top in screen pixels
+# x1:     right as measured last frame, in screen pixels
+# y1:     bottom as measured last frame, in screen pixels
+# alpha:  the opacity its fade gave it this frame
+# hidden: 1 while it lays out only to measure
+# kind:   the chrome it draws with
+# ch:     the channels its chrome and content draw in
+pub rec Shown {
+    id:     u64;
+    x0:     f32;
+    y0:     f32;
+    x1:     f32;
+    y1:     f32;
+    alpha:  f32;
+    hidden: u8;
+    kind:   u32;
+    ch:     context.Channels;
+}
+
+# what an overlay measured of itself, kept under its id for the next frame
+rec Measure {
+    w:    f32;
+    h:    f32;
+    seen: u8;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    ret maxf(lo, minf(v, hi));
+}
+
+# what an overlay of a kind draws with, from the context's theme
+#
+# the one place overlays, toasts and tooltips read their look: a bare overlay
+# draws nothing of its own, and toasts and tooltips take the window surface,
+# the edge line, the text color and the theme's padding and corners.
+# ---
+# ctx:  context
+# kind: KIND_OVERLAY, KIND_TOAST or KIND_TOOLTIP
+# ret:  the look, lengths scaled
+pub fun chrome(ctx: *context.Context, kind: u32) Chrome {
+    var c: Chrome;
+    c.text = ctx.theme.text;
+    if (kind == KIND_OVERLAY) { ret c; }
+    c.fill     = ctx.theme.window;
+    c.border   = ctx.theme.edge;
+    c.border_w = context.px(ctx, ctx.theme.edge_w);
+    c.pad      = context.px(ctx, ctx.theme.pad);
+    c.corner   = context.px(ctx, ctx.theme.corner);
+    ret c;
+}
+
+# paint a chrome's background and outline over a rect in local pixels
+# ---
+# ctx: context
+# c:   the chrome
+# x0:  left in pixels
+# y0:  top in pixels
+# x1:  right in pixels
+# y1:  bottom in pixels
+pub fun paint(ctx: *context.Context, c: Chrome, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if (c.fill.a > 0.0::f32)                              { context.fill(ctx, x0, y0, x1, y1, c.corner, context.CORNERS_ALL, c.fill); }
+    if (c.border.a <= 0.0::f32 || c.border_w <= 0.0::f32) { ret; }
+    if (c.corner > 0.0::f32)                              { context.stroke_rounded_rect(ctx, x0, y0, x1, y1, draw.radii(c.corner), c.border_w, c.border); }
+    or                                                    { context.frame(ctx, x0, y0, x1, y1, c.border_w, c.border); }
+}
+
+# an overlay anchored to the surface at a point, the same point of the
+# overlay put there, so a corner anchor sits in that corner
+# ---
+# a:   the point
+# ret: the declaration, to adjust and pass to begin
+pub fun on_surface(a: Anchor) Overlay {
+    var o: Overlay;
+    o.at    = a;
+    o.pivot = a;
+    o.fade  = Fade{dist: 0.0::f32, near: 1.0::f32, far: 1.0::f32};
+    o.align = layout.Align.start{};
+    o.band  = band.OVERLAYS;
+    o.kind  = KIND_OVERLAY;
+    ret o;
+}
+
+# an overlay anchored to a rect: its pivot put at the rect's point at
+# ---
+# r:     the rect, in the caller's local pixels
+# at:    the point of the rect
+# pivot: the point of the overlay put there
+# ret:   the declaration, to adjust and pass to begin
+pub fun on_rect(r: context.Area, at: Anchor, pivot: Anchor) Overlay {
+    var o: Overlay = on_surface(at);
+    o.target  = r;
+    o.to_rect = 1;
+    o.pivot   = pivot;
+    ret o;
+}
+
+# the side of an extent [lo, hi) an item of length len starts at, placing
+# its point pivot at the extent's point at, offset by d
+fun side(lo: f32, hi: f32, at: f32, pivot: f32, len: f32, d: f32) f32 {
+    ret lo + (hi - lo) * at - len * pivot + d;
+}
+
+# where an item starts on one axis, kept within [0, room) when keep is set:
+# flipped to the far side of its anchor when it runs off, then clamped
+fun axis(lo: f32, hi: f32, at: f32, pivot: f32, len: f32, d: f32, keep: u8, room: f32) f32 {
+    val v: f32 = side(lo, hi, at, pivot, len, d);
+    if (keep == 0) { ret v; }
+    if (v < 0.0::f32 || v + len > room) {
+        val w: f32 = side(lo, hi, 1.0::f32 - at, 1.0::f32 - pivot, len, -d);
+        if (w >= 0.0::f32 && w + len <= room) { ret w; }
+    }
+    ret clampf(v, 0.0::f32, maxf(room - len, 0.0::f32));
+}
+
+# the opacity a fade gives a screen rect with the pointer where it is
+fun fade_of(ctx: *context.Context, f: Fade, x0: f32, y0: f32, x1: f32, y1: f32) f32 {
+    if (f.dist <= 0.0::f32)  { ret 1.0::f32; }
+    if (ctx.in.present == 0) { ret f.far; }
+    val mx: f32 = ctx.in.mx;
+    val my: f32 = ctx.in.my;
+    var dx: f32 = 0.0::f32;
+    var dy: f32 = 0.0::f32;
+    if (mx < x0) { dx = x0 - mx; }
+    if (mx > x1) { dx = mx - x1; }
+    if (my < y0) { dy = y0 - my; }
+    if (my > y1) { dy = my - y1; }
+    val d: f32 = float.sqrt_f32(dx * dx + dy * dy);
+    val t: f32 = clampf(d / f.dist, 0.0::f32, 1.0::f32);
+    ret f.near + (f.far - f.near) * t;
+}
+
+# open an overlay
+#
+# widgets placed until the matching end lay out down a column inside it, in
+# screen pixels, and paint and claim on its layer. the overlay is an id scope
+# for them. pair every begin with an end.
+# ---
+# ctx: context
+# key: the overlay's key in the current id scope
+# o:   what the call declares (see on_surface and on_rect)
+# ret: a handle for end
+pub fun begin(ctx: *context.Context, key: str, o: Overlay) Shown {
+    ret begin_id(ctx, context.id_of(ctx, key), o);
+}
+
+# begin for an overlay whose id is already known, such as a part of a widget
+# ---
+# ctx: context
+# id:  the overlay's id
+# o:   what the call declares
+# ret: a handle for end
+pub fun begin_id(ctx: *context.Context, id: u64, o: Overlay) Shown {
+    val m: *Measure = state.get[Measure](ctx, id);
+    val c: Chrome   = chrome(ctx, o.kind);
+
+    var tx0: f32 = 0.0::f32;
+    var ty0: f32 = 0.0::f32;
+    var tx1: f32 = ctx.sw;
+    var ty1: f32 = ctx.sh;
+    if (o.to_rect != 0) {
+        tx0 = o.target.x0 + ctx.lx;
+        ty0 = o.target.y0 + ctx.ly;
+        tx1 = o.target.x1 + ctx.lx;
+        ty1 = o.target.y1 + ctx.ly;
+    }
+
+    var s: Shown;
+    s.id   = id;
+    s.kind = o.kind;
+    s.x0   = axis(tx0, tx1, o.at.x, o.pivot.x, m.w, o.dx, o.keep, ctx.sw);
+    s.y0   = axis(ty0, ty1, o.at.y, o.pivot.y, m.h, o.dy, o.keep, ctx.sh);
+    s.x1   = s.x0 + m.w;
+    s.y1   = s.y0 + m.h;
+
+    # a placement that reads the size waits for a measure before it shows
+    val sized: bool = o.pivot.x != 0.0::f32 || o.pivot.y != 0.0::f32 || o.keep != 0;
+    if (m.seen == 0 && sized) { s.hidden = 1; }
+    s.alpha = fade_of(ctx, o.fade, s.x0, s.y0, s.x1, s.y1);
+
+    context.push_band(ctx, o.band, o.order);
+    context.push_id(ctx, id);
+    if (s.hidden != 0) {
+        context.push_measure(ctx);
+        context.wake_at(ctx, ctx.in.time);
+    }
+    context.push_alpha(ctx, s.alpha);
+    s.ch = context.split(ctx, 2);
+    context.set_channel(ctx, s.ch, 1);
+
+    var f: layout.Frame = layout.column(s.x0 + c.pad, s.y0 + c.pad, m.w - c.pad * 2.0::f32, 0.0::f32, context.px(ctx, ctx.theme.gap));
+    f.open  = layout.OPEN_W | layout.OPEN_H;
+    f.align = o.align;
+    context.push_layout(ctx, f);
+    ret s;
+}
+
+# close an overlay: paint its chrome beneath its widgets, measure it for the
+# next frame and leave its layer
+# ---
+# ctx: context
+# s:   the value returned by begin
+pub fun end(ctx: *context.Context, s: Shown) {
+    val c: Chrome        = chrome(ctx, s.kind);
+    val f: *layout.Frame = context.top_layout(ctx);
+    var w: f32           = 0.0::f32;
+    var h: f32           = 0.0::f32;
+    if (f.items > 0) {
+        w = f.need_w + c.pad * 2.0::f32;
+        h = f.need_h + c.pad * 2.0::f32;
+    }
+    context.pop_layout(ctx);
+
+    context.set_channel(ctx, s.ch, 0);
+    if (w > 0.0::f32 && h > 0.0::f32) { paint(ctx, c, s.x0, s.y0, s.x0 + w, s.y0 + h); }
+    context.merge(ctx, s.ch);
+
+    val m: *Measure = state.get[Measure](ctx, s.id);
+    m.w    = w;
+    m.h    = h;
+    m.seen = 1;
+
+    context.pop_alpha(ctx);
+    if (s.hidden != 0) { context.pop_measure(ctx); }
+    context.pop_id(ctx);
+    context.pop_band(ctx);
+}
+
+# what the probe interface declares and what its overlays reported
+#[testing]
+rec Probe {
+    window:  u8;
+    two:     u8;
+    order_a: u32;
+    order_b: u32;
+    fade:    Fade;
+    kept:    u8;
+    hud:     Shown;
+    tip:     Shown;
+}
+
+# a world claiming the whole screen, a readout overlay in the top right
+# corner, two overlays sharing a corner when asked, an overlay kept on screen
+# below a rect at the right edge when asked and a window over the whole
+# screen, called last, when asked
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p:     *Probe       = user::*Probe;
+    val world: interact.Hit = interact.hit(ctx, context.id_of(ctx, "world"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, input.BUTTON_LEFT);
+
+    var o: Overlay = on_surface(TOP_RIGHT);
+    o.fade = p.fade;
+    val s: Shown = begin(ctx, "hud", o);
+    widget.text(ctx, "a long readout line");
+    widget.size_next(ctx, layout.fit(), layout.auto());
+    widget.button(ctx, "go");
+    end(ctx, s);
+    p.hud = s;
+
+    if (p.two != 0) {
+        var oa: Overlay = on_surface(BOTTOM_LEFT);
+        oa.order = p.order_a;
+        val sa: Shown = begin(ctx, "a", oa);
+        widget.button(ctx, "pa");
+        end(ctx, sa);
+        var ob: Overlay = on_surface(BOTTOM_LEFT);
+        ob.order = p.order_b;
+        val sb: Shown = begin(ctx, "b", ob);
+        widget.button(ctx, "pb");
+        end(ctx, sb);
+    }
+
+    if (p.kept != 0) {
+        var ot: Overlay = on_rect(context.Area{x0: 280.0::f32, y0: 10.0::f32, x1: 290.0::f32, y1: 20.0::f32}, BOTTOM_LEFT, TOP_LEFT);
+        ot.dy   = 2.0::f32;
+        ot.keep = 1;
+        val st: Shown = begin(ctx, "tip", ot);
+        widget.text(ctx, "kept on the surface");
+        end(ctx, st);
+        p.tip = st;
+    }
+    if (p.window != 0) {
+        val w: widget.WindowArea = widget.begin_window(ctx, widget.window("win", 0.0::f32, 0.0::f32, 300.0::f32, 200.0::f32));
+        widget.end_window(ctx, w);
+    }
+}
+
+#[testing]
+fun probe(d: *drv.Driver, a: *allo.Allocator, p: *Probe) bool {
+    p.fade = Fade{dist: 0.0::f32, near: 1.0::f32, far: 1.0::f32};
+    val e: err[allo.Error] = drv.init(d, a, 300.0::f32, 200.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret false; }
+    ret true;
+}
+
+test overlay__anchors_fits_and_lets_input_through {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+
+    # placed by its size, so its first frame only measures and asks for the next
+    drv.step(?d);
+    val go: u64 = drv.find(?d, "hud/go");
+    if (p.hud.hidden == 0 || drv.drawn(?d, go)) { ret 2; }
+    val again: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel again.some)        { ret 3; }
+    if (again.some != 0.0::f64) { ret 3; }
+
+    # then it sits in the corner, as wide as its widest line, with no chrome
+    drv.step(?d);
+    val tw: f32 = context.text_width(?d.ctx, "a long readout line");
+    if (p.hud.hidden != 0 || p.hud.x1 != 300.0::f32 || p.hud.y0 != 0.0::f32) { ret 4; }
+    if (p.hud.x0 != 300.0::f32 - tw)                                         { ret 5; }
+    val got: opt[context.Area] = drv.rect(?d, go);
+    if (!sel got.some) { ret 6; }
+    val r: context.Area = got.some;
+    if (r.x0 != p.hud.x0 || r.y1 > p.hud.y1) { ret 6; }
+
+    # its button takes the pointer, its empty space and text leave it to the world
+    val world: u64 = drv.find(?d, "world");
+    if (drv.at(?d, (r.x0 + r.x1) / 2.0::f32, (r.y0 + r.y1) / 2.0::f32) != go) { ret 7; }
+    if (drv.at(?d, p.hud.x0 + 1.0::f32, p.hud.y0 + 1.0::f32) != world)        { ret 8; }
+    if (drv.at(?d, p.hud.x1 - 1.0::f32, r.y0 + 1.0::f32) != world)            { ret 9; }
+    val idle: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel idle.none) { ret 10; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test overlay__stacks_above_windows_and_by_order {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+    p.window = 1;
+    p.two    = 1;
+    drv.steps(?d, 2);
+
+    # over a window called after it
+    val go:  u64               = drv.find(?d, "hud/go");
+    val got: opt[context.Area] = drv.rect(?d, go);
+    if (!sel got.some) { ret 2; }
+    val r: context.Area = got.some;
+    if (drv.at(?d, (r.x0 + r.x1) / 2.0::f32, (r.y0 + r.y1) / 2.0::f32) != go) { ret 3; }
+
+    # two in one corner: the higher order wins, a tie goes to the later call
+    val pa: u64 = drv.find(?d, "a/pa");
+    val pb: u64 = drv.find(?d, "b/pb");
+    val x:  f32 = 2.0::f32;
+    val y:  f32 = 198.0::f32;
+    if (drv.at(?d, x, y) != pb) { ret 4; }
+    p.order_a = 1;
+    drv.step(?d);
+    if (drv.at(?d, x, y) != pa) { ret 5; }
+    p.order_b = 2;
+    drv.step(?d);
+    if (drv.at(?d, x, y) != pb) { ret 6; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test overlay__keeps_on_the_surface_and_fades_by_proximity {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+    p.kept = 1;
+    p.fade = Fade{dist: 100.0::f32, near: 0.0::f32, far: 1.0::f32};
+    drv.steps(?d, 2);
+
+    # below its rect it would run off the right edge, so it ends at the rect's
+    # right instead, still 2 pixels below it
+    if (p.tip.x1 != 290.0::f32 || p.tip.y0 != 22.0::f32) { ret 2; }
+
+    # off the surface the pointer is far; on the overlay it is near; halfway
+    # out the opacity is halfway
+    if (p.hud.alpha != 1.0::f32) { ret 3; }
+    drv.move(?d, p.hud.x0 + 1.0::f32, p.hud.y0 + 1.0::f32);
+    if (p.hud.alpha != 0.0::f32) { ret 4; }
+    drv.move(?d, p.hud.x0 - 50.0::f32, p.hud.y0 + 1.0::f32);
+    if (p.hud.alpha != 0.5::f32) { ret 5; }
+    drv.move(?d, 0.0::f32, 199.0::f32);
+    if (p.hud.alpha != 1.0::f32) { ret 6; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

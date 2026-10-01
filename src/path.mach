@@ -12,8 +12,19 @@
 #
 # building never fails loudly: a command that cannot grow the list sets oom,
 # and a path with oom set draws nothing and sets the context's oom.
+#
+# the same commands also travel as path data, a flat f32 stream that needs no
+# allocator and can sit in a constant array, as icons do (see blit.icon): each
+# command is its verb as a float followed by its coordinates, two for MOVE and
+# LINE, four for QUAD (control, then end), six for CUBIC (both controls, then
+# end) and none for CLOSE. decode reads one command from a stream and valid
+# checks a whole one.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -161,6 +172,62 @@ pub fun at(p: *Path, i: usize) Op {
     ret p.ops.data[i];
 }
 
+# coordinates each verb carries in path data, or none for a value that is not a verb
+fun operands(v: f32) opt[usize] {
+    if (v == MOVE::f32 || v == LINE::f32) { ret opt[usize].some{2}; }
+    if (v == QUAD::f32)                   { ret opt[usize].some{4}; }
+    if (v == CUBIC::f32)                  { ret opt[usize].some{6}; }
+    if (v == CLOSE::f32)                  { ret opt[usize].some{0}; }
+    ret opt[usize].none{};
+}
+
+# read the command at offset i of path data
+# ---
+# data: the stream
+# n:    floats in the stream
+# i:    offset of a command's verb
+# out:  receives the command
+# ret:  floats the command takes, 0 at the end of the stream or where it is malformed
+pub fun decode(data: *f32, n: usize, i: usize, out: *Op) usize {
+    if (i >= n) { ret 0; }
+    val k: opt[usize] = operands(data[i]);
+    if (sel k.none)         { ret 0; }
+    if (n - i - 1 < k.some) { ret 0; }
+    val v: u8 = data[i]::u8;
+    if (v == CLOSE) {
+        @out = Op{verb: CLOSE, x: 0.0::f32, y: 0.0::f32, cx0: 0.0::f32, cy0: 0.0::f32, cx1: 0.0::f32, cy1: 0.0::f32};
+        ret 1;
+    }
+    if (v == QUAD) {
+        @out = Op{verb: v, x: data[i + 3], y: data[i + 4], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 1], cy1: data[i + 2]};
+        ret 5;
+    }
+    if (v == CUBIC) {
+        @out = Op{verb: v, x: data[i + 5], y: data[i + 6], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 3], cy1: data[i + 4]};
+        ret 7;
+    }
+    @out = Op{verb: v, x: data[i + 1], y: data[i + 2], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 1], cy1: data[i + 2]};
+    ret 3;
+}
+
+# whether path data is whole: every verb known and followed by all its
+# coordinates
+# ---
+# data: the stream
+# n:    floats in the stream
+# ret:  true when decode reads it to its end
+pub fun valid(data: *f32, n: usize) bool {
+    if (data == nil && n != 0) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        var o:    Op;
+        val took: usize = decode(data, n, i, ?o);
+        if (took == 0) { ret false; }
+        i = i + took;
+    }
+    ret true;
+}
+
 test path__records_commands_in_order {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -181,5 +248,20 @@ test path__records_commands_in_order {
 
     val freed: err[allo.Error] = free(?p);
     if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test path__decodes_path_data {
+    var d: [12]f32 = [12]f32{0.0, 1.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 1.0, 7.0, 8.0};
+    var o: Op;
+    if (decode(?d[0], 12, 0, ?o) != 3 || o.verb != MOVE || o.y != 2.0::f32)                      { ret 1; }
+    if (decode(?d[0], 12, 3, ?o) != 5 || o.verb != QUAD || o.cx0 != 3.0::f32 || o.x != 5.0::f32) { ret 2; }
+    if (decode(?d[0], 12, 8, ?o) != 1 || o.verb != CLOSE)                                        { ret 3; }
+    if (!valid(?d[0], 9))                                                                        { ret 4; }
+    # a line short of its y, and a value that is no verb
+    if (valid(?d[0], 11)) { ret 5; }
+    var bad: [3]f32 = [3]f32{9.0, 1.0, 2.0};
+    if (valid(?bad[0], 3)) { ret 6; }
+    if (!valid(nil, 0))    { ret 7; }
     ret 0;
 }

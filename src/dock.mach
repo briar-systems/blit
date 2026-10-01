@@ -1689,3 +1689,79 @@ test dock__panel_is_a_node_windows_dock_into {
     if (sel freed.err) { ret 1; }
     ret 0;
 }
+
+# a scrolling dock holding a dropdown and a popup with a scroll region in it
+# ---
+# side: the dock
+# pick: the dropdown's selection
+# open: 1 to show the popup
+# rows: the popup's scroll region
+#[testing]
+rec Wheeled {
+    side: Dock;
+    pick: usize;
+    open: u8;
+    rows: widget.Scroll;
+}
+
+#[testing]
+fun wheeled_ui(ctx: *context.Context, user: ptr) {
+    val w:    *Wheeled = user::*Wheeled;
+    var opts: [3]str   = [3]str{"one", "two", "three"};
+    val dk:   DockArea = begin_dock(ctx, "side", ?w.side);
+    widget.dropdown(ctx, "pick", ?w.pick, ?opts[0], 3);
+    val p: widget.Popup = widget.begin_popup(ctx, "list", w.open, 0.0::f32, 40.0::f32, 100.0::f32);
+    if (p.open != 0) {
+        val sa: widget.ScrollArea = widget.begin_scroll(ctx, "rows", ?w.rows, 40.0::f32);
+        widget.button(ctx, "row");
+        widget.space(ctx, 200.0::f32);
+        widget.end_scroll(ctx, ?w.rows, sa);
+    }
+    widget.end_popup(ctx, p);
+    widget.space(ctx, 1000.0::f32);
+    end_dock(ctx, ?w.side, dk);
+}
+
+test scroll__wheel_stops_at_the_band_a_popup_opens {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var w: Wheeled;
+    w.side.side = context.Side.left{};
+    w.side.size = 120.0::f32;
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, wheeled_ui, (?w)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.step(?d);
+
+    # the wheel over an open dropdown's option leaves the dock beneath still
+    val pick: u64 = driver.find(?d, "side/pick");
+    if (!driver.click(?d, pick)) { ret 2; }
+    val opt: u64 = bid.child_int(bid.child(pick, "#popup"), 0);
+    if (!driver.drawn(?d, opt)) { ret 3; }
+    driver.scroll(?d, opt, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.side.scroll.offset != 0.0::f32) { ret 4; }
+
+    # a scroll region inside a popup scrolls, and the dock still does not
+    state.get[widget.DropdownState](?d.ctx, pick).open = 0;
+    w.open                                             = 1;
+    driver.steps(?d, 2);
+    val row: u64 = driver.find(?d, "side/list/rows/row");
+    if (!driver.drawn(?d, row)) { ret 5; }
+    driver.scroll(?d, row, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.rows.offset != 30.0::f32)       { ret 6; }
+    if (w.side.scroll.offset != 0.0::f32) { ret 7; }
+
+    # outside the popup the dock takes the wheel as before
+    w.open = 0;
+    driver.step(?d);
+    driver.scroll(?d, pick, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (w.side.scroll.offset != 30.0::f32) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
