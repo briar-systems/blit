@@ -110,6 +110,11 @@ pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 # the fill handle reserve_fill returns when the fill could not be emitted whole
 pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
 
+# the default double-click time in seconds and distance in unscaled pixels
+# (see set_double_click)
+pub val DOUBLE_TIME: f64 = 0.3;
+pub val DOUBLE_DIST: f32 = 6.0;
+
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
 pub val CORNERS_TOP:    u8 = 1;
@@ -181,9 +186,10 @@ pub rec Area {
 # cy:           layout cursor y
 # pw:           current panel width
 # hot:          id of the widget hovered this frame (0 = none)
-# active:       id of the widget being interacted with, persists across frames (0 = none)
-# drag_off_x:   cursor-to-origin x offset captured when a drag begins
-# drag_off_y:   cursor-to-origin y offset captured when a drag begins
+# active:       id of the widget owning the pointer since a press on it, persists across frames (0 = none)
+# active_btn:   the input.BUTTON_* bit whose press made active the owner
+# dbl_time:     seconds within which a press extends a run of clicks
+# dbl_dist:     unscaled pixels within which a press extends a run of clicks
 # lx:           local origin x added to emitted positions before clipping
 # ly:           local origin y added to emitted positions before clipping
 # clip_x0:      active clip rect left in screen pixels
@@ -264,8 +270,9 @@ pub rec Context {
     pw:           f32;
     hot:          u64;
     active:       u64;
-    drag_off_x:   f32;
-    drag_off_y:   f32;
+    active_btn:   u8;
+    dbl_time:     f64;
+    dbl_dist:     f32;
     lx:           f32;
     ly:           f32;
     clip_x0:      f32;
@@ -387,8 +394,9 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.pw           = 0.0::f32;
     ctx.hot          = 0;
     ctx.active       = 0;
-    ctx.drag_off_x   = 0.0::f32;
-    ctx.drag_off_y   = 0.0::f32;
+    ctx.active_btn   = 0;
+    ctx.dbl_time     = DOUBLE_TIME;
+    ctx.dbl_dist     = DOUBLE_DIST;
     ctx.lx           = 0.0::f32;
     ctx.ly           = 0.0::f32;
     ctx.clip_x0      = 0.0::f32;
@@ -602,7 +610,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 }
 
 # finish a frame: close the last texture span, compose the draw list by layer,
-# drop the active widget once the primary button is released, drop the focus
+# drop the active widget once its button is released, drop the focus
 # when its holder was not drawn, and age out the state no widget reached
 #
 # vertex indices taken during the frame (begin_panel's handle) are emission
@@ -612,9 +620,22 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (input.held(ctx.in, input.BUTTON_LEFT) == 0) { ctx.active = 0; }
-    if (ctx.focus_drawn == 0)                       { ctx.focus = 0; }
-    if (store.sweep(?ctx.store) != 0)               { ctx.oom = 1; }
+    if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
+    if (ctx.focus_drawn == 0)                    { ctx.focus = 0; }
+    if (store.sweep(?ctx.store) != 0)            { ctx.oom = 1; }
+}
+
+# set how close in time and space a press must follow the previous press on
+# the same widget to extend a run of clicks (see blit.interact)
+#
+# a host that knows its platform's double-click settings passes them here.
+# ---
+# ctx:  context
+# time: seconds, DOUBLE_TIME by default
+# dist: unscaled pixels, multiplied by the interface scale, DOUBLE_DIST by default
+pub fun set_double_click(ctx: *Context, time: f64, dist: f32) {
+    ctx.dbl_time = time;
+    ctx.dbl_dist = dist;
 }
 
 # give a widget the keyboard
@@ -1283,6 +1304,25 @@ fun pop_origin(ctx: *Context) {
         ctx.lx = ctx.origins[ctx.org_sp].x;
         ctx.ly = ctx.origins[ctx.org_sp].y;
     }
+}
+
+# the cursor's x in the current local space
+#
+# the cursor arrives in screen space (ctx.in.mx). this is where it falls in
+# the coordinates rects are passed in, inside surfaces and layers alike.
+# ---
+# ctx: context
+# ret: cursor x in local pixels
+pub fun local_mx(ctx: *Context) f32 {
+    ret ctx.in.mx - ctx.lx;
+}
+
+# the cursor's y in the current local space (see local_mx)
+# ---
+# ctx: context
+# ret: cursor y in local pixels
+pub fun local_my(ctx: *Context) f32 {
+    ret ctx.in.my - ctx.ly;
 }
 
 # whether the screen point (x, y) lies inside the active clip rect
@@ -2024,8 +2064,8 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
     s.y        = y;
     s.w        = w;
     s.h        = h;
-    s.local_mx = ctx.in.mx - ctx.lx;
-    s.local_my = ctx.in.my - ctx.ly;
+    s.local_mx = local_mx(ctx);
+    s.local_my = local_my(ctx);
     s.inside   = 0;
     if (ctx.in.present != 0) { s.inside = input_visible(ctx, ctx.in.mx, ctx.in.my); }
     ret s;
