@@ -38,6 +38,8 @@ fwd blit.table;
 fwd blit.payload;
 fwd blit.dnd;
 fwd blit.tabs;
+fwd blit.value;
+fwd blit.color;
 fwd blit.driver;
 fwd blit.menu;
 
