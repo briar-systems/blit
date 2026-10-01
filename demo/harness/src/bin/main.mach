@@ -142,11 +142,12 @@ fun main(argc: i64, argv: **u8) i64 {
     var income: [6]f32 = [6]f32{1.0::f32, 2.0::f32, 1.5::f32, 3.0::f32, 2.5::f32, 4.0::f32};
     var net:    [6]f32 = [6]f32{2.0::f32, -1.0::f32, 3.5::f32, -2.5::f32, 1.0::f32, 0.5::f32};
     var series: [2]blit.chart.Series;
-    series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
-    series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-    val lines: blit.chart.Hover = blit.chart.line(?ctx, 240.0::f32, 300.0::f32, 300.0::f32, 150.0::f32, ?series[0], 2, 6, blit.chart.options());
-    val bars:  blit.chart.Hover = blit.chart.bars(?ctx, 240.0::f32, 460.0::f32, 200.0::f32, 100.0::f32, ?net[0], 6, blit.chart.options());
-    val spark: blit.chart.Hover = blit.chart.sparkline(?ctx, 450.0::f32, 460.0::f32, 90.0::f32, 20.0::f32, ?energy[0], 6);
+    series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 6);
+    series[0].fill = 1;
+    series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 6);
+    val lines: blit.chart.Hover = blit.chart.line(?ctx, 240.0::f32, 300.0::f32, 300.0::f32, 150.0::f32, ?series[0], 2, blit.chart.options());
+    val bars:  blit.chart.Hover = blit.chart.bars(?ctx, 240.0::f32, 460.0::f32, 200.0::f32, 100.0::f32, blit.chart.f32s(?net[0]), 6, blit.chart.options());
+    val spark: blit.chart.Hover = blit.chart.sparkline(?ctx, 450.0::f32, 460.0::f32, 90.0::f32, 20.0::f32, series[0]);
 
     # a popup over everything drawn so far
     val pop: blit.widget.Popup = blit.widget.begin_popup(?ctx, 1, 420.0::f32, 60.0::f32, 120.0::f32);
