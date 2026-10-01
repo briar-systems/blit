@@ -83,6 +83,18 @@ pub fun set_max_age(ctx: *context.Context, frames: u64) {
     ctx.store.max_age = frames;
 }
 
+# hand every T the store keeps, under any id, to f
+#
+# for state that is ordered or counted across ids, such as the windows' stack
+# order. f must not reach for other state while it walks.
+# ---
+# ctx:  context
+# f:    called with each entry and user
+# user: passed through to f
+pub fun each[T](ctx: *context.Context, f: fun(*T, ptr), user: ptr) {
+    store.walk(?ctx.store, $type_id(T), f:~fun(ptr, ptr), user);
+}
+
 # register T for persistence under a name
 #
 # save writes T's fields through the writer's put_* calls, and load reads them

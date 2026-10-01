@@ -330,6 +330,23 @@ pub fun entry(s: *Store, id: u64, kind: u64) *Entry {
     ret ?s.slots[at];
 }
 
+# hand every entry of a kind to f, in no particular order
+#
+# f must not add or drop entries.
+# ---
+# s:    store
+# kind: type id of the state
+# f:    called with each entry's state and user
+# user: passed through to f
+pub fun walk(s: *Store, kind: u64, f: fun(ptr, ptr), user: ptr) {
+    var i: usize = 0;
+    for (i < s.cap) {
+        val e: *Entry = ?s.slots[i];
+        if (e.used != 0 && e.kind == kind) { f(e.data, user); }
+        i = i + 1;
+    }
+}
+
 # the scratch state handed back for a refused entry, zeroed
 # ---
 # s:   store
