@@ -158,9 +158,10 @@ fun main(argc: i64, argv: **u8) i64 {
 
     blit.context.end(?ctx);
 
-    print.printf("blit {}: {} vertices in {} spans, {} atlas pages, ok={}, field \"{}\", typing={}\n",
+    print.printf("blit {}: {} vertices, {} indices in {} runs, {} atlas pages, ok={}, field \"{}\", typing={}\n",
         blit.VERSION,
         blit.context.draw_count(?ctx),
+        blit.context.index_count(?ctx),
         blit.context.run_count(?ctx),
         blit.atlas.page_count(blit.context.atlas_of(?ctx)),
         blit.context.ok(?ctx)::u64,

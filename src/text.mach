@@ -284,9 +284,9 @@ test text__cuts_and_spans {
     val before: usize = context.draw_count(?ctx);
     if (spans_at(?ctx, ?sp[0], 2, 0.0::f32, 50.0::f32) != 48.0::f32) { ret 9; }
     val p: *draw.Vert = context.draw_verts(?ctx);
-    if (context.draw_count(?ctx) != before + 24)   { ret 10; }
+    if (context.draw_count(?ctx) != before + 16)   { ret 10; }
     if (p[before].y != 57.0::f32)                  { ret 11; }
-    if (p[before + 12].y != 50.0::f32)             { ret 12; }
+    if (p[before + 8].y != 50.0::f32)              { ret 12; }
     if (context.style_of(?ctx) != font.STYLE_BODY) { ret 13; }
 
     val freed: err[allo.Error] = context.free(?ctx);

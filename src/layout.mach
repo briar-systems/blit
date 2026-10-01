@@ -2,7 +2,7 @@
 #
 # a frame is one level of layout: a content box, a pen, the axis items advance
 # along, the spacing between them and how they align across the axis. the
-# context keeps a stack of frames (see context.push_frame) that every container
+# context keeps a stack of frames (see context.push_layout) that every container
 # pushes and pops, and the widgets place themselves in the top one (see
 # blit.widget). this module is the data and the arithmetic alone, so it knows
 # nothing of the context, the theme or the draw list.
@@ -282,7 +282,7 @@ fun clamp(s: Size, v: f32) f32 {
 }
 
 # the natural size an item under s adds to its frame's measure
-fun natural(s: Size, nat: f32) f32 {
+pub fun natural(s: Size, nat: f32) f32 {
     if (sel s.rule.fixed) { ret clamp(s, s.v); }
     ret clamp(s, nat);
 }
@@ -316,8 +316,8 @@ fun over(f: *Frame, s: Size, nat: f32, len: f32, fit: *u8) f32 {
     @fit = 0;
     if (sel s.rule.fixed) { ret clamp(s, s.v); }
     if (len > 0.0::f32) {
-        if (sel s.rule.fill)                        { ret clamp(s, len); }
-        if (sel s.rule.frac)                        { ret clamp(s, s.v * len); }
+        if (sel s.rule.fill)                           { ret clamp(s, len); }
+        if (sel s.rule.frac)                           { ret clamp(s, s.v * len); }
         if ((sel f.align.stretch) && (sel s.rule.fit)) { ret clamp(s, len); }
     }
     @fit = 1;
@@ -326,7 +326,7 @@ fun over(f: *Frame, s: Size, nat: f32, len: f32, fit: *u8) f32 {
 
 # the offset of an item size wide across a cross extent len
 fun offset(f: *Frame, len: f32, size: f32) f32 {
-    if (len <= size)       { ret 0.0::f32; }
+    if (len <= size)        { ret 0.0::f32; }
     if (sel f.align.center) { ret (len - size) / 2.0::f32; }
     if (sel f.align.end)    { ret len - size; }
     ret 0.0::f32;
@@ -368,7 +368,7 @@ pub fun resolve(f: *Frame, sw: Size, sh: Size, nat_w: f32, nat_h: f32) Item {
         it.y = f.line_y0;
         val rest: f32 = maxf(x1 - f.x, 0.0::f32);
         if (sel rw.rule.fill) { it.w = clamp(rw, rest); }
-        or { it.w = along(f, rw, nat_w, rest, rest, wide, ?it.fit_w); }
+        or                    { it.w = along(f, rw, nat_w, rest, rest, wide, ?it.fit_w); }
         it.h = along(f, rh, nat_h, f.h, y1 - f.y, tall, ?it.fit_h);
         ret it;
     }
@@ -395,7 +395,7 @@ pub fun commit(f: *Frame, it: Item) {
         f.need_w = f.need_w + it.nat_w;
         f.need_h = maxf(f.need_h, it.nat_h);
         if (it.weight > 0.0::f32) { f.weight = f.weight + it.weight; }
-        or                        { f.fixed  = f.fixed + it.w; }
+        or                        { f.fixed = f.fixed + it.w; }
         f.x       = it.x + it.w + f.gap;
         f.line_x1 = it.x + it.w;
         f.line_y0 = it.y;
@@ -429,7 +429,7 @@ pub fun commit(f: *Frame, it: Item) {
     f.need_h = f.need_h + it.nat_h;
     f.need_w = maxf(f.need_w, it.nat_w);
     if (it.weight > 0.0::f32) { f.weight = f.weight + it.weight; }
-    or                        { f.fixed  = f.fixed + it.h; }
+    or                        { f.fixed = f.fixed + it.h; }
     f.line_x1 = it.x + it.w;
     f.line_y0 = it.y;
     f.line_y1 = it.y + it.h;
@@ -553,8 +553,8 @@ test layout__open_sides_fall_back_to_the_natural_size {
     if (a.h != 8.0::f32 || a.fit_h != 1 || a.w != 100.0::f32 || a.fit_w != 0) { ret 1; }
 
     # a width measured as nothing yet has nothing to stretch over
-    c.open = OPEN_W | OPEN_H;
-    c.w    = 0.0::f32;
+    c.open  = OPEN_W | OPEN_H;
+    c.w     = 0.0::f32;
     c.align = Align.stretch{};
     val b: Item = resolve(?c, fill(1.0::f32), fit(), 10.0::f32, 8.0::f32);
     if (b.w != 10.0::f32 || b.fit_w != 1) { ret 2; }
@@ -573,7 +573,7 @@ test layout__same_line_and_skip {
     if (b.x != 34.0::f32 || b.y != 0.0::f32 || b.w != 66.0::f32) { ret 2; }
     commit(?c, b);
     # the line is as tall as its tallest item
-    if (c.x != 0.0::f32 || c.y != 20.0::f32) { ret 3; }
+    if (c.x != 0.0::f32 || c.y != 20.0::f32)            { ret 3; }
     if (c.need_w != 54.0::f32 || c.need_h != 16.0::f32) { ret 4; }
 
     # a row by hand, then space without the gap
