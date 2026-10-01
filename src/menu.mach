@@ -1,0 +1,1208 @@
+# menus: a menu bar, menus that drop from it, submenus that open on hover and
+# context menus that open on a right press
+#
+# a bar is the next item of the current layout frame, one row high across it,
+# so placed first it runs along a window's or surface's top. each begin_menu
+# in it is a header that opens its menu on a press, and while one is open,
+# moving onto another header opens that one instead. begin_menu inside an
+# open menu is a row that opens a submenu beside it when hovered. a context
+# menu opens where the right button went down over its region, or wherever
+# the cursor is when open_context asks for it.
+#
+# a menu's body runs every frame, open or not: begin_menu and begin_context
+# return a Menu whose open says whether it is drawn, and item draws only in an
+# open menu. what an item does whatever the menu's state is answer its
+# shortcut, so a registered shortcut fires its item while the menu is closed.
+# shortcuts stay quiet while a widget holds the keyboard (see context.typing),
+# unless that widget is the item's own open menu.
+#
+# an open tree owns the keyboard: the frame it opens it takes the focus under
+# its bar's or context menu's id (see context.focus), so a text field beneath
+# no longer sees its keys, and the frame after it closes it gives the focus
+# back to the widget that held it before, which keeps it while it is drawn.
+#
+# the open menu deepest in a tree takes the arrow keys, enter and escape: up
+# and down move its highlight over the enabled items, enter fires the
+# highlighted item or opens its submenu, right opens a submenu and left
+# closes one, and in a bar's menu right and left past that move to the next
+# or previous header. escape closes the deepest menu. clicking an item or
+# firing it with enter closes the whole tree, and so does a press anywhere
+# outside it, which is consumed rather than delivered to what lies beneath.
+#
+# ids follow the label path: a bar's key, then each header and submenu label,
+# then the item's label ("main/File/Recent/notes.txt", see blit.id.of_path),
+# and a context menu's items sit under its key. open menus, highlights and
+# measured sizes are state the context keeps under those ids (see
+# blit.state), so the caller owns nothing but what its items change.
+#
+# menus are popups (see widget.begin_popup_id): each open menu paints and
+# claims above everything drawn before it, and a submenu nests in its parent
+# without an outside claim of its own, so the parent's rows stay under the
+# pointer while the submenu is open. a menu is as wide as its widest row
+# needs, measured as it is drawn and applied the frame after, which a change
+# asks for at once (see context.wake_at).
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.context;
+use blit.draw;
+use blit.driver;
+use blit.field;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.widget;
+
+# a menu bar along the top of a layout column
+pub val KIND_BAR: u8 = 0;
+# a menu dropped from a bar header or opened beside a submenu row
+pub val KIND_DROP: u8 = 1;
+# a context menu
+pub val KIND_CONTEXT: u8 = 2;
+
+# no item: an index no menu reaches
+val NONE: u32 = 0xFFFFFFFF;
+
+# the keys an open menu answers, as bits of Menu.keys
+val K_UP:    u8 = 1;
+val K_DOWN:  u8 = 2;
+val K_ENTER: u8 = 4;
+val K_LEFT:  u8 = 8;
+val K_RIGHT: u8 = 16;
+val K_ESC:   u8 = 32;
+
+# what a bar does at end_bar after a key in its open menu
+val SHIFT_NONE: u8 = 0;
+val SHIFT_NEXT: u8 = 1;
+val SHIFT_PREV: u8 = 2;
+
+# a Shortcut.mods bit for the platform's command key: ctrl or super, as
+# input.shortcut accepts, shown as "Cmd" on darwin and "Ctrl" elsewhere
+pub val MOD_PRIMARY: u8 = 0x80;
+
+# the bytes a shortcut's text can take, NUL included
+pub val SHORTCUT_TEXT: usize = 40;
+
+# a key and the modifiers held with it
+# ---
+# code: a printable ascii character, letters uppercase, or an input.KEY_*
+#       constant, 0 for none
+# mods: the input.MOD_* bits held with it, all of which must be held and no
+#       others, or MOD_PRIMARY with shift as needed for the platform's command key
+pub rec Shortcut {
+    code: u32;
+    mods: u8;
+}
+
+# one entry of a menu
+#
+# a zeroed Item is a plain enabled entry, so set what an entry has on of(label).
+# ---
+# label:    text drawn, and the item's key (see context.id_of)
+# shortcut: the key that fires it while no widget holds the keyboard, shown
+#           at its right; code 0 for none
+# check:    nil for an entry that is not checkable, else its 0/1 state, drawn
+#           as a check mark when nonzero and flipped when the item fires
+# icon:     text drawn in the icon column before the label, such as an icon
+#           codepoint, nil for none
+# disabled: true to draw it dimmed and never fire it
+pub rec Item {
+    label:    str;
+    shortcut: Shortcut;
+    check:    *u8;
+    icon:     str;
+    disabled: bool;
+}
+
+# what the context keeps for one menu, bar or context menu, under its id
+# ---
+# child:  the open menu below it: a bar's open header, a menu's open submenu
+# open:   1 while a context menu is open
+# first:  1 to put the highlight on the first enabled item at the next end
+# cursor: the highlighted item plus one, 0 for none
+# icons:  1 if the menu drew an icon last frame, so labels leave room for one
+# x:      where a context menu opened, in screen pixels
+# y:      where a context menu opened, in screen pixels
+# w:      the width the menu needed last frame
+# h:      the height the menu took last frame
+# mx:     the cursor x the menu saw last frame
+# my:     the cursor y the menu saw last frame
+# owns:   1 while a bar or context menu holds the focus for its open tree,
+#         2 the frame after it closed, before it gives the focus back
+# prev:   the focus holder before the tree took it, given back on close
+pub rec MenuState {
+    child:  u64;
+    open:   u8;
+    first:  u8;
+    cursor: u32;
+    icons:  u8;
+    x:      f32;
+    y:      f32;
+    w:      f32;
+    h:      f32;
+    mx:     f32;
+    my:     f32;
+    owns:   u8;
+    prev:   u64;
+}
+
+# the handle a bar or menu hands its items, submenus and end call
+# ---
+# id:     its id, the id scope of what it holds
+# kind:   KIND_BAR, KIND_DROP or KIND_CONTEXT
+# open:   1 if it is drawn this frame: always for a bar
+# st:     its state, valid until the frame ends
+# parent: the bar or menu it opened from, nil for a bar or context menu
+# root:   the state of the bar or context menu its tree hangs from
+# rid:    the id of the bar or context menu its tree hangs from
+# pop:    its popup, for a menu
+# keys:   the K_* bits it answers this frame, 0 unless it is the deepest open
+# moved:  true when the cursor moved since the menu's last frame
+# took:   true once a row took this frame's right key
+# n:      rows placed so far this frame
+# first:  the first enabled row this frame, NONE for none
+# last:   the last enabled row
+# prev:   the last enabled row before the highlight
+# next:   the first enabled row after the highlight
+# seen:   true once the open child was placed this frame
+# need:   the width its widest row needs
+# icons:  true once a row drew an icon this frame
+# shift:  a bar's SHIFT_* request from its open menu
+# h0:     a bar's first header id this frame, 0 for none
+# h1:     a bar's last header id
+# hprev:  a bar's header before the open one
+# hnext:  a bar's header after the open one
+# hopen:  true once a bar placed its open header
+# x:      a bar's next header left
+# x0:     a bar's left
+# x1:     a bar's right
+# y0:     a bar's top
+# y1:     a bar's bottom
+# ch:     a bar's channels: its background beneath its headers
+# claim:  a bar's reserved claim
+pub rec Menu {
+    id:     u64;
+    kind:   u8;
+    open:   u8;
+    st:     *MenuState;
+    parent: *Menu;
+    root:   *MenuState;
+    rid:    u64;
+    pop:    widget.Popup;
+    keys:   u8;
+    moved:  bool;
+    took:   bool;
+    n:      u32;
+    first:  u32;
+    last:   u32;
+    prev:   u32;
+    next:   u32;
+    seen:   bool;
+    need:   f32;
+    icons:  bool;
+    shift:  u8;
+    h0:     u64;
+    h1:     u64;
+    hprev:  u64;
+    hnext:  u64;
+    hopen:  bool;
+    x:      f32;
+    x0:     f32;
+    x1:     f32;
+    y0:     f32;
+    y1:     f32;
+    ch:     context.Channels;
+    claim:  usize;
+}
+
+# a plain enabled item with no shortcut, check or icon
+# ---
+# label: the item's text and key
+# ret:   the item, its other fields set as needed before item takes it
+pub fun of(label: str) Item {
+    var it: Item;
+    it.label = label;
+    ret it;
+}
+
+# a shortcut
+# ---
+# code: a printable ascii character, letters uppercase, or an input.KEY_* constant
+# mods: the input.MOD_* bits held with it
+# ret:  the shortcut
+pub fun keys(code: u32, mods: u8) Shortcut {
+    ret Shortcut{code: code, mods: mods};
+}
+
+# the theme's space inside chrome, at the context's scale
+fun pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.pad);
+}
+
+# height of one menu row
+fun row_h(ctx: *context.Context) f32 {
+    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+}
+
+# the narrowest a menu is drawn
+fun min_w(ctx: *context.Context) f32 {
+    ret context.px(ctx, ctx.theme.row) * 8.0::f32;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# append s to buf at n, keeping room for the NUL
+fun put(buf: *u8, cap: usize, n: usize, s: str) usize {
+    var at: usize = n;
+    var i:  usize = 0;
+    for (s[i] != 0 && at + 1 < cap) {
+        buf[at] = s[i];
+        at      = at + 1;
+        i       = i + 1;
+    }
+    ret at;
+}
+
+# the name a KEY_* constant shows as, nil for a printable key
+fun key_name(code: u32) str {
+    if (code == input.KEY_ENTER)     { ret "Enter"; }
+    if (code == input.KEY_ESCAPE)    { ret "Esc"; }
+    if (code == input.KEY_BACKSPACE) { ret "Backspace"; }
+    if (code == input.KEY_DELETE)    { ret "Del"; }
+    if (code == input.KEY_TAB)       { ret "Tab"; }
+    if (code == input.KEY_LEFT)      { ret "Left"; }
+    if (code == input.KEY_RIGHT)     { ret "Right"; }
+    if (code == input.KEY_UP)        { ret "Up"; }
+    if (code == input.KEY_DOWN)      { ret "Down"; }
+    if (code == input.KEY_HOME)      { ret "Home"; }
+    if (code == input.KEY_END)       { ret "End"; }
+    if (code == input.KEY_PAGE_UP)   { ret "PgUp"; }
+    if (code == input.KEY_PAGE_DOWN) { ret "PgDn"; }
+    if (code == input.KEY_INSERT)    { ret "Ins"; }
+    if (code == ' ')                 { ret "Space"; }
+    ret nil;
+}
+
+# write a shortcut as it is shown, such as "Ctrl+Shift+S", NUL-terminated
+#
+# super shows as "Cmd" on darwin. text that does not fit is cut short.
+# ---
+# s:   the shortcut
+# buf: where to write
+# cap: bytes buf holds, SHORTCUT_TEXT always being enough
+# ret: bytes written, not counting the NUL; 0 for no shortcut
+pub fun shortcut_text(s: Shortcut, buf: *u8, cap: usize) usize {
+    if (cap == 0) { ret 0; }
+    buf[0] = 0;
+    if (s.code == 0) { ret 0; }
+    var n: usize = 0;
+    if ((s.mods & MOD_PRIMARY) != 0) {
+        $if ($mach.build.os == $mach.os.darwin) {
+            n = put(buf, cap, n, "Cmd+");
+        }
+        $or {
+            n = put(buf, cap, n, "Ctrl+");
+        }
+    }
+    if ((s.mods & input.MOD_CTRL) != 0)  { n = put(buf, cap, n, "Ctrl+"); }
+    if ((s.mods & input.MOD_ALT) != 0)   { n = put(buf, cap, n, "Alt+"); }
+    if ((s.mods & input.MOD_SHIFT) != 0) { n = put(buf, cap, n, "Shift+"); }
+    if ((s.mods & input.MOD_SUPER) != 0) {
+        $if ($mach.build.os == $mach.os.darwin) {
+            n = put(buf, cap, n, "Cmd+");
+        }
+        $or {
+            n = put(buf, cap, n, "Super+");
+        }
+    }
+    val name: str = key_name(s.code);
+    if (name != nil) { n = put(buf, cap, n, name); }
+    or (s.code < 0x80 && n + 1 < cap) {
+        var c: u32 = s.code;
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        buf[n] = c::u8;
+        n      = n + 1;
+    }
+    buf[n] = 0;
+    ret n;
+}
+
+# whether held modifiers are a shortcut's: exactly its own, or for
+# MOD_PRIMARY the command key (see input.shortcut) and the rest exactly
+fun mods_match(held: u8, want: u8) bool {
+    if ((want & MOD_PRIMARY) == 0) { ret held == want; }
+    val cmd: u8 = input.MOD_CTRL | input.MOD_SUPER;
+    if (!input.shortcut(held)) { ret false; }
+    ret (held & (cmd ^ 0xFF)) == (want & ((cmd | MOD_PRIMARY) ^ 0xFF));
+}
+
+# whether the frame pressed a shortcut's key with exactly its modifiers
+fun struck(ctx: *context.Context, s: Shortcut) bool {
+    if (s.code == 0) { ret false; }
+    var want: u32 = s.code;
+    if (want >= 'a' && want <= 'z') { want = want - 32; }
+    val mask: u8    = input.MOD_SHIFT | input.MOD_CTRL | input.MOD_ALT | input.MOD_SUPER;
+    var i:    usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        if (sel e.key) {
+            var c: u32 = e.key.code;
+            if (c >= 'a' && c <= 'z')                               { c = c - 32; }
+            if (c == want && mods_match(e.key.mods & mask, s.mods)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the K_* bits of the keys pressed this frame
+fun nav_keys(ctx: *context.Context) u8 {
+    var k: u8    = 0;
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        if (sel e.key) {
+            val c: u32 = e.key.code;
+            if (c == input.KEY_UP)     { k = k | K_UP; }
+            if (c == input.KEY_DOWN)   { k = k | K_DOWN; }
+            if (c == input.KEY_ENTER)  { k = k | K_ENTER; }
+            if (c == input.KEY_LEFT)   { k = k | K_LEFT; }
+            if (c == input.KEY_RIGHT)  { k = k | K_RIGHT; }
+            if (c == input.KEY_ESCAPE) { k = k | K_ESC; }
+        }
+        i = i + 1;
+    }
+    ret k;
+}
+
+# keep the keyboard with an open tree, rooted at id with state st, taking it
+# the frame the tree opens and giving it back the frame after it closes, so
+# the key that closed it never reaches the widget it goes back to
+#
+# a press inside the open tree drops the focus at begin (see context.begin),
+# so an open tree takes a dropped focus back. a widget that took the focus
+# from the tree keeps it.
+fun hold(ctx: *context.Context, id: u64, st: *MenuState, open: bool) {
+    if (open) {
+        if (st.owns == 0) {
+            st.owns = 1;
+            st.prev = ctx.focus;
+            context.focus(ctx, id);
+            ret;
+        }
+        st.owns = 1;
+        if (ctx.focus == 0) { context.focus(ctx, id); }
+        context.focused(ctx, id);
+        ret;
+    }
+    if (st.owns == 0) { ret; }
+    if (st.owns == 1) {
+        st.owns = 2;
+        context.focused(ctx, id);
+        ret;
+    }
+    st.owns = 0;
+    if (ctx.focus == id || ctx.focus == 0) { context.focus(ctx, st.prev); }
+    st.prev = 0;
+}
+
+# close a whole tree from its root's state
+fun close(root: *MenuState) {
+    root.open  = 0;
+    root.child = 0;
+}
+
+# a handle for a menu whose popup state is st, under parent (nil for a root)
+fun menu_of(ctx: *context.Context, id: u64, kind: u8, st: *MenuState, parent: *Menu) Menu {
+    var m: Menu;
+    m.id     = id;
+    m.kind   = kind;
+    m.st     = st;
+    m.parent = parent;
+    m.root   = st;
+    m.rid    = id;
+    if (parent != nil) {
+        m.root = parent.root;
+        m.rid  = parent.rid;
+    }
+    m.first = NONE;
+    m.last  = NONE;
+    m.prev  = NONE;
+    m.next  = NONE;
+    m.claim = context.NO_CLAIM;
+    ret m;
+}
+
+# open m's popup at (x, y) in screen pixels, kept on the screen, and take the
+# keys when it is the deepest open menu
+#
+# a nested menu that would leave the screen on the right flips to the left
+# of flip_x.
+fun open_popup(ctx: *context.Context, m: *Menu, x: f32, y: f32, flip_x: f32, nested: bool) {
+    val st: *MenuState = m.st;
+    val w:  f32        = maxf(st.w, min_w(ctx));
+    var sx: f32        = x;
+    var sy: f32        = y;
+    if (sx + w > ctx.sw) {
+        if (nested) { sx = flip_x - w; }
+        or          { sx = ctx.sw - w; }
+    }
+    if (sx < 0.0::f32)      { sx = 0.0::f32; }
+    if (sy + st.h > ctx.sh) { sy = ctx.sh - st.h; }
+    if (sy < 0.0::f32)      { sy = 0.0::f32; }
+
+    if (nested) { m.pop = widget.begin_popup_nested(ctx, m.id, 1, sx - ctx.lx, sy - ctx.ly, w); }
+    or          { m.pop = widget.begin_popup_id(ctx, m.id, 1, sx - ctx.lx, sy - ctx.ly, w); }
+    m.open = 1;
+    # rows sit edge to edge, below the menu's top padding
+    context.top_layout(ctx).gap = 0.0::f32;
+    widget.space(ctx, pad(ctx));
+
+    m.moved = ctx.in.mx != st.mx || ctx.in.my != st.my;
+    st.mx   = ctx.in.mx;
+    st.my   = ctx.in.my;
+    if (st.child == 0 && ctx.focus == m.rid) { m.keys = nav_keys(ctx); }
+}
+
+# start a menu bar as the next item of the current layout frame
+#
+# it is one control row high and fills the frame's width, and its headers are
+# begin_menu calls between it and end_bar.
+# ---
+# ctx: context
+# key: the bar's key in the current id scope
+# ret: the handle its menus open from
+pub fun begin_bar(ctx: *context.Context, key: str) Menu {
+    val id: u64          = context.id_of(ctx, key);
+    val st: *MenuState   = state.get[MenuState](ctx, id);
+    var m:  Menu         = menu_of(ctx, id, KIND_BAR, st, nil);
+    val rh: f32          = row_h(ctx);
+    val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fixed(rh), 0.0::f32, rh);
+    m.open  = 1;
+    m.x     = r.x0;
+    m.x0    = r.x0;
+    m.x1    = r.x1;
+    m.y0    = r.y0;
+    m.y1    = r.y1;
+    m.claim = context.reserve_claim(ctx, 0);
+    m.moved = ctx.in.mx != st.mx || ctx.in.my != st.my;
+    st.mx   = ctx.in.mx;
+    st.my   = ctx.in.my;
+    m.ch    = context.split(ctx, 2);
+    context.set_channel(ctx, m.ch, 1);
+    context.push_id(ctx, id);
+    ret m;
+}
+
+# finish a menu bar: paint its background beneath its headers and give it
+# its claim
+# ---
+# ctx: context
+# m:   the value begin_bar returned
+pub fun end_bar(ctx: *context.Context, m: *Menu) {
+    context.pop_id(ctx);
+    val st: *MenuState = m.st;
+    if (st.child != 0 && !m.hopen) { st.child = 0; }
+    if (st.child != 0 && m.shift != SHIFT_NONE) {
+        var to: u64 = m.hnext;
+        if (to == 0) { to = m.h0; }
+        if (m.shift == SHIFT_PREV) {
+            to = m.hprev;
+            if (to == 0) { to = m.h1; }
+        }
+        st.child                            = to;
+        state.get[MenuState](ctx, to).first = 1;
+    }
+    hold(ctx, m.id, st, st.child != 0);
+
+    context.set_channel(ctx, m.ch, 0);
+    context.quad(ctx, m.x0, m.y0, m.x1, m.y1, ctx.theme.header);
+    context.merge(ctx, m.ch);
+    context.fill_claim(ctx, m.claim, m.x0, m.y0, m.x1, m.y1);
+}
+
+# a header in a bar, or a row opening a submenu in an open menu, and the menu
+# it opens
+#
+# the body between it and end_menu runs whether the menu is open or not, so
+# the items' shortcuts work while it is closed. pair every begin_menu with an
+# end_menu.
+# ---
+# ctx:    context
+# parent: the bar or menu it is placed in
+# label:  the header or row text, and its key in the parent's scope
+# ret:    the handle its items take
+pub fun begin_menu(ctx: *context.Context, parent: *Menu, label: str) Menu {
+    val id: u64        = context.id_of(ctx, label);
+    val st: *MenuState = state.get[MenuState](ctx, id);
+    var m:  Menu       = menu_of(ctx, id, KIND_DROP, st, parent);
+    if (parent.kind == KIND_BAR) {
+        header(ctx, parent, ?m, label);
+        ret m;
+    }
+    if (parent.open == 0) { ret m; }
+    submenu_row(ctx, parent, ?m, label);
+    ret m;
+}
+
+# a bar header: opens on a press, and on hover while another header is open
+fun header(ctx: *context.Context, bar: *Menu, m: *Menu, label: str) {
+    val bs: *MenuState = bar.st;
+    val p:  f32        = pad(ctx);
+    val tw: f32        = context.text_width_n(ctx, label, bid.shown(label));
+    val x0: f32        = bar.x;
+    val x1: f32        = bar.x + tw + p * 4.0::f32;
+    val y0: f32        = bar.y0;
+    val y1: f32        = bar.y1;
+    bar.x = x1;
+
+    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
+    if (h.pressed) {
+        if (bs.child == m.id) { bs.child = 0; }
+        or                    { bs.child = m.id; }
+    }
+    # the open menu's outside claim covers the bar, so a move onto another
+    # header is read from the cursor itself
+    if (bar.moved && bs.child != 0 && bs.child != m.id) {
+        val mx: f32  = context.local_mx(ctx);
+        val my: f32  = context.local_my(ctx);
+        val on: bool = mx >= x0 && mx < x1 && my >= y0 && my < y1;
+        if (on && context.input_visible(ctx, ctx.in.mx, ctx.in.my) != 0 && ctx.in.present != 0) { bs.child = m.id; }
+    }
+
+    if (bar.h0 == 0)                 { bar.h0 = m.id; }
+    if (bar.hopen && bar.hnext == 0) { bar.hnext = m.id; }
+    if (bs.child == m.id)            { bar.hopen = true; }
+    or (!bar.hopen)                  { bar.hprev = m.id; }
+    bar.h1 = m.id;
+
+    val open: bool = bs.child == m.id;
+    if (open)  { context.quad(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
+    or (h.hot) { context.quad(ctx, x0, y0, x1, y1, ctx.theme.header_hot); }
+    val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
+    context.text_span(ctx, label, bid.shown(label), x0 + p * 2.0::f32, ty, ctx.theme.text);
+
+    if (!open) {
+        m.st.child  = 0;
+        m.st.cursor = 0;
+        ret;
+    }
+    open_popup(ctx, m, x0 + ctx.lx, y1 + ctx.ly, 0.0::f32, false);
+}
+
+# a row in an open menu that opens a submenu beside it on hover, a click,
+# enter or right
+fun submenu_row(ctx: *context.Context, parent: *Menu, m: *Menu, label: str) {
+    val ps:   *MenuState   = parent.st;
+    val i:    u32          = row_index(parent, true);
+    val p:    f32          = pad(ctx);
+    val rh:   f32          = row_h(ctx);
+    val r:    context.Area = row(ctx, rh);
+    val x0:   f32          = r.x0;
+    val y0:   f32          = r.y0;
+    val x1:   f32          = r.x1;
+    val y1:   f32          = r.y1;
+    val here: bool         = ps.cursor == i + 1;
+
+    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
+    if ((h.hot && parent.moved) || h.pressed) {
+        ps.cursor = i + 1;
+        ps.child  = m.id;
+    }
+    if (here && (parent.keys & (K_ENTER | K_RIGHT)) != 0) {
+        ps.child    = m.id;
+        m.st.first  = 1;
+        parent.took = true;
+    }
+
+    val open: bool = ps.child == m.id;
+    if (open)                       { parent.seen = true; }
+    if (open || ps.cursor == i + 1) { context.quad(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
+    val lx: f32 = label_x(ctx, parent, x0);
+    val ty: f32 = y0 + (rh - context.line_height(ctx)) / 2.0::f32;
+    context.text_span(ctx, label, bid.shown(label), lx, ty, ctx.theme.text);
+    val k:  f32 = context.line_height(ctx) / 2.0::f32;
+    val ax: f32 = x1 - p - k;
+    val ay: f32 = y0 + (rh - k) / 2.0::f32;
+    context.tri(ctx, ax, ay, ax + k / 2.0::f32, ay + k / 2.0::f32, ax, ay + k, ctx.theme.text_dim);
+    parent.need = maxf(parent.need, lx - x0 + context.text_width_n(ctx, label, bid.shown(label)) + p * 4.0::f32 + k);
+
+    if (!open) {
+        m.st.child  = 0;
+        m.st.cursor = 0;
+        ret;
+    }
+    open_popup(ctx, m, x1, y0 - p, x0, true);
+    # the key that opened it was this frame's, and its parent's
+    if (parent.took) { m.keys = 0; }
+}
+
+# place a row h tall across an open menu
+fun row(ctx: *context.Context, h: f32) context.Area {
+    ret widget.place(ctx, layout.fill(1.0::f32), layout.fixed(h), 0.0::f32, h);
+}
+
+# count a row of an open menu, tracking the enabled ones around its highlight
+fun row_index(m: *Menu, enabled: bool) u32 {
+    val i: u32 = m.n;
+    m.n = m.n + 1;
+    if (!enabled) { ret i; }
+    val cur: u32 = m.st.cursor;
+    if (m.first == NONE) { m.first = i; }
+    m.last = i;
+    if (cur != 0 && i + 1 < cur)                   { m.prev = i; }
+    if (cur != 0 && i + 1 > cur && m.next == NONE) { m.next = i; }
+    ret i;
+}
+
+# where a row's label starts: past the check column, and the icon column when
+# the menu drew an icon last frame
+fun label_x(ctx: *context.Context, m: *Menu, x0: f32) f32 {
+    val p: f32 = pad(ctx);
+    val k: f32 = context.line_height(ctx);
+    var x: f32 = x0 + p * 2.0::f32 + k;
+    if (m.st.icons != 0) { x = x + k + p; }
+    ret x;
+}
+
+# finish a menu begun by begin_menu: apply its keys, size it from its rows
+# and close its popup
+# ---
+# ctx: context
+# m:   the value begin_menu or begin_context returned
+pub fun end_menu(ctx: *context.Context, m: *Menu) {
+    val st: *MenuState = m.st;
+    if (m.open == 0) {
+        if (m.kind == KIND_CONTEXT) { hold(ctx, m.id, st, false); }
+        ret;
+    }
+
+    if ((m.keys & K_DOWN) != 0) {
+        if (m.next != NONE)  { st.cursor = m.next + 1; }
+        or (m.first != NONE) { st.cursor = m.first + 1; }
+    }
+    if ((m.keys & K_UP) != 0) {
+        if (m.prev != NONE) { st.cursor = m.prev + 1; }
+        or (m.last != NONE) { st.cursor = m.last + 1; }
+    }
+    if (st.first != 0) {
+        st.first = 0;
+        if (m.first != NONE) { st.cursor = m.first + 1; }
+    }
+    if (st.child != 0 && !m.seen) { st.child = 0; }
+
+    val par: *Menu = m.parent;
+    val top: bool  = par == nil || par.kind == KIND_BAR;
+    if ((m.keys & K_ESC) != 0) {
+        if (top) { close(m.root); }
+        or       { par.st.child = 0; }
+    }
+    if ((m.keys & K_LEFT) != 0) {
+        if (!top)       { par.st.child = 0; }
+        or (par != nil) { par.shift = SHIFT_PREV; }
+    }
+    if ((m.keys & K_RIGHT) != 0 && !m.took && par != nil && par.kind == KIND_BAR) { par.shift = SHIFT_NEXT; }
+
+    var icons: u8 = 0;
+    if (m.icons) { icons = 1; }
+    val f: *layout.Frame = context.top_layout(ctx);
+    val h: f32           = f.y + pad(ctx) - f.y0;
+    if (m.need != st.w || h != st.h || icons != st.icons) { context.wake_at(ctx, ctx.in.time); }
+    st.w     = m.need;
+    st.h     = h;
+    st.icons = icons;
+
+    widget.end_popup(ctx, m.pop);
+    if (m.pop.dismissed != 0)   { close(m.root); }
+    if (m.kind == KIND_CONTEXT) { hold(ctx, m.id, st, st.open != 0); }
+}
+
+# a thin line between groups of items in an open menu
+# ---
+# ctx: context
+# m:   the menu
+pub fun separator(ctx: *context.Context, m: *Menu) {
+    if (m.open == 0 || m.kind == KIND_BAR) { ret; }
+    val p: f32          = pad(ctx);
+    val w: f32          = context.px(ctx, ctx.theme.edge_w);
+    val r: context.Area = row(ctx, p * 2.0::f32 + w);
+    context.quad(ctx, r.x0 + p, r.y0 + p, r.x1 - p, r.y0 + p + w, ctx.theme.edge);
+}
+
+# an entry of a menu: drawn while the menu is open, fired by a click, by enter
+# while highlighted, or by its shortcut whether the menu is open or not
+#
+# firing it flips @check for a checkable item. a click or enter also closes
+# the menu's whole tree. a disabled item never fires.
+# ---
+# ctx: context
+# m:   the menu it belongs to
+# it:  the item
+# ret: true on the frame it fires
+pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
+    var fired: bool = false;
+    val quiet: bool = context.typing(ctx) && ctx.focus != m.rid;
+    if (!it.disabled && !quiet && struck(ctx, it.shortcut)) { fired = true; }
+
+    if (m.open != 0 && m.kind != KIND_BAR) {
+        val i:       u32          = row_index(m, !it.disabled);
+        val id:      u64          = context.id_of(ctx, it.label);
+        val p:       f32          = pad(ctx);
+        val rh:      f32          = row_h(ctx);
+        val r:       context.Area = row(ctx, rh);
+        val x0:      f32          = r.x0;
+        val y0:      f32          = r.y0;
+        val x1:      f32          = r.x1;
+        val y1:      f32          = r.y1;
+        var buttons: u8           = input.BUTTON_LEFT;
+        if (it.disabled) { buttons = 0; }
+
+        val h: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, buttons);
+        if (h.hot) {
+            if (it.disabled) { context.set_cursor(ctx, input.CURSOR_NOT_ALLOWED); }
+            or               { context.set_cursor(ctx, input.CURSOR_HAND); }
+        }
+        if (h.hot && m.moved) {
+            m.st.child = 0;
+            if (!it.disabled) { m.st.cursor = i + 1; }
+        }
+        val here:   bool = m.st.cursor == i + 1 && !it.disabled;
+        var picked: bool = h.clicked;
+        if (here && (m.keys & K_ENTER) != 0) { picked = true; }
+        if (picked && !it.disabled) {
+            fired = true;
+            close(m.root);
+        }
+
+        var ink: draw.Color = ctx.theme.text;
+        if (it.disabled) { ink = ctx.theme.text_faint; }
+        if (here)        { context.quad(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
+
+        val lh: f32 = context.line_height(ctx);
+        val ty: f32 = y0 + (rh - lh) / 2.0::f32;
+        if (it.check != nil && @it.check != 0) {
+            val q: f32 = lh / 4.0::f32;
+            context.quad(ctx, x0 + p * 2.0::f32 + q, ty + q, x0 + p * 2.0::f32 + lh - q, ty + lh - q, ctx.theme.accent);
+        }
+        if (it.icon != nil) {
+            m.icons = true;
+            context.text_at(ctx, it.icon, x0 + p * 3.0::f32 + lh, ty, ink);
+        }
+        val lx: f32 = label_x(ctx, m, x0);
+        val lw: f32 = context.text_width_n(ctx, it.label, bid.shown(it.label));
+        context.text_span(ctx, it.label, bid.shown(it.label), lx, ty, ink);
+
+        var need: f32 = lx - x0 + lw + p * 2.0::f32;
+        var buf:  [40]u8;
+        if (shortcut_text(it.shortcut, ?buf[0], SHORTCUT_TEXT) != 0) {
+            val sw: f32        = context.text_width(ctx, ?buf[0]);
+            var sc: draw.Color = ctx.theme.text_dim;
+            if (it.disabled) { sc = ctx.theme.text_faint; }
+            context.text_at(ctx, ?buf[0], x1 - p * 2.0::f32 - lh / 2.0::f32 - sw, ty, sc);
+            need = need + lh * 2.0::f32 + sw;
+        }
+        m.need = maxf(m.need, need + lh / 2.0::f32);
+    }
+
+    if (fired && it.check != nil) {
+        if (@it.check != 0) { @it.check = 0; }
+        or                  { @it.check = 1; }
+    }
+    ret fired;
+}
+
+# a context menu over a region: a right press on the region opens it at the
+# cursor
+#
+# the region is claimed like a container, so claim it before what it holds:
+# widgets placed after it stay on top of it and keep their own presses. a
+# region with no area claims nothing and opens only through open_context. the
+# body between it and end_menu runs whether the menu is open or not.
+# ---
+# ctx: context
+# key: the menu's key in the current id scope
+# x0:  region left in local pixels
+# y0:  region top in local pixels
+# x1:  region right in local pixels
+# y1:  region bottom in local pixels
+# ret: the handle its items take, ended with end_menu
+pub fun begin_context(ctx: *context.Context, key: str, x0: f32, y0: f32, x1: f32, y1: f32) Menu {
+    val id: u64        = context.id_of(ctx, key);
+    val st: *MenuState = state.get[MenuState](ctx, id);
+    var m:  Menu       = menu_of(ctx, id, KIND_CONTEXT, st, nil);
+    if (x1 > x0 && y1 > y0) {
+        val h: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_RIGHT);
+        if (h.pressed) { open_at(st, ctx.in.mx, ctx.in.my); }
+    }
+    if (st.open == 0) {
+        st.child  = 0;
+        st.cursor = 0;
+        ret m;
+    }
+    open_popup(ctx, ?m, st.x, st.y, 0.0::f32, false);
+    ret m;
+}
+
+# open a context menu fresh at a screen point
+fun open_at(st: *MenuState, x: f32, y: f32) {
+    st.open   = 1;
+    st.child  = 0;
+    st.cursor = 0;
+    st.x      = x;
+    st.y      = y;
+}
+
+# open a context menu at the cursor, such as from a widget's own right click;
+# it draws from its next begin_context
+# ---
+# ctx: context
+# key: the menu's key, in the scope its begin_context runs in
+pub fun open_context(ctx: *context.Context, key: str) {
+    open_at(state.get[MenuState](ctx, context.id_of(ctx, key)), ctx.in.mx, ctx.in.my);
+}
+
+# whether a context menu is open
+# ---
+# ctx: context
+# key: the menu's key, in the scope its begin_context runs in
+# ret: true while it is open
+pub fun context_open(ctx: *context.Context, key: str) bool {
+    ret state.get[MenuState](ctx, context.id_of(ctx, key)).open != 0;
+}
+
+# what the test interface did in its last frame
+rec Probe {
+    saved:  u32;
+    quits:  u32;
+    cut:    u32;
+    exp:    u32;
+    zooms:  u32;
+    grid:   u8;
+    typing: u8;
+    f:      field.Field;
+    buf:    [16]u8;
+}
+
+# a bar with File (New, Save, Export > PNG/SVG, disabled Close) and View (Grid),
+# a context menu over the lower half, and a text field
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val pr: *Probe       = user::*Probe;
+    val p:  widget.Block = widget.begin_panel(ctx, 0.0::f32, 0.0::f32, 300.0::f32);
+
+    var bar:  Menu = begin_bar(ctx, "main");
+    var file: Menu = begin_menu(ctx, ?bar, "File");
+    item(ctx, ?file, of("New"));
+    var save: Item = of("Save");
+    save.shortcut = keys('S', input.MOD_CTRL);
+    if (item(ctx, ?file, save)) { pr.saved = pr.saved + 1; }
+    var exp: Menu = begin_menu(ctx, ?file, "Export");
+    if (item(ctx, ?exp, of("PNG"))) { pr.exp = pr.exp + 1; }
+    item(ctx, ?exp, of("SVG"));
+    end_menu(ctx, ?exp);
+    separator(ctx, ?file);
+    var cl: Item = of("Close");
+    cl.disabled = true;
+    item(ctx, ?file, cl);
+    var quit: Item = of("Quit");
+    quit.shortcut = keys('Q', input.MOD_CTRL);
+    if (item(ctx, ?file, quit)) { pr.quits = pr.quits + 1; }
+    end_menu(ctx, ?file);
+    var view: Menu = begin_menu(ctx, ?bar, "View");
+    var grid: Item = of("Grid");
+    grid.check = ?pr.grid;
+    grid.icon  = "#";
+    item(ctx, ?view, grid);
+    var zoom: Item = of("Zoom");
+    zoom.shortcut = keys('Z', MOD_PRIMARY);
+    if (item(ctx, ?view, zoom)) { pr.zooms = pr.zooms + 1; }
+    end_menu(ctx, ?view);
+    end_bar(ctx, ?bar);
+
+    var cm: Menu = begin_context(ctx, "canvas", 0.0::f32, 100.0::f32, 300.0::f32, 200.0::f32);
+    if (item(ctx, ?cm, of("Cut"))) { pr.cut = pr.cut + 1; }
+    end_menu(ctx, ?cm);
+
+    widget.text_field(ctx, "name", ?pr.f, "name");
+    widget.end_panel(ctx, p);
+}
+
+#[testing]
+fun start(d: *driver.Driver, a: *allo.Allocator, pr: *Probe) bool {
+    field.init(?pr.f, ?pr.buf[0], 16, 0, nil);
+    val ie: err[allo.Error] = driver.init(d, a, 400.0::f32, 300.0::f32, probe_ui, pr::ptr);
+    if (sel ie.err) { ret false; }
+    driver.step(d);
+    ret true;
+}
+
+test menu__bar_opens_on_press_and_switches_on_hover {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    val file: u64 = driver.find(?d, "main/File");
+    val new:  u64 = driver.find(?d, "main/File/New");
+    if (!driver.drawn(?d, file) || driver.drawn(?d, new)) { ret 2; }
+
+    # a press on the header opens it
+    driver.click(?d, file);
+    driver.step(?d);
+    if (!driver.drawn(?d, new)) { ret 3; }
+
+    # moving onto another header opens that one instead
+    driver.hover(?d, driver.find(?d, "main/View"));
+    driver.step(?d);
+    if (driver.drawn(?d, new) || !driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 4; }
+
+    # clicking an item fires it, flips its check and closes the tree
+    if (!driver.click(?d, driver.find(?d, "main/View/Grid")) || pr.grid != 1) { ret 5; }
+    driver.step(?d);
+    if (driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 6; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__submenu_opens_on_hover_and_outside_press_closes {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "main/File"));
+    driver.step(?d);
+    val png: u64 = driver.find(?d, "main/File/Export/PNG");
+    if (driver.drawn(?d, png)) { ret 2; }
+
+    # hovering the row opens its submenu, and the parent stays under the pointer
+    driver.hover(?d, driver.find(?d, "main/File/Export"));
+    driver.step(?d);
+    if (!driver.drawn(?d, png)) { ret 3; }
+    driver.hover(?d, driver.find(?d, "main/File/New"));
+    driver.step(?d);
+    if (driver.drawn(?d, png)) { ret 4; }
+    driver.hover(?d, driver.find(?d, "main/File/Export"));
+    driver.step(?d);
+    if (!driver.click(?d, png) || pr.exp != 1) { ret 5; }
+
+    # a disabled item never fires, and a press outside closes the tree
+    driver.click(?d, driver.find(?d, "main/File"));
+    driver.step(?d);
+    driver.click(?d, driver.find(?d, "main/File/Close"));
+    if (!driver.drawn(?d, driver.find(?d, "main/File/New"))) { ret 6; }
+    driver.move(?d, 390.0::f32, 290.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (driver.drawn(?d, driver.find(?d, "main/File/New"))) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__context_opens_on_right_press_and_closes_outside {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    val cut: u64 = driver.find(?d, "canvas/Cut");
+    # the left button does not open it
+    driver.move(?d, 50.0::f32, 150.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (driver.drawn(?d, cut)) { ret 2; }
+
+    driver.press(?d, input.BUTTON_RIGHT);
+    driver.release(?d, input.BUTTON_RIGHT);
+    if (!driver.drawn(?d, cut)) { ret 3; }
+    val r: opt[context.Area] = driver.rect(?d, cut);
+    if (sel r.none)                                      { ret 4; }
+    if (r.some.x0 < 50.0::f32 || r.some.y0 < 150.0::f32) { ret 4; }
+
+    # a right press outside closes it too
+    driver.move(?d, 390.0::f32, 20.0::f32);
+    driver.press(?d, input.BUTTON_RIGHT);
+    driver.release(?d, input.BUTTON_RIGHT);
+    if (driver.drawn(?d, cut)) { ret 5; }
+
+    driver.move(?d, 50.0::f32, 150.0::f32);
+    driver.press(?d, input.BUTTON_RIGHT);
+    driver.release(?d, input.BUTTON_RIGHT);
+    if (!driver.click(?d, cut) || pr.cut != 1) { ret 6; }
+    driver.step(?d);
+    if (driver.drawn(?d, cut)) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__shortcuts_fire_closed_and_stay_quiet_while_typing {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    driver.key(?d, 'S', input.MOD_CTRL);
+    if (pr.saved != 1 || driver.drawn(?d, driver.find(?d, "main/File/Save"))) { ret 2; }
+    # the modifiers must match exactly
+    driver.key(?d, 'S', input.MOD_CTRL | input.MOD_SHIFT);
+    driver.key(?d, 'S', 0);
+    if (pr.saved != 1) { ret 3; }
+
+    # the primary modifier is ctrl or super, with the rest exact
+    driver.key(?d, 'Z', input.MOD_CTRL);
+    driver.key(?d, 'Z', input.MOD_SUPER);
+    if (pr.zooms != 2) { ret 8; }
+    driver.key(?d, 'Z', input.MOD_CTRL | input.MOD_ALT);
+    driver.key(?d, 'Z', input.MOD_CTRL | input.MOD_SHIFT);
+    driver.key(?d, 'Z', 0);
+    if (pr.zooms != 2) { ret 9; }
+
+    # quiet while a text field holds the keyboard
+    driver.click(?d, driver.find(?d, "name"));
+    if (!driver.focused(?d, driver.find(?d, "name"))) { ret 4; }
+    driver.key(?d, 'Q', input.MOD_CTRL);
+    if (pr.quits != 0) { ret 5; }
+
+    var buf: [40]u8;
+    if (shortcut_text(keys('S', input.MOD_CTRL | input.MOD_SHIFT), ?buf[0], SHORTCUT_TEXT) != 12) { ret 6; }
+    if (buf[0] != 'C' || buf[11] != 'S' || buf[12] != 0)                                          { ret 6; }
+    if (shortcut_text(keys(input.KEY_DELETE, 0), ?buf[0], SHORTCUT_TEXT) != 3)                    { ret 7; }
+    val n: usize = shortcut_text(keys('Z', MOD_PRIMARY | input.MOD_SHIFT), ?buf[0], SHORTCUT_TEXT);
+    $if ($mach.build.os == $mach.os.darwin) {
+        if (n != 11 || buf[0] != 'C' || buf[1] != 'm') { ret 10; }
+    }
+    $or {
+        if (n != 12 || buf[0] != 'C' || buf[1] != 't') { ret 10; }
+    }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__keyboard_navigates_an_open_menu {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "main/File"));
+    # leave the pointer on the bar so hover does not move the highlight
+    driver.step(?d);
+    val st: *MenuState = state.get[MenuState](?d.ctx, driver.find(?d, "main/File"));
+
+    # down from nothing lands on the first item, and wraps past the last,
+    # skipping the disabled Close
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 1) { ret 2; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 3) { ret 3; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 5) { ret 4; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 1) { ret 5; }
+    driver.key(?d, input.KEY_UP, 0);
+    if (st.cursor != 5) { ret 6; }
+
+    # right opens the highlighted submenu on its first item, left closes it
+    driver.key(?d, input.KEY_UP, 0);
+    driver.key(?d, input.KEY_RIGHT, 0);
+    driver.step(?d);
+    val png: u64 = driver.find(?d, "main/File/Export/PNG");
+    if (!driver.drawn(?d, png)) { ret 7; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    driver.step(?d);
+    if (driver.drawn(?d, png)) { ret 8; }
+
+    # enter fires the highlighted item and closes the tree
+    driver.key(?d, input.KEY_RIGHT, 0);
+    driver.key(?d, input.KEY_ENTER, 0);
+    if (pr.exp != 1) { ret 9; }
+    driver.step(?d);
+    if (driver.drawn(?d, driver.find(?d, "main/File/New"))) { ret 10; }
+
+    # right past a plain item moves to the next header, escape closes
+    driver.click(?d, driver.find(?d, "main/File"));
+    driver.step(?d);
+    driver.key(?d, input.KEY_RIGHT, 0);
+    driver.step(?d);
+    if (!driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 11; }
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    driver.step(?d);
+    if (driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 12; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__an_open_menu_owns_the_keyboard {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    val name: u64 = driver.find(?d, "name");
+    driver.click(?d, name);
+    driver.type_text(?d, "ab");
+    if (!driver.focused(?d, name) || pr.f.caret != 2) { ret 2; }
+
+    # a context menu opened over the focused field takes the keyboard
+    driver.move(?d, 50.0::f32, 150.0::f32);
+    driver.press(?d, input.BUTTON_RIGHT);
+    driver.release(?d, input.BUTTON_RIGHT);
+    if (!driver.drawn(?d, driver.find(?d, "canvas/Cut")) || driver.focused(?d, name)) { ret 3; }
+
+    # the arrows move the menu's highlight and leave the caret alone
+    val st: *MenuState = state.get[MenuState](?d.ctx, driver.find(?d, "canvas"));
+    driver.key(?d, input.KEY_DOWN, 0);
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (st.cursor != 1 || pr.f.caret != 2) { ret 4; }
+
+    # escape closes it and the field has the keyboard again
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    driver.step(?d);
+    if (driver.drawn(?d, driver.find(?d, "canvas/Cut"))) { ret 5; }
+    if (!driver.focused(?d, name))                       { ret 6; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (pr.f.caret != 1) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
