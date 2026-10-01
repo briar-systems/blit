@@ -357,6 +357,7 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     val cw:    f32          = context.px(ctx, context.look_of(ctx, theme.FIELD_CARET).min_w);
     context.box(ctx, theme.FIELD, fs, x0, y0, x0 + w, y0 + bh);
 
+    val keyed: bool = interact.stop(ctx, id, a.x0, a.y0, a.x1, a.y1, interact.ARROWS | interact.TEXT);
     context.push_id(ctx, id);
     val r:  widget.ScrollArea = widget.begin_scroll_at(ctx, "#scroll", ?t.scroll, a);
     val hf: interact.Hit      = interact.hit(ctx, id, 0.0::f32, 0.0::f32, widget.avail(ctx).x1, maxf(content, bh), input.BUTTON_LEFT);
@@ -381,8 +382,8 @@ pub fun text_area(ctx: *context.Context, key: str, f: *field.Field, t: *TextArea
     if (pre != nil) { pw = context.text_width(ctx, pre); }
     val cr:    usize = row_of(t, f.caret);
     var first: usize = 0;
-    if (t.scroll.offset > p) { first = ((t.scroll.offset - p) / lh)::usize; }
-    var last: usize = ((t.scroll.offset + bh - p) / lh)::usize + 1;
+    if (r.top > p) { first = ((r.top - p) / lh)::usize; }
+    var last: usize = ((r.top + bh - p) / lh)::usize + 1;
     if (last > t.count) { last = t.count; }
     val lo: usize = field.sel_lo(f);
     val hi: usize = field.sel_hi(f);

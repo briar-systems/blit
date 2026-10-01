@@ -36,9 +36,12 @@ pub val RULE_ORDER: u8 = 2;
 # ---
 # name: what the band holds, for tools and inspectors
 # rule: RULE_FLAT, RULE_NEST or RULE_ORDER
+# trap: 1 if keyboard navigation stays inside the topmost layer of this band
+#       holding a focusable widget, as a modal keeps the keyboard, else 0
 pub rec Band {
     name: str;
     rule: u8;
+    trap: u8;
 }
 
 # the bands, by index, bottom to top
@@ -56,14 +59,14 @@ pub val COUNT: u32 = 8;
 
 # every band, bottom to top, indexed by the constants above
 val TABLE: [8]Band = [8]Band{
-    Band{name: "base", rule: RULE_FLAT},
-    Band{name: "docked", rule: RULE_FLAT},
-    Band{name: "windows", rule: RULE_ORDER},
-    Band{name: "overlays", rule: RULE_ORDER},
-    Band{name: "popups", rule: RULE_NEST},
-    Band{name: "modals", rule: RULE_NEST},
-    Band{name: "tooltips", rule: RULE_FLAT},
-    Band{name: "drag", rule: RULE_FLAT}
+    Band{name: "base", rule: RULE_FLAT, trap: 0},
+    Band{name: "docked", rule: RULE_FLAT, trap: 0},
+    Band{name: "windows", rule: RULE_ORDER, trap: 0},
+    Band{name: "overlays", rule: RULE_ORDER, trap: 0},
+    Band{name: "popups", rule: RULE_NEST, trap: 0},
+    Band{name: "modals", rule: RULE_NEST, trap: 1},
+    Band{name: "tooltips", rule: RULE_FLAT, trap: 0},
+    Band{name: "drag", rule: RULE_FLAT, trap: 0}
 };
 
 # one band's row of the table

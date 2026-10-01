@@ -22,6 +22,7 @@ use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
 
+use blit.anim;
 use blit.context;
 use blit.draw;
 use drv: blit.driver;
@@ -113,7 +114,7 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
     val y0:  f32          = at.y0;
     val tx:  f32          = x0 + box + sp;
     val x1:  f32          = tx + tw;
-    val hr:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + box, input.BUTTON_LEFT);
+    val hr:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + box, input.BUTTON_LEFT | interact.FOCUS);
     hand(ctx, hr);
 
     var changed: bool = false;
@@ -127,13 +128,19 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
     val cx: f32 = x0 + r;
     val cy: f32 = y0 + r;
     disc(ctx, theme.RADIO, st, cx, cy, r);
-    if (@choice == value) { disc(ctx, theme.RADIO_MARK, theme.ON, cx, cy, r - context.px(ctx, context.look_of(ctx, theme.RADIO).pad.l)); }
+    if (@choice == value) {
+        context.mark_current(ctx, id);
+        disc(ctx, theme.RADIO_MARK, theme.ON, cx, cy, r - context.px(ctx, context.look_of(ctx, theme.RADIO).pad.l));
+    }
 
     context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ink(ctx, theme.RADIO, st).text);
     ret changed;
 }
 
 # n radio buttons stacked down the column, button i standing for value i
+#
+# the buttons are one group of tab stops, keyed by the first label: tab
+# reaches the group once and the arrows move between its buttons.
 # ---
 # ctx:    context
 # labels: pointer to an array of n labels (pass ?labels[0])
@@ -143,10 +150,13 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
 pub fun radios(ctx: *context.Context, labels: *str, n: usize, choice: *usize) bool {
     var changed: bool  = false;
     var i:       usize = 0;
+    if (n == 0) { ret false; }
+    val grp: interact.Group = interact.begin_group(ctx, bid.child(context.id_of(ctx, labels[0]), "#group"), interact.BOTH);
     for (i < n) {
         if (radio(ctx, labels[i], choice, i)) { changed = true; }
         i = i + 1;
     }
+    interact.end_group(ctx, grp);
     ret changed;
 }
 
@@ -359,7 +369,7 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
     val x1: f32          = at.x1;
 
     var opening: bool         = false;
-    val hd:      interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + h, input.BUTTON_LEFT);
+    val hd:      interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + h, input.BUTTON_LEFT | interact.FOCUS);
     hand(ctx, hd);
     if (hd.clicked && st.open != 0) { st.open = 0; }
     or (hd.clicked) {
@@ -373,7 +383,7 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
 
     val hs:  u8          = theme.pick(hd.hot, hd.active, st.open != 0, false);
     val oin: theme.Edges = inset(ctx, theme.LIST_ITEM);
-    context.box(ctx, theme.DROPDOWN, hs, x0, y0, x1, y0 + h);
+    anim.box(ctx, id, theme.DROPDOWN, hs, x0, y0, x1, y0 + h);
     val ty: f32 = text_top(ctx, y0, h);
     context.text_span(ctx, label, bid.shown(label), x0 + in.l, ty, ink(ctx, theme.DROPDOWN, hs).text);
     if (@selected < count) {
@@ -424,7 +434,7 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
         }
         if (rows > 0) {
             val r:   widget.ScrollArea = widget.begin_scroll(ctx, "options", ?st.scroll, lh);
-            val top: f32               = st.scroll.offset;
+            val top: f32               = r.top;
             i = 0;
             for (i < count) {
                 if (widget.matches(options[i], field.text(?st.filter))) {

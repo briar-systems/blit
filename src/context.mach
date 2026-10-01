@@ -77,6 +77,22 @@
 # drawing every frame. the IME's composition in progress is kept here, for
 # the focus holder to show at its caret (preedit).
 #
+# keyboard navigation follows the frame's tab stops: widgets that take the
+# keyboard register one as they claim (see blit.interact), in call order,
+# with a group when they belong to one and what they take while focused. as
+# with claims, frame N's keys move the focus over frame N-1's stops, in
+# begin(N): tab and shift tab step through every stop in call order, a group
+# of stops counting as one, and the arrows move between the members of a
+# group unless the holder takes them itself. a band that traps the keyboard
+# (see blit.band) keeps it in its topmost layer holding a stop. a focus held
+# by anything that is not a stop, such as an open menu, owns the keys, and
+# navigation leaves them alone. the stop the keyboard moved to wears a focus
+# ring, drawn in end() above its widget from the theme.
+#
+# motion is timed by the host's clock: an animation (see blit.anim) asks for
+# frames through wake_at only while it runs, and set_reduce_motion makes
+# every one jump straight to its end.
+#
 # a widget's id is its key hashed into the seed of the current id scope (see
 # blit.id), so it survives widgets before it appearing and disappearing.
 # push_id_str and push_id_int open a scope and pop_id closes it, and
@@ -145,6 +161,35 @@ pub val Z_RENUMBER: u64 = 0x100000;
 
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
+
+# what a tab stop takes from the keyboard, bits above the input.BUTTON_* bits
+# so a widget can pass them with its buttons (see blit.interact.hit)
+#
+# focus:  a tab stop: tab reaches it, a press focuses it, and enter and space
+#         activate it while it holds the keyboard
+# arrows: it takes the arrow keys itself while focused, so they never move the
+#         focus within its group
+# text:   it takes typed text while focused: typing() is true, and enter and
+#         space are its own rather than an activation
+pub val NAV_FOCUS:  u8 = 0x80;
+pub val NAV_ARROWS: u8 = 0x40;
+pub val NAV_TEXT:   u8 = 0x20;
+
+# a stop marked as its group's current member (see mark_current), where tab
+# enters the group
+val NAV_CURRENT: u8 = 0x10;
+
+# the arrows that move between the members of a group
+#
+# row:    left and right
+# column: up and down
+# both:   left and up back, right and down on
+pub val AXIS_ROW:    u8 = 0;
+pub val AXIS_COLUMN: u8 = 1;
+pub val AXIS_BOTH:   u8 = 2;
+
+# no stop: an index no stop list reaches
+val NO_STOP: usize = 0xFFFFFFFFFFFFFFFF;
 
 # the default double-click time in seconds and distance in unscaled pixels
 # (see set_double_click)
@@ -289,6 +334,37 @@ pub rec Area {
     y1: f32;
 }
 
+# a widget keyboard navigation reaches, recorded as it claims
+# ---
+# id:    the widget's id
+# group: the group it belongs to, 0 for none
+# axis:  the AXIS_* arrows moving within its group
+# flags: the NAV_* bits it takes
+# layer: the layer it was drawn on
+# x0:    left in screen pixels, unclipped
+# y0:    top in screen pixels, unclipped
+# x1:    right in screen pixels, unclipped
+# y1:    bottom in screen pixels, unclipped
+# clip:  the clip it was drawn under, in screen pixels
+pub rec Stop {
+    id:    u64;
+    group: u64;
+    axis:  u8;
+    flags: u8;
+    layer: u32;
+    x0:    f32;
+    y0:    f32;
+    x1:    f32;
+    y1:    f32;
+    clip:  Area;
+}
+
+# which member of a group last held the keyboard, kept under the group's id
+# so tab returns to it
+rec GroupMemo {
+    last: u64;
+}
+
 # one line of text the frame drew, as the trace keeps it
 # ---
 # start: first byte of the line's text in the trace's bytes
@@ -427,6 +503,27 @@ pub rec TextLine {
 # trace_bytes:  the recorded lines' text, back to back
 # trace_cap:    bytes allocated for trace_bytes
 # trace_len:    bytes recorded this frame
+# icons:        the icon set, built-ins and the app's own
+# stops:        this frame's tab stops, in call order, which route the next frame's keys
+# stops_cap:    stops allocated for stops
+# stops_len:    stops recorded this frame
+# before:       the previous frame's tab stops, which route this frame's keys
+# before_cap:   stops allocated for before
+# before_len:   stops the previous frame recorded
+# group:        the group stops registered now belong to, 0 for none
+# group_axis:   the AXIS_* arrows moving within group
+# focus_plain:  1 while the focus holder is a stop taking no text, so typing() is false
+# focus_seen:   1 while the focus holder was reached by the keyboard, so it wears the ring
+# last_stop:    the stop that last held the focus, where tab resumes once nothing holds it
+# moved:        1 if this frame's keys moved the focus, else 0
+# moved_layer:  the layer of the stop the keys moved the focus to
+# ring_id:      the focus holder whose stop registered this frame, 0 for none
+# ring:         the focus holder's rect in screen pixels
+# ring_clip:    the clip its stop was drawn under
+# ring_layer:   the layer its stop was drawn on
+# still:        1 if motion is reduced, so every animation jumps to its end, else 0
+# focus_start:  the focus holder once begin moved it, the only stop the frame's
+#               enter and space can activate
 pub rec Context {
     dl:           draw.DrawList;
     in:           input.Input;
@@ -540,6 +637,25 @@ pub rec Context {
     trace_cap:    usize;
     trace_len:    usize;
     icons:        ico.Set;
+    stops:        *Stop;
+    stops_cap:    usize;
+    stops_len:    usize;
+    before:       *Stop;
+    before_cap:   usize;
+    before_len:   usize;
+    group:        u64;
+    group_axis:   u8;
+    focus_plain:  u8;
+    focus_seen:   u8;
+    last_stop:    u64;
+    moved:        u8;
+    moved_layer:  u32;
+    ring_id:      u64;
+    ring:         Area;
+    ring_clip:    Area;
+    ring_layer:   u32;
+    still:        u8;
+    focus_start:  u64;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -694,12 +810,29 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.trace_cap   = 0;
     ctx.trace_len   = 0;
     ctx.icons       = ico.init(a);
+    ctx.stops       = nil;
+    ctx.stops_cap   = 0;
+    ctx.stops_len   = 0;
+    ctx.before      = nil;
+    ctx.before_cap  = 0;
+    ctx.before_len  = 0;
+    ctx.group       = 0;
+    ctx.group_axis  = AXIS_BOTH;
+    ctx.focus_plain = 0;
+    ctx.focus_seen  = 0;
+    ctx.last_stop   = 0;
+    ctx.moved       = 0;
+    ctx.moved_layer = 0;
+    ctx.ring_id     = 0;
+    ctx.ring_layer  = 0;
+    ctx.still       = 0;
+    ctx.focus_start = 0;
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
 # composition, held-back button events, state, drag payload, icons, id
-# bookkeeping and text trace
+# bookkeeping, text trace and tab stops
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
@@ -715,6 +848,16 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel ex.err) { ret ex; }
     val eic: err[allo.Error] = ico.free(?ctx.icons);
     if (sel eic.err) { ret eic; }
+    val est: err[allo.Error] = allo.deallocate[Stop](ctx.a, ctx.stops, ctx.stops_cap);
+    if (sel est.err) { ret est; }
+    ctx.stops     = nil;
+    ctx.stops_cap = 0;
+    ctx.stops_len = 0;
+    val ebf: err[allo.Error] = allo.deallocate[Stop](ctx.a, ctx.before, ctx.before_cap);
+    if (sel ebf.err) { ret ebf; }
+    ctx.before     = nil;
+    ctx.before_cap = 0;
+    ctx.before_len = 0;
     if (ctx.backlog != nil) {
         val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
         if (sel eh.err) { ret eh; }
@@ -815,7 +958,9 @@ pub fun free(ctx: *Context) err[allo.Error] {
 #
 # hover is the topmost of the previous frame's claims under this frame's
 # cursor, and nothing while no pointer is present. a primary press on anything
-# but the focus holder drops the focus. the last frame's copied text, paste
+# but the focus holder drops the focus, and any press hides the focus ring.
+# the frame's tab, shift tab and arrow presses then move the focus over the
+# previous frame's tab stops (see navigate). the last frame's copied text, paste
 # request, cursor shape, candidate window and wake time are cleared, and the
 # frame's last composition event replaces the composition in progress. each
 # button pressed becomes that button's last press (see last_press).
@@ -893,6 +1038,21 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     font.begin_frame(?ctx.font);
 
     if (input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
+    if ((ctx.in.down & (ctx.in.prev_down ^ 0xFF)) != 0)                          { ctx.focus_seen = 0; }
+    val done_stops: *Stop = ctx.stops;
+    val done_cap:   usize = ctx.stops_cap;
+    ctx.stops      = ctx.before;
+    ctx.stops_cap  = ctx.before_cap;
+    ctx.before     = done_stops;
+    ctx.before_cap = done_cap;
+    ctx.before_len = ctx.stops_len;
+    ctx.stops_len  = 0;
+    ctx.group      = 0;
+    ctx.group_axis = AXIS_BOTH;
+    ctx.ring_id    = 0;
+    ctx.moved      = 0;
+    navigate(ctx);
+    ctx.focus_start  = ctx.focus;
     ctx.focus_drawn  = 0;
     ctx.clip_on      = 0;
     ctx.paste_wanted = 0;
@@ -912,13 +1072,14 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     draw.reset(?ctx.dl);
 }
 
-# finish a frame: close the last run, compose the runs by layer, drop the
-# active widget once its button is released, drop the focus when its
-# holder was not drawn, age out the state no widget reached, and settle the
-# drag and drop in flight (see blit.payload.settle)
+# finish a frame: draw the focus ring, close the last run, compose the runs
+# by layer, drop the active widget once its button is released, drop the
+# focus when its holder was not drawn, age out the state no widget reached,
+# and settle the drag and drop in flight (see blit.payload.settle)
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
+    draw_ring(ctx);
     flush_run(ctx);
     compose(ctx);
     if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
@@ -1002,7 +1163,11 @@ pub fun focus(ctx: *Context, id: u64) {
     if (id != 0 && disabled(ctx)) { ret; }
     ctx.focus       = id;
     ctx.focus_drawn = 0;
-    if (id != 0) { ctx.focus_drawn = 1; }
+    ctx.focus_plain = plain(ctx, id);
+    if (id != 0) {
+        ctx.focus_drawn = 1;
+        if (stop_in(ctx.stops, ctx.stops_len, id) < ctx.stops_len || stop_in(ctx.before, ctx.before_len, id) < ctx.before_len) { ctx.last_stop = id; }
+    }
 }
 
 # take the keyboard from whichever widget holds it
@@ -1030,16 +1195,392 @@ pub fun focused(ctx: *Context, id: u64) bool {
     ret true;
 }
 
-# whether a widget holds the keyboard, so the consumer's own key bindings
-# should stay quiet
+# whether a widget holds the keyboard for its keys, so the consumer's own key
+# bindings should stay quiet
 #
 # read before begin, it says whether the keys the consumer is about to hand
-# the frame will go to a widget.
+# the frame will go to a widget. a tab stop that takes no text, such as a
+# button reached by tab, holds the focus without taking the keys a consumer
+# binds, so this stays false while it holds it.
 # ---
 # ctx: context
-# ret: true while a widget holds the keyboard
+# ret: true while a widget holds the keyboard for its keys
 pub fun typing(ctx: *Context) bool {
-    ret ctx.focus != 0;
+    ret ctx.focus != 0 && ctx.focus_plain == 0;
+}
+
+# turn reduced motion on or off for every animation (see blit.anim)
+#
+# while on, every animation takes no time and jumps straight to its end, as
+# a host passes on its platform's reduce-motion setting.
+# ---
+# ctx: context
+# on:  1 to reduce motion, 0 to move as the theme times it
+pub fun set_reduce_motion(ctx: *Context, on: u8) {
+    ctx.still = on;
+}
+
+# whether motion is reduced
+# ---
+# ctx: context
+# ret: true while every animation jumps to its end
+pub fun reduce_motion(ctx: *Context) bool {
+    ret ctx.still != 0;
+}
+
+# the index of a stop with an id in a list, len when it holds none
+fun stop_in(list: *Stop, len: usize, id: u64) usize {
+    var i: usize = 0;
+    for (i < len) {
+        if (list[i].id == id) { ret i; }
+        i = i + 1;
+    }
+    ret len;
+}
+
+# 1 if id is a stop taking no text, by this frame's stops or the last's, else 0
+fun plain(ctx: *Context, id: u64) u8 {
+    if (id == 0) { ret 0; }
+    var at: usize = stop_in(ctx.stops, ctx.stops_len, id);
+    if (at < ctx.stops_len) { ret ((ctx.stops[at].flags & NAV_TEXT) == 0)::u8; }
+    at = stop_in(ctx.before, ctx.before_len, id);
+    if (at < ctx.before_len) { ret ((ctx.before[at].flags & NAV_TEXT) == 0)::u8; }
+    ret 0;
+}
+
+# register a tab stop for the widget id over a rect in the current local
+# space, in the current group
+#
+# interact.hit calls this for a widget passing NAV_FOCUS, and a widget whose
+# claim is a container's (a list, a tree) calls it over its whole rect. the
+# stop takes the next frame's keys (see navigate), and while id holds the
+# keyboard it counts as drawn, shows the focus ring once the keyboard moved
+# to it and says what it takes. inside push_measure or a disabled scope (see
+# begin_disabled) nothing is registered, so navigation passes over it.
+# ---
+# ctx:   context
+# id:    the widget's id, 0 registers nothing
+# x0:    left x in local pixels
+# y0:    top y in local pixels
+# x1:    right x in local pixels
+# y1:    bottom y in local pixels
+# flags: the NAV_* bits it takes, NAV_FOCUS among them
+# ret:   true if the widget holds the keyboard
+pub fun add_stop(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, flags: u8) bool {
+    if (id == 0 || ctx.measuring != 0 || disabled(ctx)) { ret false; }
+    ctx.stops = room[Stop](ctx, ctx.stops, ?ctx.stops_cap, ctx.stops_len + 1, CLIP_DEPTH);
+    if (ctx.stops_len < ctx.stops_cap) {
+        ctx.stops[ctx.stops_len] = Stop{
+            id:   id, group: ctx.group, axis: ctx.group_axis, flags: flags, layer: ctx.layer,
+            x0:   x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly,
+            clip: Area{x0: ctx.clip_x0, y0: ctx.clip_y0, x1: ctx.clip_x1, y1: ctx.clip_y1}
+        };
+        ctx.stops_len = ctx.stops_len + 1;
+    }
+    if (id != ctx.focus) { ret false; }
+    ctx.focus_drawn = 1;
+    ctx.focus_plain = ((flags & NAV_TEXT) == 0)::u8;
+    ctx.last_stop   = id;
+    if (ctx.group != 0) { remember(ctx, ctx.group, id); }
+    ctx.ring_id    = id;
+    ctx.ring       = Area{x0: x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly};
+    ctx.ring_clip  = Area{x0: ctx.clip_x0, y0: ctx.clip_y0, x1: ctx.clip_x1, y1: ctx.clip_y1};
+    ctx.ring_layer = ctx.layer;
+    ret true;
+}
+
+# mark a stop registered this frame as its group's current member, the
+# chosen segment, the checked radio or the selected tab, where tab enters
+# the group
+#
+# a group with no current member is entered at the member that last held
+# the keyboard, else at the first tab reaches.
+# ---
+# ctx: context
+# id:  the stop's widget id
+pub fun mark_current(ctx: *Context, id: u64) {
+    var i: usize = ctx.stops_len;
+    for (i > 0) {
+        i = i - 1;
+        if (ctx.stops[i].id == id) {
+            ctx.stops[i].flags = ctx.stops[i].flags | NAV_CURRENT;
+            ret;
+        }
+    }
+}
+
+# how many tab stops the frame registered so far
+# ---
+# ctx: context
+# ret: the count, an index a later stop is registered at or past
+pub fun stop_count(ctx: *Context) usize {
+    ret ctx.stops_len;
+}
+
+# where the stop the keyboard moved the focus to this frame was drawn, when
+# it registered at index from or later
+#
+# a scroll region asks this for the stops inside it, to bring the one tab or
+# an arrow reached into view.
+# ---
+# ctx:  context
+# from: the stop_count taken before the stops asked about were registered
+# ret:  its rect in screen pixels, unclipped, or none
+pub fun reached(ctx: *Context, from: usize) opt[Area] {
+    if (ctx.moved == 0 || ctx.focus == 0) { ret opt[Area].none{}; }
+    var i: usize = from;
+    for (i < ctx.stops_len) {
+        val s: Stop = ctx.stops[i];
+        if (s.id == ctx.focus) { ret opt[Area].some{Area{x0: s.x0, y0: s.y0, x1: s.x1, y1: s.y1}}; }
+        i = i + 1;
+    }
+    ret opt[Area].none{};
+}
+
+# the layer of the stop the keyboard moved the focus to, on the frame it moved
+#
+# a window raises itself when the focus moved onto its layer.
+# ---
+# ctx: context
+# ret: the layer, none on a frame the keyboard did not move the focus
+pub fun moved_to(ctx: *Context) opt[u32] {
+    if (ctx.moved == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{ctx.moved_layer};
+}
+
+# whether the focus holder wears the focus ring: the keyboard moved the focus
+# to it, and no press came since
+# ---
+# ctx: context
+# ret: true while the ring shows
+pub fun focus_visible(ctx: *Context) bool {
+    ret ctx.focus != 0 && ctx.focus_seen != 0;
+}
+
+# remember the member of a group that holds the keyboard, for tab to return to
+fun remember(ctx: *Context, group: u64, id: u64) {
+    val r: res[ptr, allo.Error] = store.slot(?ctx.store, group, $type_id(GroupMemo), $size_of(GroupMemo), $align_of(GroupMemo));
+    if (sel r.err) {
+        ctx.oom = 1;
+        ret;
+    }
+    (r.ok::*GroupMemo).last = id;
+}
+
+# the member of a group that last held the keyboard, 0 when none is known
+fun recalled(ctx: *Context, group: u64) u64 {
+    val e: *store.Entry = store.entry(?ctx.store, group, $type_id(GroupMemo));
+    if (e == nil) { ret 0; }
+    ret (e.data::*GroupMemo).last;
+}
+
+# whether keyboard navigation may land on stop i of the previous frame, given
+# the trapping layer it is kept to (0 for none)
+fun reachable(ctx: *Context, i: usize, trap: u32, trapped: bool) bool {
+    if (!trapped) { ret true; }
+    ret ctx.before[i].layer == trap;
+}
+
+# move the focus to stop i of the previous frame, by the keyboard
+fun land(ctx: *Context, i: usize) {
+    val s: Stop = ctx.before[i];
+    ctx.focus       = s.id;
+    ctx.focus_plain = ((s.flags & NAV_TEXT) == 0)::u8;
+    ctx.focus_seen  = 1;
+    ctx.last_stop   = s.id;
+    ctx.moved       = 1;
+    ctx.moved_layer = s.layer;
+    if (s.group != 0) { remember(ctx, s.group, s.id); }
+}
+
+# the stop tab lands on going from stop i (NO_STOP to start at an end) by
+# dir, skipping the rest of i's group and entering a group at the member that
+# last held the keyboard
+fun tab_from(ctx: *Context, i: usize, back: bool, trap: u32, trapped: bool) usize {
+    val n:     usize = ctx.before_len;
+    var group: u64   = 0;
+    if (i < n) { group = ctx.before[i].group; }
+    var k:    usize = i;
+    var step: usize = 0;
+    for (step < n) {
+        if (k >= n) {
+            k = 0;
+            if (back) { k = n - 1; }
+        }
+        or (back) {
+            if (k == 0) { k = n; }
+            k = k - 1;
+        }
+        or {
+            k = k + 1;
+            if (k == n) { k = 0; }
+        }
+        step = step + 1;
+        if (k == i)                                     { ret NO_STOP; }
+        if (!reachable(ctx, k, trap, trapped))          { cnt; }
+        if (group != 0 && ctx.before[k].group == group) { cnt; }
+        val g: u64 = ctx.before[k].group;
+        if (g == 0) { ret k; }
+        var m: usize = 0;
+        for (m < n) {
+            val o: Stop = ctx.before[m];
+            if (o.group == g && (o.flags & NAV_CURRENT) != 0 && reachable(ctx, m, trap, trapped)) { ret m; }
+            m = m + 1;
+        }
+        val last: usize = stop_in(ctx.before, n, recalled(ctx, g));
+        if (last < n && ctx.before[last].group == g && reachable(ctx, last, trap, trapped)) { ret last; }
+        ret k;
+    }
+    ret NO_STOP;
+}
+
+# the member of stop i's group the arrows reach from it by dir, NO_STOP for none
+fun arrow_from(ctx: *Context, i: usize, back: bool, trap: u32, trapped: bool) usize {
+    val n: usize = ctx.before_len;
+    val g: u64   = ctx.before[i].group;
+    var k: usize = i;
+    for (k < n) {
+        if (back) {
+            if (k == 0) { ret NO_STOP; }
+            k = k - 1;
+        }
+        or {
+            k = k + 1;
+            if (k >= n) { ret NO_STOP; }
+        }
+        if (ctx.before[k].group == g && reachable(ctx, k, trap, trapped)) { ret k; }
+    }
+    ret NO_STOP;
+}
+
+# move the focus by the frame's tab, shift tab and arrow presses over the
+# previous frame's tab stops
+#
+# tab steps to the next stop in call order and shift tab to the one before,
+# wrapping, with a group of stops counting as one: tab enters a group at its
+# current member (see mark_current), else the member that last held the
+# keyboard, else the first it reaches. the arrows
+# along a group's axis move between its members, unless the holder takes
+# them itself (NAV_ARROWS or NAV_TEXT). with nothing focused, tab resumes
+# from the stop that last held the focus, else starts at an end. a focus held
+# by anything that is not a stop owns the keys, and so does a press of a
+# modifier other than shift. a band that traps the keyboard keeps every move
+# inside its topmost layer holding a stop, and there tab moves on from a
+# holder that is not a stop as well, as from a modal holding the keyboard
+# onto its first stop.
+fun navigate(ctx: *Context) {
+    if (ctx.before_len == 0) { ret; }
+    var trap:    u32   = 0;
+    var trapped: bool  = false;
+    var t:       usize = 0;
+    for (t < ctx.before_len) {
+        val l: u32 = ctx.before[t].layer;
+        if (band.band(band.band_of(l)).trap != 0 && (!trapped || l > trap)) {
+            trap    = l;
+            trapped = true;
+        }
+        t = t + 1;
+    }
+
+    val other: u8    = input.MOD_CTRL | input.MOD_ALT | input.MOD_SUPER;
+    var e:     usize = 0;
+    for (e < ctx.in.events.len) {
+        val ev: input.Event = ctx.in.events.data[e];
+        e = e + 1;
+        var code: u32 = 0;
+        var mods: u8  = 0;
+        if (sel ev.key) {
+            code = ev.key.code;
+            mods = ev.key.mods;
+        }
+        if (code == 0 || (mods & other) != 0) { cnt; }
+        val held: usize = stop_in(ctx.before, ctx.before_len, ctx.focus);
+        if (ctx.focus != 0 && held >= ctx.before_len && (!trapped || code != input.KEY_TAB)) { cnt; }
+
+        if (code == input.KEY_TAB) {
+            val back: bool  = (mods & input.MOD_SHIFT) != 0;
+            var from: usize = held;
+            if (from >= ctx.before_len && ctx.focus == 0) {
+                from = stop_in(ctx.before, ctx.before_len, ctx.last_stop);
+                if (from < ctx.before_len && !reachable(ctx, from, trap, trapped)) { from = ctx.before_len; }
+            }
+            if (from >= ctx.before_len) { from = NO_STOP; }
+            val to: usize = tab_from(ctx, from, back, trap, trapped);
+            if (to < ctx.before_len) { land(ctx, to); }
+            cnt;
+        }
+
+        if (held >= ctx.before_len) { cnt; }
+        val s: Stop = ctx.before[held];
+        if ((s.flags & (NAV_ARROWS | NAV_TEXT)) != 0 || s.group == 0) { cnt; }
+        var dir: u8 = 0;
+        if (s.axis != AXIS_COLUMN) {
+            if (code == input.KEY_LEFT)  { dir = 1; }
+            if (code == input.KEY_RIGHT) { dir = 2; }
+        }
+        if (s.axis != AXIS_ROW) {
+            if (code == input.KEY_UP)   { dir = 1; }
+            if (code == input.KEY_DOWN) { dir = 2; }
+        }
+        if (dir == 0) { cnt; }
+        val to: usize = arrow_from(ctx, held, dir == 1, trap, trapped);
+        if (to < ctx.before_len) { land(ctx, to); }
+    }
+}
+
+# whether the frame pressed enter or space with no modifier but shift, the
+# keys that activate a focused stop
+# ---
+# ctx: context
+# ret: true when one was pressed
+pub fun activate_pressed(ctx: *Context) bool {
+    val other: u8    = input.MOD_CTRL | input.MOD_ALT | input.MOD_SUPER;
+    var e:     usize = 0;
+    for (e < ctx.in.events.len) {
+        val ev: input.Event = ctx.in.events.data[e];
+        e = e + 1;
+        if (sel ev.key) {
+            if ((ev.key.mods & other) == 0 && (ev.key.code == input.KEY_ENTER || ev.key.code == ' ')) { ret true; }
+        }
+    }
+    ret false;
+}
+
+# draw the focus ring, the theme's focus_ring style, around the focus
+# holder's stop, on its layer and under its clip, above everything else
+# drawn there
+fun draw_ring(ctx: *Context) {
+    if (ctx.ring_id == 0 || ctx.ring_id != ctx.focus || ctx.focus_seen == 0) { ret; }
+    val layer: u32 = ctx.layer;
+    val tex:   u64 = ctx.tex;
+    val filt:  u32 = ctx.filter;
+    val lx:    f32 = ctx.lx;
+    val ly:    f32 = ctx.ly;
+    val cx0:   f32 = ctx.clip_x0;
+    val cy0:   f32 = ctx.clip_y0;
+    val cx1:   f32 = ctx.clip_x1;
+    val cy1:   f32 = ctx.clip_y1;
+    ctx.layer   = ctx.ring_layer;
+    ctx.tex     = draw.ATLAS;
+    ctx.filter  = draw.FILTER_NEAREST;
+    ctx.lx      = 0.0::f32;
+    ctx.ly      = 0.0::f32;
+    ctx.clip_x0 = ctx.ring_clip.x0;
+    ctx.clip_y0 = ctx.ring_clip.y0;
+    ctx.clip_x1 = ctx.ring_clip.x1;
+    ctx.clip_y1 = ctx.ring_clip.y1;
+    val r: Area = ctx.ring;
+    box(ctx, th.FOCUS_RING, th.NORMAL, r.x0, r.y0, r.x1, r.y1);
+    flush_run(ctx);
+    ctx.layer   = layer;
+    ctx.tex     = tex;
+    ctx.filter  = filt;
+    ctx.lx      = lx;
+    ctx.ly      = ly;
+    ctx.clip_x0 = cx0;
+    ctx.clip_y0 = cy0;
+    ctx.clip_x1 = cx1;
+    ctx.clip_y1 = cy1;
 }
 
 # put text on the frame's clipboard hand-off, replacing any copied earlier in
@@ -2832,8 +3373,11 @@ pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32,
 # y1:      bottom y in pixels
 # corners: which corners are rounded, CORNERS_* combined with |
 pub fun box_shadow(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8) {
-    val s: *th.Style = ?ctx.theme.styles[kind];
-    val p: *th.Paint = ?s.states[shown(ctx, state)];
+    shadow_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[shown(ctx, state)], x0, y0, x1, y1, corners);
+}
+
+# a style's shadow in a paint
+fun shadow_with(ctx: *Context, s: *th.Style, p: *th.Paint, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8) {
     if (p.shadow.a <= 0.0::f32) { ret; }
     val dx: f32 = s.shadow_x * ctx.scale;
     val dy: f32 = s.shadow_y * ctx.scale;
@@ -2852,8 +3396,30 @@ pub fun box_shadow(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f3
 # corners: which corners are rounded, CORNERS_* combined with |
 # sides:   which sides are outlined, SIDES_* combined with |
 pub fun box_face(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
-    val s: *th.Style  = ?ctx.theme.styles[kind];
-    val p: *th.Paint  = ?s.states[shown(ctx, state)];
+    face_with(ctx, ?ctx.theme.styles[kind], ?ctx.theme.styles[kind].states[shown(ctx, state)], x0, y0, x1, y1, corners, sides);
+}
+
+# paint a widget kind's box with a paint of the caller's: the kind's radii,
+# shadow offsets and blur, the paint's colors, as box paints a state
+#
+# for a box whose colors are between two states, such as a face easing from
+# rest to hovered (see blit.anim.box).
+# ---
+# ctx:  context
+# kind: a registered kind
+# p:    the paint
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+pub fun box_painted(ctx: *Context, kind: u32, p: th.Paint, x0: f32, y0: f32, x1: f32, y1: f32) {
+    var q: th.Paint = p;
+    shadow_with(ctx, ?ctx.theme.styles[kind], ?q, x0, y0, x1, y1, CORNERS_ALL);
+    face_with(ctx, ?ctx.theme.styles[kind], ?q, x0, y0, x1, y1, CORNERS_ALL, SIDES_ALL);
+}
+
+# a style's face and outline in a paint
+fun face_with(ctx: *Context, s: *th.Style, p: *th.Paint, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
     val r: draw.Radii = radii_of(ctx, s, corners);
     if (same_color(p.fill, p.fill_to)) {
         if (p.fill.a > 0.0::f32) { rounded_rect(ctx, x0, y0, x1, y1, r, p.fill); }

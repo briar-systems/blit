@@ -32,12 +32,18 @@ pub val EDITED: u8 = 1;
 # save was pressed this frame: write style.save_theme's text out
 pub val SAVE: u8 = 2;
 
-# the groups the editor shows: the palette, the metrics, the chart fields and
-# a widget kind
-val GROUPS: usize = 4;
+# the groups the editor shows: the palette, the metrics, the chart fields,
+# a widget kind and the motion fields
+val GROUPS: usize = 5;
 
 # the group showing a widget kind
 val GROUP_KIND: usize = 3;
+
+# the theme.GROUP_* a group menu entry lists, past the kind entry
+fun group_of(entry: usize) u8 {
+    if (entry == GROUPS - 1) { ret th.GROUP_MOTION; }
+    ret entry::u8;
+}
 
 # the longest a length slider reaches, unscaled
 val LENGTH_MAX: f32 = 48.0;
@@ -126,6 +132,7 @@ fun field(ctx: *context.Context, row: usize, p: th.Path, name: str) u8 {
 
     var hi: f32 = LENGTH_MAX;
     if (f.unit == th.UNIT_COLOR || f.unit == th.UNIT_FACTOR) { hi = 1.0::f32; }
+    if (f.group == th.GROUP_MOTION)                          { hi = 2.0::f32; }
     val edges: bool = str_equals(f.name, "pad") || str_equals(f.name, "inset") || str_equals(f.name, "margin");
 
     var out: u8    = 0;
@@ -178,11 +185,12 @@ pub fun theme_editor(ctx: *context.Context, key: str, h: f32) u8 {
         out = out | EDITED;
     }
 
-    var groups: [4]str;
+    var groups: [5]str;
     groups[0] = "palette";
     groups[1] = "metrics";
     groups[2] = "plot";
     groups[3] = "kind";
+    groups[4] = "motion";
     if (st.group >= GROUPS) { st.group = 0; }
     widget.dropdown(ctx, "group", ?st.group, ?groups[0], GROUPS);
     val kind: bool = st.group == GROUP_KIND;
@@ -205,7 +213,7 @@ pub fun theme_editor(ctx: *context.Context, key: str, h: f32) u8 {
     for (row < th.FIELD_COUNT) {
         val f:   th.Field = th.FIELDS[row];
         var buf: [64]u8;
-        if (!kind && f.group == st.group::u8) {
+        if (!kind && f.group == group_of(st.group)) {
             var e: usize = 0;
             for (e < f.count) {
                 val p: th.Path = th.exact(row, 0, 0, e);
