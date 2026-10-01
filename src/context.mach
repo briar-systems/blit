@@ -457,7 +457,8 @@ pub rec TextLine {
 # theme:        the colors and unscaled metrics widgets draw with
 # srgb:         1 if colors are converted to linear light for an sRGB target, else 0
 # lin:          authored colors already converted to linear light
-# wheel_taken:  1 once a scroll region consumed this frame's wheel, else 0
+# wheel_taken:  1 once a region consumed this frame's vertical wheel, else 0
+# hwheel_taken: 1 once a region consumed this frame's horizontal wheel, else 0
 # free:         the screen area docked containers have not taken this frame
 # focus:        id of the widget holding the keyboard, persists across frames (0 = none)
 # focus_drawn:  1 once the focus holder was drawn this frame, else 0
@@ -595,6 +596,7 @@ pub rec Context {
     srgb:         u8;
     lin:          draw.LinearCache;
     wheel_taken:  u8;
+    hwheel_taken: u8;
     free:         Area;
     focus:        u64;
     focus_drawn:  u8;
@@ -770,6 +772,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.srgb         = 0;
     ctx.lin          = draw.LinearCache{};
     ctx.wheel_taken  = 0;
+    ctx.hwheel_taken = 0;
     ctx.free         = Area{x0: 0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32};
     ctx.focus        = 0;
     ctx.focus_drawn  = 0;
@@ -1029,8 +1032,9 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.chan      = 0;
     ctx.run_floor = 0;
 
-    ctx.wheel_taken = 0;
-    ctx.free        = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
+    ctx.wheel_taken  = 0;
+    ctx.hwheel_taken = 0;
+    ctx.free         = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
 
     val done: hit.ClaimList = ctx.claims;
     ctx.claims = ctx.prior;
