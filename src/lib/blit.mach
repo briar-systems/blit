@@ -25,6 +25,7 @@ fwd blit.context;
 fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
+fwd blit.tree;
 fwd blit.chart;
 fwd blit.driver;
 
