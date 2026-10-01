@@ -147,6 +147,18 @@ pub fun linear(c: Color) Color {
     ret rgba(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b), c.a);
 }
 
+# a color given as 0xRRGGBB with a separate alpha
+# ---
+# rgb: red, green and blue bytes, red in bits 16..23
+# a:   alpha channel in [0, 1]
+# ret: the color, straight
+pub fun hex(rgb: u32, a: f32) Color {
+    val r: u32 = (rgb >> 16) & 0xFF;
+    val g: u32 = (rgb >> 8) & 0xFF;
+    val b: u32 = rgb & 0xFF;
+    ret rgba(r::f32 / 255.0::f32, g::f32 / 255.0::f32, b::f32 / 255.0::f32, a);
+}
+
 # a straight color with its color channels multiplied by its alpha
 #
 # the draw list holds premultiplied colors, which blend with ONE /
@@ -157,6 +169,80 @@ pub fun linear(c: Color) Color {
 pub fun premultiply(c: Color) Color {
     ret rgba(c.r * c.a, c.g * c.a, c.b * c.a, c.a);
 }
+
+# a point in pixels
+# ---
+# x: x in pixels
+# y: y in pixels
+pub rec Point {
+    x: f32;
+    y: f32;
+}
+
+# a radius per corner of a rect, in pixels
+# ---
+# tl: top-left radius
+# tr: top-right radius
+# br: bottom-right radius
+# bl: bottom-left radius
+pub rec Radii {
+    tl: f32;
+    tr: f32;
+    br: f32;
+    bl: f32;
+}
+
+# the same radius on every corner
+# ---
+# r:   radius in pixels
+# ret: the radii
+pub fun radii(r: f32) Radii {
+    ret Radii{tl: r, tr: r, br: r, bl: r};
+}
+
+# a linear gradient from c0 at (x0, y0) to c1 at (x1, y1)
+#
+# the color is constant along lines perpendicular to the axis and clamps to
+# the end colors beyond the two points. points are in the local space the
+# shape is drawn in. the colors are interpolated after conversion and
+# premultiplying, as every vertex is.
+# ---
+# x0: start x in local pixels
+# y0: start y in local pixels
+# x1: end x in local pixels
+# y1: end y in local pixels
+# c0: color at the start
+# c1: color at the end
+pub rec Gradient {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+    c0: Color;
+    c1: Color;
+}
+
+# a linear gradient from c0 at (x0, y0) to c1 at (x1, y1)
+# ---
+# x0:  start x in local pixels
+# y0:  start y in local pixels
+# c0:  color at the start
+# x1:  end x in local pixels
+# y1:  end y in local pixels
+# c1:  color at the end
+# ret: the gradient
+pub fun gradient(x0: f32, y0: f32, c0: Color, x1: f32, y1: f32, c1: Color) Gradient {
+    ret Gradient{x0: x0, y0: y0, x1: x1, y1: y1, c0: c0, c1: c1};
+}
+
+# how a stroke turns a corner: its outer edges meet at a point
+pub val JOIN_MITER: u8 = 0;
+
+# how a stroke turns a corner: its outer edges are cut straight across
+pub val JOIN_BEVEL: u8 = 1;
+
+# how a stroke turns a corner: its outer edges follow an arc
+pub val JOIN_ROUND: u8 = 2;
 
 # a single vertex: pixel-space position, texture uv, and premultiplied color
 # ---
@@ -428,8 +514,11 @@ test linear__decodes_srgb_and_keeps_alpha {
     ret 0;
 }
 
-test premultiply__scales_color_by_alpha {
-    val p: Color = premultiply(rgba(1.0::f32, 0.5::f32, 0.0::f32, 0.5::f32));
-    if (p.r != 0.5::f32 || p.g != 0.25::f32 || p.b != 0.0::f32 || p.a != 0.5::f32) { ret 1; }
+test hex__splits_bytes_and_premultiply_scales {
+    val c: Color = hex(0xFF8000, 0.5::f32);
+    if (c.r != 1.0::f32 || c.g != 128.0::f32 / 255.0::f32 || c.b != 0.0::f32) { ret 1; }
+    if (c.a != 0.5::f32)                                                      { ret 2; }
+    val p: Color = premultiply(c);
+    if (p.r != 0.5::f32 || p.g != 64.0::f32 / 255.0::f32 || p.a != 0.5::f32) { ret 3; }
     ret 0;
 }
