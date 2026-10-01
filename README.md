@@ -28,7 +28,7 @@ blit.context.end(?ctx);
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
 `blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
@@ -559,6 +559,49 @@ segment count follows their size on screen and the interface scale.
   gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
   `rounded_rect_gradient` and `fill_path_gradient`.
 - **Colors.** `blit.draw.hex(0xRRGGBB, alpha)` sits beside `blit.draw.rgba`.
+
+## Icons
+
+`blit.icon` is a set of icons drawn from path data, with no font or image
+behind them, so they scale to any size and take any color: `PLAY`, `PAUSE`,
+`STEP`, `STOP`, `CLOSE`, `CHEVRON_UP`, `CHEVRON_DOWN`, `CHEVRON_LEFT`,
+`CHEVRON_RIGHT`, `PLUS`, `MINUS`, `SEARCH`, `SETTINGS`, `HELP`, `PIN` and the
+dock drop targets `DOCK_CENTER`, `DOCK_LEFT`, `DOCK_RIGHT`, `DOCK_TOP` and
+`DOCK_BOTTOM`.
+
+```mach
+blit.context.icon_at(?ctx, blit.icon.SETTINGS, x, y, 24.0::f32, look.text);
+blit.widget.button(?ctx, blit.icon.STR_PLAY);   # an icon for a label
+blit.widget.button(?ctx, "\xF3\xB0\x80\x82 step"); # inline with text
+```
+
+- **Path data.** An icon (`blit.icon.Icon`) is a flat `f32` stream of path
+  commands and the box it was drawn in. Each command is its verb
+  (`blit.path.MOVE`, `LINE`, `QUAD`, `CUBIC` or `CLOSE`, as a float) followed
+  by its coordinates: two for a move or line, four for a quadratic (control,
+  then end), six for a cubic (both controls, then end) and none for a close.
+  It is filled by the nonzero rule, scaled from its box to the size drawn.
+  The built-ins sit on a `blit.icon.BOX` (16) square, their contours meeting
+  without overlapping.
+- **Drawing.** `icon_at(?ctx, id, x, y, size, c)` draws an icon `size` pixels
+  tall with its box's top-left at `(x, y)`, feathered and clipped like any
+  path. `icon_width(?ctx, id, size)` is the width it takes.
+- **Inline with text.** Every icon id is a codepoint, `blit.icon.CODEPOINT_BASE`
+  (U+F0000) plus the id, in supplementary private use area A. Text holding
+  one draws the icon in place, a line tall (the style's ascent and descent),
+  tinted with the text, and measures it the same way, so labels, buttons and
+  every other text call take icons with no change. `blit.icon.STR_*` is each
+  built-in as a UTF-8 string, and `blit.icon.encode(id, ?buf[0], 4)` writes any
+  id's. A codepoint in that range with no icon goes to the glyph source as
+  before.
+- **Your own icons.** `blit.context.add_icon(?ctx, icon)` registers an icon in
+  the same form, in a box of any size, copying its data, and returns its id,
+  from `blit.icon.APP_FIRST` (0x1000) up, so a later built-in never moves it.
+  Malformed data or an empty box is refused.
+  ```mach
+  val TRI: [10]f32 = [10]f32{0.0, 0.0, 0.0, 1.0, 24.0, 12.0, 1.0, 0.0, 24.0, 4.0};
+  val id: opt[u32] = blit.context.add_icon(?ctx, blit.icon.Icon{data: ?TRI[0], n: 10, w: 24.0::f32, h: 24.0::f32});
+  ```
 
 ## Rendering
 
