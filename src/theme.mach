@@ -421,8 +421,8 @@ pub val FIELD_COUNT: usize = 58;
 # every field of a theme: the one table TOML, overrides, classes, the editor
 # and the README's field table are built from
 pub val FIELDS: [58]Field = [58]Field{
-    Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background"},
-    Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip and modal background"},
+    Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background, opaque in the built-in themes"},
+    Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip, toast and modal background, opaque in the built-in themes"},
     Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
     Field{group: GROUP_PALETTE, name: "header", unit: UNIT_COLOR, off: $offset_of(Theme, header), count: 1, doc: "window titlebar and section heading"},
     Field{group: GROUP_PALETTE, name: "header_hot", unit: UNIT_COLOR, off: $offset_of(Theme, header_hot), count: 1, doc: "a titlebar or heading under the cursor"},
@@ -439,7 +439,7 @@ pub val FIELDS: [58]Field = [58]Field{
     Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, doc: "a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face"},
     Field{group: GROUP_PALETTE, name: "handle", unit: UNIT_COLOR, off: $offset_of(Theme, handle), count: 1, doc: "a slider handle, toggle knob or scrollbar thumb at rest"},
     Field{group: GROUP_PALETTE, name: "handle_on", unit: UNIT_COLOR, off: $offset_of(Theme, handle_on), count: 1, doc: "a handle, knob or thumb being dragged or hovered"},
-    Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, doc: "the highlight behind selected text"},
+    Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, doc: "the highlight behind selected text, translucent in the built-in themes"},
     Field{group: GROUP_PALETTE, name: "grid", unit: UNIT_COLOR, off: $offset_of(Theme, grid), count: 1, doc: "chart grid lines"},
     Field{group: GROUP_METRICS, name: "row", unit: UNIT_LENGTH, off: $offset_of(Theme, row), count: 1, doc: "least height of a control row, which grows to fit a line of text and its inset"},
     Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows, cells and buttons in a row"},
@@ -522,7 +522,7 @@ val KIND_INFO: [52]Name = [52]Name{
     Name{name: "menu_item", doc: "a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent"},
     Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill or a border: pad around its content"},
     Name{name: "modal", doc: "a modal dialog's body"},
-    Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"},
+    Name{name: "scrim", doc: "the scrim over everything behind a modal dialog, translucent in the built-in themes"},
     Name{name: "radio", doc: "a radio button's ring: pad around the dot, inset.l between the ring and the label"},
     Name{name: "radio_mark", doc: "a radio button's dot, drawn in its on state"},
     Name{name: "progress", doc: "a progress bar's track and its text"},
@@ -1394,8 +1394,8 @@ pub fun rederive(t: *Theme, before: *Theme) {
 
 # the tokens of blit's own look
 fun default_tokens(t: *Theme) {
-    t.panel       = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.85::f32);
-    t.window      = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.95::f32);
+    t.panel       = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
+    t.window      = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
     t.dock        = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
     t.header      = draw.rgba(0.20::f32, 0.20::f32, 0.26::f32, 1.0::f32);
     t.header_hot  = draw.rgba(0.28::f32, 0.28::f32, 0.36::f32, 1.0::f32);
@@ -1515,8 +1515,8 @@ fun outline(t: *Theme, kind: u32, c: draw.Color, w: f32) {
 # t: the theme, its tokens and styles replaced, its kinds kept
 pub fun dark(t: *Theme) {
     default_tokens(t);
-    t.panel       = draw.hex(0x1B1D23, 0.92::f32);
-    t.window      = draw.hex(0x1F2229, 0.98::f32);
+    t.panel       = draw.hex(0x1B1D23, 1.0::f32);
+    t.window      = draw.hex(0x1F2229, 1.0::f32);
     t.dock        = draw.hex(0x181A1F, 1.0::f32);
     t.header      = draw.hex(0x2A2E37, 1.0::f32);
     t.header_hot  = draw.hex(0x343945, 1.0::f32);
@@ -1552,8 +1552,8 @@ pub fun dark(t: *Theme) {
 # t: the theme, its tokens and styles replaced, its kinds kept
 pub fun light(t: *Theme) {
     default_tokens(t);
-    t.panel       = draw.hex(0xF4F5F7, 0.95::f32);
-    t.window      = draw.hex(0xFFFFFF, 0.98::f32);
+    t.panel       = draw.hex(0xF4F5F7, 1.0::f32);
+    t.window      = draw.hex(0xFFFFFF, 1.0::f32);
     t.dock        = draw.hex(0xEEF0F3, 1.0::f32);
     t.header      = draw.hex(0xE2E5EA, 1.0::f32);
     t.header_hot  = draw.hex(0xD5D9E0, 1.0::f32);
