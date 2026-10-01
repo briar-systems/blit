@@ -37,6 +37,7 @@ use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -49,6 +50,7 @@ use bid: blit.id;
 use blit.input;
 use blit.interact;
 use blit.layout;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 
@@ -212,25 +214,21 @@ fun click_many(l: *List, r: *Rows, i: usize, mods: u8) bool {
     ret changed;
 }
 
-# paint a row's label at its left and its secondary label right-aligned, the
-# label clipped short of the secondary one when it would reach it
+# paint a row's label at its left and its secondary label right-aligned, each
+# fit to its share of the row as the list item style's overflow says (see
+# text.fit_pair)
 fun draw_labels(ctx: *context.Context, r: *Rows, row: Row) {
-    val pad:    f32  = row_pad(ctx);
-    val ty:     f32  = row.y0 + (row.y1 - row.y0 - context.line_height(ctx)) / 2.0::f32;
-    val label:  bool = r.labels != nil && r.labels[row.index] != nil;
-    val detail: bool = r.details != nil && r.details[row.index] != nil;
-    var dw:     f32  = 0.0::f32;
-    var clip:   bool = false;
-    if (detail) {
-        dw   = context.text_width(ctx, r.details[row.index]);
-        clip = label && row.x0 + pad + context.text_width(ctx, r.labels[row.index]) > row.x1 - pad * 2.0::f32 - dw;
+    val pad:   f32   = row_pad(ctx);
+    val ty:    f32   = row.y0 + (row.y1 - row.y0 - context.line_height(ctx)) / 2.0::f32;
+    var label: str   = nil;
+    var ln:    usize = 0;
+    var dt:    str   = nil;
+    if (r.labels != nil && r.labels[row.index] != nil) {
+        label = r.labels[row.index];
+        ln    = str_len(label);
     }
-    if (label) {
-        if (clip) { context.push_clip(ctx, row.x0, row.y0, row.x1 - pad * 2.0::f32 - dw, row.y1); }
-        context.text_at(ctx, r.labels[row.index], row.x0 + pad, ty, row.ink);
-        if (clip) { context.pop_clip(ctx); }
-    }
-    if (detail) { context.text_at(ctx, r.details[row.index], row.x1 - pad - dw, ty, row.dim); }
+    if (r.details != nil) { dt = r.details[row.index]; }
+    rich_text.fit_pair(ctx, theme.LIST_ITEM, label, ln, row.ink, dt, row.dim, pad, ty, context.Area{x0: row.x0 + pad, y0: row.y0, x1: row.x1 - pad, y1: row.y1});
 }
 
 # the width item i's labels need with the padding they are drawn with, or 0
@@ -657,7 +655,7 @@ test list__secondary_labels_sit_right_aligned {
     if (!str_equals(driver.text_of(?d, row_id(?d, 0)), "a 1 kb")) { ret 4; }
     if (!str_equals(driver.text_of(?d, row_id(?d, 1)), "b"))      { ret 5; }
 
-    # a label that would reach its secondary label is clipped short of it
+    # a label that would reach its secondary label is cut short of it
     val room: f32 = 100.0::f32 - pad * 2.0::f32 - context.text_width(?d.ctx, "300");
     val x:    f32 = right_of(?d.ctx, draw.premultiply(d.ctx.theme.text));
     if (x < 0.0::f32 || x > room) { ret 6; }

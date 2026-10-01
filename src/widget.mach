@@ -58,7 +58,9 @@
 # the context's theme (see blit.theme), painted in the state it is in through
 # context.box, each length multiplied by the context's interface scale, so a
 # theme, an override (see blit.style) or a scale changes the interface and no
-# widget holds a color or a size of its own.
+# widget holds a color or a size of its own. a label too wide for the box it
+# is drawn in is cut with an ellipsis or clipped to it, as its kind's overflow
+# says (see blit.text.fit_box).
 #
 # a control's face eases between the paints of the states it passes through
 # (see blit.anim.box), a toggle's knob slides, a section opened by
@@ -192,6 +194,12 @@ fun text_top(ctx: *context.Context, y: f32, h: f32) f32 {
 # the drawn part of a label, everything before "##", at (x, y)
 fun label_at(ctx: *context.Context, label: str, x: f32, y: f32, c: draw.Color) {
     context.text_span(ctx, label, bid.shown(label), x, y, c);
+}
+
+# the drawn part of a label at (x, y), fit to a box whose span runs from x0
+# to x1 as the kind's overflow says (see text.fit_box)
+fun label_in(ctx: *context.Context, kind: u32, label: str, x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    rich_text.fit_box(ctx, kind, label, bid.shown(label), x, y, context.Area{x0: x0, y0: y0, x1: x1, y1: y1}, c);
 }
 
 # the width of the drawn part of a label
@@ -758,9 +766,9 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
     if (on) { context.mark_current(ctx, h.id); }
     val face: theme.Paint = anim.box(ctx, h.id, theme.BUTTON, st, x0, y0, x1, y1);
 
-    val tw: f32 = label_width(ctx, label);
-    val tx: f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
-    label_at(ctx, label, tx, text_top(ctx, y0, y1 - y0), face.text);
+    val in: theme.Edges = inset(ctx, theme.BUTTON);
+    val tx: f32         = x0 + (x1 - x0 - label_width(ctx, label)) / 2.0::f32;
+    label_in(ctx, theme.BUTTON, label, tx, text_top(ctx, y0, y1 - y0), x0 + in.l, y0, x1 - in.r, y1, face.text);
     ret h.clicked;
 }
 
@@ -893,7 +901,8 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val id: u64          = context.id_of(ctx, label);
     val rh: f32          = row_of(ctx, theme.TOGGLE);
     val tp: theme.Edges  = padding(ctx, theme.TOGGLE);
-    val nw: f32          = label_width(ctx, label) + inset(ctx, theme.TOGGLE).r + maxf(rh - tp.t - tp.b, 0.0::f32) * 2.0::f32;
+    val ti: theme.Edges  = inset(ctx, theme.TOGGLE);
+    val nw: f32          = label_width(ctx, label) + ti.r + maxf(rh - tp.t - tp.b, 0.0::f32) * 2.0::f32 + tp.r;
     val r:  context.Area = place(ctx, wide(), layout.fit(), nw, rh);
     val x0: f32          = r.x0;
     val y0: f32          = r.y0;
@@ -913,13 +922,13 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     }
 
     val st: u8 = state_of(hs, @state != 0, false);
-    label_at(ctx, label, x0, text_top(ctx, y0, h), ink(ctx, theme.TOGGLE, st).text);
 
     # the switch is a track twice as wide as it is tall, inside the row's padding
     val sh: f32 = maxf(h - tp.t - tp.b, 0.0::f32);
     val sw: f32 = sh * 2.0::f32;
     val sx: f32 = x1 - tp.r - sw;
     val sy: f32 = y0 + tp.t;
+    label_in(ctx, theme.TOGGLE, label, x0, text_top(ctx, y0, h), x0, y0, sx - ti.r, y1, ink(ctx, theme.TOGGLE, st).text);
     anim.box(ctx, id, theme.TOGGLE, st, sx, sy, sx + sw, sy + sh);
 
     # the knob slides between its ends
@@ -1014,13 +1023,8 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val hx: f32 = x0 + t_out * span;
     anim.box(ctx, bid.child(id, "#handle"), theme.SLIDER_HANDLE, st, hx, y0, hx + hw, y1);
 
-    val ty: f32          = text_top(ctx, y0, h);
-    val p:  *theme.Paint = ink(ctx, theme.SLIDER, st);
-    label_at(ctx, label, x0 + in.l, ty, p.text);
-    if (reading != nil) {
-        val rw: f32 = context.text_width(ctx, reading);
-        context.text_at(ctx, reading, x1 - in.r - rw, ty, p.mark);
-    }
+    val p: *theme.Paint = ink(ctx, theme.SLIDER, st);
+    rich_text.fit_pair(ctx, theme.SLIDER, label, bid.shown(label), p.text, reading, p.mark, in.l + in.r, text_top(ctx, y0, h), context.Area{x0: x0 + in.l, y0: y0, x1: x1 - in.r, y1: y1});
     ret changed;
 }
 
@@ -1230,14 +1234,10 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val hs: u8 = state_of(hd, st.open != 0, false);
     anim.box(ctx, id, theme.DROPDOWN, hs, x0, y0, x1, y1);
 
-    val ty: f32        = text_top(ctx, y0, h);
-    val tc: draw.Color = ink(ctx, theme.DROPDOWN, hs).text;
-    label_at(ctx, label, x0 + in.l, ty, tc);
-    if (@selected < count) {
-        val cur: str = options[@selected];
-        val cw:  f32 = context.text_width(ctx, cur);
-        context.text_at(ctx, cur, x1 - in.r - cw, ty, tc);
-    }
+    val tc:  draw.Color = ink(ctx, theme.DROPDOWN, hs).text;
+    var cur: str        = nil;
+    if (@selected < count) { cur = options[@selected]; }
+    rich_text.fit_pair(ctx, theme.DROPDOWN, label, bid.shown(label), tc, cur, tc, in.l, text_top(ctx, y0, h), context.Area{x0: x0 + in.l, y0: y0, x1: x1 - in.r, y1: y1});
 
     val below: f32            = context.px(ctx, look(ctx, theme.DROPDOWN).margin.b);
     val pop:   Popup          = popup_at(ctx, pid, st.open, x0, y1 + below, x1 - x0, true, theme.POPUP);
@@ -1273,7 +1273,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
             val os: u8          = state_of(ho, false, false);
             val op: theme.Paint = anim.box(ctx, oid, theme.OPTION, os, ox0, oy0, ox1, oy1);
-            context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, oy1 - oy0), op.text);
+            rich_text.fit_box(ctx, theme.OPTION, options[i], str_len(options[i]), ox0 + oin.l, text_top(ctx, oy0, oy1 - oy0), context.Area{x0: ox0 + oin.l, y0: oy0, x1: ox1 - oin.r, y1: oy1}, op.text);
         }
         i = i + 1;
     }
@@ -2170,7 +2170,7 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         var gch: u32          = '+';
         if (st.collapsed == 0) { gch = '-'; }
         context.glyph(ctx, gch, x0 + tin.l, gy, tp.mark);
-        label_at(ctx, win.title, x0 + th + tin.l, gy, tp.text);
+        label_in(ctx, theme.WINDOW_TITLE, win.title, x0 + th + tin.l, gy, x0 + th + tin.l, y0, dx1 - tin.r, ty1, tp.text);
         if (close != 0) {
             var xc: draw.Color = tp.mark;
             if (hx.hot) { xc = tp.text; }
@@ -2580,7 +2580,7 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     # the caret centred on the caption between its line's top and its baseline
     val gy: f32 = y0 + (h - lh) / 2.0::f32;
     caret(ctx, x0 + in.l, gy + (m.ascent - k) / 2.0::f32, k, @open != 0, p.mark);
-    label_at(ctx, title, x0 + in.l * 2.0::f32 + k, gy, p.text);
+    label_in(ctx, theme.SECTION, title, x0 + in.l * 2.0::f32 + k, gy, x0 + in.l * 2.0::f32 + k, y0, x1 - in.r, y1, p.text);
     ret id;
 }
 
@@ -3242,6 +3242,111 @@ test segmented__chooses_on_click {
     # a press on the first released over the second chooses nothing
     driver.drag_onto(?d, driver.find(?d, "a"), driver.find(?d, "b"));
     if (p.choice != 2 || p.chosen != 1) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a narrow panel's state: the segmented choice, and whether buttons clip
+# their labels rather than cut them
+rec Narrow {
+    choice: usize;
+    clip:   u8;
+}
+
+# a button and a segmented choice in a panel too narrow for their labels
+#[testing]
+fun narrow_ui(ctx: *context.Context, user: ptr) {
+    val n:    *Narrow = user::*Narrow;
+    var segs: [2]str;
+    segs[0] = "klmnopqrst";
+    segs[1] = "uvwxyz0123";
+    var over: f32 = 1.0::f32;
+    if (n.clip != 0) { over = 0.0::f32; }
+    look(ctx, theme.BUTTON).overflow = over;
+    val b: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    button(ctx, "abcdefghijklmn");
+    segmented(ctx, ?segs[0], 2, ?n.choice);
+    end_panel(ctx, b);
+}
+
+# the box a button's label may take: its rect inside its inset
+#[testing]
+fun label_box(d: *driver.Driver, id: u64) context.Area {
+    var b:  context.Area;
+    val r:  opt[context.Area] = context.rect_of(?d.ctx, id);
+    val in: theme.Edges       = inset(?d.ctx, theme.BUTTON);
+    if (sel r.none) { ret b; }
+    ret context.Area{x0: r.some.x0 + in.l, y0: r.some.y0, x1: r.some.x1 - in.r, y1: r.some.y1};
+}
+
+# whether text was drawn in a button and every line of it lies within its
+# label box
+#[testing]
+fun drawn_within(d: *driver.Driver, id: u64) bool {
+    val b:   context.Area = label_box(d, id);
+    var any: bool         = false;
+    var i:   usize        = 0;
+    for (i < context.traced_count(?d.ctx)) {
+        val l:  context.TextLine = context.traced_at(?d.ctx, i);
+        val cx: f32              = (l.box.x0 + l.box.x1) / 2.0::f32;
+        val cy: f32              = (l.box.y0 + l.box.y1) / 2.0::f32;
+        if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1) {
+            if (l.box.x0 < b.x0 || l.box.x1 > b.x1) { ret false; }
+            any = true;
+        }
+        i = i + 1;
+    }
+    ret any;
+}
+
+# whether a run of the last frame is clipped to a button's label box
+#[testing]
+fun clipped_to(d: *driver.Driver, id: u64) bool {
+    val b: context.Area = label_box(d, id);
+    var i: usize        = 0;
+    for (i < context.run_count(?d.ctx)) {
+        val r: context.Run = context.run_at(?d.ctx, i);
+        if (r.clip_x0 == b.x0 && r.clip_x1 == b.x1 && r.clip_y0 == b.y0 && r.clip_y1 == b.y1) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether s ends in three full stops, the bitmap font's ellipsis
+#[testing]
+fun ends_cut(s: str) bool {
+    val n: usize = str_len(s);
+    ret n >= 3 && s[n - 1] == '.' && s[n - 2] == '.' && s[n - 3] == '.';
+}
+
+test label__narrow_button_and_segmented_keep_labels_in_their_box {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var n: Narrow;
+    n.choice = 0;
+    n.clip   = 0;
+    var d: driver.Driver;
+    val e: err[allo.Error] = driver.init(?d, ?a, 200.0::f32, 200.0::f32, narrow_ui, (?n)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+
+    # by default each label is cut with an ellipsis to fit inside its inset
+    val ok: u64 = driver.find(?d, "abcdefghijklmn");
+    val s0: u64 = driver.find(?d, "klmnopqrst");
+    val s1: u64 = driver.find(?d, "uvwxyz0123");
+    if (!drawn_within(?d, ok) || !drawn_within(?d, s0) || !drawn_within(?d, s1)) { ret 2; }
+    if (!ends_cut(driver.text_of(?d, ok)) || !ends_cut(driver.text_of(?d, s1)))  { ret 3; }
+
+    # a style that clips draws each label whole from its box's left, clipped there
+    n.clip = 1;
+    driver.step(?d);
+    if (!str_equals(driver.text_of(?d, ok), "abcdefghijklmn")) { ret 4; }
+    if (!clipped_to(?d, ok) || !clipped_to(?d, s0))            { ret 5; }
+    val b: context.Area = label_box(?d, ok);
+    if (context.traced_at(?d.ctx, 0).box.x0 != b.x0) { ret 6; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

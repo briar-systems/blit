@@ -43,6 +43,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -57,6 +58,7 @@ use blit.interact;
 use blit.layout;
 use blit.state;
 use blit.store;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 
@@ -500,8 +502,10 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
         val os: u8           = theme.pick(h.hot, h.active, s.has != 0 && tabs[i].key == s.key, false);
         context.box(ctx, theme.OPTION, os, r.x0, r.y0, r.x1, r.y1);
         if (tabs[i].label != nil) {
-            val oin: f32 = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
-            context.text_at(ctx, tabs[i].label, r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, context.paint_of(ctx, theme.OPTION, os).text);
+            val oin: f32          = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
+            val oir: f32          = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.r);
+            val ob:  context.Area = context.Area{x0: r.x0 + oin, y0: r.y0, x1: r.x1 - oir, y1: r.y1};
+            rich_text.fit_box(ctx, theme.OPTION, tabs[i].label, str_len(tabs[i].label), r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, ob, context.paint_of(ctx, theme.OPTION, os).text);
         }
         if (h.clicked) {
             s.key    = tabs[i].key;
@@ -521,10 +525,9 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
 fun body(ctx: *context.Context, g: *Geom, t: *Tab, x0: f32, y0: f32, x1: f32, y1: f32, st: u8) {
     context.box(ctx, theme.TAB, st, x0, y0, x1, y1);
     if (t.label == nil) { ret; }
-    val ink: draw.Color = context.paint_of(ctx, theme.TAB, st).text;
-    context.push_clip(ctx, x0 + g.pad, y0, maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1);
-    context.text_at(ctx, t.label, x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, ink);
-    context.pop_clip(ctx);
+    val ink: draw.Color   = context.paint_of(ctx, theme.TAB, st).text;
+    val b:   context.Area = context.Area{x0: x0 + g.pad, y0: y0, x1: maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1: y1};
+    rich_text.fit_box(ctx, theme.TAB, t.label, str_len(t.label), x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, b, ink);
 }
 
 # a tab's close box at the right of its rect: two crossed strokes
