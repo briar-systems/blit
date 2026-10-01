@@ -76,6 +76,11 @@
 # widgets. id_of hands out the id a key gets in the current scope. two claims
 # with one id in a frame are recorded as collisions, readable until the next
 # begin.
+#
+# the frame's claims double as a record of where each widget was drawn:
+# rect_of, widget_at and widget_in read them back for tests and tools (see
+# blit.driver). set_trace asks the context to keep each line of text it
+# draws as well, off by default so ordinary frames pay nothing for it.
 
 use std.types.error.err;
 use std.types.option.opt;
@@ -104,12 +109,14 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.collections.set;
 use vec: std.collections.vector;
-use std.math.float.sqrt_f32;
 use std.text.utf8;
 
 # capacity the clip, origin, layer and id stacks and the collision list start
 # with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
+
+# capacity the held-back button events start with, doubling from there
+pub val BUTTON_DEPTH: usize = 16;
 
 # capacity the run list starts with, doubling from there
 pub val RUN_DEPTH: usize = 64;
@@ -117,11 +124,35 @@ pub val RUN_DEPTH: usize = 64;
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 
+# the default double-click time in seconds and distance in unscaled pixels
+# (see set_double_click)
+pub val DOUBLE_TIME: f64 = 0.3;
+pub val DOUBLE_DIST: f32 = 6.0;
+
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
 pub val CORNERS_TOP:    u8 = 1;
 pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
+
+# pointer buttons input.BUTTON_* names, one bit each from BUTTON_LEFT up
+pub val BUTTONS: usize = 5;
+
+# the last press of one pointer button, which runs of clicks and drags are
+# measured against
+# ---
+# time:   the host's clock at the press
+# x:      cursor x in screen pixels at the press
+# y:      cursor y in screen pixels at the press
+# id:     the topmost claimant under the press, 0 for none
+# clicks: presses in the run of clicks on id it extends, 0 before the first
+pub rec Press {
+    time:   f64;
+    x:      f32;
+    y:      f32;
+    id:     u64;
+    clicks: u32;
+}
 
 # a saved local origin in screen pixels
 # ---
@@ -135,18 +166,23 @@ rec Origin {
 # a run of indexed triangles: bind the texture, set the scissor, draw the indices
 pub val RUN_TRIANGLES: u32 = 0;
 
+# a consumer span: set the scissor and call the app's own drawing for id with
+# data in the rect, then resume blit's runs
+pub val RUN_CUSTOM: u32 = 1;
+
 # one span of the composed index list, drawn with one texture and one scissor
 # on one layer
 #
 # every index lies in exactly one run. for kind RUN_TRIANGLES a renderer binds
 # atlas page `page` when tex is draw.ATLAS, else the consumer texture tex with
 # the sampling filter it names, sets the scissor to the clip rect, and draws
-# count indices from start as triangles. the record is plain numbers, so a
-# foreign renderer reads it field for field. kind is RUN_TRIANGLES today. it
-# leaves room for runs of other kinds, which a renderer that does not know
-# them skips.
+# count indices from start as triangles. a RUN_CUSTOM run holds no indices
+# (count 0): the renderer sets the scissor and calls back into the app with id,
+# data and the rect at that point in paint order (see custom). the record is
+# plain numbers, so a foreign renderer reads it field for field, and skips a
+# run of a kind it does not know.
 # ---
-# kind:    what the run asks of the renderer, RUN_TRIANGLES
+# kind:    what the run asks of the renderer, RUN_TRIANGLES or RUN_CUSTOM
 # tex:     consumer texture handle, draw.ATLAS (0) for the font atlas
 # page:    the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
 # layer:   layer the run was drawn on
@@ -156,7 +192,13 @@ pub val RUN_TRIANGLES: u32 = 0;
 # clip_x1: scissor right in screen pixels
 # clip_y1: scissor bottom in screen pixels
 # start:   first index of the run
-# count:   indices in the run, three per triangle
+# count:   indices in the run, three per triangle, 0 for RUN_CUSTOM
+# id:      RUN_CUSTOM: the app's callback id, else 0
+# data:    RUN_CUSTOM: the app's value passed back to the callback, else 0
+# x0:      RUN_CUSTOM: rect left in screen pixels, else 0
+# y0:      RUN_CUSTOM: rect top in screen pixels, y down, else 0
+# x1:      RUN_CUSTOM: rect right in screen pixels, else 0
+# y1:      RUN_CUSTOM: rect bottom in screen pixels, else 0
 pub rec Run {
     kind:    u32;
     tex:     u64;
@@ -169,6 +211,12 @@ pub rec Run {
     clip_y1: f32;
     start:   usize;
     count:   usize;
+    id:      u64;
+    data:    u64;
+    x0:      f32;
+    y0:      f32;
+    x1:      f32;
+    y1:      f32;
 }
 
 # the channels a container splits its runs into, from split, for set_channel
@@ -206,6 +254,29 @@ pub rec Area {
     y1: f32;
 }
 
+# one line of text the frame drew, as the trace keeps it
+# ---
+# start: first byte of the line's text in the trace's bytes
+# len:   bytes of text
+# box:   the line box in screen pixels, before clipping
+rec Traced {
+    start: usize;
+    len:   usize;
+    box:   Area;
+}
+
+# one line of text the frame drew, read back from the trace (see set_trace)
+# ---
+# text: the line's utf-8 text, not NUL-terminated, valid until the next begin
+# len:  bytes of text
+# box:  the line box in screen pixels, from the pen's start to its end and
+#       from the line's top to its bottom, before clipping
+pub rec TextLine {
+    text: *u8;
+    len:  usize;
+    box:  Area;
+}
+
 # immediate-mode UI state for one consumer
 # ---
 # dl:           draw list accumulated each frame
@@ -218,9 +289,11 @@ pub rec Area {
 # cy:           layout cursor y
 # pw:           current panel width
 # hot:          id of the widget hovered this frame (0 = none)
-# active:       id of the widget being interacted with, persists across frames (0 = none)
-# drag_off_x:   cursor-to-origin x offset captured when a drag begins
-# drag_off_y:   cursor-to-origin y offset captured when a drag begins
+# active:       id of the widget owning the pointer since a press on it, persists across frames (0 = none)
+# active_btn:   the input.BUTTON_* bit whose press made active the owner
+# dbl_time:     seconds within which a press extends a run of clicks
+# dbl_dist:     unscaled pixels within which a press extends a run of clicks
+# presses:      each button's last press, by bit index
 # lx:           local origin x added to emitted positions before clipping
 # ly:           local origin y added to emitted positions before clipping
 # clip_x0:      active clip rect left in screen pixels
@@ -295,6 +368,17 @@ pub rec Area {
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
 # store:        state kept by widget id across frames (see blit.state)
+# backlog:      button events held back for the frames after, in arrival order
+# backlog_cap:  events allocated for backlog
+# backlog_len:  events held in backlog
+# lag:          1 if the frame left button events or the cursor behind the host's, else 0
+# trace_on:     1 if the frame's text lines are recorded (see set_trace), else 0
+# traced:       the frame's recorded text lines, grown on demand
+# traced_cap:   lines allocated for traced
+# traced_len:   lines recorded this frame
+# trace_bytes:  the recorded lines' text, back to back
+# trace_cap:    bytes allocated for trace_bytes
+# trace_len:    bytes recorded this frame
 pub rec Context {
     dl:           draw.DrawList;
     in:           input.Input;
@@ -307,8 +391,10 @@ pub rec Context {
     pw:           f32;
     hot:          u64;
     active:       u64;
-    drag_off_x:   f32;
-    drag_off_y:   f32;
+    active_btn:   u8;
+    dbl_time:     f64;
+    dbl_dist:     f32;
+    presses:      [5]Press;
     lx:           f32;
     ly:           f32;
     clip_x0:      f32;
@@ -383,6 +469,17 @@ pub rec Context {
     collided_cap: usize;
     collided_len: usize;
     store:        store.Store;
+    backlog:      *input.Event;
+    backlog_cap:  usize;
+    backlog_len:  usize;
+    lag:          u8;
+    trace_on:     u8;
+    traced:       *Traced;
+    traced_cap:   usize;
+    traced_len:   usize;
+    trace_bytes:  *u8;
+    trace_cap:    usize;
+    trace_len:    usize;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -419,17 +516,23 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     var none: input.Input;
     ctx.in = none;
 
-    ctx.sw           = 0.0::f32;
-    ctx.sh           = 0.0::f32;
-    ctx.ox           = 0.0::f32;
-    ctx.oy           = 0.0::f32;
-    ctx.cx           = 0.0::f32;
-    ctx.cy           = 0.0::f32;
-    ctx.pw           = 0.0::f32;
-    ctx.hot          = 0;
-    ctx.active       = 0;
-    ctx.drag_off_x   = 0.0::f32;
-    ctx.drag_off_y   = 0.0::f32;
+    ctx.sw         = 0.0::f32;
+    ctx.sh         = 0.0::f32;
+    ctx.ox         = 0.0::f32;
+    ctx.oy         = 0.0::f32;
+    ctx.cx         = 0.0::f32;
+    ctx.cy         = 0.0::f32;
+    ctx.pw         = 0.0::f32;
+    ctx.hot        = 0;
+    ctx.active     = 0;
+    ctx.active_btn = 0;
+    ctx.dbl_time   = DOUBLE_TIME;
+    ctx.dbl_dist   = DOUBLE_DIST;
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        ctx.presses[b] = Press{time: 0.0::f64, x: 0.0::f32, y: 0.0::f32, id: 0, clicks: 0};
+        b              = b + 1;
+    }
     ctx.lx           = 0.0::f32;
     ctx.ly           = 0.0::f32;
     ctx.clip_x0      = 0.0::f32;
@@ -499,18 +602,46 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.collided     = nil;
     ctx.collided_cap = 0;
     ctx.collided_len = 0;
+    ctx.backlog      = nil;
+    ctx.backlog_cap  = 0;
+    ctx.backlog_len  = 0;
+    ctx.lag          = 0;
     store.init(?ctx.store, a);
+    ctx.trace_on    = 0;
+    ctx.traced      = nil;
+    ctx.traced_cap  = 0;
+    ctx.traced_len  = 0;
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, state and id bookkeeping
+# composition, held-back button events, state, id bookkeeping and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    if (ctx.backlog != nil) {
+        val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
+        if (sel eh.err) { ret eh; }
+        ctx.backlog     = nil;
+        ctx.backlog_cap = 0;
+        ctx.backlog_len = 0;
+    }
+    val el: err[allo.Error] = allo.deallocate[Traced](ctx.a, ctx.traced, ctx.traced_cap);
+    if (sel el.err) { ret el; }
+    ctx.traced     = nil;
+    ctx.traced_cap = 0;
+    ctx.traced_len = 0;
+    val eb: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.trace_bytes, ctx.trace_cap);
+    if (sel eb.err) { ret eb; }
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
     if (ctx.pre != nil) {
         val ep: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.pre, ctx.pre_cap);
         if (sel ep.err) { ret ep; }
@@ -572,14 +703,24 @@ pub fun free(ctx: *Context) err[allo.Error] {
 }
 
 # start a frame: store input (carrying the previous buttons into prev_down),
-# take dt from the host's clock, resolve the hovered claimant, clear the draw
-# list, and reset the id scopes, collisions, layout and layers
+# apply its button events, take dt from the host's clock, resolve the hovered
+# claimant, clear the draw list, and reset the id scopes, collisions, layout
+# and layers
+#
+# button events queue behind any held back from earlier frames and apply in
+# order until one would change a button already changed this frame. the rest
+# wait for the frames after, which next_frame asks for, so a press and release
+# between two frames are a press in one frame and a release in the next. a
+# frame that applies one takes the cursor where the last applied happened. a
+# button no event is waiting on takes the input's down, so a host that only
+# samples the buttons is read as it always was.
 #
 # hover is the topmost of the previous frame's claims under this frame's
 # cursor, and nothing while no pointer is present. a primary press on anything
 # but the focus holder drops the focus. the last frame's copied text, paste
 # request, cursor shape, candidate window and wake time are cleared, and the
-# frame's last composition event replaces the composition in progress.
+# frame's last composition event replaces the composition in progress. each
+# button pressed becomes that button's last press (see last_press).
 # ---
 # ctx: context
 # in:  this frame's input (prev_down is managed here)
@@ -603,6 +744,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.pw  = 0.0::f32;
     ctx.hot = 0;
     ctx.oom = 0;
+    trickle(ctx, prev);
 
     ctx.lx      = 0.0::f32;
     ctx.ly      = 0.0::f32;
@@ -647,26 +789,42 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.shape        = input.CURSOR_ARROW;
     ctx.ime_on       = 0;
     take_preedit(ctx);
+    take_presses(ctx);
 
     ctx.id_sp        = 0;
     ctx.hover_seen   = 0;
     ctx.collided_len = 0;
     set.clear[u64](?ctx.seen);
+    ctx.traced_len = 0;
+    ctx.trace_len  = 0;
 
     draw.reset(?ctx.dl);
 }
 
 # finish a frame: close the last run, compose the runs by layer, drop the
-# active widget once the primary button is released, drop the focus when its
+# active widget once its button is released, drop the focus when its
 # holder was not drawn, and age out the state no widget reached
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (input.held(ctx.in, input.BUTTON_LEFT) == 0) { ctx.active = 0; }
-    if (ctx.focus_drawn == 0)                       { ctx.focus = 0; }
-    if (store.sweep(?ctx.store) != 0)               { ctx.oom = 1; }
+    if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
+    if (ctx.focus_drawn == 0)                    { ctx.focus = 0; }
+    if (store.sweep(?ctx.store) != 0)            { ctx.oom = 1; }
+}
+
+# set how close in time and space a press must follow the previous press on
+# the same widget to extend a run of clicks (see blit.interact)
+#
+# a host that knows its platform's double-click settings passes them here.
+# ---
+# ctx:  context
+# time: seconds, DOUBLE_TIME by default
+# dist: unscaled pixels, multiplied by the interface scale, DOUBLE_DIST by default
+pub fun set_double_click(ctx: *Context, time: f64, dist: f32) {
+    ctx.dbl_time = time;
+    ctx.dbl_dist = dist;
 }
 
 # give a widget the keyboard
@@ -796,8 +954,9 @@ pub fun wake_at(ctx: *Context, t: f64) {
 
 # when the host should draw the next frame, read after end
 #
-# some(0) asks for one now: a wake time has already passed, or a widget asked
-# for the clipboard, which only the next frame can deliver. some(t) asks for
+# some(0) asks for one now: a wake time has already passed, a widget asked
+# for the clipboard, which only the next frame can deliver, or button events
+# are held back for the frames after (see begin). some(t) asks for
 # one by time t on the host's clock. none means nothing is pending, and an
 # idle host can sleep until input arrives.
 # ---
@@ -805,6 +964,7 @@ pub fun wake_at(ctx: *Context, t: f64) {
 # ret: some(0) for now, some(t) by time t, none for only on input
 pub fun next_frame(ctx: *Context) opt[f64] {
     if (ctx.paste_wanted != 0)   { ret opt[f64].some{0.0::f64}; }
+    if (ctx.lag != 0)            { ret opt[f64].some{0.0::f64}; }
     if (ctx.wake_on == 0)        { ret opt[f64].none{}; }
     if (ctx.wake <= ctx.in.time) { ret opt[f64].some{0.0::f64}; }
     ret opt[f64].some{ctx.wake};
@@ -868,6 +1028,111 @@ pub fun preedit(ctx: *Context, id: u64) str {
 # ret: the caret, 0 when nothing is being composed
 pub fun preedit_caret(ctx: *Context) usize {
     ret ctx.pre_caret;
+}
+
+# record each button pressed this frame as its last press, extending the run
+# of clicks when it lands on the claimant the one before did, soon and near
+# enough
+fun take_presses(ctx: *Context) {
+    val near: f32   = px(ctx, ctx.dbl_dist);
+    var b:    usize = 0;
+    for (b < BUTTONS) {
+        if (input.pressed(ctx.in, (1::u8) << b::u8) != 0) {
+            val p:   *Press = ?ctx.presses[b];
+            val dx:  f32    = ctx.in.mx - p.x;
+            val dy:  f32    = ctx.in.my - p.y;
+            var run: u32    = 1;
+            if (p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
+                run = p.clicks + 1;
+            }
+            @p = Press{time: ctx.in.time, x: ctx.in.mx, y: ctx.in.my, id: ctx.hover, clicks: run};
+        }
+        b = b + 1;
+    }
+}
+
+# the last press of a pointer button (see Press)
+#
+# begin records every press, on a widget or not, against the topmost
+# claimant under it: a press on the same claimant within the double-click
+# time and distance (see set_double_click) of the one before extends its run.
+# ---
+# ctx:    context
+# button: an input.BUTTON_* bit
+# ret:    the press, a zeroed one for a bit that names no button
+pub fun last_press(ctx: *Context, button: u8) Press {
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        if (button == (1::u8) << b::u8) { ret ctx.presses[b]; }
+        b = b + 1;
+    }
+    var none: Press;
+    ret none;
+}
+
+# queue the frame's button events behind those held back, apply them in order
+# until a button would change twice, and hold the rest for the frames after
+#
+# ctx.in is this frame's input, and prev the buttons held last frame.
+fun trickle(ctx: *Context, prev: u8) {
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        i = i + 1;
+        if (!sel e.down && !sel e.up) { cnt; }
+        ctx.backlog = room[input.Event](ctx, ctx.backlog, ?ctx.backlog_cap, ctx.backlog_len + 1, BUTTON_DEPTH);
+        if (ctx.backlog_len >= ctx.backlog_cap) { cnt; }
+        ctx.backlog[ctx.backlog_len] = e;
+        ctx.backlog_len              = ctx.backlog_len + 1;
+    }
+
+    var down:    u8    = prev;
+    var changed: u8    = 0;
+    var moved:   u8    = 0;
+    var x:       f32   = ctx.in.mx;
+    var y:       f32   = ctx.in.my;
+    var n:       usize = 0;
+    for (n < ctx.backlog_len) {
+        val e:  input.Event  = ctx.backlog[n];
+        var b:  input.Button = input.Button{button: 0, x: 0.0::f32, y: 0.0::f32};
+        var on: u8           = 0;
+        if (sel e.down) {
+            b  = e.down;
+            on = b.button;
+        }
+        if (sel e.up) { b = e.up; }
+        if ((down & b.button) == on) {
+            n = n + 1;
+            cnt;
+        }
+        if ((changed & b.button) != 0) { brk; }
+        down    = (down & (b.button ^ 0xFF)) | on;
+        changed = changed | b.button;
+        moved   = 1;
+        x       = b.x;
+        y       = b.y;
+        n       = n + 1;
+    }
+
+    var waiting: u8    = 0;
+    var k:       usize = 0;
+    for (n + k < ctx.backlog_len) {
+        val e: input.Event = ctx.backlog[n + k];
+        if (sel e.down) { waiting = waiting | e.down.button; }
+        if (sel e.up)   { waiting = waiting | e.up.button; }
+        ctx.backlog[k] = e;
+        k              = k + 1;
+    }
+    ctx.backlog_len = k;
+
+    ctx.in.down = (down & waiting) | (ctx.in.down & (waiting ^ 0xFF));
+    ctx.lag     = 0;
+    if (k != 0) { ctx.lag = 1; }
+    if (moved != 0) {
+        if (x != ctx.in.mx || y != ctx.in.my) { ctx.lag = 1; }
+        ctx.in.mx = x;
+        ctx.in.my = y;
+    }
 }
 
 # take the frame's last composition event as the composition in progress,
@@ -995,6 +1260,127 @@ pub fun collision_at(ctx: *Context, index: usize) u64 {
     ret ctx.collided[index];
 }
 
+# the screen rect a widget claimed this frame, the union of its visible claims
+#
+# while a frame is built it covers the claims made so far, and after end() the
+# whole frame's, until the next begin. a widget clipped out of sight or not
+# drawn has none, so this also says whether a widget was drawn.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: the rect in screen pixels, or none when the widget claimed nothing visible
+pub fun rect_of(ctx: *Context, id: u64) opt[Area] {
+    var found: u8    = 0;
+    var r:     Area;
+    var i:     usize = 0;
+    if (id == 0) { ret opt[Area].none{}; }
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id != id || c.x1 <= c.x0 || c.y1 <= c.y0) { cnt; }
+        if (found == 0) {
+            r     = Area{x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1};
+            found = 1;
+            cnt;
+        }
+        r.x0 = minf(r.x0, c.x0);
+        r.y0 = minf(r.y0, c.y0);
+        r.x1 = maxf(r.x1, c.x1);
+        r.y1 = maxf(r.y1, c.y1);
+    }
+    if (found == 0) { ret opt[Area].none{}; }
+    ret opt[Area].some{r};
+}
+
+# the widget a pointer at a screen point would reach next frame: the topmost
+# of this frame's claims holding it
+# ---
+# ctx: context
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the widget's id, 0 when nothing or only an anonymous container is there
+pub fun widget_at(ctx: *Context, x: f32, y: f32) u64 {
+    ret hit.resolve(?ctx.claims, x, y);
+}
+
+# the topmost widget whose claim this frame lies wholly inside a screen rect
+# ---
+# ctx: context
+# r:   the rect in screen pixels
+# ret: the widget's id, 0 when no widget's claim lies inside it
+pub fun widget_in(ctx: *Context, r: Area) u64 {
+    var found: u8    = 0;
+    var best:  u64   = 0;
+    var id:    u64   = 0;
+    var i:     usize = 0;
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id == 0 || c.x1 <= c.x0 || c.y1 <= c.y0)                { cnt; }
+        if (c.x0 < r.x0 || c.y0 < r.y0 || c.x1 > r.x1 || c.y1 > r.y1) { cnt; }
+        if (found == 0 || c.key > best) {
+            found = 1;
+            best  = c.key;
+            id    = c.id;
+        }
+    }
+    ret id;
+}
+
+# record the text each frame draws, line by line, for tests to read back
+#
+# off by default, so a frame pays nothing for it. while on, every line of text
+# drawn at least partly inside the clip is kept with its screen box until the
+# next begin (see traced_count and traced_at). a line the trace cannot grow to
+# hold sets oom and is left out.
+# ---
+# ctx: context
+# on:  1 to record, 0 to stop
+pub fun set_trace(ctx: *Context, on: u8) {
+    ctx.trace_on = on;
+}
+
+# how many lines of text the frame drew while tracing
+# ---
+# ctx: context
+# ret: the line count
+pub fun traced_count(ctx: *Context) usize {
+    ret ctx.traced_len;
+}
+
+# one line of text the frame drew while tracing, in drawing order
+# ---
+# ctx:   context
+# index: line index below traced_count()
+# ret:   the line, or an empty one for an index out of range
+pub fun traced_at(ctx: *Context, index: usize) TextLine {
+    var l: TextLine;
+    if (index >= ctx.traced_len) { ret l; }
+    val t: Traced = ctx.traced[index];
+    l.text = ?ctx.trace_bytes[t.start];
+    l.len  = t.len;
+    l.box  = t.box;
+    ret l;
+}
+
+# keep one drawn line of text in the trace, given in local coordinates
+fun trace_line(ctx: *Context, s: *u8, n: usize, x0: f32, y0: f32, x1: f32, y1: f32) {
+    val b: Area = Area{x0: x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly};
+    if (b.x1 <= ctx.clip_x0 || b.x0 >= ctx.clip_x1) { ret; }
+    if (b.y1 <= ctx.clip_y0 || b.y0 >= ctx.clip_y1) { ret; }
+    ctx.traced      = room[Traced](ctx, ctx.traced, ?ctx.traced_cap, ctx.traced_len + 1, RUN_DEPTH);
+    ctx.trace_bytes = room[u8](ctx, ctx.trace_bytes, ?ctx.trace_cap, ctx.trace_len + n, 1024);
+    if (ctx.traced_len >= ctx.traced_cap || ctx.trace_len + n > ctx.trace_cap) { ret; }
+    var k: usize = 0;
+    for (k < n) {
+        ctx.trace_bytes[ctx.trace_len + k] = s[k];
+        k                                  = k + 1;
+    }
+    ctx.traced[ctx.traced_len] = Traced{start: ctx.trace_len, len: n, box: b};
+    ctx.traced_len             = ctx.traced_len + 1;
+    ctx.trace_len              = ctx.trace_len + n;
+}
+
 # note a claim's id: a repeat within the frame is a collision, and a claim by
 # the hovered widget is counted
 fun note_id(ctx: *Context, id: u64) {
@@ -1107,7 +1493,8 @@ fun state(ctx: *Context) Run {
     var r: Run = Run{
         kind:    RUN_TRIANGLES, tex: ctx.tex, page: 0, layer: ctx.layer, filter: ctx.filter,
         clip_x0: ctx.clip_x0, clip_y0: ctx.clip_y0, clip_x1: ctx.clip_x1, clip_y1: ctx.clip_y1,
-        start:   0, count: 0
+        start:   0, count: 0, id: 0, data: 0,
+        x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
     };
     if (ctx.tex == draw.ATLAS) {
         r.page   = ctx.page;
@@ -1117,8 +1504,11 @@ fun state(ctx: *Context) Run {
 }
 
 # whether two runs draw the same way: kind, texture, layer and scissor
+#
+# a consumer span is a call of its own and never draws the same way as another
+# run.
 fun same_state(a: Run, b: Run) bool {
-    ret a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
+    ret a.kind == RUN_TRIANGLES && a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
         && a.layer == b.layer && a.clip_x0 == b.clip_x0 && a.clip_y0 == b.clip_y0
         && a.clip_x1 == b.clip_x1 && a.clip_y1 == b.clip_y1;
 }
@@ -1169,7 +1559,8 @@ pub fun run_at(ctx: *Context, index: usize) Run {
         ret Run{
             kind:    RUN_TRIANGLES, tex: draw.ATLAS, page: 0, layer: 0, filter: draw.FILTER_NEAREST,
             clip_x0: 0.0::f32, clip_y0: 0.0::f32, clip_x1: 0.0::f32, clip_y1: 0.0::f32,
-            start:   0, count: 0
+            start:   0, count: 0, id: 0, data: 0,
+            x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
         };
     }
     ret ctx.runs[index];
@@ -1192,6 +1583,49 @@ fun flush_run(ctx: *Context) {
     ctx.chans[ctx.run_len] = ctx.chan;
     ctx.run_len            = ctx.run_len + 1;
     ctx.run_start          = len;
+}
+
+# place a consumer span: the app draws into a rect itself at this point in
+# paint order
+#
+# the span is a run of kind RUN_CUSTOM with no indices, carrying id, data, the
+# rect in screen space and the current clip as its scissor. it lands on the
+# current layer and channel and sorts like any run, so geometry drawn after it
+# or on a higher layer paints over it. a rect wholly outside the clip is
+# dropped. if the run list cannot grow, oom is set and the span is dropped.
+# ---
+# ctx:  context
+# x0:   rect left in local pixels
+# y0:   rect top in local pixels
+# x1:   rect right in local pixels
+# y1:   rect bottom in local pixels
+# id:   the app's callback id, passed through untouched
+# data: the app's value for the callback, passed through untouched
+pub fun custom(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, id: u64, data: u64) {
+    val sx0: f32 = minf(x0, x1) + ctx.lx;
+    val sy0: f32 = minf(y0, y1) + ctx.ly;
+    val sx1: f32 = maxf(x0, x1) + ctx.lx;
+    val sy1: f32 = maxf(y0, y1) + ctx.ly;
+    if (culled(ctx, sx0, sy0, sx1, sy1)) { ret; }
+    flush_run(ctx);
+    ctx.runs  = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
+    ctx.chans = room[u32](ctx, ctx.chans, ?ctx.chans_cap, ctx.run_len + 1, RUN_DEPTH);
+    if (ctx.run_len >= ctx.runs_cap || ctx.run_len >= ctx.chans_cap) { ret; }
+    var run: Run = state(ctx);
+    run.kind               = RUN_CUSTOM;
+    run.tex                = draw.ATLAS;
+    run.page               = 0;
+    run.filter             = draw.FILTER_NEAREST;
+    run.start              = draw.index_count(?ctx.dl);
+    run.id                 = id;
+    run.data               = data;
+    run.x0                 = sx0;
+    run.y0                 = sy0;
+    run.x1                 = sx1;
+    run.y1                 = sy1;
+    ctx.runs[ctx.run_len]  = run;
+    ctx.chans[ctx.run_len] = ctx.chan;
+    ctx.run_len            = ctx.run_len + 1;
 }
 
 # split the runs drawn from here on into n channels, starting in channel 0
@@ -1429,6 +1863,25 @@ fun pop_origin(ctx: *Context) {
         ctx.lx = ctx.origins[ctx.org_sp].x;
         ctx.ly = ctx.origins[ctx.org_sp].y;
     }
+}
+
+# the cursor's x in the current local space
+#
+# the cursor arrives in screen space (ctx.in.mx). this is where it falls in
+# the coordinates rects are passed in, inside surfaces and layers alike.
+# ---
+# ctx: context
+# ret: cursor x in local pixels
+pub fun local_mx(ctx: *Context) f32 {
+    ret ctx.in.mx - ctx.lx;
+}
+
+# the cursor's y in the current local space (see local_mx)
+# ---
+# ctx: context
+# ret: cursor y in local pixels
+pub fun local_my(ctx: *Context) f32 {
+    ret ctx.in.my - ctx.ly;
 }
 
 # whether the screen point (x, y) lies inside the active clip rect
@@ -2278,7 +2731,9 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
 }
 
 # draw one line of shaped glyphs with the pen starting at x on the baseline
-fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) {
+#
+# ret: the pen's x after the line
+fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
     val g:  usize       = font.shape(?ctx.font, ctx.style, ctx.scale, s, n);
     val sh: *gly.Shaped = font.shaped(?ctx.font);
     var px: f32         = x;
@@ -2289,6 +2744,7 @@ fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color
         px = px + one.advance;
         k  = k + 1;
     }
+    ret px;
 }
 
 # draw the first n bytes of utf-8 text with its first line box's top-left at
@@ -2313,7 +2769,10 @@ pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color
     for (a <= n) {
         var b: usize = a;
         for (b < n && s[b] != '\n') { b = b + 1; }
-        if (b > a) { pen_line(ctx, ?s[a], b - a, x, base, ink); }
+        if (b > a) {
+            val end: f32 = pen_line(ctx, ?s[a], b - a, x, base, ink);
+            if (ctx.trace_on != 0) { trace_line(ctx, ?s[a], b - a, x, base - m.ascent, end, base - m.ascent + lh); }
+        }
         base = base + lh;
         a    = b + 1;
     }
@@ -2407,8 +2866,8 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
     s.y        = y;
     s.w        = w;
     s.h        = h;
-    s.local_mx = ctx.in.mx - ctx.lx;
-    s.local_my = ctx.in.my - ctx.ly;
+    s.local_mx = local_mx(ctx);
+    s.local_my = local_my(ctx);
     s.inside   = 0;
     if (ctx.in.present != 0) { s.inside = input_visible(ctx, ctx.in.mx, ctx.in.my); }
     ret s;
@@ -2456,6 +2915,46 @@ test clip__runs_carry_their_scissor {
     if (cut.clip_x1 != 4.0::f32 || cut.clip_y1 != 100.0::f32)          { ret 8; }
     val full: Run = run_at(?ctx, 1);
     if (full.start != 6 || full.clip_x1 != 100.0::f32) { ret 9; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test custom__span_sorts_with_its_rect_and_scissor {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    # a popup drawn before the span still paints over it
+    push_layer(?ctx);
+    quad(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, white);
+    pop_layer(?ctx);
+    val surf: Surface = begin_surface(?ctx, 10.0::f32, 10.0::f32, 40.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    custom(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 100.0::f32, 7, 9);
+    # a span wholly outside the clip is dropped
+    custom(?ctx, 60.0::f32, 60.0::f32, 70.0::f32, 70.0::f32, 8, 0);
+    end_surface(?ctx, surf);
+    # the same state as the first quad, kept apart by the span between them
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    end(?ctx);
+
+    if (run_count(?ctx) != 4 || index_count(?ctx) != 18) { ret 2; }
+    val span: Run = run_at(?ctx, 1);
+    if (span.kind != RUN_CUSTOM || span.id != 7 || span.data != 9)           { ret 3; }
+    if (span.start != 6 || span.count != 0 || span.layer != 0)               { ret 4; }
+    if (span.x0 != 10.0::f32 || span.y0 != 10.0::f32)                        { ret 5; }
+    if (span.x1 != 110.0::f32 || span.y1 != 110.0::f32)                      { ret 6; }
+    if (span.clip_x0 != 10.0::f32 || span.clip_x1 != 50.0::f32)              { ret 7; }
+    if (run_at(?ctx, 0).kind != RUN_TRIANGLES || run_at(?ctx, 0).count != 6) { ret 8; }
+    if (run_at(?ctx, 2).start != 6 || run_at(?ctx, 2).count != 6)            { ret 9; }
+    if (run_at(?ctx, 3).layer != 1 || run_at(?ctx, 3).start != 12)           { ret 10; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
