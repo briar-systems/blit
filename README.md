@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -271,15 +271,59 @@ blit.context.end(?ctx);
   val did: u8 = blit.widget.text_field(?ctx, "name", ?name, "name");
   if ((did & blit.field.ENTERED) != 0) { ... }
   ```
-  A press on the field focuses it and puts the caret under the cursor. It takes
-  typed text, backspace and delete, left, right, home and end (shift extends
-  the selection), shortcut A to select all, shortcut C, X and V through the
-  clipboard hand-off, and enter or escape, which end the edit and give the
-  keyboard back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
-  While focused it shows the IME's composition inline at the caret, underlined,
-  and places the candidate window at the caret.
-  The edit model in `blit.field` needs no context, so it can be driven
-  directly.
+  A press on the field focuses it and puts the caret under the cursor, or
+  extends the selection to it with shift held. A double click selects a word
+  and a triple click the line, and dragging extends the selection by
+  characters, words or lines to match. Runs of clicks are counted by
+  `blit.interact` (see `blit.context.set_double_click`).
+  The field takes typed text, backspace and delete, left, right, home and end
+  (shift extends the selection), word movement and deletion with
+  `blit.input.MOD_WORD` (option on darwin, ctrl elsewhere) held with the
+  arrows, backspace and delete, shortcut A to select all, shortcut Z to undo
+  and shortcut shift Z or Y to redo, shortcut C, X and V through the clipboard
+  hand-off, and enter or escape, which end the edit and give the keyboard
+  back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
+  While focused the caret blinks every `blit.edit.BLINK` seconds, asking for
+  the frames it needs through `next_frame`, and the field shows the IME's
+  composition inline at the caret, underlined, and places the candidate window
+  at the caret.
+- **Field flags.** `f.flags` shapes a field, 0 after `init`:
+  `blit.field.MASKED` draws `*` for every character, never copies and takes no
+  composition (a password); `READ_ONLY` moves, selects and copies but refuses
+  every edit; `COUNT` shows the length in characters, against `max` when set;
+  `LINES` makes enter type a newline and home and end act on the line.
+- **Undo.** Undo history lives in a second buffer the consumer owns, so a field
+  without one has no undo:
+  ```mach
+  var hist: [4096]u8;
+  blit.field.keep_history(?name, ?hist[0], 4096);
+  ```
+  Typing and single-character deletions coalesce into word-sized steps, any
+  other edit or a caret movement ends a step, and the oldest steps are dropped
+  when the buffer fills. `blit.field.set` clears the history.
+- **Text area.** `blit.textarea.text_area(?ctx, key, ?f, ?view, h)` edits a
+  field over many lines in a box `h` tall across the column. The text wraps at
+  word boundaries, up and down move the caret by wrapped rows toward the column
+  they started in, page up and page down by a box of rows, and the box scrolls
+  by wheel and scrollbar and to keep the caret in view. Clicks, drags, the
+  keyboard, undo, the clipboard, the caret and the composition behave as in
+  the text field, enter types a newline (the area makes its field `LINES`) and
+  escape ends the edit. A `COUNT` field shows its length on a row below.
+  The `blit.textarea.TextArea` view keeps the scroll and the start of every
+  wrapped row, laid out again only when the text, width, style or scale
+  changes, so each frame draws only the rows in view of however long a text:
+  ```mach
+  var view: blit.textarea.TextArea;
+  blit.textarea.init(?view, ?a);               # once
+  blit.textarea.text_area(?ctx, "notes", ?notes, ?view, 200.0);
+  blit.textarea.free(?view);                   # at shutdown
+  ```
+- **The edit model.** `blit.field` needs no context, so a field can be driven
+  directly: `insert`, `paste`, `erase`, `key`, `undo`, `redo`, `select_word`,
+  `select_line`, `word_left`, `word_right`, `place` and `move`.
+  `blit.edit` holds what both text widgets share between the frame's input and
+  a field (event routing, click and drag selection, the caret blink and masked
+  drawing), for a consumer building a text widget of its own.
 
 ## Clipping & sub-surfaces
 
