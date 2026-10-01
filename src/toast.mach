@@ -1,11 +1,16 @@
 # toasts: a stack of timed notifications at an anchor, built on an overlay
 #
-# a Toasts record owns its notifications and a copy of each one's text, so
-# post can be called from anywhere, with or without a frame open. show draws
-# them each frame as cards in one overlay anchored to the surface, the newest
-# nearest the anchor and the older ones stacked away from it, and drops the
-# ones whose time is up. a toast's clock starts the first frame it is shown,
-# and it fades in over its first FADE seconds and out over its last.
+# a Toasts record owns its notifications and a copy of each one's text and
+# key, so post can be called from anywhere, with or without a frame open,
+# with a transient buffer. show draws them each frame as cards in one overlay
+# anchored to the surface, or show_in to a rect, the newest nearest the anchor
+# and the older ones stacked away from it, and drops the ones whose time is
+# up. a toast's clock starts the first frame it is shown, and it fades in over
+# its first FADE seconds and out over its last.
+#
+# a toast posted with a key (see post_keyed) is one status that later posts
+# under the same key replace in place, such as "identifying..." then the
+# result, and withdraw takes it down before its time is up.
 #
 # show asks for frames only while a toast is fading, and otherwise for the
 # moment the next one starts to fade out (see context.wake_at), so an
@@ -15,11 +20,14 @@
 # toast stays interactive.
 
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use blit.context;
@@ -44,15 +52,24 @@ val INIT_CAP: usize = 8;
 # ---
 # text:    its text, owned, NUL-terminated
 # len:     bytes of text before the NUL
+# key:     its key, owned, NUL-terminated, nil for none
+# klen:    bytes of key before the NUL
 # seconds: how long it is shown, fades included
+# lead:    seconds of its life behind it when next shown, FADE for one
+#          replaced while on screen, which does not fade in again
 # born:    the time it was first shown
-# shown:   1 once a frame has shown it
+# shown:   1 once a frame has shown it since it was posted or replaced
+# gone:    1 once withdrawn, until a show starts its fade out
 rec Toast {
     text:    *u8;
     len:     usize;
+    key:     *u8;
+    klen:    usize;
     seconds: f64;
+    lead:    f64;
     born:    f64;
     shown:   u8;
+    gone:    u8;
 }
 
 # the notifications a toast stack holds, oldest first
@@ -97,14 +114,77 @@ pub fun free(t: *Toasts) err[allo.Error] {
 
 # remove the toast at i, keeping the others in order
 fun drop(t: *Toasts, i: usize) err[allo.Error] {
-    val e: err[allo.Error] = allo.deallocate[u8](t.a, t.items[i].text, t.items[i].len + 1);
-    var k: usize           = i;
+    var e: err[allo.Error] = allo.deallocate[u8](t.a, t.items[i].text, t.items[i].len + 1);
+    if (t.items[i].key != nil) {
+        val ek: err[allo.Error] = allo.deallocate[u8](t.a, t.items[i].key, t.items[i].klen + 1);
+        if (!sel e.err) { e = ek; }
+    }
+    var k: usize = i;
     for (k + 1 < t.len) {
         t.items[k] = t.items[k + 1];
         k          = k + 1;
     }
     t.len = t.len - 1;
     ret e;
+}
+
+# an owned, NUL-terminated copy of s
+fun copy(t: *Toasts, s: str, n: usize) res[*u8, allo.Error] {
+    val rb: res[*u8, allo.Error] = allo.allocate[u8](t.a, n + 1);
+    if (sel rb.err) { ret rb; }
+    var i: usize = 0;
+    for (i < n) {
+        rb.ok[i] = s[i];
+        i        = i + 1;
+    }
+    rb.ok[n] = 0;
+    ret rb;
+}
+
+# the seconds a post asks for, SECONDS for 0 or less
+fun life(seconds: f64) f64 {
+    if (seconds <= 0.0) { ret SECONDS; }
+    ret seconds;
+}
+
+# where the toast posted under key is, or none
+fun find(t: *Toasts, key: str) opt[usize] {
+    var i: usize = 0;
+    for (i < t.len) {
+        if (t.items[i].key != nil && str_equals(t.items[i].key::str, key)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# append a toast, its text and key copied, key nil for none
+fun add(t: *Toasts, key: str, text: str, seconds: f64) err[allo.Error] {
+    if (t.len == t.cap) {
+        var n: usize = t.cap * 2;
+        if (n < INIT_CAP) { n = INIT_CAP; }
+        val r: res[*Toast, allo.Error] = allo.reallocate[Toast](t.a, t.items, t.cap, n);
+        if (sel r.err) { ret err[allo.Error].err{r.err}; }
+        t.items = r.ok;
+        t.cap   = n;
+    }
+    val n:  usize                = str_len(text);
+    val rb: res[*u8, allo.Error] = copy(t, text, n);
+    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
+    var kp: *u8   = nil;
+    var kn: usize = 0;
+    if (key != nil) {
+        kn = str_len(key);
+        val rk: res[*u8, allo.Error] = copy(t, key, kn);
+        if (sel rk.err) {
+            val e: err[allo.Error] = allo.deallocate[u8](t.a, rb.ok, n + 1);
+            ret err[allo.Error].err{rk.err};
+        }
+        kp = rk.ok;
+    }
+
+    t.items[t.len] = Toast{text: rb.ok, len: n, key: kp, klen: kn, seconds: life(seconds), lead: 0.0, born: 0.0, shown: 0, gone: 0};
+    t.len          = t.len + 1;
+    ret err[allo.Error].ok{};
 }
 
 # add a notification, shown for seconds once the next show draws it
@@ -116,29 +196,54 @@ fun drop(t: *Toasts, i: usize) err[allo.Error] {
 # seconds: how long it is shown, fades included; 0 or less for SECONDS
 # ret:     ok, or the allocator's refusal with nothing added
 pub fun post(t: *Toasts, text: str, seconds: f64) err[allo.Error] {
-    if (t.len == t.cap) {
-        var n: usize = t.cap * 2;
-        if (n < INIT_CAP) { n = INIT_CAP; }
-        val r: res[*Toast, allo.Error] = allo.reallocate[Toast](t.a, t.items, t.cap, n);
-        if (sel r.err) { ret err[allo.Error].err{r.err}; }
-        t.items = r.ok;
-        t.cap   = n;
-    }
-    val n:  usize                = str_len(text);
-    val rb: res[*u8, allo.Error] = allo.allocate[u8](t.a, n + 1);
-    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
-    var i: usize = 0;
-    for (i < n) {
-        rb.ok[i] = text[i];
-        i        = i + 1;
-    }
-    rb.ok[n] = 0;
+    ret add(t, nil, text, seconds);
+}
 
-    var s: f64 = seconds;
-    if (s <= 0.0) { s = SECONDS; }
-    t.items[t.len] = Toast{text: rb.ok, len: n, seconds: s, born: 0.0, shown: 0};
-    t.len          = t.len + 1;
-    ret err[allo.Error].ok{};
+# post a notification under a key, replacing the one the stack holds under
+# that key if any
+#
+# a replaced toast keeps its place in the stack and takes the new text and
+# time, its clock starting over at the next show. one already on screen does
+# not fade in again, and one withdrawn and fading out comes back. a caller
+# posting between frames asks for that frame with context.redraw.
+# ---
+# t:       the stack
+# key:     what names the toast in the stack, copied
+# text:    its text, copied
+# seconds: how long it is shown from the next show, fades included; 0 or less for SECONDS
+# ret:     ok, or the allocator's refusal, the stack unchanged if it refused the copy
+pub fun post_keyed(t: *Toasts, key: str, text: str, seconds: f64) err[allo.Error] {
+    val at: opt[usize] = find(t, key);
+    if (sel at.none) { ret add(t, key, text, seconds); }
+
+    val it: *Toast               = ?t.items[at.some];
+    val n:  usize                = str_len(text);
+    val rb: res[*u8, allo.Error] = copy(t, text, n);
+    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
+    val e: err[allo.Error] = allo.deallocate[u8](t.a, it.text, it.len + 1);
+    it.text = rb.ok;
+    it.len  = n;
+    if (it.shown != 0) { it.lead = FADE; }
+    it.seconds = life(seconds) + it.lead;
+    it.shown   = 0;
+    it.gone    = 0;
+    ret e;
+}
+
+# take down the toast posted under a key before its time is up
+#
+# one on screen fades out from the next show, over FADE seconds or what it
+# has left if less, and one not yet shown is dropped without showing. a
+# caller withdrawing between frames asks for that frame with context.redraw.
+# ---
+# t:   the stack
+# key: the key it was posted under
+# ret: true when the stack held a toast under key
+pub fun withdraw(t: *Toasts, key: str) bool {
+    val at: opt[usize] = find(t, key);
+    if (sel at.none) { ret false; }
+    t.items[at.some].gone = 1;
+    ret true;
 }
 
 # how many notifications the stack holds
@@ -182,14 +287,47 @@ fun card(ctx: *context.Context, c: overlay.Chrome, s: str) {
 # t:   the stack
 # at:  the point of the surface it is anchored at
 pub fun show(ctx: *context.Context, key: str, t: *Toasts, at: overlay.Anchor) {
+    stack(ctx, key, t, overlay.on_surface(at));
+}
+
+# show the stack's toasts at an anchor of a rect, inside it, and drop the
+# ones whose time is up
+#
+# show for a sub-area of the surface, such as a viewport beside a docked
+# panel: the stack sits inside r as show's sits inside the surface, kept off
+# r's edges by the toast style's margin.
+# ---
+# ctx: context
+# key: the overlay's key in the current id scope
+# t:   the stack
+# r:   the rect, in the caller's local pixels
+# at:  the point of r it is anchored at
+pub fun show_in(ctx: *context.Context, key: str, t: *Toasts, r: context.Area, at: overlay.Anchor) {
+    stack(ctx, key, t, overlay.on_rect(r, at, at));
+}
+
+# start the clocks of new toasts, fade out withdrawn ones, drop the ones
+# whose time is up, and draw the rest in o, whose pivot is its anchor
+fun stack(ctx: *context.Context, key: str, t: *Toasts, o: overlay.Overlay) {
     val now: f64   = ctx.in.time;
     var i:   usize = 0;
     for (i < t.len) {
-        if (t.items[i].shown == 0) {
-            t.items[i].born  = now;
-            t.items[i].shown = 1;
+        val it: *Toast = ?t.items[i];
+        if (it.shown == 0) {
+            if (it.gone != 0 && it.lead == 0.0) {
+                val ew: err[allo.Error] = drop(t, i);
+                if (sel ew.err) { ctx.oom = 1; }
+                cnt;
+            }
+            it.born  = now - it.lead;
+            it.shown = 1;
         }
-        if (now - t.items[i].born >= t.items[i].seconds) {
+        if (it.gone != 0) {
+            val out: f64 = now - it.born + FADE;
+            if (out < it.seconds) { it.seconds = out; }
+            it.gone = 0;
+        }
+        if (now - it.born >= it.seconds) {
             val e: err[allo.Error] = drop(t, i);
             if (sel e.err) { ctx.oom = 1; }
             cnt;
@@ -198,16 +336,17 @@ pub fun show(ctx: *context.Context, key: str, t: *Toasts, at: overlay.Anchor) {
     }
     if (t.len == 0) { ret; }
 
-    val m: theme.Edges     = context.px_edges(ctx, context.look_of(ctx, theme.TOAST).margin);
-    var o: overlay.Overlay = overlay.on_surface(at);
-    o.dx = m.l * (1.0::f32 - at.x) - m.r * at.x;
-    o.dy = m.t * (1.0::f32 - at.y) - m.b * at.y;
-    if (at.x > 0.5::f32)  { o.align = layout.Align.end{}; }
-    or (at.x == 0.5::f32) { o.align = layout.Align.center{}; }
+    val at: overlay.Anchor  = o.at;
+    val m:  theme.Edges     = context.px_edges(ctx, context.look_of(ctx, theme.TOAST).margin);
+    var ov: overlay.Overlay = o;
+    ov.dx = m.l * (1.0::f32 - at.x) - m.r * at.x;
+    ov.dy = m.t * (1.0::f32 - at.y) - m.b * at.y;
+    if (at.x > 0.5::f32)  { ov.align = layout.Align.end{}; }
+    or (at.x == 0.5::f32) { ov.align = layout.Align.center{}; }
     val up: bool = at.y > 0.5::f32;
 
     val c: overlay.Chrome = overlay.chrome(ctx, overlay.KIND_TOAST);
-    val s: overlay.Shown  = overlay.begin(ctx, key, o);
+    val s: overlay.Shown  = overlay.begin(ctx, key, ov);
     var k: usize          = 0;
     for (k < t.len) {
         var j: usize = t.len - 1 - k;
@@ -224,15 +363,31 @@ pub fun show(ctx: *context.Context, key: str, t: *Toasts, at: overlay.Anchor) {
     overlay.end(ctx, s);
 }
 
-# a toast stack in the bottom right corner
+# the rect the probe's stack is anchored in when asked
 #[testing]
-fun probe_ui(ctx: *context.Context, user: ptr) {
-    show(ctx, "toasts", user::*Toasts, overlay.BOTTOM_RIGHT);
+val BOX: context.Area = context.Area{x0: 40.0::f32, y0: 30.0::f32, x1: 160.0::f32, y1: 120.0::f32};
+
+# a toast stack and where the probe shows it
+# ---
+# t:  the stack
+# in: 1 to show it in BOX, 0 in the surface
+#[testing]
+rec Probe {
+    t:  Toasts;
+    in: u8;
 }
 
-# the top of the first text line drawn whose text is s, or -1
+# a toast stack in the bottom right corner of the surface, or of BOX
 #[testing]
-fun line_y(ctx: *context.Context, s: str) f32 {
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p: *Probe = user::*Probe;
+    if (p.in != 0) { show_in(ctx, "toasts", ?p.t, BOX, overlay.BOTTOM_RIGHT); }
+    or             { show(ctx, "toasts", ?p.t, overlay.BOTTOM_RIGHT); }
+}
+
+# the box of the first text line drawn whose text is s, if any
+#[testing]
+fun line(ctx: *context.Context, s: str) opt[context.Area] {
     var i: usize = 0;
     for (i < context.traced_count(ctx)) {
         val l: context.TextLine = context.traced_at(ctx, i);
@@ -240,19 +395,35 @@ fun line_y(ctx: *context.Context, s: str) f32 {
         if (l.len != str_len(s)) { cnt; }
         var k: usize = 0;
         for (k < l.len && l.text[k] == s[k]) { k = k + 1; }
-        if (k == l.len) { ret l.box.y0; }
+        if (k == l.len) { ret opt[context.Area].some{l.box}; }
     }
-    ret 0.0::f32 - 1.0::f32;
+    ret opt[context.Area].none{};
+}
+
+# whether two times are the same up to rounding
+#[testing]
+fun near(a: f64, b: f64) bool {
+    ret a - b < 0.000001 && b - a < 0.000001;
+}
+
+# the top of the first text line drawn whose text is s, or -1
+#[testing]
+fun line_y(ctx: *context.Context, s: str) f32 {
+    val b: opt[context.Area] = line(ctx, s);
+    if (sel b.none) { ret 0.0::f32 - 1.0::f32; }
+    ret b.some.y0;
 }
 
 test toast__stacks_fades_and_goes_idle {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
-    var t: Toasts;
-    init(?t, ?a);
+    var p: Probe;
+    p.in = 0;
+    init(?p.t, ?a);
+    val t: *Toasts         = ?p.t;
     var d: drv.Driver;
-    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?t)::ptr);
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?p)::ptr);
     if (sel e.err) { ret 1; }
 
     # nothing posted: nothing drawn and nothing pending
@@ -260,9 +431,9 @@ test toast__stacks_fades_and_goes_idle {
     val none: opt[f64] = context.next_frame(?d.ctx);
     if (!sel none.none) { ret 2; }
 
-    val p1: err[allo.Error] = post(?t, "saved", 1.0);
-    val p2: err[allo.Error] = post(?t, "exported", 1.0);
-    if ((sel p1.err) || (sel p2.err) || count(?t) != 2) { ret 3; }
+    val p1: err[allo.Error] = post(t, "saved", 1.0);
+    val p2: err[allo.Error] = post(t, "exported", 1.0);
+    if ((sel p1.err) || (sel p2.err) || count(t) != 2) { ret 3; }
     drv.steps(?d, 3);
 
     # stacked up from the corner, the newest at the bottom, fading in
@@ -283,10 +454,98 @@ test toast__stacks_fades_and_goes_idle {
     # gone once their time is up, and the interface idle again
     drv.steps(?d, 60);
     val idle: opt[f64] = context.next_frame(?d.ctx);
-    if (count(?t) != 0 || line_y(?d.ctx, "saved") >= 0.0::f32) { ret 7; }
-    if (!sel idle.none)                                        { ret 8; }
+    if (count(t) != 0 || line_y(?d.ctx, "saved") >= 0.0::f32) { ret 7; }
+    if (!sel idle.none)                                       { ret 8; }
 
-    val ft: err[allo.Error] = free(?t);
+    val ft: err[allo.Error] = free(t);
+    if (sel ft.err) { ret 1; }
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test toast__replaces_and_withdraws_by_key {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    p.in = 0;
+    init(?p.t, ?a);
+    val t: *Toasts         = ?p.t;
+    var d: drv.Driver;
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?p)::ptr);
+    if (sel e.err) { ret 1; }
+
+    # a keyed status under an unkeyed toast, both up at full; the key and
+    # text are copied, so the caller's buffer can change after the post
+    var buf: [8]u8;
+    buf[0] = 0x73;
+    buf[1] = 0x74;
+    buf[2] = 0x61;
+    buf[3] = 0x74;
+    buf[4] = 0x75;
+    buf[5] = 0x73;
+    buf[6] = 0;
+    val p1: err[allo.Error] = post_keyed(t, (?buf[0])::str, "identifying", 2.0);
+    buf[0] = 0x78;
+    val p2: err[allo.Error] = post(t, "saved", 2.0);
+    if ((sel p1.err) || (sel p2.err) || count(t) != 2) { ret 2; }
+    drv.steps(?d, 20);
+    val yi: f32 = line_y(?d.ctx, "identifying");
+    if (yi < 0.0::f32 || line_y(?d.ctx, "saved") <= yi) { ret 3; }
+
+    # posting under the key again replaces it in place, at full at once and
+    # shown for its new time from the frame that shows it
+    val p3: err[allo.Error] = post_keyed(t, "status", "a cat", 1.0);
+    if ((sel p3.err) || count(t) != 2) { ret 4; }
+    drv.step(?d);
+    if (line_y(?d.ctx, "identifying") >= 0.0::f32 || line_y(?d.ctx, "a cat") != yi) { ret 5; }
+    if (opacity(d.ctx.in.time - t.items[0].born, t.items[0].seconds) < 0.999::f32)  { ret 6; }
+    if (!near(t.items[0].born + t.items[0].seconds, d.ctx.in.time + 1.0))           { ret 6; }
+
+    # withdrawn, it fades out over FADE and goes, leaving the other
+    if (!withdraw(t, "status") || withdraw(t, "none")) { ret 7; }
+    drv.step(?d);
+    if (!near(t.items[0].born + t.items[0].seconds, d.ctx.in.time + FADE)) { ret 8; }
+    drv.steps(?d, 13);
+    if (count(t) != 1 || line_y(?d.ctx, "a cat") >= 0.0::f32 || line_y(?d.ctx, "saved") < 0.0::f32) { ret 9; }
+
+    # withdrawn before any frame shows it, it never shows
+    val p4: err[allo.Error] = post_keyed(t, "status", "never", 0.0);
+    if ((sel p4.err) || !withdraw(t, "status")) { ret 10; }
+    drv.step(?d);
+    if (count(t) != 1 || line_y(?d.ctx, "never") >= 0.0::f32) { ret 11; }
+
+    val ft: err[allo.Error] = free(t);
+    if (sel ft.err) { ret 1; }
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test toast__anchors_to_a_rect {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    p.in = 1;
+    init(?p.t, ?a);
+    var d: drv.Driver;
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?p)::ptr);
+    if (sel e.err) { ret 1; }
+
+    # in the rect's bottom right corner, kept off its edges by the margin
+    val pt: err[allo.Error] = post(?p.t, "saved", 0.0);
+    if (sel pt.err) { ret 1; }
+    drv.steps(?d, 3);
+    val got: opt[context.Area] = line(?d.ctx, "saved");
+    if (!sel got.some) { ret 2; }
+    val b: context.Area = got.some;
+    val m: theme.Edges  = context.px_edges(?d.ctx, context.look_of(?d.ctx, theme.TOAST).margin);
+    if (b.x0 < BOX.x0 || b.y0 < BOX.y0 || b.x1 > BOX.x1 - m.r || b.y1 > BOX.y1 - m.b) { ret 3; }
+    if (b.x1 < (BOX.x0 + BOX.x1) / 2.0::f32 || b.y0 < (BOX.y0 + BOX.y1) / 2.0::f32)   { ret 4; }
+
+    val ft: err[allo.Error] = free(?p.t);
     if (sel ft.err) { ret 1; }
     val freed: err[allo.Error] = drv.free(?d);
     if (sel freed.err) { ret 1; }

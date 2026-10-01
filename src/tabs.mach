@@ -43,6 +43,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -57,6 +58,7 @@ use blit.interact;
 use blit.layout;
 use blit.state;
 use blit.store;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 
@@ -149,6 +151,7 @@ pub rec Event {
 rec Geom {
     rh:    f32;
     pad:   f32;
+    sep:   f32;
     lh:    f32;
     x0:    f32;
     x1:    f32;
@@ -355,10 +358,19 @@ fun least(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
     ret minf(natural(ctx, g, t), g.pad * 2.0::f32 + g.lh * 2.0::f32 + close_w(g, t));
 }
 
-# a tab's width this frame
+# a tab's width this frame. a tab the bar has room for is exactly its natural
+# width: rebuilt through the shrink, least plus the rest times one, it can come
+# out a hair short and cut a label that fits.
 fun width(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    if (g.fit >= 1.0::f32) { ret natural(ctx, g, t); }
     val lo: f32 = least(ctx, g, t);
     ret lo + (natural(ctx, g, t) - lo) * g.fit;
+}
+
+# the room a tab takes on the strip this frame: its body and the separator
+# after it, which the body is drawn short of, so the body keeps its whole width
+fun room(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    ret width(ctx, g, t) + g.sep;
 }
 
 # the furthest the strip scrolls
@@ -371,14 +383,15 @@ fun measure(ctx: *context.Context, tabs: *Tab, n: usize) Geom {
     var g:  Geom;
     val ts: *theme.Style = context.look_of(ctx, theme.TAB);
     g.pad = context.px(ctx, ts.inset.l);
+    g.sep = context.px(ctx, ts.margin.r);
     g.lh  = context.line_height(ctx);
     g.rh  = maxf(context.px(ctx, ts.min_h), g.lh + context.px(ctx, ts.inset.t + ts.inset.b));
     var nat: f32   = 0.0::f32;
     var lo:  f32   = 0.0::f32;
     var i:   usize = 0;
     for (i < n) {
-        nat = nat + natural(ctx, ?g, ?tabs[i]);
-        lo  = lo + least(ctx, ?g, ?tabs[i]);
+        nat = nat + natural(ctx, ?g, ?tabs[i]) + g.sep;
+        lo  = lo + least(ctx, ?g, ?tabs[i]) + g.sep;
         i   = i + 1;
     }
     val r: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nat, g.rh);
@@ -399,7 +412,7 @@ fun measure(ctx: *context.Context, tabs: *Tab, n: usize) Geom {
     g.total = 0.0::f32;
     i       = 0;
     for (i < n) {
-        g.total = g.total + width(ctx, ?g, ?tabs[i]);
+        g.total = g.total + room(ctx, ?g, ?tabs[i]);
         i       = i + 1;
     }
     ret g;
@@ -410,7 +423,7 @@ fun reveal(ctx: *context.Context, g: *Geom, s: *State, tabs: *Tab, n: usize) {
     var x: f32   = 0.0::f32;
     var i: usize = 0;
     for (i < n) {
-        val w: f32 = width(ctx, g, ?tabs[i]);
+        val w: f32 = room(ctx, g, ?tabs[i]);
         if (i == s.index) {
             val view: f32 = g.x1 - g.x0;
             if (x < s.scroll)            { s.scroll = x; }
@@ -430,7 +443,7 @@ fun step(ctx: *context.Context, g: *Geom, s: *State, tabs: *Tab, n: usize, right
     var i:    usize = 0;
     val eps:  f32   = 0.5::f32;
     for (i < n) {
-        val w: f32 = width(ctx, g, ?tabs[i]);
+        val w: f32 = room(ctx, g, ?tabs[i]);
         if (right && x + w > s.scroll + view + eps) { ret x + w - view; }
         if (!right && x < s.scroll - eps)           { to = x; }
         x = x + w;
@@ -500,8 +513,10 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
         val os: u8           = theme.pick(h.hot, h.active, s.has != 0 && tabs[i].key == s.key, false);
         context.box(ctx, theme.OPTION, os, r.x0, r.y0, r.x1, r.y1);
         if (tabs[i].label != nil) {
-            val oin: f32 = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
-            context.text_at(ctx, tabs[i].label, r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, context.paint_of(ctx, theme.OPTION, os).text);
+            val oin: f32          = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
+            val oir: f32          = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.r);
+            val ob:  context.Area = context.Area{x0: r.x0 + oin, y0: r.y0, x1: r.x1 - oir, y1: r.y1};
+            rich_text.fit_box(ctx, theme.OPTION, tabs[i].label, str_len(tabs[i].label), r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, ob, context.paint_of(ctx, theme.OPTION, os).text);
         }
         if (h.clicked) {
             s.key    = tabs[i].key;
@@ -521,10 +536,9 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
 fun body(ctx: *context.Context, g: *Geom, t: *Tab, x0: f32, y0: f32, x1: f32, y1: f32, st: u8) {
     context.box(ctx, theme.TAB, st, x0, y0, x1, y1);
     if (t.label == nil) { ret; }
-    val ink: draw.Color = context.paint_of(ctx, theme.TAB, st).text;
-    context.push_clip(ctx, x0 + g.pad, y0, maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1);
-    context.text_at(ctx, t.label, x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, ink);
-    context.pop_clip(ctx);
+    val ink: draw.Color   = context.paint_of(ctx, theme.TAB, st).text;
+    val b:   context.Area = context.Area{x0: x0 + g.pad, y0: y0, x1: maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1: y1};
+    rich_text.fit_box(ctx, theme.TAB, t.label, str_len(t.label), x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, b, ink);
 }
 
 # a tab's close box at the right of its rect: two crossed strokes
@@ -579,7 +593,7 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
     var over:  interact.Hit;
     var slot:  usize          = n;
     var mark:  f32            = g.x0 + g.total - s.scroll;
-    val seps:  f32            = context.px(ctx, context.look_of(ctx, theme.TAB).margin.r);
+    val seps:  f32            = g.sep;
     var x:     f32            = g.x0 - s.scroll;
     var i:     usize          = 0;
     val grp:   interact.Group = interact.begin_group(ctx, id, interact.ROW);
@@ -588,7 +602,7 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
     for (i < n) {
         val t:  *Tab = ?tabs[i];
         val x0: f32  = x;
-        val x1: f32  = x + width(ctx, ?g, t);
+        val x1: f32  = x + room(ctx, ?g, t);
         x = x1;
         val tid: u64          = tab_id(id, t.key);
         val h:   interact.Hit = interact.hit(ctx, tid, x0, g.y0, x1 - seps, g.y1, input.BUTTON_LEFT | input.BUTTON_MIDDLE | interact.FOCUS);
@@ -746,6 +760,67 @@ fun keys(a: *App) u64 {
         i = i + 1;
     }
     ret k;
+}
+
+test bar__a_tab_with_room_is_drawn_its_whole_width {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: App;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?a, 6, 1600.0::f32)) { ret 1; }
+    a.tabs[1].closable = false;
+    a.tabs[4].closable = false;
+    driver.step(?d);
+    driver.step(?d);
+    val ts: *theme.Style = context.look_of(?d.ctx, theme.TAB);
+    var g:  Geom;
+    g.pad = context.px(?d.ctx, ts.inset.l);
+    g.sep = context.px(?d.ctx, ts.margin.r);
+    g.lh  = context.line_height(?d.ctx);
+    g.fit = 1.0::f32;
+    if (g.sep <= 0.0::f32) { ret 2; }
+    # each tab's drawn rect, short of its separator, is its whole natural width,
+    # so its label box is exactly its label
+    val bid: u64   = context.id_of(?d.ctx, "tabs");
+    var i:   usize = 0;
+    for (i < a.n) {
+        val r: opt[context.Area] = driver.rect(?d, tab_id(bid, a.tabs[i].key));
+        if (sel r.none)                                               { ret 3; }
+        if (r.some.x1 - r.some.x0 != natural(?d.ctx, ?g, ?a.tabs[i])) { ret 4; }
+        i = i + 1;
+    }
+    val f: err[allo.Error] = driver.free(?d);
+    if (sel f.err) { ret 1; }
+    ret 0;
+}
+
+test bar__unshrunk_tabs_are_their_natural_width {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: App;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?a, 8, 2000.0::f32)) { ret 1; }
+    a.tabs[1].closable = false;
+    a.tabs[4].closable = false;
+    var g: Geom;
+    g.fit = 1.0::f32;
+    g.lh  = context.line_height(?d.ctx);
+    # paddings that do not land on whole pixels, as a scaled theme gives
+    var k: u32 = 1;
+    for (k < 400) {
+        g.pad = k::f32 * 0.037::f32;
+        var i: usize = 0;
+        for (i < a.n) {
+            if (width(?d.ctx, ?g, ?a.tabs[i]) != natural(?d.ctx, ?g, ?a.tabs[i])) { ret 2; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    val f: err[allo.Error] = driver.free(?d);
+    if (sel f.err) { ret 1; }
+    ret 0;
 }
 
 test bar__selects_closes_and_reorders {

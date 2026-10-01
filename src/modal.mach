@@ -57,6 +57,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use rich_text: blit.text;
 use blit.theme;
 use blit.widget;
 
@@ -406,8 +407,9 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
         val ts: u8           = theme.pick(hx.hot, hx.active, false, false);
         val tp: *theme.Paint = context.paint_of(ctx, theme.WINDOW_TITLE, ts);
         context.box_face(ctx, theme.WINDOW_TITLE, ts, x0, y0, x1, y1, context.CORNERS_TOP, context.SIDES_ALL);
-        val ty: f32 = y0 + (th - context.line_height(ctx)) / 2.0::f32;
-        context.text_span(ctx, m.title, bid.shown(m.title), x0 + ti.l, ty, tp.text);
+        val ty: f32          = y0 + (th - context.line_height(ctx)) / 2.0::f32;
+        val tb: context.Area = context.Area{x0: x0 + ti.l, y0: y0, x1: x1 - close_w - ti.r, y1: y1};
+        rich_text.fit_box(ctx, theme.WINDOW_TITLE, m.title, bid.shown(m.title), x0 + ti.l, ty, tb, tp.text);
         if (closer) {
             var xc: draw.Color = tp.mark;
             if (hx.hot) { xc = tp.text; }

@@ -1,6 +1,6 @@
 [project]
 id      = "blit"
-version = "0.10.1"
+version = "0.11.0"
 mach    = "^6"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
@@ -9,7 +9,6 @@ out     = "out/{target.name}/{profile.name}"
 isa     = "x86_64"
 os      = "linux"
 abi     = "sysv64"
-default = true
 
 [target.windows-x86_64]
 isa = "x86_64"

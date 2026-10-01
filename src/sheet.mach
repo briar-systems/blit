@@ -7,7 +7,9 @@
 # popping it restores the theme exactly. one push writes every field its path
 # names, so "*.hot.fill" is one push and one pop. a class is a named list of
 # path and value settings, and pushing it is one push of all of them in
-# order, so a later setting wins over an earlier one for the same field.
+# order, so a later setting wins over an earlier one for the same field. a
+# write of a paint's fill writes its fill_to too (see theme.follower), and the
+# pop restores both.
 # classes are allocator-backed and a sheet grows them; a push the allocator
 # refuses writes nothing and reports it.
 
@@ -121,20 +123,28 @@ pub fun free(s: *Sheet) err[allo.Error] {
     ret first;
 }
 
-# write every field a path names and save what it replaced, without a mark
+# write every field a path names, each with the field that follows it (see
+# theme.follower), and save what they replaced, without a mark
 fun write(s: *Sheet, t: *th.Theme, p: th.Path, v: th.Value) bool {
     val n:    usize                  = th.span(t, p);
-    val room: res[usize, allo.Error] = vec.reserve[Saved](?s.saved, n);
+    val room: res[usize, allo.Error] = vec.reserve[Saved](?s.saved, n * 2);
     if (sel room.err) { ret false; }
     var i: usize = 0;
     for (i < n) {
         val r: th.Ref = th.ref_at(p, i);
-        s.saved.data[s.saved.len] = Saved{r: r, old: th.get(t, r)};
-        s.saved.len               = s.saved.len + 1;
-        th.put(t, r, v);
+        keep(s, t, r, v);
+        val f: opt[th.Ref] = th.follower(r);
+        if (sel f.some) { keep(s, t, f.some, v); }
         i = i + 1;
     }
     ret true;
+}
+
+# write one field and save what it replaced, its room reserved
+fun keep(s: *Sheet, t: *th.Theme, r: th.Ref, v: th.Value) {
+    s.saved.data[s.saved.len] = Saved{r: r, old: th.get(t, r)};
+    s.saved.len               = s.saved.len + 1;
+    th.put(t, r, v);
 }
 
 # open a push: one mark the next pop returns to
@@ -332,7 +342,9 @@ pub fun class_clear(s: *Sheet, id: u32) {
 #
 # each setting's path is resolved against the theme now, and a setting
 # naming no field of it, such as a kind the theme has not registered, is
-# skipped.
+# skipped. settings of fields that follow another (see theme.follower) are
+# written after the rest, so a class's fill_to wins over its fills wherever
+# it is listed.
 # ---
 # s:   sheet
 # t:   the theme it overrides
@@ -341,17 +353,22 @@ pub fun class_clear(s: *Sheet, id: u32) {
 pub fun push_class(s: *Sheet, t: *th.Theme, id: u32) bool {
     if (id::usize >= s.classes.len) { ret false; }
     if (!open(s))                   { ret false; }
-    val c: *Class = ?s.classes.data[id];
-    var i: usize  = 0;
-    for (i < c.sets.len) {
-        val p: opt[th.Path] = th.path(t, c.sets.data[i].text::str);
-        if (sel p.some) {
-            if (th.FIELDS[p.some.field].unit == c.sets.data[i].unit && !write(s, t, p.some, c.sets.data[i].v)) {
-                pop(s, t);
-                ret false;
+    val c:    *Class = ?s.classes.data[id];
+    var late: u8     = 0;
+    for (late < 2) {
+        var i: usize = 0;
+        for (i < c.sets.len) {
+            val p: opt[th.Path] = th.path(t, c.sets.data[i].text::str);
+            if (sel p.some) {
+                val fits: bool = th.FIELDS[p.some.field].unit == c.sets.data[i].unit;
+                if (fits && th.follows(th.ref_at(p.some, 0)) == (late == 1) && !write(s, t, p.some, c.sets.data[i].v)) {
+                    pop(s, t);
+                    ret false;
+                }
             }
+            i = i + 1;
         }
-        i = i + 1;
+        late = late + 1;
     }
     ret true;
 }

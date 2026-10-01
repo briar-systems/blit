@@ -210,6 +210,13 @@ blit.style.pop(?ctx);
 blit.style.pop(?ctx);
 ```
 
+A paint's `fill_to` follows its `fill`: every write of a fill through a path
+(a push, a class, `theme.set` and `set_path`, a TOML document) writes `fill_to`
+too, so a fill alone gives a flat face. Writing `fill_to` as well, in the same
+push, class or document in any order, or in a later push, gives the gradient,
+and a pop restores both. A save writes `fill_to` after `fill` whenever the two
+differ, so the gradient reads back.
+
 `push_color`, `push_length`, `push_radii`, `push_edges` and the untyped `push`
 refuse a path naming no field of their unit, and still open an empty push so
 every push pairs with its pop. A frame left with pushes open is restored at
@@ -319,7 +326,7 @@ shows.
 | `metrics.gap` | length | space between layout rows, cells and buttons in a row |
 | `metrics.pad` | length | container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content |
 | `metrics.inset` | length | control inset: between a control's edge and its text, and between a box and its label |
-| `metrics.handle_w` | length | slider handle width |
+| `metrics.handle_w` | length | slider handle width, 0 for none |
 | `metrics.bar_w` | length | scrollbar width |
 | `metrics.thumb_min` | length | shortest scrollbar thumb |
 | `metrics.corner` | length | corner radius of controls and containers, 0 for square |
@@ -346,8 +353,9 @@ shows.
 | `<kind>.shadow_x` | length | shadow offset right |
 | `<kind>.shadow_y` | length | shadow offset down |
 | `<kind>.shadow_blur` | length | how far the shadow fades out, 0 for a hard edge |
+| `<kind>.overflow` | factor | how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end |
 | `<kind>.<state>.fill` | color | the face, at its top when it is a gradient |
-| `<kind>.<state>.fill_to` | color | the face at its bottom: equal to fill for a flat face, else a vertical gradient |
+| `<kind>.<state>.fill_to` | color | the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat |
 | `<kind>.<state>.text` | color | text drawn on the face |
 | `<kind>.<state>.mark` | color | secondary ink: a glyph, a caret, a reading or a hint |
 | `<kind>.<state>.border` | color | the outline, transparent for none |
@@ -369,12 +377,12 @@ shows.
 | `toggle` | a toggle's switch track and label, on while set: pad between the row and the track |
 | `toggle_knob` | a toggle's knob, in the toggle's state: margin between the knob and the track |
 | `slider` | a slider's track: text the label, mark the reading |
-| `slider_handle` | a slider's handle: min_w its width |
+| `slider_handle` | a slider's handle: min_w its width, 0 for none |
 | `dropdown` | a dropdown's header, on while open |
 | `field` | a text field: mark the hint, focused while it holds the keyboard |
 | `field_caret` | a text field's caret and its composition underline: fill, min_w the width |
 | `field_select` | the highlight behind selected text: fill |
-| `section` | a collapsible section heading: mark the caret |
+| `section` | a collapsible section heading: mark the caret, min_w its size, 0 to follow the caption's ascent |
 | `scrollbar` | a scrollbar's track: min_w its width, margin.l between it and the content |
 | `scrollbar_thumb` | a scrollbar's thumb: min_h its least length |
 | `list` | a list's body |
@@ -392,7 +400,7 @@ shows.
 | `progress` | a progress bar's track and its text |
 | `progress_bar` | a progress bar's done part |
 | `separator` | a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule |
-| `tree_item` | a tree's row, on while selected: mark the caret |
+| `tree_item` | a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent |
 | `drop_target` | where a drag would drop: fill and border |
 | `drag_preview` | what a drag carries, drawn at the cursor |
 | `menu_bar` | a menu bar's background |
@@ -408,6 +416,7 @@ shows.
 | `checker` | the checkerboard alpha shows through: fill and mark its two cells |
 | `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
 | `focus_ring` | the ring around the control the keyboard reached: border and border_w its stroke, radius its corners |
+| `slider_fill` | a slider's fill from the track's start to the value, transparent unless a theme gives it a fill |
 
 | state | when |
 |---|---|
@@ -488,8 +497,9 @@ blit.widget.end_window(?ctx, w);
 - **The tree.** A split node divides its rect between two children along an
   axis by a ratio, and a leaf is a tab stack of windows. `root`, `split` (a
   new empty leaf on one side of a node, taking a share of it), `add` (dock a
-  window as a leaf's last tab), `remove` (float it again) and `node_of` build
-  and read it in code. A window is its title's id. The tree lives in the
+  window as a leaf's last tab), `insert` (dock it at an index in the leaf's
+  tab stack), `select` (bring a docked window to its leaf's front), `remove`
+  (float it again) and `node_of` build and read it in code. A window is its title's id. The tree lives in the
   state store, one small entry per space, node and docked window, so a layout
   of any size fits, and everything in it is pinned.
 - **Drawing.** `space(?ctx, key, area)` lays the tree out over the rect, in
@@ -507,6 +517,16 @@ blit.widget.end_window(?ctx, w);
   target floats there. A tab dragged onto another leaf's tab bar joins it. A
   leaf whose windows are all closed or not drawn gives its room to its
   sibling, and comes back when they do.
+- **A see-through centre.** `central(?ctx, sid)` makes the space's root its
+  central node, the leaf kept open for what the app draws beneath the space,
+  such as a 3D scene. Ask for it before splitting the root, and split it to
+  dock panels around it: it keeps its id, so it stays the centre. While it
+  holds no window it keeps its share of the space and never collapses, paints
+  no background, and the space claims no input over it, so a claim the app
+  registered beneath the space (earlier, in a lower band) takes the pointer
+  there. `central_area(?ctx, sid)` gives its rect once the space has drawn
+  this frame, none while a window is docked in it, which makes it an ordinary
+  leaf until the window leaves.
 - **Docking by drag.** A window's titlebar is a drag source of
   `widget.WINDOW_KIND` carrying its id. While it, or a docked window's tab, is
   dragged over a space, the space shows drop zones over the leaf under the
@@ -969,6 +989,9 @@ instead of `ox` and `pw`.
   true, then `end_section(?ctx, s)` whatever it is. Opening or closing, the
   rows show in a clip that grows or shrinks to the height they last took
   whole, over the theme's `MOTION_OPEN`, and the layout below follows it.
+  The caret is as tall as the caption's ascent in the current text style,
+  whatever the line height, or the section style's `min_w` when it sets one
+  (`section.min_w`).
 - **Buttons.** `button` spans the column, `buttons(?ctx, ?labels[0], n)` is a
   row of n, and `button_grid(?ctx, ?labels[0], n, cols, on)` wraps them cols
   to a row with button `on` drawn chosen. Both return the index clicked, or n.
@@ -977,7 +1000,9 @@ instead of `ox` and `pw`.
   `checkbox` a box beside its label.
 - **Sliders.** `slider(?ctx, label, reading, ?v, lo, hi)` shows the caller's
   formatted `reading` of the value beside its label, and `slider_f` is the
-  same without one.
+  same without one. A theme fills the track up to the value through
+  `slider_fill`, clear in the built-in themes, and a `slider_handle.min_w` of
+  0 leaves the handle out for a fill alone.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
 - **Lists.** `blit.list.show(?ctx, key, ?l, rows, h)` is a scrolling list `h`
@@ -1299,6 +1324,17 @@ its state where it wants to.
 
 `blit.menu` draws a menu bar, the menus it drops, submenus and context menus.
 A bar is the next item of the current layout frame, one row high across it.
+A main bar (`begin_main_bar`, closed by the same `end_bar`) instead takes its
+row off the top of the free area, as a docked container does, so a dock space
+placed from `blit.context.free_area` after it starts below it:
+
+```mach
+var bar: blit.menu.Menu = blit.menu.begin_main_bar(?ctx, "main");
+...
+blit.menu.end_bar(?ctx, ?bar);
+blit.dock.space(?ctx, "work", blit.context.free_area(?ctx));
+```
+
 Each menu's body runs every frame, open or not, so its items answer their
 shortcuts while it is closed:
 
@@ -1447,25 +1483,41 @@ o.keep = 1;
   through, which nests by multiplying. A consumer span is drawn by the
   consumer and is not faded.
 
-`blit.toast` stacks timed notifications at an anchor of the surface:
+`blit.toast` stacks timed notifications at an anchor of the surface or of
+any rect:
 
 ```mach
 var toasts: blit.toast.Toasts;
 blit.toast.init(?toasts, ?a);                     # once
 val posted: err[allo.Error] = blit.toast.post(?toasts, "saved", 0.0); # anywhere: 0 for SECONDS
+val st: err[allo.Error] = blit.toast.post_keyed(?toasts, "status", "identifying...", 0.0); # one card per key
+val re: err[allo.Error] = blit.toast.post_keyed(?toasts, "status", "a cat", 2.0); # the same card, new text
+val held: bool = blit.toast.withdraw(?toasts, "status"); # take it down early
 blit.toast.show(?ctx, "toasts", ?toasts, blit.overlay.BOTTOM_RIGHT); # per frame
+blit.toast.show_in(?ctx, "toasts", ?toasts, viewport, blit.overlay.TOP_RIGHT); # or inside a rect
 ```
 
 - **Life.** A toast's clock starts the first frame `show` draws it. It fades
   in over its first `FADE` seconds and out over its last, and is dropped once
-  its time is up. `post` copies the text into storage the `Toasts` owns, and
-  `free` releases it.
+  its time is up. `post` copies the text into storage the `Toasts` owns, so a
+  transient buffer will do, and `free` releases it.
+- **Keys.** `post_keyed` names a toast by a key, copied like the text.
+  Posting under a key the stack holds replaces that toast in place: it keeps
+  its place in the stack, takes the new text and time, and its clock starts
+  over at the next show without fading in again if it was on screen.
+  `withdraw` takes a keyed toast down before its time is up, fading it out
+  over `FADE` from the next show, or dropping it unseen if no frame showed it
+  yet, and returns whether the stack held the key.
 - **Stack.** The cards stack away from the anchor's edge, up from a bottom
   anchor and down from any other, the newest nearest the anchor, lined up on
-  its side and kept off the edges by twice the theme's padding.
+  its side and kept off the edges by the `toast` style's margin. `show`
+  anchors to the surface, `show_in` to a rect in local pixels, such as a
+  viewport beside a docked panel, the stack inside it as `show`'s is inside
+  the surface.
 - **Frames.** `show` asks for frames only while a toast fades, and otherwise
   for the moment the next one starts to fade out, so once they are gone
-  `next_frame` is `none` again.
+  `next_frame` is `none` again. A post or withdraw between frames asks for
+  the next one with `blit.context.redraw`.
 
 `blit.tooltip` shows an overlay over a widget once the pointer has rested on
 it, named by id after the widget is drawn:
