@@ -507,6 +507,16 @@ blit.widget.end_window(?ctx, w);
   target floats there. A tab dragged onto another leaf's tab bar joins it. A
   leaf whose windows are all closed or not drawn gives its room to its
   sibling, and comes back when they do.
+- **A see-through centre.** `central(?ctx, sid)` makes the space's root its
+  central node, the leaf kept open for what the app draws beneath the space,
+  such as a 3D scene. Ask for it before splitting the root, and split it to
+  dock panels around it: it keeps its id, so it stays the centre. While it
+  holds no window it keeps its share of the space and never collapses, paints
+  no background, and the space claims no input over it, so a claim the app
+  registered beneath the space (earlier, in a lower band) takes the pointer
+  there. `central_area(?ctx, sid)` gives its rect once the space has drawn
+  this frame, none while a window is docked in it, which makes it an ordinary
+  leaf until the window leaves.
 - **Docking by drag.** A window's titlebar is a drag source of
   `widget.WINDOW_KIND` carrying its id. While it, or a docked window's tab, is
   dragged over a space, the space shows drop zones over the leaf under the

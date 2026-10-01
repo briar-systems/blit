@@ -42,6 +42,15 @@
 # edge whose root holds the panel's own content, which other windows dock
 # beside or tab with like any leaf.
 #
+# a space can keep one leaf open for what the app draws beneath it, such as
+# a 3d scene: its central node (see central). the central node stays laid out
+# at its share while it holds no window, where an ordinary leaf gives its room
+# away, and it never collapses. while empty it paints no background and the
+# space claims no input over it, so the app's own pixels show through and a
+# claim the app made beneath the space takes the pointer there. central_area
+# says where it lies. a window docked into it makes it an ordinary leaf until
+# the window leaves.
+#
 # the chrome draws its colours and lengths through look alone, the one place
 # a style system maps the dock's look from the theme.
 
@@ -113,11 +122,13 @@ val LAST: f64 = 1.0e9;
 # what a dock space keeps in the store under its id
 # ---
 # root:     the root node, 0 before the first is made
+# central:  the central node, 0 while it has none (see central)
 # next:     node ids handed out so far
 # suppress: the MOD_* bits that, held, keep a drag from docking
 # custom:   1 once set_suppress chose them, else SUPPRESS applies
 pub rec SpaceState {
     root:     u64;
+    central:  u64;
     next:     u64;
     suppress: u8;
     custom:   u8;
@@ -135,7 +146,9 @@ pub rec SpaceState {
 # axis:   AXIS_X or AXIS_Y
 # ratio:  a's share of the split
 # front:  a leaf's selected window, 0 for none
-# live:   1 when it holds a window drawn this frame or the last
+# live:   1 when it holds a window drawn this frame or the last, or is the
+#         space's central node
+# open:   1 when it is the space's central node and holds no live window
 # laid:   the stamp it was last laid out in
 # mw:     least width it can take
 # mh:     least height it can take
@@ -153,6 +166,7 @@ pub rec Node {
     ratio:  f32;
     front:  u64;
     live:   u8;
+    open:   u8;
     laid:   u64;
     mw:     f32;
     mh:     f32;
@@ -325,6 +339,46 @@ pub fun root(ctx: *context.Context, space: u64) u64 {
     ret sp.root;
 }
 
+# the central node of a dock space: the leaf kept open for what the app draws
+# beneath the space, made from the root the first time it is asked for
+#
+# ask for it before splitting the root, and split it to dock panels around
+# it: it keeps its id through every split, so it stays the centre. while it
+# holds no live window it keeps its share of the space, paints no background
+# and takes no input (see central_area). a saved layout keeps it (see
+# persist).
+# ---
+# ctx:   context
+# space: the space's id, its key's id (see context.id_of)
+# ret:   the central node's id, 0 when the space has none and its root is
+#        already split
+pub fun central(ctx: *context.Context, space: u64) u64 {
+    val sp: *SpaceState = space_of(ctx, space);
+    if (sp.central != 0 && node(ctx, sp.central) != nil) { ret sp.central; }
+    sp.central = 0;
+    val r: u64 = root(ctx, space);
+    if (node(ctx, r).a != 0) { ret 0; }
+    sp.central = r;
+    context.redraw(ctx);
+    ret r;
+}
+
+# where a space's empty central node lies this frame, for the app to draw
+# into and centre on
+# ---
+# ctx:   context
+# space: the space's id
+# ret:   the central node's rect in screen pixels once the space has drawn
+#        this frame, none when it has no central node, was not laid out this
+#        frame or holds a live window
+pub fun central_area(ctx: *context.Context, space: u64) opt[context.Area] {
+    val sp: *SpaceState = state.find[SpaceState](ctx, space);
+    if (sp == nil) { ret opt[context.Area].none{}; }
+    val n: *Node = node(ctx, sp.central);
+    if (n == nil || n.open == 0 || n.laid != widget.dock_stamp(ctx)) { ret opt[context.Area].none{}; }
+    ret opt[context.Area].some{context.Area{x0: n.x0, y0: n.y0, x1: n.x1, y1: n.y1}};
+}
+
 # put node to where old stood: its parent's child, or the space's root
 fun replace(ctx: *context.Context, old: u64, to: u64) {
     val o: *Node = node(ctx, old);
@@ -402,10 +456,11 @@ fun held(ctx: *context.Context, id: u64, skip: u64) usize {
 
 # take an empty leaf out of the tree, its sibling taking its parent's place
 #
-# the root stays, as an empty leaf.
+# the root and the central node stay, as empty leaves.
 fun collapse(ctx: *context.Context, id: u64) {
     val n: *Node = node(ctx, id);
-    if (n == nil) { ret; }
+    if (n == nil)                             { ret; }
+    if (space_of(ctx, n.space).central == id) { ret; }
     val p: *Node = node(ctx, n.parent);
     if (p == nil) { ret; }
     val pid: u64 = n.parent;
@@ -677,6 +732,11 @@ fun measure(ctx: *context.Context, p: *Pass, id: u64) {
                 n.mh   = maxf(n.mh, p.m[i].dk.min_h);
             }
             i = i + 1;
+        }
+        n.open = 0;
+        if (n.live == 0 && id == p.sp.central) {
+            n.live = 1;
+            n.open = 1;
         }
         ret;
     }
@@ -1108,18 +1168,73 @@ fun draw_space(ctx: *context.Context, sid: u64, a: context.Area) {
     val rid: u64 = root(ctx, sid);
 
     context.push_band(ctx, band.DOCKED, 0);
-    context.box(ctx, p.lk.space, theme.NORMAL, a.x0, a.y0, a.x1, a.y1);
-    val bg: interact.Hit = interact.hit(ctx, 0, a.x0, a.y0, a.x1, a.y1, 0);
-    if (!members(ctx, ?p)) {
+    # with a central node the background goes beneath the layout once the
+    # node's rect is known, its claims reserved below all the layout claims;
+    # without one it is painted and claimed whole, first
+    val hole: bool = node(ctx, p.sp.central) != nil;
+    var bg:   Ground;
+    var ch:   context.Channels;
+    if (hole) {
+        var i: usize = 0;
+        for (i < 4) {
+            bg.claims[i] = context.reserve_claim(ctx, 0);
+            i            = i + 1;
+        }
+        ch = context.split(ctx, 2);
+        context.set_channel(ctx, ch, 1);
+    }
+    or {
+        context.box(ctx, p.lk.space, theme.NORMAL, a.x0, a.y0, a.x1, a.y1);
+        interact.hit(ctx, 0, a.x0, a.y0, a.x1, a.y1, 0);
+    }
+    val ok: bool = members(ctx, ?p);
+    if (ok) {
+        measure(ctx, ?p, rid);
+        lay(ctx, ?p, rid, a.x0, a.y0, a.x1, a.y1);
+    }
+    if (hole) {
+        context.set_channel(ctx, ch, 0);
+        ground(ctx, ?p, ?bg, a);
+        context.merge(ctx, ch);
+    }
+    if (!ok) {
         ctx.oom = 1;
         context.pop_band(ctx);
         ret;
     }
-    measure(ctx, ?p, rid);
-    lay(ctx, ?p, rid, a.x0, a.y0, a.x1, a.y1);
     zones(ctx, ?p, rid);
     context.pop_band(ctx);
     apply(ctx, ?p);
+}
+
+# the claims a space's background takes, one for each band around the
+# central node's rect
+rec Ground {
+    claims: [4]usize;
+}
+
+# paint a space's background and fill its claims: around the central node
+# while it is open, over the whole space otherwise
+fun ground(ctx: *context.Context, p: *Pass, g: *Ground, a: context.Area) {
+    var r: [4]context.Area;
+    r[0] = a;
+    r[1] = context.Area{x0: a.x0, y0: a.y0, x1: a.x0, y1: a.y0};
+    r[2] = r[1];
+    r[3] = r[1];
+    val c: *Node = node(ctx, p.sp.central);
+    if (c != nil && c.open != 0 && c.laid == p.stamp) {
+        r[0] = context.Area{x0: a.x0, y0: a.y0, x1: a.x1, y1: c.y0};
+        r[1] = context.Area{x0: a.x0, y0: c.y1, x1: a.x1, y1: a.y1};
+        r[2] = context.Area{x0: a.x0, y0: c.y0, x1: c.x0, y1: c.y1};
+        r[3] = context.Area{x0: c.x1, y0: c.y0, x1: a.x1, y1: c.y1};
+    }
+    var i: usize = 0;
+    for (i < 4) {
+        val b: context.Area = r[i];
+        if (b.x1 > b.x0 && b.y1 > b.y0) { context.box(ctx, p.lk.space, theme.NORMAL, b.x0, b.y0, b.x1, b.y1); }
+        context.fill_claim(ctx, g.claims[i], b.x0, b.y0, b.x1, b.y1);
+        i = i + 1;
+    }
 }
 
 # draw a dock space filling a rect, once a frame, before its windows
@@ -1265,12 +1380,14 @@ fun get_id(t: *toml.Table, key: str) u64 {
 
 fun space_save(sp: *SpaceState, w: *state.Writer) {
     put_id(w, "root", sp.root);
+    put_id(w, "central", sp.central);
     state.put_int(w, "next", sp.next:~i64);
 }
 
 fun space_load(sp: *SpaceState, t: *toml.Table) {
-    sp.root = get_id(t, "root");
-    sp.next = get_id(t, "next");
+    sp.root    = get_id(t, "root");
+    sp.central = get_id(t, "central");
+    sp.next    = get_id(t, "next");
 }
 
 fun node_save(n: *Node, w: *state.Writer) {
@@ -1606,6 +1723,147 @@ test space__layout_saves_and_loads {
     if (sel f1.err) { ret 1; }
     val f2: err[allo.Error] = driver.free(?e);
     if (sel f2.err) { ret 1; }
+    ret 0;
+}
+
+# a space with a central node and a panel docked left of it, over a claim
+# the app makes beneath the space, as a 3d scene's camera would
+# ---
+# wins:  the panel P and a window Q
+# sid:   the space's id
+# mid:   its central node
+# area:  the central node's area as the frame saw it, after the space
+# built: the panel was docked
+# dock:  true to dock Q into the central node
+#[testing]
+rec Hole {
+    wins:  [2]widget.Window;
+    sid:   u64;
+    mid:   u64;
+    area:  opt[context.Area];
+    built: bool;
+    dock:  bool;
+}
+
+#[testing]
+fun hole_ui(ctx: *context.Context, user: ptr) {
+    val hp: *Hole = user::*Hole;
+    interact.hit(ctx, context.id_of(ctx, "scene"), 0.0::f32, 0.0::f32, 400.0::f32, 300.0::f32, input.BUTTON_LEFT);
+    val sid: u64 = context.id_of(ctx, "main");
+    hp.mid = central(ctx, sid);
+    if (!hp.built) {
+        add(ctx, split(ctx, hp.mid, context.Side.left{}, 0.25::f32), context.id_of(ctx, "P"));
+        hp.built = true;
+    }
+    if (hp.dock) {
+        add(ctx, hp.mid, context.id_of(ctx, "Q"));
+        hp.dock = false;
+    }
+    hp.sid  = space(ctx, "main", context.Area{x0: 0.0::f32, y0: 0.0::f32, x1: 400.0::f32, y1: 300.0::f32});
+    hp.area = central_area(ctx, hp.sid);
+    var i: usize = 0;
+    for (i < 2) {
+        val w: widget.WindowArea = widget.begin_window(ctx, hp.wins[i]);
+        if (w.body != 0) { widget.button(ctx, "b"); }
+        widget.end_window(ctx, w);
+        i = i + 1;
+    }
+}
+
+# whether the last frame painted anything in the docked band over a point
+#[testing]
+fun docked_paint_at(d: *driver.Driver, x: f32, y: f32) bool {
+    val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    val ix: *u32       = context.draw_indices(?d.ctx);
+    var i:  usize      = 0;
+    for (i < context.run_count(?d.ctx)) {
+        val r: context.Run = context.run_at(?d.ctx, i);
+        i = i + 1;
+        if (r.kind == context.RUN_CUSTOM || (r.layer >> band.SLOT_BITS) != band.DOCKED) { cnt; }
+        var k: usize = r.start;
+        for (k + 3 <= r.start + r.count) {
+            val a: draw.Vert = vs[ix[k]];
+            val b: draw.Vert = vs[ix[k + 1]];
+            val c: draw.Vert = vs[ix[k + 2]];
+            k = k + 3;
+            if (x < minf(a.x, minf(b.x, c.x)) || x > maxf(a.x, maxf(b.x, c.x))) { cnt; }
+            if (y < minf(a.y, minf(b.y, c.y)) || y > maxf(a.y, maxf(b.y, c.y))) { cnt; }
+            ret true;
+        }
+    }
+    ret false;
+}
+
+test space__central_node_lets_the_app_beneath_show_through {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var hp: Hole;
+    hp.wins[0] = widget.window("P", 20.0::f32, 20.0::f32, 120.0::f32, 100.0::f32);
+    hp.wins[1] = widget.window("Q", 320.0::f32, 220.0::f32, 60.0::f32, 60.0::f32);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?al, 400.0::f32, 300.0::f32, hole_ui, (?hp)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+    val scene: u64 = win(?d, "scene");
+    val p:     u64 = win(?d, "P");
+    val q:     u64 = win(?d, "Q");
+
+    # the empty central node keeps its share beside the panel docked left of it
+    if (hp.mid == 0 || central(?d.ctx, hp.sid) != hp.mid) { ret 2; }
+    val lp: u64 = node_of(?d.ctx, p);
+    if (lp == 0 || node(?d.ctx, lp).parent != node(?d.ctx, hp.mid).parent) { ret 3; }
+    if (left_of(?d, "P/b") != 0.0::f32)                                    { ret 4; }
+    val ca: opt[context.Area] = hp.area;
+    if (sel ca.none)                                          { ret 5; }
+    if (ca.some.x0 < 98.0::f32 || ca.some.x0 > 106.0::f32)    { ret 6; }
+    if (ca.some.x1 != 400.0::f32 || ca.some.y1 != 300.0::f32) { ret 7; }
+
+    # nothing of the dock is painted inside it, and the panel is
+    if (docked_paint_at(?d, 250.0::f32, 150.0::f32)) { ret 8; }
+    if (!docked_paint_at(?d, 50.0::f32, 150.0::f32)) { ret 9; }
+
+    # the app's claim beneath the space is hot there, and not over the panel
+    # or the splitter, which still take the pointer
+    driver.move(?d, 250.0::f32, 150.0::f32);
+    driver.step(?d);
+    if (!driver.hot(?d, scene) || driver.at(?d, 250.0::f32, 150.0::f32) != scene) { ret 10; }
+    driver.move(?d, 50.0::f32, 150.0::f32);
+    driver.step(?d);
+    if (driver.hot(?d, scene) || driver.at(?d, 50.0::f32, 150.0::f32) == scene) { ret 11; }
+    val cut: f32 = (ca.some.x0 + node(?d.ctx, lp).x1) / 2.0::f32;
+    if (driver.at(?d, cut, 150.0::f32) != splitter(node(?d.ctx, hp.mid).parent)) { ret 12; }
+
+    # a window docked into it makes it an ordinary leaf, painted and claimed
+    hp.dock = true;
+    driver.steps(?d, 2);
+    if (node_of(?d.ctx, q) != hp.mid) { ret 13; }
+    val docked: opt[context.Area] = hp.area;
+    if (sel docked.some)                                { ret 14; }
+    if (!docked_paint_at(?d, 250.0::f32, 150.0::f32))   { ret 15; }
+    if (driver.at(?d, 250.0::f32, 150.0::f32) == scene) { ret 16; }
+
+    # undocking its last window leaves it in place, see-through again
+    remove(?d.ctx, q);
+    driver.steps(?d, 2);
+    if (node(?d.ctx, hp.mid) == nil || central(?d.ctx, hp.sid) != hp.mid) { ret 17; }
+    val again: opt[context.Area] = hp.area;
+    if (sel again.none)                              { ret 18; }
+    if (docked_paint_at(?d, 250.0::f32, 150.0::f32)) { ret 19; }
+    driver.move(?d, 250.0::f32, 150.0::f32);
+    driver.step(?d);
+    if (!driver.hot(?d, scene)) { ret 20; }
+
+    # and with the panel gone too, it takes the whole space
+    remove(?d.ctx, p);
+    driver.steps(?d, 2);
+    val whole: opt[context.Area] = hp.area;
+    if (sel whole.none)                                           { ret 21; }
+    if (whole.some.x0 != 0.0::f32 || whole.some.x1 != 400.0::f32) { ret 21; }
+    if (docked_paint_at(?d, 50.0::f32, 150.0::f32))               { ret 22; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
 
