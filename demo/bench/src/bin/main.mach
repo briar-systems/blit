@@ -142,10 +142,9 @@ fun rows(ctx: *blit.context.Context, s: *State) {
 
 # a line chart of SAMPLES values filling the screen
 fun chart(ctx: *blit.context.Context, s: *State) {
-    var series: blit.chart.Series;
-    series.values = s.samples;
-    series.fill   = 1;
-    blit.chart.line(ctx, 20.0::f32, 20.0::f32, 1240.0::f32, 760.0::f32, ?series, 1, SAMPLES, blit.chart.options());
+    var series: blit.chart.Series = blit.chart.series(blit.chart.f32s(s.samples), SAMPLES);
+    series.fill = 1;
+    blit.chart.line(ctx, 20.0::f32, 20.0::f32, 1240.0::f32, 760.0::f32, ?series, 1, blit.chart.options());
 }
 
 # overlapping windows, each a section holding a scroll region of controls
