@@ -109,14 +109,14 @@ blit.context.set_scale(?ctx, 2.0::f32);
 
 ## Docked containers
 
-Alongside floating windows, `blit.widget.begin_dock`/`end_dock` attach a panel
-to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
+Alongside floating windows, `blit.widget.begin_dock(?ctx, key, ?d)`/`end_dock`
+attach a panel to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
 takes a strip from the frame's free area, so docks opened in turn stack inward,
 and `blit.context.free_area` reports what they leave for the rest of the screen,
 such as a world view. Call docks at the root.
 
-A dock's body is a scroll region. `blit.widget.begin_scroll`/`end_scroll` open
-one at the layout cursor on its own: its column is clipped and scrolls by the
+A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
+open one at the layout cursor on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
@@ -137,8 +137,10 @@ and `MOD_SUPER` bits, and `blit.input.shortcut(mods)` is ctrl, or super as
 darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
 
 - **Focus.** One widget at a time holds the keyboard, by id across frames
-  (`blit.context.focus`, `focused`, `unfocus`). A press that lands anywhere
-  else takes it back, and so does a frame that does not draw the holder.
+  (`blit.context.focus`, `focused`, `unfocus`), so
+  `focus(?ctx, blit.context.id_of(?ctx, key))` hands it to a widget from code.
+  A press that lands anywhere else takes it back, and so does a frame that does
+  not draw the holder.
   `blit.context.typing(?ctx)` is true exactly while a widget holds it: read it
   before `begin` to keep the consumer's own key bindings quiet for the keys that
   frame will type into a field.
@@ -146,7 +148,7 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   `blit.context.copied(?ctx)` is text a copy or cut left for the consumer to put
   on the clipboard (nil when none), and `wants_paste(?ctx)` asks for the
   clipboard's text, which the consumer hands to the next frame as `in.paste`.
-- **Text field.** `blit.widget.text_field(?ctx, ?f, hint)` edits a
+- **Text field.** `blit.widget.text_field(?ctx, key, ?f, hint)` edits a
   `blit.field.Field`: UTF-8 in a buffer the consumer owns, with a caret, a
   selection, a maximum length in characters and a per-field filter.
   ```mach
@@ -154,7 +156,7 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   var name: blit.field.Field;
   blit.field.init(?name, ?buf[0], 64, 24, nil); # 24 characters, any printable
   # per frame, inside a panel:
-  val did: u8 = blit.widget.text_field(?ctx, ?name, "name");
+  val did: u8 = blit.widget.text_field(?ctx, "name", ?name, "name");
   if ((did & blit.field.ENTERED) != 0) { ... }
   ```
   A press on the field focuses it and puts the caret under the cursor. It takes
@@ -201,9 +203,7 @@ Coordinates compose one way:
 
 Every widget places itself at the layout cursor, spans the column, advances
 the cursor and emits only quads, so each one clips and scrolls like any
-geometry and works inside surfaces, docks and windows alike. A widget takes
-the same ids every frame whatever it shows, so later widgets keep their hit
-identity.
+geometry and works inside surfaces, docks and windows alike.
 
 - **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
   `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
@@ -225,7 +225,7 @@ identity.
   same without one.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
-- **Lists.** `list(?ctx, ?l, ?items[0], count, query, h)` is a scrolling list
+- **Lists.** `list(?ctx, key, ?l, ?items[0], count, query, h)` is a scrolling list
   `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
   none), and only the items holding `query`, ignoring ASCII case, are shown,
   so a search box the caller keeps narrows it.
@@ -236,9 +236,48 @@ sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
 a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
-draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
-opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
+draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
+x, y, w)`/`end_popup` opens an overlay column, and
+`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
 rect for consumer-drawn affordances.
+
+## Widget ids
+
+A widget's id is a 64-bit FNV-1a hash of its key folded into the seed of the
+current id scope, never its place in the call order. A widget drawn only some
+frames, a clipped row or a reordered window therefore moves no other widget's
+id, and the active drag, the focus holder and the open dropdown stay where they
+were. 0 is never an id: it means "no widget".
+
+- **Labels are keys.** A labelled widget (`button`, `checkbox`, `toggle`,
+  `slider`, `dropdown`, `section`, a window's title) is keyed by its label.
+  Text after `##` is hashed but not drawn, so `"Save##toolbar"` shows `Save`
+  and is a different widget from another `"Save"`. A label holding `###` is
+  keyed by the text from `###` on alone, so what it shows can change without
+  changing its id: `"Frames: 12###fps"` and `"Frames: 13###fps"` are one
+  widget. Widgets without a label (`text_field`, `region_clicked`, popups,
+  scroll regions, docks, lists and charts) take a key argument the same way.
+- **Scopes.** `blit.context.push_id_str(?ctx, s)` and `push_id_int(?ctx, n)`
+  open a scope and `pop_id(?ctx)` closes it, and a pop with no scope open is
+  ignored. Windows, open popups and scroll regions (so docks and lists too)
+  open their own scope for what they hold, so two windows can each hold a
+  button called `ok`. Repeated rows built from one label, such as buttons in a
+  loop, take `push_id_int` with their index. The stack grows from the
+  context's allocator.
+- **Parts.** A widget's internal parts (a window's title and collapse box, a
+  scrollbar thumb, a popup's outside claim, a dropdown's options, a list's
+  items) take ids derived from the widget's id with a fixed suffix or index.
+- **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
+  that label or key gets in the current scope, for `focus`, state lookups and
+  tests.
+- **Collisions.** Two claims with one id in a frame are recorded:
+  `blit.context.collisions(?ctx)` counts them after `end` and
+  `collision_at(?ctx, i)` names each repeated id, until the next `begin`.
+
+This is a breaking change from call-order ids: `blit.context.next_id` and
+`Context.seq` are gone, and `begin_popup`, `begin_scroll`, `begin_dock`,
+`list`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
+`sparkline` take a key argument after the context.
 
 ## Charts
 
@@ -251,11 +290,11 @@ var income: [64]f32;
 var series: [2]blit.chart.Series;
 series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
 series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, 64, blit.chart.options());
+val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, 64, blit.chart.options());
 if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
 
-blit.chart.bars(?ctx, x, y, w, h, ?net[0], count, blit.chart.options());
-blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
+blit.chart.bars(?ctx, "net", x, y, w, h, ?net[0], count, blit.chart.options());
+blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
 ```
 
 - **Line.** One or more series share x: sample `i` of every series sits at the
@@ -271,7 +310,7 @@ blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
   sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
   labels come from the glyph source, with k, M, G or T for large steps.
   `Options.axes = 0` gives the whole rect to the plot.
-- **Hover.** A chart takes one id in call order and claims its plot, so it
+- **Hover.** A chart takes its id from its key and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
   widget. A line reports the sample nearest the cursor and the series nearest it
   there, bars report the slot under the cursor, and both draw a read-out of the
