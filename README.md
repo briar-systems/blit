@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.textarea`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -477,7 +477,11 @@ were. 0 is never an id: it means "no widget".
   items) take ids derived from the widget's id with a fixed suffix or index.
 - **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
   that label or key gets in the current scope, for `focus`, state lookups and
-  tests.
+  tests. `blit.id.of_path(blit.id.ROOT, "Settings/Audio/volume")` names a
+  widget from outside its scopes: each segment is a container's label or key
+  (a window's title, a dock's, popup's, scroll region's or list's key, a
+  `push_id_str` key) and the last is the widget's. A key holding `/` cannot
+  be named by a path; use its id.
 - **Collisions.** Two claims with one id in a frame are recorded:
   `blit.context.collisions(?ctx)` counts them after `end` and
   `collision_at(?ctx, i)` names each repeated id, until the next `begin`.
@@ -752,6 +756,72 @@ cell. Colors and texels are premultiplied.
     kind that is not `RUN_TRIANGLES`
   - upload consumer textures premultiplied
 
+## Testing with the driver
+
+`blit.driver` runs an interface headless, the way blit's own tests do, so an
+app built on blit can test its interface. A `Driver` owns a context and an
+input, a screen size and a clock, and runs the interface through a callback
+between `begin` and `end`, one frame per `step`:
+
+```mach
+fun ui(ctx: *blit.context.Context, user: ptr) {
+    val app: *App = user::*App;
+    # ... widgets, as in a frame, without begin and end ...
+}
+
+var d: blit.driver.Driver;
+val made: err[allo.Error] = blit.driver.init(?d, ?a, 800.0::f32, 600.0::f32, ui, (?app)::ptr);
+blit.driver.step(?d);                               # lay out once
+val save: u64 = blit.driver.find(?d, "Settings/Save");
+blit.driver.click(?d, save);
+blit.driver.click(?d, blit.driver.find(?d, "Settings/name"));
+blit.driver.type_text(?d, "untitled");
+blit.driver.key(?d, blit.input.KEY_ENTER, 0);
+if (!str_equals(blit.driver.text_of(?d, save), "Save")) { ... }
+blit.driver.free(?d);
+```
+
+- **Finding.** `find(?d, path)` is the id a label path names from the root
+  (see Widget ids), `at(?d, x, y)` the widget a pointer there reaches and
+  `inside(?d, x0, y0, x1, y1)` the topmost widget drawn wholly inside a rect.
+  Any id works, `blit.context.id_of` and `blit.id.child` included.
+- **Acting.** `hover`, `click`, `double_click`, `right_click` and
+  `click_with(?d, id, button)` move the pointer onto the widget's centre in a
+  frame of their own, since input routes by the previous frame's claims, then
+  press and release a frame each. `drag(?d, id, x, y)` presses on the widget
+  and moves to the point in `DRAG_STEPS` held frames before releasing, and
+  `drag_onto(?d, id, target)` drops on another widget's centre. `scroll(?d,
+  id, dx, dy)` turns the wheels over a widget, `type_text(?d, s)` types text in
+  one frame, and `key(?d, code, mods)` presses a key in one frame and releases
+  it in the next. `move`, `leave`, `press` and `release` drive the pointer and
+  buttons by hand, a frame each, and a press or release is sent as a button
+  event at the pointer as well as in `down`. An action on a widget the last frame did not draw runs
+  nothing and returns false.
+- **Frames.** Each step carries the clock (`d.time`, advanced by `d.dt`, 1/60
+  s by default) and clears the frame's key events, wheel and paste, so input
+  set between steps lands in exactly one frame. `d.ctx` and `d.in` are the
+  context and input, free to read and set between steps.
+- **Queries** read the last frame: `drawn`, `rect` (the screen rect the widget
+  claimed, clipped, none when it was not visible), `hot`, `active` and
+  `focused`, and `text_in(?d, x0, y0, x1, y1)` and `text_of(?d, id)`, the
+  text drawn inside a rect or a widget's rect. Text lines whose box has its
+  centre inside are joined in drawing order: directly when one continues the
+  last on its row, by a space further along the row, by a newline otherwise.
+- **Snapshots.** `snapshot(?d)` is a stable text dump of the last frame's draw
+  list for golden comparison: the screen size, then each run with its kind,
+  texture, page, layer, filter and scissor. A consumer span adds its callback
+  id, data and rect, and any other run its triangle count, followed by its
+  geometry one shape a line. A flat-coloured, axis-aligned rect is a `quad`
+  (its corners' position and uv, then its colour), anything else a `tri` of
+  three vertices. Positions print to two decimals, uvs to four, colours as
+  the premultiplied 0 to 255 channels emitted.
+
+The driver's text (`text_in`, `text_of`, `snapshot`) stays valid until the
+next of those calls. The context underneath keeps per-widget rects from its
+claims (`blit.context.rect_of`, `widget_at`, `widget_in`) and, while
+`set_trace(?ctx, 1)` is on, every drawn line of text (`traced_count`,
+`traced_at`), off by default so an app's frames pay nothing for it.
+
 ## Build & test
 
 ```
@@ -771,7 +841,16 @@ mach build demo/harness
 demo/harness/out/linux-x86_64/debug/bin/harness
 ```
 
-`demo/panel/` builds and runs the same way.
+`demo/panel/` builds and runs the same way, driven by `blit.driver`. Its
+test compares the scripted panel's last frame with the golden snapshot
+`demo/panel/src/bin/panel.snap`, and `panel --snapshot` prints a new one when
+a change to the draw list is meant. `mach dep pull demo/panel` again after
+changing blit, since a demo builds against its pulled copy:
+
+```
+mach test demo/panel
+demo/panel/out/linux-x86_64/debug/bin/panel --snapshot > demo/panel/src/bin/panel.snap
+```
 
 ## Benchmark
 

@@ -28,6 +28,7 @@ fwd blit.text;
 fwd blit.widget;
 fwd blit.textarea;
 fwd blit.chart;
+fwd blit.driver;
 
 # blit library version
 pub val VERSION: str = "0.9.0";
