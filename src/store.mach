@@ -89,6 +89,8 @@ pub def LoadFun: fun(ptr, *toml.Table);
 # align: alignment of the state
 # save:  writes one entry
 # load:  reads one entry
+# keep:  1 to pin every entry a load reads, so it outlives frames that do not
+#        reach it, else 0
 pub rec Kind {
     kind:  u64;
     name:  str;
@@ -96,6 +98,7 @@ pub rec Kind {
     align: usize;
     save:  SaveFun;
     load:  LoadFun;
+    keep:  u8;
 }
 
 # why a registration did not complete
@@ -318,6 +321,24 @@ pub fun slot(s: *Store, id: u64, kind: u64, size: usize, align: usize) res[ptr, 
     ret r;
 }
 
+# drop the entry for (id, kind), releasing its state
+#
+# a pointer to its state is dangling from here on. dropping an entry that is
+# not there does nothing.
+# ---
+# s:    store
+# id:   widget id
+# kind: type id of the state
+# ret:  ok, or the allocator's refusal, with the entry gone either way
+pub fun drop(s: *Store, id: u64, kind: u64) err[allo.Error] {
+    val at: usize = find(s, id, kind);
+    if (at >= s.cap) { ret err[allo.Error].ok{}; }
+    val e: Entry           = s.slots[at];
+    val f: err[allo.Error] = allo.deallocate_raw(s.a, e.data, e.size, e.align);
+    remove(s, at);
+    ret f;
+}
+
 # the slot record for (id, kind), nil when there is none
 # ---
 # s:    store
@@ -401,6 +422,8 @@ fun kind_named(s: *Store, name: str) *Kind {
 }
 
 # register a kind for persistence, replacing its hooks when already registered
+#
+# replacing keeps the kind's keep as it was.
 # ---
 # s:   store
 # k:   the kind; its name must outlive the store
@@ -410,7 +433,9 @@ pub fun register(s: *Store, k: Kind) err[Error] {
     if (named != nil && named.kind != k.kind) { ret err[Error].err{Error.taken{}}; }
     val have: *Kind = kind_of(s, k.kind);
     if (have != nil) {
-        @have = k;
+        val keep: u8 = have.keep;
+        @have     = k;
+        have.keep = keep;
         ret err[Error].ok{};
     }
     if (s.kind_len >= s.kind_cap) {
@@ -510,6 +535,19 @@ fun put_key(w: *Writer, key: str) {
 fun put_assign(w: *Writer, key: str) {
     put_key(w, key);
     put_text(w, " = ");
+}
+
+# pin every entry a kind's loads read, or stop pinning them
+# ---
+# s:    store
+# kind: type id of a registered kind
+# on:   1 to pin, 0 to load entries unpinned
+# ret:  1 if the kind is registered, else 0
+pub fun keep(s: *Store, kind: u64, on: u8) u8 {
+    val k: *Kind = kind_of(s, kind);
+    if (k == nil) { ret 0; }
+    k.keep = on;
+    ret 1;
 }
 
 # write `key = v` into the entry being saved
@@ -637,6 +675,10 @@ fun load_kind(s: *Store, kd: *Kind, t: *toml.Table) err[toml.TomlError] {
         if (sel p.err) { ret err[toml.TomlError].err{toml.TomlError.alloc{p.err}}; }
         memory.raw_zero(p.ok, kd.size);
         kd.load(p.ok, ?v.data.table);
+        if (kd.keep != 0) {
+            val e: *Entry = entry(s, id.some, kd.kind);
+            if (e != nil) { e.pinned = 1; }
+        }
         i = i + 1;
     }
     ret err[toml.TomlError].ok{};
