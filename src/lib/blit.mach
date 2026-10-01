@@ -18,6 +18,7 @@ fwd blit.glyph;
 fwd blit.input;
 fwd blit.layout;
 fwd blit.hit;
+fwd blit.band;
 fwd blit.interact;
 fwd blit.id;
 fwd blit.field;
