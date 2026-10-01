@@ -1,0 +1,466 @@
+# a local benchmark of blit's per-frame cost
+#
+# builds a few representative interfaces headless, each with sRGB output off
+# and on, and prints a table of the median frame time over several timed
+# batches with its spread, the vertices and runs a frame emits and the
+# allocations it makes. build it in the release profile
+# for numbers worth comparing. it is never a CI job.
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.chrono.duration.Duration;
+use std.chrono.time;
+use std.math.float.cos_f32;
+use std.math.float.sin_f32;
+use std.print;
+use std.runtime;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# frames run before timing, so caches and buffers have settled
+val WARMUP: usize = 20;
+
+# a scene warms up for at least this long
+val WARM_BUDGET: Duration = 300000000;
+
+# timed batches a scene runs in each sRGB mode, the median is reported
+val BATCHES: usize = 21;
+
+# a batch runs for about this long
+val BATCH_BUDGET: Duration = 20000000;
+
+# and for at least this many frames
+val MIN_FRAMES: usize = 4;
+
+# rows in the list scene
+val ROWS: usize = 10000;
+
+# samples in the chart scene
+val SAMPLES: usize = 100000;
+
+# sections in the dense panel
+val SECTIONS: usize = 8;
+
+# windows in the windows scene
+val WINDOWS: usize = 6;
+
+# edges in the filled path scene
+val FILL_EDGES: usize = 10000;
+
+# edges in each of the path's circles
+val CIRCLE_EDGES: usize = 100;
+
+# an allocator that counts the calls it forwards to another
+# ---
+# inner:  the allocator doing the work
+# allocs: allocate and reallocate calls so far
+rec Counter {
+    inner:  *allo.Allocator;
+    allocs: u64;
+}
+
+fun count_allocate(self: ptr, size: usize, align: usize) opt[ptr] {
+    val c: *Counter = self::*Counter;
+    c.allocs = c.allocs + 1;
+    ret c.inner.fn_allocate(c.inner.ctx, size, align);
+}
+
+fun count_reallocate(self: ptr, p: ptr, old: usize, new: usize, align: usize) opt[ptr] {
+    val c: *Counter = self::*Counter;
+    c.allocs = c.allocs + 1;
+    ret c.inner.fn_reallocate(c.inner.ctx, p, old, new, align);
+}
+
+fun count_deallocate(self: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *Counter = self::*Counter;
+    ret c.inner.fn_deallocate(c.inner.ctx, p, size, align);
+}
+
+# the scenes' state, kept across frames
+# ---
+# dock:    the dense panel's dock
+# open:    which dense panel sections are open
+# toggles: the dense panel's toggles
+# checks:  the dense panel's checkboxes
+# values:  the dense panel's sliders
+# choices: the dense panel's segmented choices
+# list:    the list scene's list
+# rows:    ROWS item strings
+# samples: SAMPLES chart values
+# wins:    the windows scene's windows
+# scrolls: a scroll region in each window
+# wopen:   each window's section is open
+# shape:   the filled path scene's path
+rec State {
+    dock:    blit.dock.Dock;
+    open:    [8]u8;
+    toggles: [8]u8;
+    checks:  [8]u8;
+    values:  [8]f32;
+    choices: [8]usize;
+    list:    blit.list.List;
+    rows:    *str;
+    samples: *f32;
+    wins:    [6]blit.widget.Window;
+    scrolls: [6]blit.widget.Scroll;
+    wopen:   [6]u8;
+    shape:   blit.path.Path;
+}
+
+# a dock of eight open sections, each a full set of controls
+fun dense(ctx: *blit.context.Context, s: *State) {
+    var titles: [8]str;
+    titles[0] = "RUN";
+    titles[1] = "VIEW";
+    titles[2] = "FILES";
+    titles[3] = "LAYERS";
+    titles[4] = "BRUSH";
+    titles[5] = "EXPORT";
+    titles[6] = "DEBUG";
+    titles[7] = "ABOUT";
+    var acts: [3]str;
+    acts[0] = "Play";
+    acts[1] = "Step";
+    acts[2] = "Reset";
+    var modes: [4]str;
+    modes[0] = "Solid";
+    modes[1] = "Trails";
+    modes[2] = "Age";
+    modes[3] = "Heat";
+
+    val area: blit.dock.DockArea = blit.dock.begin_dock(ctx, "dock", ?s.dock);
+    var k:    usize              = 0;
+    for (k < SECTIONS) {
+        blit.context.push_id_int(ctx, k::u64);
+        if (blit.widget.section(ctx, titles[k], ?s.open[k])) {
+            blit.widget.text(ctx, "the quick brown fox jumps over the lazy dog");
+            blit.widget.buttons(ctx, ?acts[0], 3);
+            blit.widget.slider(ctx, "Speed", "30 gen/s", ?s.values[k], 0.0::f32, 1.0::f32);
+            blit.widget.toggle(ctx, "Uncapped", ?s.toggles[k]);
+            blit.widget.checkbox(ctx, "Grid lines", ?s.checks[k]);
+            blit.widget.segmented(ctx, ?modes[0], 4, ?s.choices[k]);
+            blit.widget.note(ctx, "a note long enough to wrap onto a second line in a docked panel");
+        }
+        blit.context.pop_id(ctx);
+        k = k + 1;
+    }
+    blit.dock.end_dock(ctx, ?s.dock, area);
+}
+
+# a panel holding a list of ROWS items
+fun rows(ctx: *blit.context.Context, s: *State) {
+    val b: blit.widget.Block = blit.widget.begin_panel(ctx, 8.0::f32, 8.0::f32, 400.0::f32);
+    blit.list.show(ctx, "rows", ?s.list, blit.list.rows(s.rows, ROWS), 700.0::f32);
+    blit.widget.end_panel(ctx, b);
+}
+
+# a line chart of SAMPLES values filling the screen
+fun chart(ctx: *blit.context.Context, s: *State) {
+    var series: blit.chart.Series = blit.chart.series(blit.chart.f32s(s.samples), SAMPLES);
+    series.fill = 1;
+    blit.chart.line(ctx, "samples", 20.0::f32, 20.0::f32, 1240.0::f32, 760.0::f32, ?series, 1, blit.chart.options());
+}
+
+# overlapping windows, each a section holding a scroll region of controls
+fun windows(ctx: *blit.context.Context, s: *State) {
+    var k: usize = 0;
+    for (k < WINDOWS) {
+        blit.context.push_id_int(ctx, k::u64);
+        val b: blit.widget.WindowArea = blit.widget.begin_window(ctx, s.wins[k]);
+        if (b.body != 0 && blit.widget.section(ctx, "contents", ?s.wopen[k])) {
+            val r: blit.widget.ScrollArea = blit.widget.begin_scroll(ctx, "scroll", ?s.scrolls[k], 200.0::f32);
+            var i: usize                  = 0;
+            for (i < 6) {
+                blit.context.push_id_int(ctx, i::u64);
+                blit.widget.text(ctx, "a row of window content");
+                blit.widget.button(ctx, "Apply");
+                blit.widget.slider_f(ctx, "level", ?s.values[i], 0.0::f32, 1.0::f32);
+                blit.context.pop_id(ctx);
+                i = i + 1;
+            }
+            blit.widget.end_scroll(ctx, ?s.scrolls[k], r);
+        }
+        blit.widget.end_window(ctx, b);
+        blit.context.pop_id(ctx);
+        k = k + 1;
+    }
+}
+
+# a path of FILL_EDGES edges filled, a grid of many-sided circles like a page
+# of glyph outlines
+fun shape(ctx: *blit.context.Context, s: *State) {
+    blit.context.fill_path(ctx, ?s.shape, blit.draw.rgba(0.8::f32, 0.8::f32, 0.8::f32, 1.0::f32));
+}
+
+# one frame of a scene on a 1280 by 800 screen, the cursor off it
+fun frame(ctx: *blit.context.Context, s: *State, scene: fun(*blit.context.Context, *State)) {
+    var in: blit.input.Input;
+    in.mx = -1.0::f32;
+    in.my = -1.0::f32;
+    blit.context.begin(ctx, in, 1280.0::f32, 800.0::f32);
+    scene(ctx, s);
+    blit.context.end(ctx);
+}
+
+# what timing a scene measured
+# ---
+# ns:     median nanoseconds a frame across the timed batches
+# spread: slowest batch minus fastest, in tenths of a percent of the median
+# verts:  vertices the last frame emitted
+# runs:   runs the last frame divided into
+# allocs: allocations a frame makes
+rec Result {
+    ns:     i64;
+    spread: i64;
+    verts:  usize;
+    runs:   usize;
+    allocs: u64;
+}
+
+# the batches of one scene, one set per sRGB mode
+# ---
+# ns:     nanoseconds a frame, one entry per batch
+# allocs: allocations over all the batches
+rec Batches {
+    ns:     [21]i64;
+    allocs: u64;
+}
+
+# run frames of a scene and return the mean nanoseconds a frame, or -1 if the clock fails
+fun batch(ctx: *blit.context.Context, s: *State, scene: fun(*blit.context.Context, *State), frames: usize) i64 {
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret -1; }
+    var i: usize = 0;
+    for (i < frames) {
+        frame(ctx, s, scene);
+        i = i + 1;
+    }
+    val e: time.Elapsed = time.elapsed(start.ok);
+    if (sel e.err) { ret -1; }
+    ret e.ok / frames::i64;
+}
+
+# sort a batch set ascending
+fun sort(v: *i64, n: usize) {
+    var i: usize = 1;
+    for (i < n) {
+        val x: i64   = v[i];
+        var j: usize = i;
+        for (j > 0 && v[j - 1] > x) {
+            v[j] = v[j - 1];
+            j    = j - 1;
+        }
+        v[j] = x;
+        i    = i + 1;
+    }
+}
+
+# reduce a batch set to its median and spread
+fun summarize(b: *Batches, frames: usize, ctx: *blit.context.Context, r: *Result) {
+    sort(?b.ns[0], BATCHES);
+    r.ns     = b.ns[BATCHES / 2];
+    r.spread = (b.ns[BATCHES - 1] - b.ns[0]) * 1000 / r.ns;
+    r.verts  = blit.context.draw_count(ctx);
+    r.runs   = blit.context.run_count(ctx);
+    r.allocs = b.allocs / (frames * BATCHES)::u64;
+}
+
+# time a scene with sRGB output off and on, batches interleaved so drift in the
+# machine's speed lands on both modes alike
+fun measure(ctx: *blit.context.Context, s: *State, c: *Counter, scene: fun(*blit.context.Context, *State), off: *Result, on: *Result) u8 {
+    var warm:  usize             = 0;
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret 1; }
+    var spent: Duration = 0;
+    for (warm < WARMUP || spent < WARM_BUDGET) {
+        blit.context.set_srgb(ctx, (warm % 2)::u8);
+        frame(ctx, s, scene);
+        warm = warm + 1;
+        val e: time.Elapsed = time.elapsed(start.ok);
+        if (sel e.err) { ret 1; }
+        spent = e.ok;
+    }
+
+    var frames: usize = (BATCH_BUDGET / (spent / warm::i64))::usize;
+    if (frames < MIN_FRAMES) { frames = MIN_FRAMES; }
+
+    var bs: [2]Batches;
+    var k:  usize = 0;
+    for (k < BATCHES) {
+        var m: usize = 0;
+        for (m < 2) {
+            blit.context.set_srgb(ctx, m::u8);
+            val before: u64 = c.allocs;
+            val ns:     i64 = batch(ctx, s, scene, frames);
+            if (ns < 0) { ret 1; }
+            bs[m].ns[k]  = ns;
+            bs[m].allocs = bs[m].allocs + (c.allocs - before);
+            m            = m + 1;
+        }
+        k = k + 1;
+    }
+    if (blit.context.ok(ctx) == 0) { ret 2; }
+    summarize(?bs[0], frames, ctx, off);
+    summarize(?bs[1], frames, ctx, on);
+    ret 0;
+}
+
+# print one row of the table
+fun row(name: str, srgb: u8, r: Result, base: i64) {
+    var mode: str = "off";
+    if (srgb != 0) { mode = "on"; }
+    val us:   i64 = r.ns / 1000;
+    val frac: i64 = (r.ns % 1000) / 100;
+    print.printf("{:<14} {:<5} {:8}.{} {:5}.{}% {:9} {:5} {:7}", name, mode, us, frac, r.spread / 10, r.spread % 10, r.verts, r.runs, r.allocs);
+    if (base > 0) {
+        var pct:  i64 = (r.ns - base) * 1000 / base;
+        var sign: str = "+";
+        if (pct < 0) {
+            sign = "-";
+            pct  = -pct;
+        }
+        print.printf("   {}{}.{}%", sign, pct / 10, pct % 10);
+    }
+    print.println("");
+}
+
+# time a scene with sRGB off and on and print both rows
+fun bench(ctx: *blit.context.Context, s: *State, c: *Counter, name: str, scene: fun(*blit.context.Context, *State)) u8 {
+    var off: Result;
+    var on:  Result;
+    val bad: u8 = measure(ctx, s, c, scene, ?off, ?on);
+    if (bad != 0) { ret bad; }
+    row(name, 0, off, 0);
+    row(name, 1, on, off.ns);
+    ret 0;
+}
+
+# fill the scenes' state, the list rows and chart samples from data
+fun setup(s: *State, data: *allo.Allocator) u8 {
+    s.dock.side = blit.context.Side.right{};
+    s.dock.size = 360.0::f32;
+    var k: usize = 0;
+    for (k < SECTIONS) {
+        s.open[k]   = 1;
+        s.values[k] = k::f32 / SECTIONS::f32;
+        k           = k + 1;
+    }
+    s.list.selected = 3;
+
+    val rr: res[*str, allo.Error] = allo.allocate[str](data, ROWS);
+    if (sel rr.err) { ret 1; }
+    s.rows = rr.ok;
+    var names: [8]str;
+    names[0] = "glider gun";
+    names[1] = "pulsar";
+    names[2] = "acorn";
+    names[3] = "r-pentomino";
+    names[4] = "garden of eden";
+    names[5] = "spaceship";
+    names[6] = "diehard";
+    names[7] = "beacon";
+    var i: usize = 0;
+    for (i < ROWS) {
+        s.rows[i] = names[i % 8];
+        i         = i + 1;
+    }
+
+    # a random walk, so the chart is neither flat nor regular
+    val rs: res[*f32, allo.Error] = allo.allocate[f32](data, SAMPLES);
+    if (sel rs.err) { ret 1; }
+    s.samples = rs.ok;
+    var seed: u64 = 0x2545F4914F6CDD1D;
+    var v:    f32 = 0.0::f32;
+    i = 0;
+    for (i < SAMPLES) {
+        seed         = seed * 6364136223846793005 + 1442695040888963407;
+        v            = v + ((seed >> 40)::f32 / 16777216.0::f32 - 0.5::f32);
+        s.samples[i] = v;
+        i            = i + 1;
+    }
+
+    k = 0;
+    for (k < WINDOWS) {
+        s.wins[k]       = blit.widget.window("window", 40.0::f32 + k::f32 * 60.0::f32, 30.0::f32 + k::f32 * 50.0::f32, 320.0::f32, 0.0::f32);
+        s.wins[k].flags = blit.widget.WINDOW_AUTO_SIZE;
+        s.wopen[k]      = 1;
+        k               = k + 1;
+    }
+
+    # rows of ten circles, each row a little lower at its right so few
+    # circles share their point heights
+    s.shape = blit.path.init(data);
+    k       = 0;
+    for (k < FILL_EDGES / CIRCLE_EDGES) {
+        val cx: f32 = 70.0::f32 + (k % 10)::f32 * 120.0::f32;
+        val cy: f32 = 45.0::f32 + (k / 10)::f32 * 75.0::f32 + (k % 10)::f32 * 0.7::f32;
+        i = 0;
+        for (i < CIRCLE_EDGES) {
+            val a: f32 = i::f32 * 6.2831853::f32 / CIRCLE_EDGES::f32;
+            val x: f32 = cx + 34.0::f32 * cos_f32(a);
+            val y: f32 = cy + 34.0::f32 * sin_f32(a);
+            if (i == 0) { blit.path.move(?s.shape, x, y); }
+            or          { blit.path.line(?s.shape, x, y); }
+            i = i + 1;
+        }
+        blit.path.close(?s.shape);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var base: allo.Allocator;
+    val made: err[allo.Error] = page.make(?base);
+    if (sel made.err) {
+        print.println("allocator init failed");
+        ret 1;
+    }
+    var c: Counter;
+    c.inner = ?base;
+    var counted: allo.Allocator;
+    counted.ctx           = ?c;
+    counted.fn_allocate   = count_allocate;
+    counted.fn_reallocate = count_reallocate;
+    counted.fn_deallocate = count_deallocate;
+    counted.retains       = base.retains;
+
+    var s: State;
+    if (setup(?s, ?base) != 0) {
+        print.println("scene setup failed");
+        ret 1;
+    }
+
+    var ctx: blit.context.Context;
+    val ce:  err[allo.Error] = blit.context.init(?ctx, ?counted);
+    if (sel ce.err) {
+        print.println("context init failed");
+        ret 1;
+    }
+
+    print.printf("blit {} bench, median of {} batches\n\n", blit.VERSION, BATCHES);
+    print.println("scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost");
+    var failed: u8 = 0;
+    if (failed == 0) { failed = bench(?ctx, ?s, ?c, "dense panel", dense); }
+    if (failed == 0) { failed = bench(?ctx, ?s, ?c, "10k row list", rows); }
+    if (failed == 0) { failed = bench(?ctx, ?s, ?c, "100k chart", chart); }
+    if (failed == 0) { failed = bench(?ctx, ?s, ?c, "windows", windows); }
+    if (failed == 0) { failed = bench(?ctx, ?s, ?c, "10k-edge fill", shape); }
+
+    val freed: err[allo.Error] = blit.context.free(?ctx);
+    if (sel freed.err) {
+        print.println("context free failed");
+        ret 1;
+    }
+    if (failed != 0) {
+        print.println("a scene failed: the clock or an allocation was refused");
+        ret 1;
+    }
+    ret 0;
+}

@@ -1,0 +1,123 @@
+# ids and state: how widgets are keyed, and state kept by id
+#
+# a widget's id is its label hashed into the current id scope, never its
+# place in the call order. text after ## is hashed but not drawn, and a
+# label holding ### is keyed by the text from ### on alone, so what it shows
+# can change. state that outlives a frame lives in the context's store under
+# an id, and a kind registered with save and load hooks persists as TOML.
+
+use allo: std.allocator;
+use std.data.toml;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# what one row keeps in the store under its id
+# ---
+# clicks: times its button was clicked
+rec Clicks {
+    clicks: u64;
+}
+
+# what the section keeps
+# ---
+# kept:    1 once the Clicks kind is registered
+# frames:  frames drawn, shown in a label whose id never changes
+# doc:     the read-only field showing the last save
+# doc_buf: its text
+# view:    its text area
+pub rec State {
+    kept:    u8;
+    frames:  u64;
+    doc:     blit.field.Field;
+    doc_buf: [1024]u8;
+    view:    blit.textarea.TextArea;
+}
+
+pub fun init(s: *State, a: *allo.Allocator) {
+    blit.field.init(?s.doc, ?s.doc_buf[0], 1024, 0, nil);
+    s.doc.flags = blit.field.READ_ONLY | blit.field.LINES;
+    blit.textarea.init(?s.view, a);
+}
+
+pub fun free(s: *State) bool {
+    val e: err[allo.Error] = blit.textarea.free(?s.view);
+    ret !sel e.err;
+}
+
+# write a row's state into its table
+fun clicks_save(c: *Clicks, w: *blit.state.Writer) {
+    blit.state.put_int(w, "clicks", c.clicks::i64);
+}
+
+# read a row's state from its table
+fun clicks_load(c: *Clicks, t: *toml.Table) {
+    val n: opt[i64] = toml.get_int(t, "clicks");
+    if (sel n.some) { c.clicks = n.some::u64; }
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+    if (s.kept == 0) {
+        val r: err[blit.state.Error] = blit.state.register[Clicks](ctx, "clicks", clicks_save, clicks_load);
+        s.kept = 1;
+    }
+
+    # one label, two widgets: the text after ## tells them apart
+    blit.controls.separator_label(ctx, "Labels and keys");
+    var c: blit.widget.Columns = blit.widget.begin_columns(ctx, 2);
+    blit.widget.button(ctx, "Save##file");
+    blit.widget.next_column(ctx, ?c);
+    blit.widget.button(ctx, "Save##theme");
+    blit.widget.end_columns(ctx, ?c);
+
+    # the text before ### changes every frame, the id never does
+    s.frames = s.frames + 1;
+    var buf: [64]u8;
+    var num: [48]u8;
+    val n:   str   = blit.value.format(blit.value.U64, blit.value.num[u64](s.frames), ?num[0]);
+    var k:   usize = 0;
+    for (n[k] != 0) {
+        buf[k] = n[k];
+        k      = k + 1;
+    }
+    val tail: str   = " frames###counter";
+    var j:    usize = 0;
+    for (tail[j] != 0) {
+        buf[k] = tail[j];
+        k      = k + 1;
+        j      = j + 1;
+    }
+    buf[k] = 0;
+    blit.widget.button(ctx, ?buf[0]);
+
+    # rows built from one label each open a scope of their own, and each
+    # keeps its count in the store under its button's id
+    blit.controls.separator_label(ctx, "State by id");
+    var i: u64 = 0;
+    for (i < 3) {
+        blit.context.push_id_int(ctx, i);
+        val id: u64     = blit.context.id_of(ctx, "Count");
+        val st: *Clicks = blit.state.get[Clicks](ctx, id);
+        blit.state.pin[Clicks](ctx, id, 1);
+        blit.widget.size_next(ctx, blit.layout.fit(), blit.layout.auto());
+        if (blit.widget.button(ctx, "Count")) { st.clicks = st.clicks + 1; }
+        blit.widget.same_line(ctx);
+        blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](st.clicks), ?num[0]));
+        blit.context.pop_id(ctx);
+        i = i + 1;
+    }
+
+    # every entry of a registered kind saves as one TOML document
+    blit.controls.separator_label(ctx, "Persistence");
+    if (blit.widget.button(ctx, "Save the store")) {
+        val doc: res[str, allo.Error] = blit.state.save(ctx);
+        if (sel doc.ok) { blit.field.set(?s.doc, doc.ok); }
+    }
+    blit.textarea.text_area(ctx, "toml", ?s.doc, ?s.view, blit.context.px(ctx, 120.0::f32));
+}

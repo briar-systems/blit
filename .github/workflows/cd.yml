@@ -25,6 +25,8 @@ jobs:
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("mach.toml", "rb"))["project"]["version"])')
           [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match mach.toml version $version"; exit 1; }
+          const=$(sed -n 's/^pub val VERSION: str = "\(.*\)";$/\1/p' src/lib/blit.mach)
+          [ "$const" = "$version" ] || { echo "::error::VERSION $const in src/lib/blit.mach does not match mach.toml version $version"; exit 1; }
 
   # the hosts this project ships to, tested natively before anything is published
   ci:
@@ -34,7 +36,7 @@ jobs:
       profile: release
       runners: '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]'
 
-  # one archive per artifact and target, cross-compiled at the paths mach's build plan reports
+  # one archive per artifact and target, except the test-only `tests` artifact, cross-compiled at the paths mach's build plan reports
   package:
     needs: verify
     runs-on: ubuntu-latest
@@ -55,7 +57,7 @@ jobs:
           mach build . --all -p release --plan | awk '
             /^unit / { name = $3; for (i = 4; i < NF; i++) if ($i == "target") target = $(i + 1) }
             $1 == "tuple" { split($2, t, "-"); os = t[2] }
-            $1 == "out" { print name, target, os, $2 }' |
+            $1 == "out" && name != "tests" { print name, target, os, $2 }' |
           while read -r name target os path; do
             archive="$PWD/dist/$name-$version-$target"
             case "$os" in

@@ -1,0 +1,308 @@
+# a TOML emitter: the text a save writes, grown from an allocator
+#
+# std.data.toml only parses, so blit writes its own documents here: the state
+# store's saved entries (see blit.store) and themes (see blit.theme). a writer
+# holds one document at a time. reset starts a new one in the same storage,
+# and a write the allocator refuses marks the writer failed and drops every
+# write after it, so a save checks once, at the end, through text.
+#
+# keys are written bare when they can be and quoted otherwise. floats are
+# written so they read back exactly.
+
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use allo: std.allocator;
+use fmt:  std.format;
+use io:   std.io.writer;
+use std.memory;
+
+# bytes the text allocates on its first write
+val INIT_TEXT: usize = 256;
+
+# the text a save writes
+# ---
+# a:      allocator backing buf
+# buf:    the text so far, NUL-terminated, nil before the first write
+# len:    bytes written, not counting the NUL
+# cap:    bytes allocated at buf
+# failed: 1 once a write was refused, after which writes are dropped
+# why:    the refusal, when failed
+# sink:   buf as a std.io writer, for std.format
+pub rec Writer {
+    a:      *allo.Allocator;
+    buf:    *u8;
+    len:    usize;
+    cap:    usize;
+    failed: u8;
+    why:    allo.Error;
+    sink:   io.Writer;
+}
+
+# set a writer up empty; it allocates on its first write, so this cannot fail
+# ---
+# w: writer to initialize
+# a: allocator to back its text
+pub fun init(w: *Writer, a: *allo.Allocator) {
+    w.a      = a;
+    w.buf    = nil;
+    w.len    = 0;
+    w.cap    = 0;
+    w.failed = 0;
+}
+
+# release the writer's text
+# ---
+# w:   writer to free
+# ret: ok, or the allocator's refusal; the writer is empty either way
+pub fun free(w: *Writer) err[allo.Error] {
+    var out: err[allo.Error] = err[allo.Error].ok{};
+    if (w.buf != nil) { out = allo.deallocate[u8](w.a, w.buf, w.cap); }
+    w.buf = nil;
+    w.len = 0;
+    w.cap = 0;
+    ret out;
+}
+
+# start a new document in the writer's storage, empty and not failed
+# ---
+# w: writer, set up by init
+pub fun reset(w: *Writer) {
+    w.len    = 0;
+    w.failed = 0;
+    w.sink   = io.Writer{ctx: w::ptr, f_write: sink_write};
+    put_bytes(w, nil, 0);
+}
+
+# the document written since reset
+# ---
+# w:   writer
+# ret: the text, NUL-terminated and owned by the writer until its next reset
+#      or free, or the refusal that cut it short
+pub fun text(w: *Writer) res[str, allo.Error] {
+    if (w.failed != 0) { ret res[str, allo.Error].err{w.why}; }
+    ret res[str, allo.Error].ok{w.buf::str};
+}
+
+# append bytes to the text, keeping it NUL-terminated
+fun put_bytes(w: *Writer, b: *u8, n: usize) u8 {
+    if (w.failed != 0) { ret 0; }
+    val need: usize = w.len + n + 1;
+    if (need > w.cap) {
+        var c: usize = w.cap * 2;
+        if (c < INIT_TEXT) { c = INIT_TEXT; }
+        for (c < need) { c = c * 2; }
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](w.a, w.buf, w.cap, c);
+        if (sel r.err) {
+            w.failed = 1;
+            w.why    = r.err;
+            ret 0;
+        }
+        w.buf = r.ok;
+        w.cap = c;
+    }
+    if (n > 0) { memory.raw_copy((w.buf::usize + w.len)::ptr, b::ptr, n); }
+    w.len        = w.len + n;
+    w.buf[w.len] = 0;
+    ret 1;
+}
+
+# append text as it is, with no quoting
+# ---
+# w: writer
+# s: text, such as a comment or a blank line
+pub fun put_text(w: *Writer, s: str) {
+    put_bytes(w, s::*u8, str_len(s));
+}
+
+# append one byte as it is
+# ---
+# w: writer
+# b: the byte
+pub fun put_byte(w: *Writer, b: u8) {
+    var one: u8 = b;
+    put_bytes(w, ?one, 1);
+}
+
+# the writer's std.io sink
+fun sink_write(c: ptr, b: *u8, n: usize) res[usize, io.WriteError] {
+    val w: *Writer = c::*Writer;
+    if (put_bytes(w, b, n) == 0) { ret res[usize, io.WriteError].err{io.WriteError.stalled{0}}; }
+    ret res[usize, io.WriteError].ok{n};
+}
+
+# write s as a TOML basic string
+fun put_quoted(w: *Writer, s: str) {
+    val hex: str = "0123456789ABCDEF";
+    put_byte(w, '"');
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (c == '"')  { put_text(w, "\\\""); }
+        or (c == '\\') { put_text(w, "\\\\"); }
+        or (c == '\n') { put_text(w, "\\n"); }
+        or (c == '\t') { put_text(w, "\\t"); }
+        or (c == '\r') { put_text(w, "\\r"); }
+        or (c < 0x20u8 || c == 0x7Fu8) {
+            put_text(w, "\\u00");
+            put_byte(w, hex[c >> 4]);
+            put_byte(w, hex[c & 0x0Fu8]);
+        }
+        or { put_byte(w, c); }
+        i = i + 1;
+    }
+    put_byte(w, '"');
+}
+
+# whether s is a non-empty TOML bare key
+fun bare(s: str) u8 {
+    if (s[0] == 0) { ret 0; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c:  u8 = s[i];
+        val ok: u8 = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (ok == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# write a key, bare when it can be and quoted otherwise
+# ---
+# w:   writer
+# key: the key
+pub fun put_key(w: *Writer, key: str) {
+    if (bare(key) != 0) { put_text(w, key); }
+    or                  { put_quoted(w, key); }
+}
+
+# write a table header, [k0.k1...], each key bare or quoted, and end the line
+# ---
+# w:    writer
+# keys: the header's keys, outermost first (pass ?keys[0])
+# n:    how many keys
+pub fun put_table(w: *Writer, keys: *str, n: usize) {
+    put_byte(w, '[');
+    var i: usize = 0;
+    for (i < n) {
+        if (i > 0) { put_byte(w, '.'); }
+        put_key(w, keys[i]);
+        i = i + 1;
+    }
+    put_text(w, "]\n");
+}
+
+# start a `key = ` line, for a value written with the value_ calls and ended
+# with end_line
+# ---
+# w:   writer
+# key: the key
+pub fun put_assign(w: *Writer, key: str) {
+    put_key(w, key);
+    put_text(w, " = ");
+}
+
+# end the line a put_assign started
+# ---
+# w: writer
+pub fun end_line(w: *Writer) {
+    put_byte(w, '\n');
+}
+
+# write a float value that reads back exactly
+# ---
+# w: writer
+# v: value; an f32 widens exactly
+pub fun value_float(w: *Writer, v: f64) {
+    val mark: usize                     = w.len;
+    val r:    res[usize, io.WriteError] = fmt.write_f64(?w.sink, v);
+    # toml reads a float without a point or exponent as an integer
+    var point: u8    = 0;
+    var i:     usize = mark;
+    for (w.failed == 0 && i < w.len) {
+        val c: u8 = w.buf[i];
+        if (c == '.' || c == 'e' || c == 'E' || c == 'n' || c == 'i') { point = 1; }
+        i = i + 1;
+    }
+    if (point == 0) { put_text(w, ".0"); }
+}
+
+# write a string value, escaped
+# ---
+# w: writer
+# s: utf-8 text
+pub fun value_str(w: *Writer, s: str) {
+    put_quoted(w, s);
+}
+
+# write an array of floats, [a, b, ...], each reading back exactly
+# ---
+# w: writer
+# v: the floats (pass ?v[0])
+# n: how many
+pub fun value_floats(w: *Writer, v: *f32, n: usize) {
+    put_byte(w, '[');
+    var i: usize = 0;
+    for (i < n) {
+        if (i > 0) { put_text(w, ", "); }
+        value_float(w, v[i]::f64);
+        i = i + 1;
+    }
+    put_byte(w, ']');
+}
+
+# write `key = v` into the document
+# ---
+# w:   writer
+# key: the field's key
+# v:   value
+pub fun put_int(w: *Writer, key: str, v: i64) {
+    put_assign(w, key);
+    val r: res[usize, io.WriteError] = fmt.write_i64(?w.sink, v);
+    end_line(w);
+}
+
+# write `key = v` into the document, a float that reads back exactly
+# ---
+# w:   writer
+# key: the field's key
+# v:   value; an f32 widens exactly
+pub fun put_float(w: *Writer, key: str, v: f64) {
+    put_assign(w, key);
+    value_float(w, v);
+    end_line(w);
+}
+
+# write `key = true` or `key = false` into the document
+# ---
+# w:   writer
+# key: the field's key
+# v:   nonzero for true
+pub fun put_bool(w: *Writer, key: str, v: u8) {
+    put_assign(w, key);
+    if (v != 0) { put_text(w, "true\n"); }
+    or          { put_text(w, "false\n"); }
+}
+
+# write `key = "v"` into the document, escaped
+# ---
+# w:   writer
+# key: the field's key
+# v:   utf-8 text
+pub fun put_str(w: *Writer, key: str, v: str) {
+    put_assign(w, key);
+    put_quoted(w, v);
+    end_line(w);
+}
+
+# write the decimal digits of an unsigned integer as they are, such as a
+# numeric key
+# ---
+# w: writer
+# v: value
+pub fun put_u64(w: *Writer, v: u64) {
+    val r: res[usize, io.WriteError] = fmt.write_u64(?w.sink, v);
+}

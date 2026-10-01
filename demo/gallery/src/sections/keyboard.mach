@@ -1,0 +1,75 @@
+# keyboard navigation: tab stops, groups, the focus ring and focus from code
+#
+# every control is a tab stop. tab and shift tab move the keyboard through
+# them in the order they are drawn, across windows and docks; controls drawn
+# as one row are a group tab reaches once, and the arrows move within it.
+# enter and space activate the control holding the keyboard as a click does.
+# the control the keyboard moved to wears the focus ring until a press.
+# a control of your own becomes a stop with interact.FOCUS among its buttons.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# what the section edits
+# ---
+# name:     a field focused from code
+# name_buf: its text
+# pick:     the custom group's chosen swatch
+# presses:  times a swatch was activated
+pub rec State {
+    name:     blit.field.Field;
+    name_buf: [32]u8;
+    pick:     usize;
+    presses:  u64;
+}
+
+pub fun init(s: *State) {
+    blit.field.init(?s.name, ?s.name_buf[0], 32, 0, nil);
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State            = user::*State;
+    val t: *blit.theme.Theme = blit.context.theme_of(ctx);
+    blit.widget.note(ctx, "Press tab to move through the controls, shift tab to go back, the arrows within a row, enter or space to press.");
+
+    var row: [3]str;
+    row[0] = "One";
+    row[1] = "Two";
+    row[2] = "Three";
+    blit.widget.buttons(ctx, ?row[0], 3);
+    blit.widget.text_field(ctx, "name", ?s.name, "a field");
+    if (blit.widget.button(ctx, "Focus the field from code")) { blit.context.focus(ctx, blit.context.id_of(ctx, "name")); }
+
+    # a row of swatches drawn by hand, one group of tab stops: tab enters it
+    # at the chosen one, left and right move within it
+    blit.controls.separator_label(ctx, "A group of your own");
+    val gid:  u64                 = blit.context.id_of(ctx, "swatches");
+    val g:    blit.interact.Group = blit.interact.begin_group(ctx, gid, blit.interact.ROW);
+    val side: f32                 = blit.context.px(ctx, 32.0::f32);
+    var i:    usize               = 0;
+    for (i < 5) {
+        if (i > 0) { blit.widget.same_line(ctx); }
+        val r:  blit.context.Area = blit.widget.place(ctx, blit.layout.fixed(side), blit.layout.fixed(side), side, side);
+        val id: u64               = blit.id.child_int(gid, i::u64);
+        val h:  blit.interact.Hit = blit.interact.hit(ctx, id, r.x0, r.y0, r.x1, r.y1, blit.input.BUTTON_LEFT | blit.interact.FOCUS);
+        if (h.clicked) {
+            s.pick    = i;
+            s.presses = s.presses + 1;
+        }
+        if (i == s.pick) { blit.context.mark_current(ctx, id); }
+        blit.context.rounded_rect(ctx, r.x0, r.y0, r.x1, r.y1, blit.draw.radii(blit.context.px(ctx, 4.0::f32)), t.series[i]);
+        if (i == s.pick) { blit.context.stroke_rounded_rect(ctx, r.x0, r.y0, r.x1, r.y1, blit.draw.radii(blit.context.px(ctx, 4.0::f32)), blit.context.px(ctx, 2.0::f32), t.text); }
+        i = i + 1;
+    }
+    blit.interact.end_group(ctx, g);
+
+    blit.controls.separator_label(ctx, "Who holds the keyboard");
+    var buf: [48]u8;
+    blit.widget.text(ctx, "focus id");
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](ctx.focus), ?buf[0]));
+    if (blit.context.focus_visible(ctx)) { blit.widget.text(ctx, "wearing the ring: the keyboard moved it there"); }
+    if (blit.context.typing(ctx))        { blit.widget.text(ctx, "typing: the app's own key bindings should keep quiet"); }
+}

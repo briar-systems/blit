@@ -1,0 +1,146 @@
+# layer bands: the fixed order kinds of surface paint and take input in
+#
+# a layer is a band and a slot within it, packed as band << SLOT_BITS | slot,
+# so comparing two layers compares their bands first and their slots second.
+# claims key on the layer (see blit.hit) and end() sorts runs by it, so paint
+# and input both follow the bands with nothing else to keep in step.
+#
+# the bands are data: TABLE lists them bottom to top, each with the rule that
+# picks a slot when something opens in it (see context.push_band). a kind of
+# surface takes its band by index and its rule comes with it, so a new kind
+# that fits a band drops in with no change here, and a new band is one more
+# row and one more index.
+
+use std.types.string.str;
+
+# low bits of a layer holding the slot within its band
+pub val SLOT_BITS: u32 = 24;
+
+# the highest slot a band holds
+pub val SLOT_MAX: u32 = 0xFFFFFF;
+
+# how a band picks the slot of something opened in it
+#
+# flat:  every opening shares slot 0, ordered among themselves by call order
+# nest:  an opening inside another of the same band is one slot above it,
+#        and so is one inside a higher band, in that band, so a popup opened
+#        in a modal stacks above the modal; otherwise slot 0. a child always
+#        stacks above its parent
+# order: the caller names the slot, such as a window's place in the z order
+#        or an overlay's order among overlays
+pub val RULE_FLAT:  u8 = 0;
+pub val RULE_NEST:  u8 = 1;
+pub val RULE_ORDER: u8 = 2;
+
+# one band of layers
+# ---
+# name: what the band holds, for tools and inspectors
+# rule: RULE_FLAT, RULE_NEST or RULE_ORDER
+# trap: 1 if keyboard navigation stays inside the topmost layer of this band
+#       holding a focusable widget, as a modal keeps the keyboard, else 0
+pub rec Band {
+    name: str;
+    rule: u8;
+    trap: u8;
+}
+
+# the bands, by index, bottom to top
+pub val BASE:     u32 = 0;
+pub val DOCKED:   u32 = 1;
+pub val WINDOWS:  u32 = 2;
+pub val OVERLAYS: u32 = 3;
+pub val POPUPS:   u32 = 4;
+pub val MODALS:   u32 = 5;
+pub val TOOLTIPS: u32 = 6;
+pub val DRAG:     u32 = 7;
+
+# how many bands there are
+pub val COUNT: u32 = 8;
+
+# every band, bottom to top, indexed by the constants above
+val TABLE: [8]Band = [8]Band{
+    Band{name: "base", rule: RULE_FLAT, trap: 0},
+    Band{name: "docked", rule: RULE_FLAT, trap: 0},
+    Band{name: "windows", rule: RULE_ORDER, trap: 0},
+    Band{name: "overlays", rule: RULE_ORDER, trap: 0},
+    Band{name: "popups", rule: RULE_NEST, trap: 0},
+    Band{name: "modals", rule: RULE_NEST, trap: 1},
+    Band{name: "tooltips", rule: RULE_FLAT, trap: 0},
+    Band{name: "drag", rule: RULE_FLAT, trap: 0}
+};
+
+# one band's row of the table
+# ---
+# i:   the band's index, below COUNT
+# ret: its row, the top band's for an index out of range
+pub fun band(i: u32) Band {
+    if (i >= COUNT) { ret TABLE[COUNT - 1]; }
+    ret TABLE[i];
+}
+
+# the layer of a slot within a band
+# ---
+# b:    the band's index
+# slot: the slot, clamped to SLOT_MAX
+# ret:  the packed layer
+pub fun layer(b: u32, slot: u32) u32 {
+    var s: u32 = slot;
+    if (s > SLOT_MAX) { s = SLOT_MAX; }
+    ret (b << SLOT_BITS) | s;
+}
+
+# the band a layer lies in
+# ---
+# l:   a packed layer
+# ret: the band's index
+pub fun band_of(l: u32) u32 {
+    ret l >> SLOT_BITS;
+}
+
+# the slot a layer holds within its band
+# ---
+# l:   a packed layer
+# ret: the slot
+pub fun slot_of(l: u32) u32 {
+    ret l & SLOT_MAX;
+}
+
+# the layer something opened in band b lands on, inside a parent on layer
+# parent, by the band's rule
+# ---
+# b:      the band's index
+# slot:   the slot asked for, used by RULE_ORDER bands alone
+# parent: the layer current when it opens
+# ret:    the packed layer
+pub fun open(b: u32, slot: u32, parent: u32) u32 {
+    val r: u8 = band(b).rule;
+    if (r == RULE_ORDER)                        { ret layer(b, slot); }
+    if (r == RULE_NEST && band_of(parent) >= b) { ret layer(band_of(parent), slot_of(parent) + 1); }
+    ret layer(b, 0);
+}
+
+test bands__order_bottom_to_top {
+    # every slot of a band lies below every slot of the band above it
+    var i: u32 = 0;
+    for (i + 1 < COUNT) {
+        if (layer(i, SLOT_MAX) >= layer(i + 1, 0)) { ret 1; }
+        i = i + 1;
+    }
+    if (band_of(layer(WINDOWS, 7)) != WINDOWS || slot_of(layer(WINDOWS, 7)) != 7) { ret 2; }
+    ret 0;
+}
+
+test open__follows_each_rule {
+    # a popup at the root or in a window starts its band, inside a popup it nests
+    if (open(POPUPS, 9, layer(BASE, 0)) != layer(POPUPS, 0))    { ret 1; }
+    if (open(POPUPS, 9, layer(WINDOWS, 3)) != layer(POPUPS, 0)) { ret 2; }
+    if (open(POPUPS, 0, layer(POPUPS, 2)) != layer(POPUPS, 3))  { ret 3; }
+    # a window or an overlay takes the slot it names wherever it opens
+    if (open(WINDOWS, 5, layer(POPUPS, 1)) != layer(WINDOWS, 5))    { ret 4; }
+    if (open(OVERLAYS, 2, layer(WINDOWS, 9)) != layer(OVERLAYS, 2)) { ret 7; }
+    # a popup opened in a modal nests above it, in the modals band
+    if (open(POPUPS, 0, layer(MODALS, 1)) != layer(MODALS, 2)) { ret 6; }
+    # a flat band never nests
+    if (open(DRAG, 4, layer(DRAG, 0)) != layer(DRAG, 0)) { ret 5; }
+    ret 0;
+}

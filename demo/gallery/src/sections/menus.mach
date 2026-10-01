@@ -1,0 +1,86 @@
+# menus: a menu bar, submenus, checks, shortcuts and a context menu
+#
+# each menu's body runs every frame, open or not, so its items answer their
+# shortcuts while it is closed. a bar is the next item of the layout, one row
+# across it. a context menu opens at the cursor on a right press over its
+# region.
+
+use std.types.bool.true;
+use std.types.string.str;
+
+use blit;
+
+# what the menus did
+# ---
+# last: the label of the item last fired, nil before any
+# grid: the View menu's checked item
+# wrap: the View menu's other checked item
+pub rec State {
+    last: str;
+    grid: u8;
+    wrap: u8;
+}
+
+pub fun init(s: *State) {
+    s.grid = 1;
+}
+
+# an item that, fired, is remembered by label
+fun act(ctx: *blit.context.Context, m: *blit.menu.Menu, s: *State, it: blit.menu.Item) {
+    if (blit.menu.item(ctx, m, it)) { s.last = it.label; }
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s: *State = user::*State;
+
+    var bar:  blit.menu.Menu = blit.menu.begin_bar(ctx, "main");
+    var file: blit.menu.Menu = blit.menu.begin_menu(ctx, ?bar, "File");
+    var open: blit.menu.Item = blit.menu.of("Open");
+    open.shortcut = blit.menu.keys('O', blit.menu.MOD_PRIMARY);
+    open.icon     = blit.icon.STR_PLUS;
+    act(ctx, ?file, s, open);
+    var save: blit.menu.Item = blit.menu.of("Save");
+    save.shortcut = blit.menu.keys('S', blit.menu.MOD_PRIMARY);
+    act(ctx, ?file, s, save);
+    var recent: blit.menu.Menu = blit.menu.begin_menu(ctx, ?file, "Recent");
+    act(ctx, ?recent, s, blit.menu.of("notes.txt"));
+    act(ctx, ?recent, s, blit.menu.of("theme.toml"));
+    blit.menu.end_menu(ctx, ?recent);
+    blit.menu.separator(ctx, ?file);
+    var quit: blit.menu.Item = blit.menu.of("Quit");
+    quit.disabled = true;
+    act(ctx, ?file, s, quit);
+    blit.menu.end_menu(ctx, ?file);
+
+    var view: blit.menu.Menu = blit.menu.begin_menu(ctx, ?bar, "View");
+    var grid: blit.menu.Item = blit.menu.of("Grid");
+    grid.check = ?s.grid;
+    act(ctx, ?view, s, grid);
+    var wrap: blit.menu.Item = blit.menu.of("Wrap lines");
+    wrap.check    = ?s.wrap;
+    wrap.shortcut = blit.menu.keys('W', blit.input.MOD_ALT);
+    act(ctx, ?view, s, wrap);
+    blit.menu.end_menu(ctx, ?view);
+    blit.menu.end_bar(ctx, ?bar);
+
+    var last: str = "nothing yet";
+    if (s.last != nil) { last = s.last; }
+    blit.widget.text(ctx, "Last fired:");
+    blit.widget.same_line(ctx);
+    blit.widget.text(ctx, last);
+
+    # a region that opens a menu at the cursor on a right press
+    blit.controls.separator_label(ctx, "Context menu");
+    val t:  *blit.theme.Theme = blit.context.theme_of(ctx);
+    val h:  f32               = blit.context.px(ctx, 80.0::f32);
+    val r:  blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    var cm: blit.menu.Menu    = blit.menu.begin_context(ctx, "canvas", r.x0, r.y0, r.x1, r.y1);
+    act(ctx, ?cm, s, blit.menu.of("Cut"));
+    act(ctx, ?cm, s, blit.menu.of("Copy"));
+    var paste: blit.menu.Item = blit.menu.of("Paste");
+    paste.shortcut = blit.menu.keys('V', blit.menu.MOD_PRIMARY);
+    act(ctx, ?cm, s, paste);
+    blit.menu.end_menu(ctx, ?cm);
+    blit.context.frame(ctx, r.x0, r.y0, r.x1, r.y1, blit.context.px(ctx, 1.0::f32), t.edge);
+    blit.context.text_at(ctx, "right click here", r.x0 + blit.context.px(ctx, 8.0::f32), r.y0 + blit.context.px(ctx, 8.0::f32), t.text_dim);
+}

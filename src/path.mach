@@ -1,0 +1,267 @@
+# a vector path: contours of lines and quadratic and cubic curves
+#
+# a path is a list of commands the consumer builds and the context fills or
+# strokes (see blit.context.fill_path and stroke_path), the basis for icons.
+# move starts a contour, line, quad and cubic extend it, and close ends it
+# with a line back to its start. a contour drawn before move starts at the
+# origin.
+#
+# curves stay curves until drawn: the context flattens them at draw time, so
+# the segment count follows their size in screen pixels. a fill takes the
+# nonzero rule, so a hole is a contour wound against its outline.
+#
+# building never fails loudly: a command that cannot grow the list sets oom,
+# and a path with oom set draws nothing and sets the context's oom.
+#
+# the same commands also travel as path data, a flat f32 stream that needs no
+# allocator and can sit in a constant array, as icons do (see blit.icon): each
+# command is its verb as a float followed by its coordinates, two for MOVE and
+# LINE, four for QUAD (control, then end), six for CUBIC (both controls, then
+# end) and none for CLOSE. decode reads one command from a stream and valid
+# checks a whole one.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use allo: std.allocator;
+use std.allocator.page;
+use vec: std.collections.vector;
+
+# start a contour at (x, y)
+pub val MOVE: u8 = 0;
+
+# a line to (x, y)
+pub val LINE: u8 = 1;
+
+# a quadratic curve through control (cx0, cy0) to (x, y)
+pub val QUAD: u8 = 2;
+
+# a cubic curve through controls (cx0, cy0) and (cx1, cy1) to (x, y)
+pub val CUBIC: u8 = 3;
+
+# close the contour with a line back to its start
+pub val CLOSE: u8 = 4;
+
+# one path command
+# ---
+# verb: MOVE, LINE, QUAD, CUBIC or CLOSE
+# x:    end point x
+# y:    end point y
+# cx0:  first control x, for QUAD and CUBIC
+# cy0:  first control y, for QUAD and CUBIC
+# cx1:  second control x, for CUBIC
+# cy1:  second control y, for CUBIC
+pub rec Op {
+    verb: u8;
+    x:    f32;
+    y:    f32;
+    cx0:  f32;
+    cy0:  f32;
+    cx1:  f32;
+    cy1:  f32;
+}
+
+# a list of path commands
+# ---
+# ops: the commands, in order
+# oom: 1 if a command could not be appended, else 0
+pub rec Path {
+    ops: vec.Vector[Op];
+    oom: u8;
+}
+
+# an empty path whose commands grow from a
+# ---
+# a:   allocator backing the commands
+# ret: the path, owning nothing until the first command
+pub fun init(a: *allo.Allocator) Path {
+    ret Path{ops: vec.init[Op](a), oom: 0};
+}
+
+# release the commands
+# ---
+# p:   path to free
+# ret: ok, or the allocator's refusal with the path still owning its commands
+pub fun free(p: *Path) err[allo.Error] {
+    ret vec.dnit[Op](?p.ops);
+}
+
+# drop every command and the oom flag, keeping capacity
+# ---
+# p: path to reset
+pub fun reset(p: *Path) {
+    vec.clear[Op](?p.ops);
+    p.oom = 0;
+}
+
+# append one command, setting oom when the list cannot grow
+fun add(p: *Path, o: Op) {
+    val r: res[usize, allo.Error] = vec.push[Op](?p.ops, o);
+    if (sel r.err) { p.oom = 1; }
+}
+
+# start a new contour at (x, y)
+# ---
+# p: path
+# x: x in pixels
+# y: y in pixels
+pub fun move(p: *Path, x: f32, y: f32) {
+    add(p, Op{verb: MOVE, x: x, y: y, cx0: x, cy0: y, cx1: x, cy1: y});
+}
+
+# extend the contour with a line to (x, y)
+# ---
+# p: path
+# x: x in pixels
+# y: y in pixels
+pub fun line(p: *Path, x: f32, y: f32) {
+    add(p, Op{verb: LINE, x: x, y: y, cx0: x, cy0: y, cx1: x, cy1: y});
+}
+
+# extend the contour with a quadratic curve through (cx, cy) to (x, y)
+# ---
+# p:  path
+# cx: control x in pixels
+# cy: control y in pixels
+# x:  end x in pixels
+# y:  end y in pixels
+pub fun quad(p: *Path, cx: f32, cy: f32, x: f32, y: f32) {
+    add(p, Op{verb: QUAD, x: x, y: y, cx0: cx, cy0: cy, cx1: cx, cy1: cy});
+}
+
+# extend the contour with a cubic curve through (cx0, cy0) and (cx1, cy1) to
+# (x, y)
+# ---
+# p:   path
+# cx0: first control x in pixels
+# cy0: first control y in pixels
+# cx1: second control x in pixels
+# cy1: second control y in pixels
+# x:   end x in pixels
+# y:   end y in pixels
+pub fun cubic(p: *Path, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+    add(p, Op{verb: CUBIC, x: x, y: y, cx0: cx0, cy0: cy0, cx1: cx1, cy1: cy1});
+}
+
+# close the contour with a line back to where it started
+# ---
+# p: path
+pub fun close(p: *Path) {
+    add(p, Op{verb: CLOSE, x: 0.0::f32, y: 0.0::f32, cx0: 0.0::f32, cy0: 0.0::f32, cx1: 0.0::f32, cy1: 0.0::f32});
+}
+
+# number of commands in the path
+# ---
+# p:   path
+# ret: command count
+pub fun len(p: *Path) usize {
+    ret p.ops.len;
+}
+
+# command i of the path
+# ---
+# p:   path
+# i:   command index below len
+# ret: the command
+pub fun at(p: *Path, i: usize) Op {
+    ret p.ops.data[i];
+}
+
+# coordinates each verb carries in path data, or none for a value that is not a verb
+fun operands(v: f32) opt[usize] {
+    if (v == MOVE::f32 || v == LINE::f32) { ret opt[usize].some{2}; }
+    if (v == QUAD::f32)                   { ret opt[usize].some{4}; }
+    if (v == CUBIC::f32)                  { ret opt[usize].some{6}; }
+    if (v == CLOSE::f32)                  { ret opt[usize].some{0}; }
+    ret opt[usize].none{};
+}
+
+# read the command at offset i of path data
+# ---
+# data: the stream
+# n:    floats in the stream
+# i:    offset of a command's verb
+# out:  receives the command
+# ret:  floats the command takes, 0 at the end of the stream or where it is malformed
+pub fun decode(data: *f32, n: usize, i: usize, out: *Op) usize {
+    if (i >= n) { ret 0; }
+    val k: opt[usize] = operands(data[i]);
+    if (sel k.none)         { ret 0; }
+    if (n - i - 1 < k.some) { ret 0; }
+    val v: u8 = data[i]::u8;
+    if (v == CLOSE) {
+        @out = Op{verb: CLOSE, x: 0.0::f32, y: 0.0::f32, cx0: 0.0::f32, cy0: 0.0::f32, cx1: 0.0::f32, cy1: 0.0::f32};
+        ret 1;
+    }
+    if (v == QUAD) {
+        @out = Op{verb: v, x: data[i + 3], y: data[i + 4], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 1], cy1: data[i + 2]};
+        ret 5;
+    }
+    if (v == CUBIC) {
+        @out = Op{verb: v, x: data[i + 5], y: data[i + 6], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 3], cy1: data[i + 4]};
+        ret 7;
+    }
+    @out = Op{verb: v, x: data[i + 1], y: data[i + 2], cx0: data[i + 1], cy0: data[i + 2], cx1: data[i + 1], cy1: data[i + 2]};
+    ret 3;
+}
+
+# whether path data is whole: every verb known and followed by all its
+# coordinates
+# ---
+# data: the stream
+# n:    floats in the stream
+# ret:  true when decode reads it to its end
+pub fun valid(data: *f32, n: usize) bool {
+    if (data == nil && n != 0) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        var o:    Op;
+        val took: usize = decode(data, n, i, ?o);
+        if (took == 0) { ret false; }
+        i = i + took;
+    }
+    ret true;
+}
+
+test path__records_commands_in_order {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+
+    var p: Path = init(?a);
+    move(?p, 1.0::f32, 2.0::f32);
+    line(?p, 3.0::f32, 4.0::f32);
+    quad(?p, 5.0::f32, 6.0::f32, 7.0::f32, 8.0::f32);
+    cubic(?p, 9.0::f32, 10.0::f32, 11.0::f32, 12.0::f32, 13.0::f32, 14.0::f32);
+    close(?p);
+    if (len(?p) != 5 || p.oom != 0)                            { ret 2; }
+    if (at(?p, 0).verb != MOVE || at(?p, 1).x != 3.0::f32)     { ret 3; }
+    if (at(?p, 2).cx0 != 5.0::f32 || at(?p, 2).y != 8.0::f32)  { ret 4; }
+    if (at(?p, 3).cx1 != 11.0::f32 || at(?p, 4).verb != CLOSE) { ret 5; }
+    reset(?p);
+    if (len(?p) != 0) { ret 6; }
+
+    val freed: err[allo.Error] = free(?p);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test path__decodes_path_data {
+    var d: [12]f32 = [12]f32{0.0, 1.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 4.0, 1.0, 7.0, 8.0};
+    var o: Op;
+    if (decode(?d[0], 12, 0, ?o) != 3 || o.verb != MOVE || o.y != 2.0::f32)                      { ret 1; }
+    if (decode(?d[0], 12, 3, ?o) != 5 || o.verb != QUAD || o.cx0 != 3.0::f32 || o.x != 5.0::f32) { ret 2; }
+    if (decode(?d[0], 12, 8, ?o) != 1 || o.verb != CLOSE)                                        { ret 3; }
+    if (!valid(?d[0], 9))                                                                        { ret 4; }
+    # a line short of its y, and a value that is no verb
+    if (valid(?d[0], 11)) { ret 5; }
+    var bad: [3]f32 = [3]f32{9.0, 1.0, 2.0};
+    if (valid(?bad[0], 3)) { ret 6; }
+    if (!valid(nil, 0))    { ret 7; }
+    ret 0;
+}

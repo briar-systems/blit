@@ -1,0 +1,86 @@
+# shapes and paths: what the painter draws for a custom widget
+#
+# every shape is drawn in the current local space and clipped like any
+# geometry, and every edge but a plain quad's is antialiased by feathered
+# geometry, so a renderer needs nothing more than blit's draw contract.
+# a path is contours of lines and curves the caller owns, filled by the
+# nonzero rule or stroked.
+
+use allo: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+
+use blit;
+
+# the path the section fills and strokes
+# ---
+# heart: a closed contour of two cubics, built once
+pub rec State {
+    heart: blit.path.Path;
+}
+
+pub fun init(s: *State, a: *allo.Allocator) {
+    s.heart = blit.path.init(a);
+    blit.path.move(?s.heart, 32.0::f32, 56.0::f32);
+    blit.path.cubic(?s.heart, -8.0::f32, 28.0::f32, 12.0::f32, -4.0::f32, 32.0::f32, 16.0::f32);
+    blit.path.cubic(?s.heart, 52.0::f32, -4.0::f32, 72.0::f32, 28.0::f32, 32.0::f32, 56.0::f32);
+    blit.path.close(?s.heart);
+}
+
+pub fun free(s: *State) bool {
+    val e: err[allo.Error] = blit.path.free(?s.heart);
+    ret !sel e.err;
+}
+
+# a canvas h pixels tall across the column, its top left the origin
+fun canvas(ctx: *blit.context.Context, h: f32) blit.context.Surface {
+    val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    ret blit.context.begin_surface(ctx, r.x0, r.y0, r.x1 - r.x0, h, 0.0::f32, 0.0::f32);
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s:  *State            = user::*State;
+    val t:  *blit.theme.Theme = blit.context.theme_of(ctx);
+    val c0: blit.draw.Color   = t.series[0];
+    val c1: blit.draw.Color   = t.series[1];
+    val c2: blit.draw.Color   = t.series[2];
+
+    blit.controls.separator_label(ctx, "Rects, circles and arcs");
+    val a: blit.context.Surface = canvas(ctx, 72.0::f32);
+    blit.context.quad(ctx, 0.0::f32, 4.0::f32, 56.0::f32, 60.0::f32, c0);
+    blit.context.frame(ctx, 64.0::f32, 4.0::f32, 120.0::f32, 60.0::f32, 3.0::f32, c1);
+    blit.context.rounded_rect(ctx, 128.0::f32, 4.0::f32, 184.0::f32, 60.0::f32, blit.draw.Radii{tl: 16.0::f32, tr: 2.0::f32, br: 16.0::f32, bl: 2.0::f32}, c2);
+    blit.context.stroke_rounded_rect(ctx, 192.0::f32, 4.0::f32, 248.0::f32, 60.0::f32, blit.draw.radii(10.0::f32), 2.0::f32, t.text);
+    blit.context.circle(ctx, 284.0::f32, 32.0::f32, 26.0::f32, c1);
+    blit.context.stroke_circle(ctx, 344.0::f32, 32.0::f32, 26.0::f32, 4.0::f32, c0);
+    blit.context.arc(ctx, 404.0::f32, 32.0::f32, 24.0::f32, 0.0::f32, 4.5::f32, 6.0::f32, c2);
+    blit.context.end_surface(ctx, a);
+
+    # strokes end square, and a corner joins mitred, bevelled or round
+    blit.controls.separator_label(ctx, "Lines and joins");
+    val b:    blit.context.Surface = canvas(ctx, 72.0::f32);
+    var join: u8                   = blit.draw.JOIN_MITER;
+    for (join <= blit.draw.JOIN_ROUND) {
+        val x:   f32 = join::f32 * 96.0::f32;
+        var pts: [3]blit.draw.Point;
+        pts[0] = blit.draw.Point{x: x + 8.0::f32, y: 60.0::f32};
+        pts[1] = blit.draw.Point{x: x + 40.0::f32, y: 10.0::f32};
+        pts[2] = blit.draw.Point{x: x + 72.0::f32, y: 60.0::f32};
+        blit.context.polyline(ctx, ?pts[0], 3, false, 10.0::f32, join, c0);
+        join = join + 1;
+    }
+    blit.context.line(ctx, 300.0::f32, 8.0::f32, 380.0::f32, 64.0::f32, 1.5::f32, t.text);
+    blit.context.tri(ctx, 392.0::f32, 64.0::f32, 432.0::f32, 8.0::f32, 448.0::f32, 64.0::f32, c1);
+    blit.context.end_surface(ctx, b);
+
+    blit.controls.separator_label(ctx, "Paths and gradients");
+    val c: blit.context.Surface = canvas(ctx, 72.0::f32);
+    blit.context.fill_path(ctx, ?s.heart, c2);
+    blit.context.stroke_path(ctx, ?s.heart, 2.0::f32, blit.draw.JOIN_ROUND, t.text);
+    val g: blit.draw.Gradient = blit.draw.gradient(80.0::f32, 0.0::f32, c0, 200.0::f32, 0.0::f32, c1);
+    blit.context.quad_gradient(ctx, 80.0::f32, 8.0::f32, 200.0::f32, 64.0::f32, g);
+    val v: blit.draw.Gradient = blit.draw.gradient(0.0::f32, 8.0::f32, c1, 0.0::f32, 64.0::f32, c2);
+    blit.context.rounded_rect_gradient(ctx, 216.0::f32, 8.0::f32, 336.0::f32, 64.0::f32, blit.draw.radii(12.0::f32), v);
+    blit.context.end_surface(ctx, c);
+}

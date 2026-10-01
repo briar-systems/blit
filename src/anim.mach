@@ -1,0 +1,399 @@
+# animated values: numbers that move toward a target over time instead of
+# jumping to it
+#
+# an animated value is state kept by id in the context's store (see
+# blit.state), so a widget animates by asking for its value each frame with
+# the target it wants, and the value eases from wherever it stands to the
+# target over the motion's duration on the host's clock (input.time). a
+# change of target mid-flight starts a new run from the value as it stands,
+# so nothing ever jumps.
+#
+# a value asks for frames through context.wake_at only while it moves, so an
+# interface whose values have all settled reports no pending frame from
+# context.next_frame and an idle host can sleep. a value seen for the first
+# time starts at its target, a host that never advances its clock gets every
+# value at its target at once, and so does context.set_reduce_motion.
+#
+# how long a kind of motion takes and how it eases are the theme's motion
+# fields (motion.hover_time, motion.hover_ease and so on, see theme.motion):
+# timing is the one place a widget reads them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.context;
+use blit.draw;
+use blit.ease;
+use blit.input;
+use blit.state;
+use blit.store;
+use th: blit.theme;
+
+# one animated value
+# ---
+# from:  where the current run started
+# to:    the target
+# start: the host time the run started at
+# dur:   the run's length in seconds, 0 once settled at to
+# curve: the run's ease curve
+# live:  1 once the value was first seen
+rec Track {
+    from:  f32;
+    to:    f32;
+    start: f64;
+    dur:   f32;
+    curve: u8;
+    live:  u8;
+}
+
+# how a kind of motion moves under the context's theme
+#
+# every animated widget takes its duration and curve from here, the theme's
+# motion fields (see theme.motion), and reduced motion (see
+# context.set_reduce_motion) makes every duration 0.
+# ---
+# ctx:  context
+# kind: a theme.MOTION_* kind
+# ret:  its duration and curve, a zero duration for a kind out of range
+pub fun timing(ctx: *context.Context, kind: usize) th.Motion {
+    var m: th.Motion = th.motion(?ctx.theme, kind);
+    if (ctx.still != 0) { m.dur = 0.0::f32; }
+    ret m;
+}
+
+# where a track stands at time now, settling it once its run ends and asking
+# for the next frame while it runs
+fun now_of(ctx: *context.Context, t: *Track, now: f64) f32 {
+    if (t.dur <= 0.0::f32) { ret t.to; }
+    val p: f64 = (now - t.start) / t.dur::f64;
+    if (p >= 1.0::f64 || ctx.still != 0 || ctx.clocked == 0) {
+        t.dur = 0.0::f32;
+        ret t.to;
+    }
+    context.wake_at(ctx, now);
+    var q: f32 = 0.0::f32;
+    if (p > 0.0::f64) { q = p::f32; }
+    ret t.from + (t.to - t.from) * ease.at(t.curve, q);
+}
+
+# move a track toward target with motion m and say where it stands
+fun step(ctx: *context.Context, t: *Track, target: f32, m: th.Motion) f32 {
+    val now: f64 = ctx.in.time;
+    if (t.live == 0) {
+        t.from  = target;
+        t.to    = target;
+        t.start = now;
+        t.dur   = 0.0::f32;
+        t.live  = 1;
+        ret target;
+    }
+    if (target != t.to) {
+        t.from  = now_of(ctx, t, now);
+        t.to    = target;
+        t.start = now;
+        t.dur   = m.dur;
+        t.curve = m.curve;
+        if (ctx.clocked == 0 || t.from == target) { t.dur = 0.0::f32; }
+    }
+    ret now_of(ctx, t, now);
+}
+
+# the value an id animates toward target, with a motion of its own
+#
+# the first time an id is seen its value is the target. the pointer-free
+# state lives in the store under id, so each animated value of a widget takes
+# an id of its own, such as blit.id.child(id, "#hover").
+# ---
+# ctx:    context
+# id:     the value's id
+# target: where the value is headed
+# m:      the duration and curve of a run toward a new target
+# ret:    the value this frame
+pub fun toward(ctx: *context.Context, id: u64, target: f32, m: th.Motion) f32 {
+    ret step(ctx, state.get[Track](ctx, id), target, m);
+}
+
+# the value an id animates toward target, timed by the theme's motion of a kind
+# ---
+# ctx:    context
+# id:     the value's id
+# target: where the value is headed
+# kind:   a theme.MOTION_* kind
+# ret:    the value this frame
+pub fun value(ctx: *context.Context, id: u64, target: f32, kind: usize) f32 {
+    ret toward(ctx, id, target, timing(ctx, kind));
+}
+
+# a 0 to 1 value an id fades in while on and out while off, timed by the
+# theme's motion of a kind, for a hover or a press
+#
+# unlike value, it starts from 0 the first time it turns on, and a value at
+# rest at 0 keeps no state: its entry ages out of the store, so a control the
+# pointer never visits costs nothing.
+# ---
+# ctx:  context
+# id:   the value's id
+# on:   true to head for 1, false for 0
+# kind: a theme.MOTION_* kind
+# ret:  the value this frame, in [0, 1]
+pub fun fade(ctx: *context.Context, id: u64, on: bool, kind: usize) f32 {
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(Track));
+    if (e == nil) {
+        if (!on) { ret 0.0::f32; }
+        val fresh: *Track = state.get[Track](ctx, id);
+        fresh.live = 1;
+        ret step(ctx, fresh, 1.0::f32, timing(ctx, kind));
+    }
+    val held: *Track = e.data::*Track;
+    if (!on && held.live != 0 && held.to == 0.0::f32 && held.dur <= 0.0::f32) { ret 0.0::f32; }
+    var target: f32 = 0.0::f32;
+    if (on) { target = 1.0::f32; }
+    ret step(ctx, state.get[Track](ctx, id), target, timing(ctx, kind));
+}
+
+# put an id's value at v at once, ending any run, as a drag that moves a
+# value under the pointer does
+# ---
+# ctx: context
+# id:  the value's id
+# v:   the value
+pub fun snap(ctx: *context.Context, id: u64, v: f32) {
+    val t: *Track = state.get[Track](ctx, id);
+    if (t.from != v || t.to != v) { context.redraw(ctx); }
+    t.from  = v;
+    t.to    = v;
+    t.start = ctx.in.time;
+    t.dur   = 0.0::f32;
+    t.live  = 1;
+}
+
+# whether an id's value is still moving
+# ---
+# ctx: context
+# id:  the value's id
+# ret: true while a run is in flight
+pub fun running(ctx: *context.Context, id: u64) bool {
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(Track));
+    if (e == nil) { ret false; }
+    ret (e.data::*Track).dur > 0.0::f32;
+}
+
+# the number t of the way from a to b
+# ---
+# a:   at t 0
+# b:   at t 1
+# t:   how far, usually in [0, 1]
+# ret: a + (b - a) * t
+pub fun lerp(a: f32, b: f32, t: f32) f32 {
+    ret a + (b - a) * t;
+}
+
+# the color t of the way from a to b, channel by channel as authored
+# ---
+# a:   at t 0
+# b:   at t 1
+# t:   how far, clamped to [0, 1]
+# ret: the mixed color
+pub fun mix(a: draw.Color, b: draw.Color, t: f32) draw.Color {
+    if (t <= 0.0::f32) { ret a; }
+    if (t >= 1.0::f32) { ret b; }
+    ret draw.rgba(lerp(a.r, b.r, t), lerp(a.g, b.g, t), lerp(a.b, b.b, t), lerp(a.a, b.a, t));
+}
+
+# the paint a box shows while it eases from one state to another
+# ---
+# from:  the paint the run started from, as it showed then
+# to:    the state it is headed for
+# start: the host time the run started at
+# dur:   the run's length in seconds, 0 once settled
+# curve: the run's ease curve
+rec Blend {
+    from:  th.Paint;
+    to:    u8;
+    start: f64;
+    dur:   f32;
+    curve: u8;
+}
+
+# a paint t of the way from a to b, color by color and width by width
+fun mix_paint(a: th.Paint, b: *th.Paint, t: f32) th.Paint {
+    var p: th.Paint;
+    p.fill     = mix(a.fill, b.fill, t);
+    p.fill_to  = mix(a.fill_to, b.fill_to, t);
+    p.text     = mix(a.text, b.text, t);
+    p.mark     = mix(a.mark, b.mark, t);
+    p.border   = mix(a.border, b.border, t);
+    p.border_w = lerp(a.border_w, b.border_w, t);
+    p.shadow   = mix(a.shadow, b.shadow, t);
+    ret p;
+}
+
+# where a blend stands now, settling it once its run ends and asking for the
+# next frame while it runs
+fun blended(ctx: *context.Context, b: *Blend, kind: u32) th.Paint {
+    val to: *th.Paint = context.paint_of(ctx, kind, b.to);
+    if (b.dur <= 0.0::f32) { ret @to; }
+    val now: f64 = ctx.in.time;
+    val p:   f64 = (now - b.start) / b.dur::f64;
+    if (p >= 1.0::f64 || ctx.still != 0 || ctx.clocked == 0) {
+        b.dur = 0.0::f32;
+        ret @to;
+    }
+    context.wake_at(ctx, now);
+    var q: f32 = 0.0::f32;
+    if (p > 0.0::f64) { q = p::f32; }
+    ret mix_paint(b.from, to, ease.at(b.curve, q));
+}
+
+# the paint a box of a kind shows in a state, easing from the state it was
+# in over the theme's hover motion, as every built-in control paints its face
+#
+# a box at rest in the normal state keeps no state, so a control the pointer
+# never visits costs nothing. the blend lives in the store under id, so each
+# box a widget paints takes an id of its own.
+# ---
+# ctx:  context
+# id:   the box's id
+# kind: a registered kind (see theme.register_kind)
+# now:  the state it is in this frame, theme.NORMAL .. theme.FOCUSED
+# ret:  the paint to draw with this frame
+pub fun paint(ctx: *context.Context, id: u64, kind: u32, now: u8) th.Paint {
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(Blend));
+    if (e == nil && now == th.NORMAL) { ret @context.paint_of(ctx, kind, now); }
+    if (e != nil) {
+        val held: *Blend = e.data::*Blend;
+        if (now == th.NORMAL && held.to == th.NORMAL && held.dur <= 0.0::f32) { ret @context.paint_of(ctx, kind, now); }
+    }
+    val b: *Blend = state.get[Blend](ctx, id);
+    if (e == nil) {
+        b.from = @context.paint_of(ctx, kind, th.NORMAL);
+        b.to   = th.NORMAL;
+        b.dur  = 0.0::f32;
+    }
+    if (b.to != now) {
+        val m: th.Motion = timing(ctx, th.MOTION_HOVER);
+        b.from  = blended(ctx, b, kind);
+        b.to    = now;
+        b.start = ctx.in.time;
+        b.dur   = m.dur;
+        b.curve = m.curve;
+        if (ctx.clocked == 0) { b.dur = 0.0::f32; }
+    }
+    ret blended(ctx, b, kind);
+}
+
+# paint a widget kind's box in a state, easing from the state it was in (see
+# paint), and hand back the paint it drew with for its text and marks
+# ---
+# ctx:  context
+# id:   the box's id
+# kind: a registered kind
+# now:  the state it is in this frame
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# ret:  the paint drawn with
+pub fun box(ctx: *context.Context, id: u64, kind: u32, now: u8, x0: f32, y0: f32, x1: f32, y1: f32) th.Paint {
+    val p: th.Paint = paint(ctx, id, kind, now);
+    context.box_painted(ctx, kind, p, x0, y0, x1, y1);
+    ret p;
+}
+
+# one frame at time t, asking for a value of id toward target
+#[testing]
+fun frame_value(ctx: *context.Context, t: f64, id: u64, target: f32) f32 {
+    var in: input.Input;
+    in.time = t;
+    context.begin(ctx, in, 100.0::f32, 100.0::f32);
+    val v: f32 = value(ctx, id, target, th.MOTION_OPEN);
+    context.end(ctx);
+    ret v;
+}
+
+test value__eases_to_its_target_and_then_sleeps {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    ctx.theme.open_time = 0.1::f32;
+    ctx.theme.open_ease = ease.LINEAR::f32;
+
+    # first sight starts at the target, and nothing is pending
+    if (frame_value(?ctx, 0.0::f64, 7, 0.0::f32) != 0.0::f32) { ret 2; }
+    val idle: opt[f64] = context.next_frame(?ctx);
+    if (sel idle.some)                                         { ret 3; }
+    if (frame_value(?ctx, 0.01::f64, 7, 0.0::f32) != 0.0::f32) { ret 4; }
+
+    # a new target runs from where the value stands, asking for frames
+    if (frame_value(?ctx, 1.0::f64, 7, 10.0::f32) != 0.0::f32) { ret 5; }
+    val busy: opt[f64] = context.next_frame(?ctx);
+    if (!sel busy.some)        { ret 6; }
+    if (busy.some != 0.0::f64) { ret 6; }
+    val mid: f32 = frame_value(?ctx, 1.05::f64, 7, 10.0::f32);
+    if (mid < 4.9::f32 || mid > 5.1::f32) { ret 7; }
+
+    # a change mid-flight turns back from there without a jump
+    val back: f32 = frame_value(?ctx, 1.06::f64, 7, 0.0::f32);
+    if (back < 5.9::f32 || back > 6.1::f32) { ret 8; }
+
+    # settled, the value holds its target and asks for nothing
+    if (frame_value(?ctx, 2.0::f64, 7, 0.0::f32) != 0.0::f32) { ret 9; }
+    val done: opt[f64] = context.next_frame(?ctx);
+    if (sel done.some) { ret 10; }
+
+    # reduced motion jumps straight to the target
+    context.set_reduce_motion(?ctx, 1);
+    if (frame_value(?ctx, 3.0::f64, 7, 10.0::f32) != 10.0::f32) { ret 11; }
+    val still: opt[f64] = context.next_frame(?ctx);
+    if (sel still.some) { ret 12; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test fade__keeps_no_state_at_rest {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var in: input.Input;
+
+    in.time = 0.0::f64;
+    context.begin(?ctx, in, 10.0::f32, 10.0::f32);
+    if (fade(?ctx, 9, false, th.MOTION_HOVER) != 0.0::f32) { ret 2; }
+    context.end(?ctx);
+    if (store.entry(?ctx.store, 9, $type_id(Track)) != nil) { ret 3; }
+
+    # turning on starts from 0 and climbs to 1
+    in.time = 1.0::f64;
+    context.begin(?ctx, in, 10.0::f32, 10.0::f32);
+    if (fade(?ctx, 9, true, th.MOTION_HOVER) != 0.0::f32) { ret 4; }
+    context.end(?ctx);
+    in.time = 1.04::f64;
+    context.begin(?ctx, in, 10.0::f32, 10.0::f32);
+    val up: f32 = fade(?ctx, 9, true, th.MOTION_HOVER);
+    context.end(?ctx);
+    if (up <= 0.0::f32 || up >= 1.0::f32 || !running(?ctx, 9)) { ret 5; }
+    in.time = 2.0::f64;
+    context.begin(?ctx, in, 10.0::f32, 10.0::f32);
+    if (fade(?ctx, 9, true, th.MOTION_HOVER) != 1.0::f32) { ret 6; }
+    context.end(?ctx);
+    if (running(?ctx, 9)) { ret 7; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

@@ -1,0 +1,192 @@
+# widget ids: hashed keys under a scope seed
+#
+# an id is the 64-bit FNV-1a hash of a key folded into the seed of the scope
+# it is made in, finished with a 64-bit mixer, so it depends on what a widget
+# is called and where, never on how many widgets came before it. 0 is reserved
+# for "no widget": a hash that lands on it is moved to 1.
+#
+# a label is its own key, with two markers. text after "##" is hashed but not
+# drawn, so "Save##toolbar" shows "Save" and differs from another "Save". a
+# label holding "###" is keyed by the text from "###" on alone, so the shown
+# text can change without changing the id: "Frames: 12###fps" and
+# "Frames: 13###fps" are one widget. parts of a widget (a scrollbar thumb, a
+# popup's outside claim) are children of its id under a fixed suffix or an
+# index. a label path ("Settings/Audio/volume") folds its labels in as nested
+# scopes, naming a widget the way the containers around it scope it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use fnv: std.crypto.hash.fnv1a;
+
+# the seed of the root scope
+pub val ROOT: u64 = fnv.FNV_OFFSET;
+
+# a folded hash finished into an id: mixed (murmur3's fmix64) so the next
+# fold under it starts from a scrambled state, then moved off the reserved 0
+#
+# without the mix a scope and a key would hash as their concatenation, and
+# "x" then "ab" would equal "xa" then "b".
+fun finish(h: u64) u64 {
+    var x: u64 = h;
+    x = x ^ (x >> 33);
+    x = x * 0xff51afd7ed558ccd;
+    x = x ^ (x >> 33);
+    x = x * 0xc4ceb9fe1a85ec53;
+    x = x ^ (x >> 33);
+    if (x == 0) { ret 1; }
+    ret x;
+}
+
+# fold bytes [lo, hi) of s into h
+fun fold(h: u64, s: str, lo: usize, hi: usize) u64 {
+    var x: u64   = h;
+    var i: usize = lo;
+    for (i < hi) {
+        x = fnv.step_u8(x, s[i]);
+        i = i + 1;
+    }
+    ret x;
+}
+
+# the byte "##" or "###" starts at in s, n when it has none
+fun find(s: str, n: usize, three: bool) usize {
+    var i: usize = 0;
+    for (i + 1 < n) {
+        if (s[i] == '#' && s[i + 1] == '#') {
+            if (!three)                       { ret i; }
+            if (i + 2 < n && s[i + 2] == '#') { ret i; }
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the id of a string key under a seed, the key hashed as it is
+# ---
+# seed: the scope's seed
+# s:    the key, nil for the empty key
+# ret:  a nonzero id
+pub fun of_str(seed: u64, s: str) u64 {
+    if (s == nil) { ret finish(seed); }
+    ret finish(fold(seed, s, 0, str_len(s)));
+}
+
+# the id of an integer key under a seed
+# ---
+# seed: the scope's seed
+# n:    the key
+# ret:  a nonzero id
+pub fun of_int(seed: u64, n: u64) u64 {
+    var x: u64 = seed;
+    var k: u64 = 0;
+    for (k < 8) {
+        x = fnv.step_u8(x, ((n >> (k * 8)) & 0xFF)::u8);
+        k = k + 1;
+    }
+    ret finish(x);
+}
+
+# the id of bytes [lo, hi) of s taken as a label under a seed
+fun label_range(seed: u64, s: str, lo: usize, hi: usize) u64 {
+    val at: usize = find((?s[lo])::str, hi - lo, true);
+    if (at < hi - lo) { ret finish(fold(seed, s, lo + at, hi)); }
+    ret finish(fold(seed, s, lo, hi));
+}
+
+# the id of a label under a seed, keyed by the text from "###" on when it holds
+# one, else by the whole label
+# ---
+# seed:  the scope's seed
+# label: the label, nil for the empty key
+# ret:   a nonzero id
+pub fun of_label(seed: u64, label: str) u64 {
+    if (label == nil) { ret finish(seed); }
+    ret label_range(seed, label, 0, str_len(label));
+}
+
+# the id a "/"-separated label path names under a seed
+#
+# each segment but the last is a scope a container opened under its label,
+# and the last is the widget's label, so "Settings/Audio/volume" is the
+# "volume" widget inside "Audio" inside "Settings". every segment is keyed as
+# a label, markers included. a key holding "/" cannot be named by a path.
+# ---
+# seed: the scope's seed
+# path: the label path, nil for the empty key
+# ret:  a nonzero id
+pub fun of_path(seed: u64, path: str) u64 {
+    if (path == nil) { ret finish(seed); }
+    val n:  usize = str_len(path);
+    var h:  u64   = seed;
+    var lo: usize = 0;
+    for {
+        var hi: usize = lo;
+        for (hi < n && path[hi] != '/') { hi = hi + 1; }
+        h = label_range(h, path, lo, hi);
+        if (hi >= n) { brk; }
+        lo = hi + 1;
+    }
+    ret h;
+}
+
+# how many leading bytes of a label are drawn: all of it up to the first "##"
+# ---
+# label: the label, nil for none
+# ret:   the drawn byte count
+pub fun shown(label: str) usize {
+    if (label == nil) { ret 0; }
+    val n: usize = str_len(label);
+    ret find(label, n, false);
+}
+
+# the id of a part of a widget, named by a fixed suffix
+# ---
+# parent: the widget's id
+# suffix: the part's name
+# ret:    a nonzero id
+pub fun child(parent: u64, suffix: str) u64 {
+    ret of_str(parent, suffix);
+}
+
+# the id of the n-th of a widget's repeated parts, such as a list's items
+# ---
+# parent: the widget's id
+# n:      the part's index
+# ret:    a nonzero id
+pub fun child_int(parent: u64, n: u64) u64 {
+    ret of_int(parent, n);
+}
+
+test id__labels_key_and_show {
+    # "##" is hashed but not shown
+    if (shown("Save##toolbar") != 4)                               { ret 1; }
+    if (of_label(ROOT, "Save##toolbar") == of_label(ROOT, "Save")) { ret 2; }
+    if (of_label(ROOT, "Save##a") == of_label(ROOT, "Save##b"))    { ret 3; }
+    if (of_label(ROOT, "Save") != of_str(ROOT, "Save"))            { ret 4; }
+    # "###" keys by its tail alone, and shows what precedes it
+    if (shown("Frames: 12###fps") != 10)                                 { ret 5; }
+    if (of_label(ROOT, "Frames: 12###fps") != of_label(ROOT, "x###fps")) { ret 6; }
+    if (of_label(ROOT, "a###fps") == of_label(ROOT, "a###ups"))          { ret 7; }
+    if (shown("plain") != 5 || shown(nil) != 0)                          { ret 8; }
+    # a seed scopes the same key apart, and parts differ from their widget
+    if (of_label(1, "ok") == of_label(2, "ok")) { ret 9; }
+    val w: u64 = of_label(ROOT, "w");
+    if (child(w, "#thumb") == w || child_int(w, 0) == child_int(w, 1)) { ret 10; }
+    if (of_int(ROOT, 7) == 0 || of_str(ROOT, nil) == 0)                { ret 11; }
+    # a scope and a key never hash as their concatenation
+    if (of_str(of_str(ROOT, "x"), "ab") == of_str(of_str(ROOT, "xa"), "b"))         { ret 12; }
+    if (of_label(of_label(ROOT, "x"), "ab") == of_label(of_label(ROOT, "xa"), "b")) { ret 13; }
+    if (child(of_label(ROOT, "x"), "ab") == child(of_label(ROOT, "xa"), "b"))       { ret 14; }
+    if (of_str(ROOT, nil) == ROOT)                                                  { ret 15; }
+    # a path is its labels nested as scopes
+    val path: u64 = of_label(of_label(of_label(ROOT, "Settings"), "Audio##x"), "volume");
+    if (of_path(ROOT, "Settings/Audio##x/volume") != path)      { ret 16; }
+    if (of_path(ROOT, "a###k/ok") != of_path(ROOT, "b###k/ok")) { ret 17; }
+    if (of_path(ROOT, "ok") != of_label(ROOT, "ok"))            { ret 18; }
+    ret 0;
+}

@@ -1,0 +1,62 @@
+# tables: rows of any widgets under columns you resize, reorder, sort and hide
+#
+# the table draws only the rows in view, so ten thousand rows cost what a
+# screenful does. it never sorts: it reports the column and direction asked
+# for, and the caller orders its rows. right click the header to hide a
+# column, drag a header to move it, drag its edge to resize it.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit;
+
+# rows in the table
+val ROWS: usize = 10000;
+
+# what the table keeps
+# ---
+# cols: its columns, which begin fills with where they went
+# done: one checkbox per row
+# desc: 1 while the rows are ordered last first
+pub rec State {
+    cols: [4]blit.table.Column;
+    done: [10000]u8;
+    desc: u8;
+}
+
+pub fun init(s: *State) {
+    s.cols[0] = blit.table.Column{label: "Row", width: 60.0::f32};
+    s.cols[1] = blit.table.Column{label: "Name", width: 120.0::f32, flags: blit.table.NO_SORT};
+    s.cols[2] = blit.table.Column{label: "Size", width: 70.0::f32, flags: blit.table.NO_SORT};
+    s.cols[3] = blit.table.Column{label: "Done", flags: blit.table.NO_SORT | blit.table.NO_HIDE};
+}
+
+# the size of a row, made up from its index
+fun size_of(row: usize) usize {
+    ret (row * 7919) % 100000;
+}
+
+pub fun show(ctx: *blit.context.Context, user: ptr) {
+    val s:     *State = user::*State;
+    var names: [4]str;
+    names[0] = "alpha";
+    names[1] = "beta";
+    names[2] = "gamma";
+    names[3] = "delta";
+
+    var o: blit.table.Options = blit.table.options(ROWS, blit.context.px(ctx, 320.0::f32));
+    o.freeze_cols = 1;
+    var t: blit.table.Table = blit.table.begin(ctx, "files", ?s.cols[0], 4, o);
+    if (t.sorted) { s.desc = (t.sort == 0 && t.dir == blit.table.SORT_DESC)::u8; }
+    for (blit.table.next_row(ctx, ?t)) {
+        # a caller ordering rows maps the row shown to the row it stands for
+        var row: usize = t.row;
+        if (s.desc != 0) { row = ROWS - 1 - t.row; }
+        var buf: [48]u8;
+        if (blit.table.cell(ctx, ?t, 0)) { blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](row::u64), ?buf[0])); }
+        if (blit.table.cell(ctx, ?t, 1)) { blit.widget.text(ctx, names[row % 4]); }
+        if (blit.table.cell(ctx, ?t, 2)) { blit.widget.text(ctx, blit.value.format(blit.value.U64, blit.value.num[u64](size_of(row)::u64), ?buf[0])); }
+        if (blit.table.cell(ctx, ?t, 3)) { blit.widget.checkbox(ctx, "##done", ?s.done[row]); }
+    }
+    blit.table.end(ctx, ?t);
+}

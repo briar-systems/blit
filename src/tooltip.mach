@@ -1,0 +1,251 @@
+# tooltips: an overlay shown over a widget after the pointer rests on it
+#
+# a tooltip names the widget it describes by id, after that widget is drawn
+# in the frame. once the widget has been the hovered claimant for the hover
+# delay, the tooltip opens in the tooltips band, above every band but the drag
+# preview, anchored below and to the right of the pointer or below the
+# widget, and kept on the surface: it flips to the other side of its anchor
+# where it would run off an edge, then is clamped. a held button hides it and
+# starts the delay over.
+#
+# while the delay runs the tooltip asks for the frame it ends in (see
+# context.wake_at), so a host that sleeps between inputs still shows it, and
+# asks for nothing once it is shown or the pointer has left. it claims
+# nothing, so the widget under it keeps the pointer.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use blit.band;
+use blit.context;
+use drv: blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.layout;
+use blit.overlay;
+use blit.state;
+use blit.theme;
+use blit.widget;
+use allo: std.allocator;
+use std.allocator.page;
+
+# seconds the pointer rests on a widget before its tooltip shows
+pub val DELAY: f64 = 0.5;
+
+# unscaled pixels between the pointer and a tooltip that follows it, clear of
+# the cursor's own shape
+pub val CURSOR_GAP: f32 = 16.0;
+
+# how a tooltip shows
+# ---
+# delay:  seconds the pointer rests on the widget first
+# follow: 1 to sit below and right of the pointer, 0 to sit below the widget
+pub rec Tip {
+    delay:  f64;
+    follow: u8;
+}
+
+# when the pointer came to rest on a widget, kept under its tooltip's id
+rec Rest {
+    since: f64;
+    on:    u8;
+}
+
+# the handle begin returns for end
+# ---
+# open:  1 when the tooltip is shown this frame and widgets go in it
+# shown: the overlay, when open
+pub rec Shown {
+    open:  u8;
+    shown: overlay.Shown;
+}
+
+# a tooltip that follows the pointer after DELAY
+# ---
+# ret: the options, to adjust and pass to begin
+pub fun tip() Tip {
+    ret Tip{delay: DELAY, follow: 1};
+}
+
+# the widget's rect this frame in screen pixels when the pointer is on it,
+# the hovered claimant, with no button held
+fun resting(ctx: *context.Context, id: u64, r: *context.Area) bool {
+    if (id == 0 || ctx.in.present == 0 || ctx.in.down != 0 || ctx.hover != id) { ret false; }
+    val got: opt[context.Area] = context.rect_of(ctx, id);
+    if (sel got.none) { ret false; }
+    val a:  context.Area = got.some;
+    val mx: f32          = ctx.in.mx;
+    val my: f32          = ctx.in.my;
+    if (mx < a.x0 || mx >= a.x1 || my < a.y0 || my >= a.y1) { ret false; }
+    @r = a;
+    ret true;
+}
+
+# open the tooltip of a widget drawn earlier in the frame, when the pointer
+# has rested on it for t.delay
+#
+# widgets placed while the returned open is 1 fill the tooltip, laid out down
+# a column it sizes to. pair every begin with an end, open or not.
+# ---
+# ctx: context
+# id:  the widget's id (see context.id_of)
+# t:   how it shows (see tip)
+# ret: a handle for end
+pub fun begin(ctx: *context.Context, id: u64, t: Tip) Shown {
+    var r:    Shown;
+    val tid:  u64   = bid.child(id, "#tip");
+    val rest: *Rest = state.get[Rest](ctx, tid);
+    var a:    context.Area;
+    if (!resting(ctx, id, ?a)) {
+        rest.on = 0;
+        ret r;
+    }
+    val now: f64 = ctx.in.time;
+    if (rest.on == 0) {
+        rest.on    = 1;
+        rest.since = now;
+    }
+    if (now - rest.since < t.delay) {
+        context.wake_at(ctx, rest.since + t.delay);
+        ret r;
+    }
+
+    # the anchor arrives in screen pixels, the overlay takes local ones
+    var o: overlay.Overlay;
+    if (t.follow != 0) {
+        val g:  f32 = context.px(ctx, CURSOR_GAP);
+        val mx: f32 = ctx.in.mx - ctx.lx;
+        val my: f32 = ctx.in.my - ctx.ly;
+        o    = overlay.on_rect(context.Area{x0: mx, y0: my, x1: mx, y1: my}, overlay.TOP_LEFT, overlay.TOP_LEFT);
+        o.dx = g;
+        o.dy = g;
+    }
+    or {
+        val local: context.Area = context.Area{x0: a.x0 - ctx.lx, y0: a.y0 - ctx.ly, x1: a.x1 - ctx.lx, y1: a.y1 - ctx.ly};
+        o    = overlay.on_rect(local, overlay.BOTTOM_LEFT, overlay.TOP_LEFT);
+        o.dy = context.px(ctx, context.look_of(ctx, theme.TOOLTIP).margin.t);
+    }
+    o.keep  = 1;
+    o.band  = band.TOOLTIPS;
+    o.kind  = overlay.KIND_TOOLTIP;
+    r.open  = 1;
+    r.shown = overlay.begin_id(ctx, tid, o);
+    ret r;
+}
+
+# close a tooltip begin opened
+# ---
+# ctx: context
+# s:   the value returned by begin
+pub fun end(ctx: *context.Context, s: Shown) {
+    if (s.open == 0) { ret; }
+    overlay.end(ctx, s.shown);
+}
+
+# a line of text as a widget's tooltip, following the pointer after DELAY
+# ---
+# ctx: context
+# id:  the widget's id
+# s:   the text
+# ret: true when it is shown this frame
+pub fun text(ctx: *context.Context, id: u64, s: str) bool {
+    val sh: Shown = begin(ctx, id, tip());
+    if (sh.open != 0) {
+        val c: overlay.Chrome = overlay.chrome(ctx, overlay.KIND_TOOLTIP);
+        val r: context.Area   = widget.place(ctx, layout.fit(), layout.fit(), context.text_width(ctx, s), context.line_height(ctx));
+        context.text_at(ctx, s, r.x0, r.y0, c.text);
+    }
+    end(ctx, sh);
+    ret sh.open != 0;
+}
+
+# what the probe interface's tooltips reported
+#[testing]
+rec Probe {
+    shown: u8;
+    under: Shown;
+}
+
+# a button with a tooltip at the pointer in the top left, and one in the
+# bottom right corner whose tooltip sits by the button
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p: *Probe = user::*Probe;
+    widget.size_next(ctx, layout.fit(), layout.auto());
+    widget.button(ctx, "save");
+    p.shown = 0;
+    if (text(ctx, context.id_of(ctx, "save"), "write the file")) { p.shown = 1; }
+
+    val r: context.Area = context.Area{x0: 260.0::f32, y0: 180.0::f32, x1: 300.0::f32, y1: 200.0::f32};
+    widget.button_at(ctx, "corner", r.x0, r.y0, r.x1, r.y1, false);
+    var t: Tip = tip();
+    t.follow = 0;
+    val s: Shown = begin(ctx, context.id_of(ctx, "corner"), t);
+    if (s.open != 0) { widget.text(ctx, "by the corner button"); }
+    end(ctx, s);
+    p.under = s;
+}
+
+test tooltip__shows_after_the_delay_and_stays_on_screen {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?p)::ptr);
+    if (sel e.err) { ret 1; }
+    drv.step(?d);
+
+    # resting on the button asks for the frame the delay ends in, and no
+    # sooner once its hover has eased in
+    val save:  u64 = drv.find(?d, "save");
+    val since: f64 = d.time;
+    if (!drv.hover(?d, save)) { ret 2; }
+    drv.step(?d);
+    drv.settle(?d);
+    val wait: opt[f64] = context.next_frame(?d.ctx);
+    if (p.shown != 0)               { ret 3; }
+    if (!sel wait.some)             { ret 3; }
+    if (wait.some != since + DELAY) { ret 4; }
+
+    # shown once it has passed: below and right of the pointer, claiming nothing
+    d.time = since + DELAY;
+    drv.step(?d);
+    if (p.shown == 0) { ret 5; }
+    drv.step(?d);
+    val mx: f32 = d.in.mx;
+    val my: f32 = d.in.my;
+    val g:  f32 = CURSOR_GAP;
+    if (!str_equals(drv.text_in(?d, mx + g, my + g, 300.0::f32, 100.0::f32), "write the file")) { ret 6; }
+    if (drv.at(?d, mx, my) != save || !drv.hot(?d, save))                                       { ret 7; }
+    val idle: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel idle.none) { ret 8; }
+
+    # a held button hides it
+    drv.press(?d, input.BUTTON_LEFT);
+    if (p.shown != 0) { ret 9; }
+    drv.release(?d, input.BUTTON_LEFT);
+
+    # by the corner button it would run off the bottom, so it sits above it,
+    # and off the right, so it is clamped to the edge
+    val corner: u64 = drv.find(?d, "corner");
+    if (!drv.hover(?d, corner)) { ret 10; }
+    d.time = d.time + DELAY;
+    drv.steps(?d, 3);
+    if (p.under.open == 0)                                            { ret 11; }
+    if (p.under.shown.y1 > 180.0::f32 || p.under.shown.y0 < 0.0::f32) { ret 12; }
+    if (p.under.shown.x1 != 300.0::f32)                               { ret 13; }
+
+    # leaving the widget hides it
+    drv.leave(?d);
+    if (p.under.open != 0) { ret 14; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

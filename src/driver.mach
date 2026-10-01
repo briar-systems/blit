@@ -1,0 +1,841 @@
+# a headless test driver: run an interface frame by frame, act on its widgets
+# and read back what it drew
+#
+# a driver owns a context and an input, a screen size and a clock, and runs
+# the consumer's interface through a ui callback between begin and end, one
+# frame per step. it finds widgets by id, by label path ("Settings/Audio/
+# volume", see blit.id.of_path) or by a point or rect on screen, acts on them
+# the way a user would (hover, click, double and right click, drag to a point
+# or onto another widget, scroll, type text, press keys), each action running
+# the frames that input takes, and queries what the last frame did: whether a
+# widget was drawn, its rect, whether it is hot, active or focused, and the
+# text drawn in a rect. a snapshot is a stable text dump of the frame's draw
+# runs, quads and triangles for golden comparison.
+#
+# routing is the context's own: a widget is reached through the claims of the
+# frame before, so every action first moves the pointer onto the widget in a
+# frame of its own and then acts in the next. an action on a widget the last
+# frame did not draw does nothing and reports false. each step advances the
+# clock by dt (1/60 s unless changed) and clears the frame's key events and
+# wheel, so input given between steps lands in exactly one frame.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use blit.context;
+use blit.draw;
+use blit.font;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use allo: std.allocator;
+use std.allocator.page;
+
+# the frames a drag moves through between its press and its release
+pub val DRAG_STEPS: usize = 4;
+
+# the consumer's interface, built between the driver's begin and end
+# ---
+# ctx:  the driver's context, between begin and end
+# user: the pointer the driver was given at init
+pub def Ui: fun(*context.Context, ptr);
+
+# a context and an input driven frame by frame
+# ---
+# ctx:     the context the interface draws into, read freely between steps
+# in:      the input the next frame takes, kept across frames but for events
+# sw:      screen width in pixels
+# sh:      screen height in pixels
+# time:    the clock the next frame carries, in seconds
+# dt:      seconds each step advances the clock by
+# ui:      the interface to run each frame
+# user:    passed to ui untouched
+# a:       allocator backing the context, the input and out
+# out:     text the last text query or snapshot returned, NUL-terminated
+# out_cap: bytes allocated for out
+# out_len: bytes written to out, not counting the NUL
+# out_oom: 1 if out could not grow while it was written, else 0
+pub rec Driver {
+    ctx:     context.Context;
+    in:      input.Input;
+    sw:      f32;
+    sh:      f32;
+    time:    f64;
+    dt:      f64;
+    ui:      Ui;
+    user:    ptr;
+    a:       *allo.Allocator;
+    out:     *u8;
+    out_cap: usize;
+    out_len: usize;
+    out_oom: u8;
+}
+
+# set up a driver with its pointer off the screen and no frame run yet
+#
+# the context records the text each frame draws (see context.set_trace), which
+# text_in reads.
+# ---
+# d:    driver to initialize
+# a:    allocator backing the context, the input and the driver's text
+# sw:   screen width in pixels
+# sh:   screen height in pixels
+# ui:   the interface to run each frame
+# user: passed to ui untouched
+# ret:  ok, or the allocator's refusal with nothing left allocated
+pub fun init(d: *Driver, a: *allo.Allocator, sw: f32, sh: f32, ui: Ui, user: ptr) err[allo.Error] {
+    val e: err[allo.Error] = context.init(?d.ctx, a);
+    if (sel e.err) { ret e; }
+    context.set_trace(?d.ctx, 1);
+    var none: input.Input;
+    d.in = none;
+    input.init(?d.in, a);
+    d.sw      = sw;
+    d.sh      = sh;
+    d.time    = 0.0::f64;
+    d.dt      = 1.0::f64 / 60.0::f64;
+    d.ui      = ui;
+    d.user    = user;
+    d.a       = a;
+    d.out     = nil;
+    d.out_cap = 0;
+    d.out_len = 0;
+    d.out_oom = 0;
+    ret err[allo.Error].ok{};
+}
+
+# release the driver's context, input and text
+# ---
+# d:   driver to free
+# ret: ok, or the first refusal
+pub fun free(d: *Driver) err[allo.Error] {
+    if (d.out != nil) {
+        val eo: err[allo.Error] = allo.deallocate[u8](d.a, d.out, d.out_cap);
+        if (sel eo.err) { ret eo; }
+        d.out     = nil;
+        d.out_cap = 0;
+    }
+    val ei: err[allo.Error] = input.free(?d.in);
+    if (sel ei.err) { ret ei; }
+    ret context.free(?d.ctx);
+}
+
+# run one frame with the input as it stands, then advance the clock and clear
+# the frame's key events, wheel and paste
+# ---
+# d: driver
+pub fun step(d: *Driver) {
+    d.in.time = d.time;
+    context.begin(?d.ctx, d.in, d.sw, d.sh);
+    d.ui(?d.ctx, d.user);
+    context.end(?d.ctx);
+    input.clear_keys(?d.in);
+    d.in.wheel   = 0.0::f32;
+    d.in.wheel_x = 0.0::f32;
+    d.in.paste   = nil;
+    d.time       = d.time + d.dt;
+}
+
+# run n frames with the input as it stands
+# ---
+# d: driver
+# n: frames to run
+pub fun steps(d: *Driver, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        step(d);
+        i = i + 1;
+    }
+}
+
+# the most frames settle runs before giving up on an interface that never rests
+pub val SETTLE_MAX: usize = 600;
+
+# run frames while the interface asks for the next one at once (see
+# context.next_frame), so its animations and glides reach their ends
+#
+# a frame asked for later, such as a caret's next blink, ends it.
+# ---
+# d:   driver
+# ret: the frames run, SETTLE_MAX when it never settled
+pub fun settle(d: *Driver) usize {
+    var n: usize = 0;
+    for (n < SETTLE_MAX) {
+        val next: opt[f64] = context.next_frame(?d.ctx);
+        if (sel next.none) { ret n; }
+        if (sel next.some) {
+            if (next.some != 0.0::f64) { ret n; }
+        }
+        step(d);
+        n = n + 1;
+    }
+    ret n;
+}
+
+# whichever widget holds the keyboard after the last frame
+# ---
+# d:   driver
+# ret: its id, 0 for none
+pub fun focus_of(d: *Driver) u64 {
+    ret d.ctx.focus;
+}
+
+# the id a label path names from the root scope
+# ---
+# d:    driver
+# path: "/"-separated labels, outermost scope first (see blit.id.of_path)
+# ret:  the widget's id
+pub fun find(d: *Driver, path: str) u64 {
+    ret bid.of_path(bid.ROOT, path);
+}
+
+# the widget a pointer at a screen point reaches, by the last frame's claims
+# ---
+# d:   driver
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the widget's id, 0 for none
+pub fun at(d: *Driver, x: f32, y: f32) u64 {
+    ret context.widget_at(?d.ctx, x, y);
+}
+
+# the topmost widget the last frame drew wholly inside a screen rect
+# ---
+# d:   driver
+# x0:  left edge in screen pixels
+# y0:  top edge in screen pixels
+# x1:  right edge in screen pixels
+# y1:  bottom edge in screen pixels
+# ret: the widget's id, 0 for none
+pub fun inside(d: *Driver, x0: f32, y0: f32, x1: f32, y1: f32) u64 {
+    ret context.widget_in(?d.ctx, context.Area{x0: x0, y0: y0, x1: x1, y1: y1});
+}
+
+# whether the last frame drew a widget where it could be seen
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: true if it claimed a visible rect
+pub fun drawn(d: *Driver, id: u64) bool {
+    val r: opt[context.Area] = context.rect_of(?d.ctx, id);
+    ret sel r.some;
+}
+
+# the screen rect the last frame drew a widget in
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: the visible rect, or none when it was not drawn
+pub fun rect(d: *Driver, id: u64) opt[context.Area] {
+    ret context.rect_of(?d.ctx, id);
+}
+
+# whether a widget was hovered in the last frame
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: true if it was the hot widget
+pub fun hot(d: *Driver, id: u64) bool {
+    ret id != 0 && d.ctx.hot == id;
+}
+
+# whether a widget is being pressed or dragged after the last frame
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: true if it is the active widget
+pub fun active(d: *Driver, id: u64) bool {
+    ret id != 0 && d.ctx.active == id;
+}
+
+# whether a widget holds the keyboard after the last frame
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: true if it holds the focus
+pub fun focused(d: *Driver, id: u64) bool {
+    ret id != 0 && d.ctx.focus == id;
+}
+
+# put the pointer at a screen point and run a frame
+# ---
+# d: driver
+# x: pointer x in screen pixels
+# y: pointer y in screen pixels
+pub fun move(d: *Driver, x: f32, y: f32) {
+    d.in.present = 1;
+    d.in.mx      = x;
+    d.in.my      = y;
+    step(d);
+}
+
+# take the pointer off the screen and run a frame
+# ---
+# d: driver
+pub fun leave(d: *Driver) {
+    d.in.present = 0;
+    step(d);
+}
+
+# hold buttons down at the pointer and run a frame
+#
+# each button is sent as a press event at the pointer and held in down, as a
+# host that sees every event does (see blit.input.press_button).
+# ---
+# d:       driver
+# buttons: input.BUTTON_* bits to press
+pub fun press(d: *Driver, buttons: u8) {
+    buttons_at(d, buttons, 1);
+    step(d);
+}
+
+# let buttons go at the pointer and run a frame
+# ---
+# d:       driver
+# buttons: input.BUTTON_* bits to release
+pub fun release(d: *Driver, buttons: u8) {
+    buttons_at(d, buttons, 0);
+    step(d);
+}
+
+# send a press or release event at the pointer for each button whose state
+# changes, and update down
+fun buttons_at(d: *Driver, buttons: u8, down: u8) {
+    var b: u8 = 1;
+    for (b <= input.BUTTON_X2) {
+        val held: bool = (d.in.down & b) != 0;
+        if ((buttons & b) != 0 && down != 0 && !held) {
+            input.press_button(?d.in, b, d.in.mx, d.in.my);
+            d.in.down = d.in.down | b;
+        }
+        or ((buttons & b) != 0 && down == 0 && held) {
+            input.release_button(?d.in, b, d.in.mx, d.in.my);
+            d.in.down = d.in.down & ~b;
+        }
+        b = b << 1;
+    }
+}
+
+# the centre of the rect the last frame drew a widget in
+fun centre(d: *Driver, id: u64, x: *f32, y: *f32) bool {
+    val r: opt[context.Area] = context.rect_of(?d.ctx, id);
+    if (sel r.none) { ret false; }
+    @x = (r.some.x0 + r.some.x1) / 2.0::f32;
+    @y = (r.some.y0 + r.some.y1) / 2.0::f32;
+    ret true;
+}
+
+# move the pointer onto the centre of a widget and run a frame, after which
+# it is hot when nothing covers it
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: false, running nothing, when the last frame did not draw it
+pub fun hover(d: *Driver, id: u64) bool {
+    var x: f32;
+    var y: f32;
+    if (!centre(d, id, ?x, ?y)) { ret false; }
+    move(d, x, y);
+    ret true;
+}
+
+# hover a widget, then press and release a button on it, a frame each
+# ---
+# d:      driver
+# id:     the widget's id
+# button: the input.BUTTON_* to click with
+# ret:    false, running nothing, when the last frame did not draw it
+pub fun click_with(d: *Driver, id: u64, button: u8) bool {
+    if (!hover(d, id)) { ret false; }
+    press(d, button);
+    release(d, button);
+    ret true;
+}
+
+# click a widget with the left button
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: false, running nothing, when the last frame did not draw it
+pub fun click(d: *Driver, id: u64) bool {
+    ret click_with(d, id, input.BUTTON_LEFT);
+}
+
+# click a widget with the right button
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: false, running nothing, when the last frame did not draw it
+pub fun right_click(d: *Driver, id: u64) bool {
+    ret click_with(d, id, input.BUTTON_RIGHT);
+}
+
+# click a widget twice with the left button, on consecutive frames
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: false, running nothing, when the last frame did not draw it
+pub fun double_click(d: *Driver, id: u64) bool {
+    if (!click(d, id)) { ret false; }
+    press(d, input.BUTTON_LEFT);
+    release(d, input.BUTTON_LEFT);
+    ret true;
+}
+
+# press the left button on a widget, move the pointer to a screen point in
+# DRAG_STEPS frames with it held, and release it there
+# ---
+# d:   driver
+# id:  the widget to drag from
+# x:   where to drop, in screen pixels
+# y:   where to drop, in screen pixels
+# ret: false, running nothing, when the last frame did not draw the widget
+pub fun drag(d: *Driver, id: u64, x: f32, y: f32) bool {
+    if (!hover(d, id)) { ret false; }
+    press(d, input.BUTTON_LEFT);
+    val x0: f32   = d.in.mx;
+    val y0: f32   = d.in.my;
+    var k:  usize = 1;
+    for (k <= DRAG_STEPS) {
+        val t: f32 = k::f32 / DRAG_STEPS::f32;
+        move(d, x0 + (x - x0) * t, y0 + (y - y0) * t);
+        k = k + 1;
+    }
+    release(d, input.BUTTON_LEFT);
+    ret true;
+}
+
+# drag one widget onto the centre of another, as drag does
+# ---
+# d:      driver
+# id:     the widget to drag from
+# target: the widget to drop on
+# ret:    false, running nothing, when the last frame did not draw either
+pub fun drag_onto(d: *Driver, id: u64, target: u64) bool {
+    var x: f32;
+    var y: f32;
+    if (!centre(d, target, ?x, ?y) || !drawn(d, id)) { ret false; }
+    ret drag(d, id, x, y);
+}
+
+# hover a widget, then turn the wheels over it for a frame
+# ---
+# d:   driver
+# id:  the widget's id
+# dx:  horizontal wheel in pixels
+# dy:  vertical wheel in pixels
+# ret: false, running nothing, when the last frame did not draw it
+pub fun scroll(d: *Driver, id: u64, dx: f32, dy: f32) bool {
+    if (!hover(d, id)) { ret false; }
+    d.in.wheel_x = dx;
+    d.in.wheel   = dy;
+    step(d);
+    ret true;
+}
+
+# type utf-8 text in one frame, to whichever widget holds the keyboard
+# ---
+# d: driver
+# s: the text
+pub fun type_text(d: *Driver, s: str) {
+    if (s != nil) {
+        val n: usize = str_len(s);
+        var i: usize = 0;
+        for (i < n) {
+            var cp: u32;
+            i = i + font.next(s, i, n, ?cp);
+            input.type_text(?d.in, cp);
+        }
+    }
+    step(d);
+}
+
+# press a key with modifiers held in one frame and release it in the next
+# ---
+# d:    driver
+# code: the key, a printable ASCII character or an input.KEY_* constant
+# mods: input.MOD_* bits held with it
+pub fun key(d: *Driver, code: u32, mods: u8) {
+    val held: u8 = d.in.mods;
+    d.in.mods = held | mods;
+    input.press_key(?d.in, code, d.in.mods);
+    step(d);
+    input.release_key(?d.in, code, d.in.mods);
+    d.in.mods = held;
+    step(d);
+}
+
+# start the driver's text over
+fun out_reset(d: *Driver) {
+    d.out_len = 0;
+    d.out_oom = 0;
+}
+
+# append bytes to the driver's text, growing it; a refusal sets out_oom
+fun out_bytes(d: *Driver, s: *u8, n: usize) {
+    if (d.out_len + n + 1 > d.out_cap) {
+        var c: usize = d.out_cap * 2;
+        if (c < 256)               { c = 256; }
+        if (c < d.out_len + n + 1) { c = d.out_len + n + 1; }
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](d.a, d.out, d.out_cap, c);
+        if (sel r.err) {
+            d.out_oom = 1;
+            ret;
+        }
+        d.out     = r.ok;
+        d.out_cap = c;
+    }
+    var k: usize = 0;
+    for (k < n) {
+        d.out[d.out_len + k] = s[k];
+        k                    = k + 1;
+    }
+    d.out_len = d.out_len + n;
+}
+
+fun out_str(d: *Driver, s: str) {
+    out_bytes(d, s, str_len(s));
+}
+
+fun out_byte(d: *Driver, b: u8) {
+    var one: u8 = b;
+    out_bytes(d, ?one, 1);
+}
+
+fun out_u64(d: *Driver, n: u64) {
+    var tmp: [20]u8;
+    var k:   usize = 20;
+    var v:   u64   = n;
+    for {
+        k      = k - 1;
+        tmp[k] = ('0'::u64 + v % 10)::u8;
+        v      = v / 10;
+        if (v == 0) { brk; }
+    }
+    out_bytes(d, ?tmp[k], 20 - k);
+}
+
+# a number with a fixed count of decimal places, rounded half away from zero
+fun out_fixed(d: *Driver, v: f32, places: usize) {
+    var scale: f64   = 1.0::f64;
+    var k:     usize = 0;
+    for (k < places) {
+        scale = scale * 10.0::f64;
+        k     = k + 1;
+    }
+    var x: f64 = v::f64;
+    if (x < 0.0::f64) { x = -x; }
+    val m: u64 = (x * scale + 0.5::f64)::u64;
+    if (v < 0.0::f32 && m != 0) { out_byte(d, '-'); }
+    val whole: u64 = m / scale::u64;
+    out_u64(d, whole);
+    if (places == 0) { ret; }
+    out_byte(d, '.');
+    var frac: u64 = m - whole * scale::u64;
+    var div:  u64 = scale::u64 / 10;
+    for (div > 0) {
+        out_byte(d, ('0'::u64 + frac / div)::u8);
+        frac = frac % div;
+        div  = div / 10;
+    }
+}
+
+# a colour channel in [0, 1] as an integer in [0, 255]
+fun out_channel(d: *Driver, c: f32) {
+    var v: f32 = c;
+    if (v < 0.0::f32) { v = 0.0::f32; }
+    if (v > 1.0::f32) { v = 1.0::f32; }
+    out_u64(d, (v * 255.0::f32 + 0.5::f32)::u64);
+}
+
+# the driver's text, terminated, or "" when it could not be held
+fun out_text(d: *Driver) str {
+    if (d.out_oom != 0 || d.out == nil) { ret ""; }
+    d.out[d.out_len] = 0;
+    ret d.out::str;
+}
+
+# the text the last frame drew inside a screen rect
+#
+# every traced line (see context.traced_at) whose box has its centre inside the
+# rect is taken, in drawing order. a line that continues the one before it on
+# the same row with no gap joins it directly, one further along the same row
+# follows a space, and any other starts a new line.
+# ---
+# d:   driver
+# x0:  left edge in screen pixels
+# y0:  top edge in screen pixels
+# x1:  right edge in screen pixels
+# y1:  bottom edge in screen pixels
+# ret: the text, valid until the next text query or snapshot, "" for none
+pub fun text_in(d: *Driver, x0: f32, y0: f32, x1: f32, y1: f32) str {
+    out_reset(d);
+    var any:  u8    = 0;
+    var last: context.Area;
+    var i:    usize = 0;
+    val n:    usize = context.traced_count(?d.ctx);
+    for (i < n) {
+        val l: context.TextLine = context.traced_at(?d.ctx, i);
+        i = i + 1;
+        val cx: f32 = (l.box.x0 + l.box.x1) / 2.0::f32;
+        val cy: f32 = (l.box.y0 + l.box.y1) / 2.0::f32;
+        if (cx < x0 || cx >= x1 || cy < y0 || cy >= y1) { cnt; }
+        if (any != 0) {
+            val row: bool = l.box.y0 == last.y0 && l.box.x0 >= last.x0;
+            if (row && l.box.x0 - last.x1 > 0.5::f32) { out_byte(d, ' '); }
+            or (!row)                                 { out_byte(d, '\n'); }
+        }
+        out_bytes(d, l.text, l.len);
+        any  = 1;
+        last = l.box;
+    }
+    ret out_text(d);
+}
+
+# the text the last frame drew inside a widget's rect, as text_in reads it
+# ---
+# d:   driver
+# id:  the widget's id
+# ret: the text, valid until the next text query or snapshot, "" when the
+#      widget was not drawn
+pub fun text_of(d: *Driver, id: u64) str {
+    val r: opt[context.Area] = context.rect_of(?d.ctx, id);
+    if (sel r.none) {
+        out_reset(d);
+        ret out_text(d);
+    }
+    ret text_in(d, r.some.x0, r.some.y0, r.some.x1, r.some.y1);
+}
+
+# a vertex's position, uv and colour, as the snapshot writes them
+fun out_vert(d: *Driver, v: draw.Vert) {
+    out_fixed(d, v.x, 2);
+    out_byte(d, ' ');
+    out_fixed(d, v.y, 2);
+    out_str(d, " uv ");
+    out_fixed(d, v.u, 4);
+    out_byte(d, ' ');
+    out_fixed(d, v.v, 4);
+    out_str(d, " rgba ");
+    out_rgba(d, v);
+}
+
+fun out_rgba(d: *Driver, v: draw.Vert) {
+    out_channel(d, v.r);
+    out_byte(d, ' ');
+    out_channel(d, v.g);
+    out_byte(d, ' ');
+    out_channel(d, v.b);
+    out_byte(d, ' ');
+    out_channel(d, v.a);
+}
+
+fun same_rgba(a: draw.Vert, b: draw.Vert) bool {
+    ret a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+
+# whether triangles (a, b, c) and (a, c, d) make one flat-coloured,
+# axis-aligned rect from corner a to corner c, as draw.push_quad emits it
+fun is_quad(vs: *draw.Vert, ix: *u32, k: usize) bool {
+    if (ix[k + 3] != ix[k] || ix[k + 4] != ix[k + 2]) { ret false; }
+    val a: draw.Vert = vs[ix[k]];
+    val b: draw.Vert = vs[ix[k + 1]];
+    val c: draw.Vert = vs[ix[k + 2]];
+    val e: draw.Vert = vs[ix[k + 5]];
+    if (b.x != c.x || b.y != a.y || e.x != a.x || e.y != c.y) { ret false; }
+    if (b.u != c.u || b.v != a.v || e.u != a.u || e.v != c.v) { ret false; }
+    ret same_rgba(a, b) && same_rgba(a, c) && same_rgba(a, e);
+}
+
+# a stable text dump of the last frame's draw list, for golden comparison
+#
+# one header line with the screen size, then each run in paint order with its
+# kind, texture, atlas page, layer, filter and scissor. a consumer span
+# (context.RUN_CUSTOM) adds its callback id, data and rect; any other run adds
+# its triangle count, followed by its geometry, one shape a line. two triangles that make a
+# flat-coloured, axis-aligned rect are written as one quad, its corners'
+# position and uv, then its colour; any other triangle is written as its
+# three vertices, each a position, uv and colour. positions and the scissor
+# are written to two decimals, uvs to four, and colours as the premultiplied
+# channels emitted, in 0 to 255. the same interface driven the same way gives
+# the same text.
+# ---
+# d:   driver
+# ret: the dump, valid until the next text query or snapshot, "" if it could
+#      not be held
+pub fun snapshot(d: *Driver) str {
+    out_reset(d);
+    out_str(d, "screen ");
+    out_fixed(d, d.sw, 0);
+    out_byte(d, ' ');
+    out_fixed(d, d.sh, 0);
+    out_byte(d, '\n');
+    val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    val ix: *u32       = context.draw_indices(?d.ctx);
+    val nr: usize      = context.run_count(?d.ctx);
+    var i:  usize      = 0;
+    for (i < nr) {
+        val r: context.Run = context.run_at(?d.ctx, i);
+        out_str(d, "run ");
+        out_u64(d, i::u64);
+        out_str(d, " kind ");
+        out_u64(d, r.kind::u64);
+        out_str(d, " tex ");
+        out_u64(d, r.tex);
+        out_str(d, " page ");
+        out_u64(d, r.page::u64);
+        out_str(d, " layer ");
+        out_u64(d, r.layer::u64);
+        out_str(d, " filter ");
+        out_u64(d, r.filter::u64);
+        out_str(d, " clip ");
+        out_fixed(d, r.clip_x0, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_y0, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_x1, 2);
+        out_byte(d, ' ');
+        out_fixed(d, r.clip_y1, 2);
+        if (r.kind == context.RUN_CUSTOM) {
+            out_str(d, " id ");
+            out_u64(d, r.id);
+            out_str(d, " data ");
+            out_u64(d, r.data);
+            out_str(d, " rect ");
+            out_fixed(d, r.x0, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.y0, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.x1, 2);
+            out_byte(d, ' ');
+            out_fixed(d, r.y1, 2);
+            out_byte(d, '\n');
+            i = i + 1;
+            cnt;
+        }
+        out_str(d, " tris ");
+        out_u64(d, (r.count / 3)::u64);
+        out_byte(d, '\n');
+        val end: usize = r.start + r.count;
+        var k:   usize = r.start;
+        for (k + 3 <= end) {
+            if (k + 6 <= end && is_quad(vs, ix, k)) {
+                val a: draw.Vert = vs[ix[k]];
+                val c: draw.Vert = vs[ix[k + 2]];
+                out_str(d, "  quad ");
+                out_fixed(d, a.x, 2);
+                out_byte(d, ' ');
+                out_fixed(d, a.y, 2);
+                out_byte(d, ' ');
+                out_fixed(d, c.x, 2);
+                out_byte(d, ' ');
+                out_fixed(d, c.y, 2);
+                out_str(d, " uv ");
+                out_fixed(d, a.u, 4);
+                out_byte(d, ' ');
+                out_fixed(d, a.v, 4);
+                out_byte(d, ' ');
+                out_fixed(d, c.u, 4);
+                out_byte(d, ' ');
+                out_fixed(d, c.v, 4);
+                out_str(d, " rgba ");
+                out_rgba(d, a);
+                out_byte(d, '\n');
+                k = k + 6;
+                cnt;
+            }
+            out_str(d, "  tri ");
+            out_vert(d, vs[ix[k]]);
+            out_str(d, " / ");
+            out_vert(d, vs[ix[k + 1]]);
+            out_str(d, " / ");
+            out_vert(d, vs[ix[k + 2]]);
+            out_byte(d, '\n');
+            k = k + 3;
+        }
+        i = i + 1;
+    }
+    ret out_text(d);
+}
+
+# whether needle occurs in s
+#[testing]
+fun has(s: str, needle: str) bool {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        var k: usize = 0;
+        for (needle[k] != 0 && s[i + k] == needle[k]) { k = k + 1; }
+        if (needle[k] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# what the probe's box saw: doubles, then right-button clicks
+#[testing]
+rec Seen {
+    doubles: u32;
+    rights:  u32;
+}
+
+# a quad and a box taking both buttons, then text in runs along one row and
+# onto the next, a line and a consumer span
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val seen: *Seen = user::*Seen;
+    context.quad(ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, draw.rgba(1.0::f32, 0.5::f32, 0.0::f32, 1.0::f32));
+    val ink: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val w:   f32        = context.text_width(ctx, "ab");
+    context.text_at(ctx, "ab", 20.0::f32, 0.0::f32, ink);
+    context.text_at(ctx, "cd", 20.0::f32 + w, 0.0::f32, ink);
+    context.text_at(ctx, "ef", 60.0::f32, 0.0::f32, ink);
+    context.text_at(ctx, "gh\nij", 20.0::f32, 20.0::f32, ink);
+    val h: interact.Hit = interact.hit(ctx, bid.of_path(bid.ROOT, "box"), 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, input.BUTTON_LEFT | input.BUTTON_RIGHT);
+    if (h.double)                                    { seen.doubles = seen.doubles + 1; }
+    if (h.clicked && h.button == input.BUTTON_RIGHT) { seen.rights = seen.rights + 1; }
+    context.line(ctx, 0.0::f32, 40.0::f32, 10.0::f32, 48.0::f32, 1.0::f32, ink);
+    context.custom(ctx, 80.0::f32, 40.0::f32, 90.0::f32, 50.0::f32, 7, 9);
+}
+
+test driver__reads_text_snapshots_and_clicks {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var seen: Seen;
+    var d:    Driver;
+    val ie:   err[allo.Error] = init(?d, ?a, 100.0::f32, 50.0::f32, probe_ui, (?seen)::ptr);
+    if (sel ie.err) { ret 1; }
+    step(?d);
+
+    if (!str_equals(text_in(?d, 0.0::f32, 0.0::f32, 100.0::f32, 50.0::f32), "abcd ef\ngh\nij")) { ret 2; }
+    if (!str_equals(text_in(?d, 50.0::f32, 0.0::f32, 100.0::f32, 10.0::f32), "ef"))             { ret 3; }
+    if (!str_equals(text_of(?d, find(?d, "box")), ""))                                          { ret 4; }
+    if (!str_equals(text_of(?d, find(?d, "none")), ""))                                         { ret 5; }
+    if (at(?d, 5.0::f32, 5.0::f32) != find(?d, "box") || at(?d, 50.0::f32, 40.0::f32) != 0)     { ret 6; }
+
+    # the dump is stable text: runs, then quads and triangles
+    val dump: str = snapshot(?d);
+    if (!has(dump, "screen 100 50\nrun 0 kind 0 tex 0 page 0 layer 0 filter 0 clip 0.00 0.00 100.00 50.00 tris ")) { ret 7; }
+    if (!has(dump, "\n  quad 0.00 0.00 10.00 10.00 uv 0.0039 0.0039 0.0039 0.0039 rgba 255 128 0 255\n"))          { ret 8; }
+    if (!has(dump, "\n  quad 20.00 0.00 28.00 8.00 uv "))                                                          { ret 9; }
+    if (!has(dump, " id 7 data 9 rect 80.00 40.00 90.00 50.00\n"))                                                 { ret 11; }
+    if (!has(dump, "\n  tri "))                                                                                    { ret 10; }
+
+    # clicks reach the box as a host's would send them
+    val box: u64 = find(?d, "box");
+    if (!double_click(?d, box) || seen.doubles != 1 || seen.rights != 0) { ret 12; }
+    if (!right_click(?d, box) || seen.rights != 1)                       { ret 13; }
+    if (click(?d, find(?d, "none")))                                     { ret 14; }
+
+    val freed: err[allo.Error] = free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

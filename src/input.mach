@@ -1,31 +1,71 @@
-# per-frame input the consumer fills before calling widgets
+# the host contract: what the consumer hands blit each frame, and what blit
+# asks of it back
 #
-# the mouse: position, primary button and wheel. the consumer writes
-# mx/my/down/wheel each frame; the context carries the previous frame's button
-# state into prev_down so press and release edges can be detected.
+# blit never reads a window, so a frame's input is plain data the consumer
+# fills before context.begin. it is written against the hardest host, a
+# desktop window with an IME, high-resolution wheels and several pointer
+# buttons, and a simpler host leaves the parts it lacks zeroed.
 #
-# the keyboard: this frame's typed codepoints and key presses, in the order
-# they arrived, as one list of events (see type_text and press_key). the
-# consumer empties it each frame with clear_keys before filling it. blit never
-# reads a window, so a key is a plain code: a key that types a printable ascii
+# the clock: time is the host's monotonic clock in seconds. the context
+# derives the frame's dt from it and schedules frames against it (see
+# context.wake_at and context.next_frame).
+#
+# the pointer: position, presence, the buttons held as BUTTON_* bits and the
+# wheel. the context carries the previous frame's buttons into prev_down so
+# press and release edges can be detected. a frame with present 0 has no
+# pointer over the surface, and nothing is hovered.
+#
+# a host that only samples the buttons sets down each frame and nothing more,
+# and a press and release that both land between two frames are then lost. a
+# host that sees each press and release also adds it to the events as it
+# arrives, with the cursor where it happened (press_button and
+# release_button), and still sets down to the buttons held after the last of
+# them. the context hands those to widgets in order, at most one change of a
+# button per frame, holds the rest for the frames after and asks for them
+# through context.next_frame, so every press and release lands. a frame that
+# applies one sees the cursor where it happened, and down as it stood after
+# it (see context.begin).
+#
+# the keyboard: the MOD_* bits held this frame, and this frame's typed
+# codepoints, key presses and releases and IME compositions in the order they
+# arrived, as one list of events with the button presses and releases (see type_text, press_key, release_key and
+# compose). a key is a plain code: a key that types a printable ascii
 # character is that character, letters in uppercase ('A', '7', ' '), and every
-# other key is one of the KEY_* constants. a press carries the modifiers held
-# with it as MOD_* bits. only presses and repeats are events, never releases.
+# other key is one of the KEY_* constants. the events live in storage the
+# consumer owns through the Input (see init and free), which grows as they
+# arrive, so a frame holds any number of them. the consumer empties it each
+# frame with clear_keys before filling it.
 #
 # the clipboard is a hand-off the consumer fulfils. a widget that copies puts
 # its text on the context (see context.copied), which the consumer moves to
 # the system clipboard after the frame. a widget that pastes asks for it (see
 # context.wants_paste), and the consumer answers with the clipboard's text in
 # the next frame's paste.
+#
+# after the frame the context asks the host for a pointer shape (see
+# context.cursor and the CURSOR_* constants), a place for the IME's candidate
+# window (context.ime_rect) and when to draw again (context.next_frame).
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-# most keyboard events one frame holds
-pub val EVENT_CAP: usize = 32;
+use allo: std.allocator;
+use std.allocator.page;
+
+# event capacity the first event allocates, doubled whenever it fills
+pub val EVENTS_INIT_CAP: usize = 32;
+
+# pointer buttons, combined with | in down and prev_down
+pub val BUTTON_LEFT:   u8 = 1;
+pub val BUTTON_RIGHT:  u8 = 2;
+pub val BUTTON_MIDDLE: u8 = 4;
+pub val BUTTON_X1:     u8 = 8;
+pub val BUTTON_X2:     u8 = 16;
 
 # key codes for keys that type no printable ascii character
 pub val KEY_ENTER:     u32 = 0x100;
@@ -43,13 +83,33 @@ pub val KEY_PAGE_UP:   u32 = 0x10B;
 pub val KEY_PAGE_DOWN: u32 = 0x10C;
 pub val KEY_INSERT:    u32 = 0x10D;
 
-# modifier bits a key press carries, combined with |
+# modifier bits, combined with |
 pub val MOD_SHIFT: u8 = 1;
 pub val MOD_CTRL:  u8 = 2;
 pub val MOD_ALT:   u8 = 4;
 pub val MOD_SUPER: u8 = 8;
 
-# one key press or repeat
+# the modifier that makes arrows, backspace and delete act on words: option
+# (alt) on darwin, ctrl elsewhere
+$if ($mach.build.os == $mach.os.darwin) {
+    pub val MOD_WORD: u8 = MOD_ALT;
+}
+$or {
+    pub val MOD_WORD: u8 = MOD_CTRL;
+}
+
+# pointer shapes the context asks the host for (see context.cursor)
+pub val CURSOR_ARROW:       u8 = 0;
+pub val CURSOR_TEXT:        u8 = 1;
+pub val CURSOR_HAND:        u8 = 2;
+pub val CURSOR_MOVE:        u8 = 3;
+pub val CURSOR_RESIZE_EW:   u8 = 4;
+pub val CURSOR_RESIZE_NS:   u8 = 5;
+pub val CURSOR_RESIZE_NWSE: u8 = 6;
+pub val CURSOR_RESIZE_NESW: u8 = 7;
+pub val CURSOR_NOT_ALLOWED: u8 = 8;
+
+# one key press, repeat or release
 # ---
 # code: the key, a printable ascii character or a KEY_* constant
 # mods: the MOD_* bits held with it
@@ -58,48 +118,138 @@ pub rec Key {
     mods: u8;
 }
 
-# one keyboard event: a typed codepoint or a key press
+# the IME's composition in progress, which replaces any earlier one
+#
+# the text is shown at the caret of whatever holds the keyboard until a later
+# composition replaces it. an empty one (nil or "") ends it, and the text the
+# composition commits arrives as text events.
+# ---
+# text:  the composition's utf-8 text, valid until the frame ends
+# caret: the composition's caret as a byte offset into text
+pub rec Preedit {
+    text:  str;
+    caret: usize;
+}
+
+# one pointer button press or release
+# ---
+# button: the BUTTON_* bit
+# x:      cursor x in pixels when it happened
+# y:      cursor y in pixels when it happened
+pub rec Button {
+    button: u8;
+    x:      f32;
+    y:      f32;
+}
+
+# one keyboard or button event
 pub tag Event: u8 {
-    text: u32;
-    key:  Key;
+    text:    u32;
+    key:     Key;
+    release: Key;
+    preedit: Preedit;
+    down:    Button;
+    up:      Button;
+}
+
+# a frame's keyboard and button events, in storage the consumer owns
+#
+# the record is a view the Input carries by value: copying an Input copies
+# this header, never the events.
+# ---
+# data: the events in arrival order (nil before the first)
+# len:  events this frame holds
+# cap:  events data has room for
+# a:    allocator backing data, nil when the Input was never bound to one
+pub rec Events {
+    data: *Event;
+    len:  usize;
+    cap:  usize;
+    a:    *allo.Allocator;
 }
 
 # input for a single frame
 # ---
-# mx:         cursor x in pixels
-# my:         cursor y in pixels
-# down:       1 if the primary button is down this frame, else 0
-# prev_down:  1 if the primary button was down last frame, else 0
-# wheel:      vertical wheel travel this frame in pixels, positive when turned away from the user
-# events:     this frame's keyboard events in arrival order, the first events_len of them
-# events_len: how many events this frame holds
-# paste:      the clipboard's utf-8 text in answer to last frame's paste request, else nil
+# time:      the host's monotonic clock in seconds
+# mx:        cursor x in pixels
+# my:        cursor y in pixels
+# present:   1 if the pointer is over the surface this frame, else 0
+# down:      the BUTTON_* bits held this frame, after its last button event
+# prev_down: the BUTTON_* bits held last frame, managed by context.begin
+# mods:      the MOD_* bits held this frame
+# wheel:     vertical wheel travel this frame in pixels, positive when turned away from the user
+# wheel_x:   horizontal wheel travel this frame in pixels, positive toward the right
+# events:    this frame's keyboard and button events in arrival order
+# paste:     the clipboard's utf-8 text in answer to last frame's paste request, else nil
 pub rec Input {
-    mx:         f32;
-    my:         f32;
-    down:       u8;
-    prev_down:  u8;
-    wheel:      f32;
-    events:     [32]Event;
-    events_len: usize;
-    paste:      str;
+    time:      f64;
+    mx:        f32;
+    my:        f32;
+    present:   u8;
+    down:      u8;
+    prev_down: u8;
+    mods:      u8;
+    wheel:     f32;
+    wheel_x:   f32;
+    events:    Events;
+    paste:     str;
 }
 
-# 1 on the frame the primary button transitions from up to down
+# bind an input's events to an allocator, with nothing allocated until the
+# first event
+#
+# an input never bound holds no events, which suits a host without a keyboard.
 # ---
-# in:  input state
-# ret: 1 if pressed this frame, else 0
-pub fun pressed(in: Input) u8 {
-    if (in.down != 0 && in.prev_down == 0) { ret 1; }
+# in: input to bind
+# a:  allocator backing its events
+pub fun init(in: *Input, a: *allo.Allocator) {
+    in.events.data = nil;
+    in.events.len  = 0;
+    in.events.cap  = 0;
+    in.events.a    = a;
+}
+
+# release an input's events
+# ---
+# in:  input to free
+# ret: ok, or the allocator's refusal with the events still owned
+pub fun free(in: *Input) err[allo.Error] {
+    if (in.events.data == nil) { ret err[allo.Error].ok{}; }
+    val freed: err[allo.Error] = allo.deallocate[Event](in.events.a, in.events.data, in.events.cap);
+    if (sel freed.err) { ret freed; }
+    in.events.data = nil;
+    in.events.len  = 0;
+    in.events.cap  = 0;
+    ret err[allo.Error].ok{};
+}
+
+# 1 if a button is held this frame
+# ---
+# in:     input state
+# button: a BUTTON_* bit
+# ret:    1 if held, else 0
+pub fun held(in: Input, button: u8) u8 {
+    if ((in.down & button) != 0) { ret 1; }
     ret 0;
 }
 
-# 1 on the frame the primary button transitions from down to up
+# 1 on the frame a button transitions from up to down
 # ---
-# in:  input state
-# ret: 1 if released this frame, else 0
-pub fun released(in: Input) u8 {
-    if (in.down == 0 && in.prev_down != 0) { ret 1; }
+# in:     input state
+# button: a BUTTON_* bit
+# ret:    1 if pressed this frame, else 0
+pub fun pressed(in: Input, button: u8) u8 {
+    if ((in.down & button) != 0 && (in.prev_down & button) == 0) { ret 1; }
+    ret 0;
+}
+
+# 1 on the frame a button transitions from down to up
+# ---
+# in:     input state
+# button: a BUTTON_* bit
+# ret:    1 if released this frame, else 0
+pub fun released(in: Input, button: u8) u8 {
+    if ((in.down & button) == 0 && (in.prev_down & button) != 0) { ret 1; }
     ret 0;
 }
 
@@ -110,42 +260,100 @@ pub fun released(in: Input) u8 {
 # y0:  top edge in pixels (inclusive)
 # x1:  right edge in pixels (exclusive)
 # y1:  bottom edge in pixels (exclusive)
-# ret: 1 if the cursor is inside, else 0
+# ret: 1 if a pointer is present and inside, else 0
 pub fun in_rect(in: Input, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
+    if (in.present == 0)                                        { ret 0; }
     if (in.mx >= x0 && in.mx < x1 && in.my >= y0 && in.my < y1) { ret 1; }
     ret 0;
 }
 
-# add a typed codepoint to the frame's keyboard events
+# add an event to the frame's events, growing their storage when full
 # ---
 # in:  input being filled
-# cp:  the codepoint typed
-# ret: false when the frame already holds EVENT_CAP events and it was dropped
-pub fun type_text(in: *Input, cp: u32) bool {
-    if (in.events_len >= EVENT_CAP) { ret false; }
-    in.events[in.events_len] = Event.text{cp};
-    in.events_len            = in.events_len + 1;
+# e:   the event
+# ret: false when the storage could not grow and the event was dropped
+pub fun push(in: *Input, e: Event) bool {
+    val q: *Events = ?in.events;
+    if (q.len >= q.cap) {
+        var cap: usize = q.cap * 2;
+        if (cap == 0) { cap = EVENTS_INIT_CAP; }
+        val r: res[*Event, allo.Error] = allo.reallocate[Event](q.a, q.data, q.cap, cap);
+        if (sel r.err) { ret false; }
+        q.data = r.ok;
+        q.cap  = cap;
+    }
+    q.data[q.len] = e;
+    q.len         = q.len + 1;
     ret true;
 }
 
-# add a key press or repeat to the frame's keyboard events
+# add a typed codepoint to the frame's events
+# ---
+# in:  input being filled
+# cp:  the codepoint typed
+# ret: false when it was dropped (see push)
+pub fun type_text(in: *Input, cp: u32) bool {
+    ret push(in, Event.text{cp});
+}
+
+# add a key press or repeat to the frame's events
 # ---
 # in:   input being filled
 # code: the key, a printable ascii character (letters uppercase) or a KEY_* constant
 # mods: the MOD_* bits held with it
-# ret:  false when the frame already holds EVENT_CAP events and it was dropped
+# ret:  false when it was dropped (see push)
 pub fun press_key(in: *Input, code: u32, mods: u8) bool {
-    if (in.events_len >= EVENT_CAP) { ret false; }
-    in.events[in.events_len] = Event.key{Key{code: code, mods: mods}};
-    in.events_len            = in.events_len + 1;
-    ret true;
+    ret push(in, Event.key{Key{code: code, mods: mods}});
 }
 
-# empty the keyboard events and the paste, ready to fill a new frame
+# add a key release to the frame's events
+# ---
+# in:   input being filled
+# code: the key, as press_key names it
+# mods: the MOD_* bits held as it was released
+# ret:  false when it was dropped (see push)
+pub fun release_key(in: *Input, code: u32, mods: u8) bool {
+    ret push(in, Event.release{Key{code: code, mods: mods}});
+}
+
+# add a button press to the frame's events
+# ---
+# in:     input being filled
+# button: a BUTTON_* bit
+# x:      cursor x in pixels when it was pressed
+# y:      cursor y in pixels when it was pressed
+# ret:    false when it was dropped (see push)
+pub fun press_button(in: *Input, button: u8, x: f32, y: f32) bool {
+    ret push(in, Event.down{Button{button: button, x: x, y: y}});
+}
+
+# add a button release to the frame's events
+# ---
+# in:     input being filled
+# button: a BUTTON_* bit
+# x:      cursor x in pixels when it was released
+# y:      cursor y in pixels when it was released
+# ret:    false when it was dropped (see push)
+pub fun release_button(in: *Input, button: u8, x: f32, y: f32) bool {
+    ret push(in, Event.up{Button{button: button, x: x, y: y}});
+}
+
+# add the IME's composition in progress to the frame's events
+# ---
+# in:    input being filled
+# text:  the composition's utf-8 text, valid until the frame ends, nil or "" to end it
+# caret: the composition's caret as a byte offset into text
+# ret:   false when it was dropped (see push)
+pub fun compose(in: *Input, text: str, caret: usize) bool {
+    ret push(in, Event.preedit{Preedit{text: text, caret: caret}});
+}
+
+# empty the events and the paste, ready to fill a new frame, keeping the
+# events' storage
 # ---
 # in: input being filled
 pub fun clear_keys(in: *Input) {
-    in.events_len = 0;
+    in.events.len = 0;
     in.paste      = nil;
 }
 
@@ -159,27 +367,73 @@ pub fun shortcut(mods: u8) bool {
     ret (mods & (MOD_CTRL | MOD_SUPER)) != 0;
 }
 
-test keys__fill_in_order_until_full {
+test events__grow_past_the_initial_capacity_in_order {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
     var in: Input;
-    if (!type_text(?in, 0xE9) || !press_key(?in, KEY_LEFT, MOD_SHIFT)) { ret 1; }
-    if (in.events_len != 2)                                            { ret 2; }
-    val first: Event = in.events[0];
-    if (!(sel first.text && first.text == 0xE9)) { ret 3; }
-    val second: Event = in.events[1];
-    if (!sel second.key)                                             { ret 4; }
-    if (second.key.code != KEY_LEFT || second.key.mods != MOD_SHIFT) { ret 4; }
 
-    var i: usize = 2;
-    for (i < EVENT_CAP) {
-        type_text(?in, 'a');
+    # an input never bound to an allocator drops what it is given
+    if (type_text(?in, 'a') || in.events.len != 0) { ret 2; }
+
+    init(?in, ?a);
+    if (!type_text(?in, 0xE9) || !press_key(?in, KEY_LEFT, MOD_SHIFT)) { ret 3; }
+    if (!release_key(?in, KEY_LEFT, 0) || !compose(?in, "ka", 1))      { ret 4; }
+    if (!press_button(?in, BUTTON_RIGHT, 1.0::f32, 2.0::f32))          { ret 4; }
+    var i: usize = 5;
+    for (i < EVENTS_INIT_CAP * 3) {
+        if (!type_text(?in, 'a' + (i % 26)::u32)) { ret 5; }
         i = i + 1;
     }
-    if (type_text(?in, 'b') || press_key(?in, KEY_ENTER, 0)) { ret 5; }
+    if (in.events.len != EVENTS_INIT_CAP * 3) { ret 6; }
+
+    val first: Event = in.events.data[0];
+    if (!(sel first.text && first.text == 0xE9)) { ret 7; }
+    val second: Event = in.events.data[1];
+    if (!sel second.key)                                             { ret 8; }
+    if (second.key.code != KEY_LEFT || second.key.mods != MOD_SHIFT) { ret 8; }
+    val third: Event = in.events.data[2];
+    if (!(sel third.release && third.release.code == KEY_LEFT)) { ret 9; }
+    val fourth: Event = in.events.data[3];
+    if (!(sel fourth.preedit && fourth.preedit.caret == 1)) { ret 10; }
+    val fifth: Event = in.events.data[4];
+    if (!sel fifth.down)                                               { ret 10; }
+    if (fifth.down.button != BUTTON_RIGHT || fifth.down.y != 2.0::f32) { ret 10; }
+    i = 5;
+    for (i < in.events.len) {
+        val e: Event = in.events.data[i];
+        if (!(sel e.text && e.text == 'a' + (i % 26)::u32)) { ret 11; }
+        i = i + 1;
+    }
+
+    # passing the input by value copies the view, never the events
+    val copy: Input = in;
+    if (copy.events.data != in.events.data) { ret 12; }
+
     in.paste = "x";
     clear_keys(?in);
-    if (in.events_len != 0 || in.paste != nil) { ret 6; }
+    if (in.events.len != 0 || in.paste != nil || in.events.cap == 0) { ret 13; }
 
-    if (!shortcut(MOD_CTRL) || !shortcut(MOD_SUPER | MOD_SHIFT)) { ret 7; }
-    if (shortcut(MOD_CTRL | MOD_ALT) || shortcut(MOD_SHIFT))     { ret 8; }
+    if (!shortcut(MOD_CTRL) || !shortcut(MOD_SUPER | MOD_SHIFT)) { ret 14; }
+    if (shortcut(MOD_CTRL | MOD_ALT) || shortcut(MOD_SHIFT))     { ret 15; }
+
+    val freed: err[allo.Error] = free(?in);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test buttons__edges_per_button_and_no_pointer_misses {
+    var in: Input;
+    in.present   = 1;
+    in.mx        = 5.0::f32;
+    in.my        = 5.0::f32;
+    in.prev_down = BUTTON_LEFT;
+    in.down      = BUTTON_RIGHT | BUTTON_X2;
+    if (pressed(in, BUTTON_RIGHT) != 1 || pressed(in, BUTTON_LEFT) != 0) { ret 1; }
+    if (released(in, BUTTON_LEFT) != 1 || released(in, BUTTON_X2) != 0)  { ret 2; }
+    if (held(in, BUTTON_X2) != 1 || held(in, BUTTON_MIDDLE) != 0)        { ret 3; }
+    if (in_rect(in, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32) != 1)      { ret 4; }
+    in.present = 0;
+    if (in_rect(in, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32) != 0) { ret 5; }
     ret 0;
 }

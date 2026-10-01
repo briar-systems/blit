@@ -1,0 +1,503 @@
+# the style system on a context: overrides, classes and themes as TOML
+#
+# every field of the context's theme has a path (see blit.theme.FIELDS), and
+# a push writes every field a path names until its pop, so
+#
+#     blit.style.push_color(?ctx, "button.*.fill", red);
+#     blit.widget.button(?ctx, "delete");
+#     blit.style.pop(?ctx);
+#
+# draws one red button. a class is a named list of such settings, defined in
+# code with add_class and set, or in a theme document's [class.<name>]
+# tables, and push_class applies all of them to the widgets until its pop.
+# pushes nest, and begin undoes any a frame left open.
+#
+# load_theme replaces the context's theme with one read from TOML and reads
+# its classes, so a running interface reloads its look from a file whenever
+# the host reads it again, and save_theme writes the theme and the classes
+# back out.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use blit.context;
+use blit.draw;
+use blit.input;
+use blit.sheet;
+use th:   blit.theme;
+use tw:   blit.writer;
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+
+# override every field a path names with a value until the matching pop
+#
+# a push the allocator refuses writes nothing and is recorded in context.ok,
+# and its pop is still owed.
+# ---
+# ctx:  context
+# path: the fields, such as "button.hot.fill" or "*.*.border_w"
+# v:    the value, of the path's unit
+# ret:  true, or false when the path names no field or the push was refused,
+#       which still opens an empty push for the pop to close
+pub fun push(ctx: *context.Context, path: str, v: th.Value) bool {
+    val p: opt[th.Path] = th.path(?ctx.theme, path);
+    if (sel p.none) {
+        open_empty(ctx);
+        ret false;
+    }
+    if (!sheet.push(?ctx.sheet, ?ctx.theme, p.some, v)) {
+        ctx.oom = 1;
+        open_empty(ctx);
+        ret false;
+    }
+    ret true;
+}
+
+# open an empty push, so a push that wrote nothing still pairs with its pop
+fun open_empty(ctx: *context.Context) {
+    if (!sheet.push_none(?ctx.sheet)) { ctx.oom = 1; }
+}
+
+# whether a path names fields of a unit in the context's theme
+fun of_unit(ctx: *context.Context, path: str, unit: u8) bool {
+    val p: opt[th.Path] = th.path(?ctx.theme, path);
+    if (sel p.none) { ret false; }
+    ret th.FIELDS[p.some.field].unit == unit;
+}
+
+# override color fields until the matching pop
+# ---
+# ctx:  context
+# path: the fields, each a color
+# c:    the color
+# ret:  true, or false when the path names no color field or the push was refused
+pub fun push_color(ctx: *context.Context, path: str, c: draw.Color) bool {
+    if (!of_unit(ctx, path, th.UNIT_COLOR)) {
+        open_empty(ctx);
+        ret false;
+    }
+    ret push(ctx, path, th.of_color(c));
+}
+
+# override length or factor fields until the matching pop
+# ---
+# ctx:  context
+# path: the fields, each a length or a factor
+# x:    the value, unscaled
+# ret:  true, or false when the path names no such field or the push was refused
+pub fun push_length(ctx: *context.Context, path: str, x: f32) bool {
+    if (!of_unit(ctx, path, th.UNIT_LENGTH) && !of_unit(ctx, path, th.UNIT_FACTOR)) {
+        open_empty(ctx);
+        ret false;
+    }
+    ret push(ctx, path, th.of_length(x));
+}
+
+# override corner radii until the matching pop
+# ---
+# ctx:  context
+# path: the fields, such as "button.radius"
+# r:    the radii, unscaled
+# ret:  true, or false when the path names no quad field or the push was refused
+pub fun push_radii(ctx: *context.Context, path: str, r: draw.Radii) bool {
+    if (!of_unit(ctx, path, th.UNIT_QUAD)) {
+        open_empty(ctx);
+        ret false;
+    }
+    ret push(ctx, path, th.of_radii(r));
+}
+
+# override padding, inset or margin until the matching pop
+# ---
+# ctx:  context
+# path: the fields, such as "panel.pad"
+# e:    the edges, unscaled
+# ret:  true, or false when the path names no quad field or the push was refused
+pub fun push_edges(ctx: *context.Context, path: str, e: th.Edges) bool {
+    if (!of_unit(ctx, path, th.UNIT_QUAD)) {
+        open_empty(ctx);
+        ret false;
+    }
+    ret push(ctx, path, th.of_edges(e));
+}
+
+# undo the latest push or push_class, restoring every field it wrote
+# ---
+# ctx: context
+pub fun pop(ctx: *context.Context) {
+    sheet.pop(?ctx.sheet, ?ctx.theme);
+}
+
+# how many pushes are open
+# ---
+# ctx: context
+# ret: the depth of the override stack
+pub fun depth(ctx: *context.Context) usize {
+    ret sheet.depth(?ctx.sheet);
+}
+
+# a class by name, made empty the first time it is named
+# ---
+# ctx:  context
+# name: the class's name, copied
+# ret:  its id, or none when the allocator refused
+pub fun add_class(ctx: *context.Context, name: str) opt[u32] {
+    val r: res[u32, allo.Error] = sheet.add_class(?ctx.sheet, name);
+    if (sel r.err) { ret opt[u32].none{}; }
+    ret opt[u32].some{r.ok};
+}
+
+# the class a name names
+# ---
+# ctx:  context
+# name: the class's name
+# ret:  its id, or none
+pub fun class_of(ctx: *context.Context, name: str) opt[u32] {
+    ret sheet.class_of(?ctx.sheet, name);
+}
+
+# set a class's value for a path, replacing its earlier value for that path
+# ---
+# ctx:  context
+# id:   the class
+# path: the fields
+# v:    the value, of the path's unit
+# ret:  true, or false when the path names no field or the allocator refused
+pub fun set(ctx: *context.Context, id: u32, path: str, v: th.Value) bool {
+    val p: opt[th.Path] = th.path(?ctx.theme, path);
+    if (sel p.none) { ret false; }
+    val e: err[allo.Error] = sheet.class_set(?ctx.sheet, id, path, th.FIELDS[p.some.field].unit, v);
+    if (sel e.err) { ret false; }
+    context.redraw(ctx);
+    ret true;
+}
+
+# apply a class's settings to the widgets drawn until the matching pop
+#
+# a class that does not exist, or a push the allocator refused, still opens
+# an empty push for the pop to close.
+# ---
+# ctx: context
+# id:  the class
+# ret: true, or false when nothing was applied
+pub fun push_class(ctx: *context.Context, id: u32) bool {
+    if (sheet.push_class(?ctx.sheet, ?ctx.theme, id)) { ret true; }
+    open_empty(ctx);
+    ret false;
+}
+
+# replace the context's theme with one read from TOML, and read its classes
+#
+# the document is read as theme.read reads it, its [class.<name>] tables
+# replacing classes of the same name, and the theme keeps its registered
+# kinds, so a document can style any of them by name. open pushes are undone
+# first. a theme the document refuses changes nothing else, and a class it
+# refuses leaves the new theme and the classes read before it.
+# ---
+# ctx:  context
+# text: the document
+# ret:  ok, or why the document was refused
+pub fun load_theme(ctx: *context.Context, text: str) err[th.LoadError] {
+    val pr: res[toml.Table, toml.TomlError] = toml.parse(ctx.a, text);
+    if (sel pr.err) { ret err[th.LoadError].err{th.LoadError.toml{pr.err}}; }
+    var root: toml.Table = pr.ok;
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
+    val read: err[th.LoadError] = th.read(?ctx.theme, ?root);
+    var out:  err[th.LoadError] = read;
+    if (sel read.ok) { out = sheet.read_classes(?ctx.sheet, ?ctx.theme, ?root); }
+    val d: err[allo.Error] = toml.dnit(ctx.a, ?root);
+    if (sel read.ok) { context.redraw(ctx); }
+    if (sel out.err) { ret out; }
+    if (sel d.err)   { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{d.err}}}; }
+    ret out;
+}
+
+# write the context's theme and its classes as TOML
+#
+# open pushes are not written: the theme is saved as it stands without them.
+# ---
+# ctx: context
+# ret: the document, owned by the context until the next save_theme or free,
+#      or the refusal that cut it short
+pub fun save_theme(ctx: *context.Context) res[str, allo.Error] {
+    var t: th.Theme;
+    t.a = ctx.a;
+    val c: err[allo.Error] = th.copy(?t, ?ctx.theme);
+    if (sel c.err) { ret res[str, allo.Error].err{c.err}; }
+    sheet.restored(?ctx.sheet, ?t);
+    val w: *tw.Writer = ?ctx.sheet.out;
+    tw.reset(w);
+    th.save(w, ?t);
+    sheet.save_classes(?ctx.sheet, w);
+    val f: err[allo.Error] = th.free(?t);
+    ret tw.text(w);
+}
+
+# a context for a test, over a page allocator
+#[testing]
+fun made(ctx: *context.Context, a: *allo.Allocator) bool {
+    val m: err[allo.Error] = page.make(a);
+    if (sel m.err) { ret false; }
+    val e: err[allo.Error] = context.init(ctx, a);
+    ret sel e.ok;
+}
+
+# a copy of the context's theme a test compares against, freed by the caller
+#[testing]
+fun snapshot(ctx: *context.Context, a: *allo.Allocator) th.Theme {
+    var t: th.Theme;
+    t.a = a;
+    val e: err[allo.Error] = th.copy(?t, ?ctx.theme);
+    ret t;
+}
+
+# whether two themes hold the same tokens and styles
+#[testing]
+fun same_look(x: *th.Theme, y: *th.Theme) bool {
+    val n: usize = $offset_of(th.Theme, a);
+    var i: usize = 0;
+    val p: *u8   = x::*u8;
+    val q: *u8   = y::*u8;
+    for (i < n) {
+        if (p[i] != q[i]) { ret false; }
+        i = i + 1;
+    }
+    if (x.len != y.len) { ret false; }
+    val m: usize = x.len::usize * $size_of(th.Style);
+    val r: *u8   = x.styles::*u8;
+    val s: *u8   = y.styles::*u8;
+    i = 0;
+    for (i < m) {
+        if (r[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a kind the registry test adds: a teal face, its text the theme's
+#[testing]
+fun gauge_style(t: *th.Theme, k: u32, s: *th.Style) {
+    th.fill_all(s, draw.hex(0x008080, 1.0::f32));
+}
+
+test push__overrides_a_scope_and_pop_restores {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    val red: draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    var was: th.Theme   = snapshot(?ctx, ?a);
+    if (!push_color(?ctx, "button.*.fill", red))                               { ret 2; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.HOT].fill.r != 1.0::f32)     { ret 3; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.FOCUSED].fill.r != 1.0::f32) { ret 4; }
+    if (!push_radii(?ctx, "*.radius", draw.radii(5.0::f32)))                   { ret 5; }
+    if (th.style(?ctx.theme, th.SCRIM).radius.br != 5.0::f32)                  { ret 6; }
+    if (depth(?ctx) != 2)                                                      { ret 7; }
+    pop(?ctx);
+    if (th.style(?ctx.theme, th.SCRIM).radius.br != th.style(?was, th.SCRIM).radius.br) { ret 8; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.HOT].fill.r != 1.0::f32)              { ret 9; }
+    pop(?ctx);
+    if (th.style(?ctx.theme, th.BUTTON).states[th.HOT].fill.r != th.style(?was, th.BUTTON).states[th.HOT].fill.r) { ret 10; }
+
+    # a push that names nothing, or the wrong unit, still pairs with its pop
+    if (push_color(?ctx, "button.radius", red))     { ret 11; }
+    if (push_length(?ctx, "button.nope", 1.0::f32)) { ret 12; }
+    if (depth(?ctx) != 2)                           { ret 13; }
+    pop(?ctx);
+    pop(?ctx);
+
+    # a frame left open is closed by the next begin
+    push_length(?ctx, "panel.min_h", 99.0::f32);
+    var in: input.Input;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    if (depth(?ctx) != 0 || th.style(?ctx.theme, th.PANEL).min_h != th.style(?was, th.PANEL).min_h) { ret 14; }
+    context.end(?ctx);
+    val f: err[allo.Error] = context.free(?ctx);
+    ret 0;
+}
+
+test class__applies_in_order_and_pops_as_one {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    var was: th.Theme = snapshot(?ctx, ?a);
+    val id:  opt[u32] = add_class(?ctx, "danger");
+    if (sel id.none) { ret 2; }
+    val again: opt[u32] = add_class(?ctx, "danger");
+    if (sel again.none)                                                                                         { ret 3; }
+    if (again.some != id.some)                                                                                  { ret 3; }
+    if (!set(?ctx, id.some, "button.*.fill", th.of_color(draw.rgba(0.8::f32, 0.1::f32, 0.1::f32, 1.0::f32))))   { ret 4; }
+    if (!set(?ctx, id.some, "button.hot.fill", th.of_color(draw.rgba(1.0::f32, 0.2::f32, 0.2::f32, 1.0::f32)))) { ret 5; }
+    if (set(?ctx, id.some, "button.cold.fill", th.of_length(1.0::f32)))                                         { ret 6; }
+    if (!push_class(?ctx, id.some))                                                                             { ret 7; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.NORMAL].fill.r != 0.8::f32)                                   { ret 8; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.HOT].fill.r != 1.0::f32)                                      { ret 9; }
+    pop(?ctx);
+    if (th.style(?ctx.theme, th.BUTTON).states[th.HOT].fill.r != th.style(?was, th.BUTTON).states[th.HOT].fill.r) { ret 10; }
+    if (push_class(?ctx, 7))                                                                                      { ret 11; }
+    pop(?ctx);
+    if (depth(?ctx) != 0) { ret 12; }
+    val f: err[allo.Error] = context.free(?ctx);
+    ret 0;
+}
+
+test theme__loads_and_saves_with_classes {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    val doc: str               = "base = \"dark\"\n[button.on]\nfill = \"#ff8800\"\n[class.quiet]\n\"*.*.border_w\" = 0.0\n\"label.normal.text\" = \"#808080\"\n";
+    val e:   err[th.LoadError] = load_theme(?ctx, doc);
+    if (sel e.err) { ret 2; }
+    var d:  th.Theme;
+    val de: err[allo.Error] = th.init(?d, ?a);
+    if (sel de.err) { ret 2; }
+    th.dark(?d);
+    if (ctx.theme.text.r != d.text.r)                                                   { ret 3; }
+    if (th.style(?ctx.theme, th.BUTTON).states[th.ON].fill.g != 0x88::f32 / 255.0::f32) { ret 4; }
+    val q: opt[u32] = class_of(?ctx, "quiet");
+    if (sel q.none) { ret 5; }
+
+    # what is saved, with a push open, loads back to the same theme and classes
+    push_length(?ctx, "*.min_w", 50.0::f32);
+    val saved: res[str, allo.Error] = save_theme(?ctx);
+    if (sel saved.err) { ret 6; }
+    var b:    allo.Allocator;
+    var back: context.Context;
+    if (!made(?back, ?b)) { ret 7; }
+    val e2: err[th.LoadError] = load_theme(?back, saved.ok);
+    if (sel e2.err) { ret 8; }
+    pop(?ctx);
+    if (!same_look(?ctx.theme, ?back.theme)) { ret 9; }
+    val q2: opt[u32] = class_of(?back, "quiet");
+    if (sel q2.none) { ret 10; }
+    push_class(?back, q2.some);
+    if (th.style(?back.theme, th.LABEL).states[th.NORMAL].text.r != 128.0::f32 / 255.0::f32) { ret 11; }
+    pop(?back);
+
+    # a refused document leaves the theme alone
+    val bad: err[th.LoadError] = load_theme(?ctx, "[button]\nnope = 1\n");
+    if (sel bad.ok)                   { ret 12; }
+    if (ctx.theme.text.r != d.text.r) { ret 13; }
+    val f:  err[allo.Error] = context.free(?ctx);
+    val f2: err[allo.Error] = context.free(?back);
+    val f3: err[allo.Error] = th.free(?d);
+    ret 0;
+}
+
+test registry__a_registered_kind_loads_from_toml_and_paints {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    val doc: str = "[gauge.normal]\nfill = \"#ff0000\"\nborder = \"#0000ff\"\nborder_w = 2.0\n";
+
+    # unregistered, the kind is an unknown key at its table's name
+    val before: err[th.LoadError] = load_theme(?ctx, doc);
+    if (sel before.ok)           { ret 2; }
+    if (!sel before.err.unknown) { ret 2; }
+    if (before.err.unknown != 1) { ret 2; }
+
+    val k: res[u32, allo.Error] = th.register_kind(context.theme_of(?ctx), "gauge", "a test gauge", gauge_style);
+    if (sel k.err) { ret 3; }
+    val e: err[th.LoadError] = load_theme(?ctx, doc);
+    if (sel e.err)                                                       { ret 4; }
+    if (th.style(?ctx.theme, k.ok).states[th.NORMAL].fill.r != 1.0::f32) { ret 5; }
+    # the fields the document leaves alone come from the kind's derive
+    if (th.style(?ctx.theme, k.ok).states[th.HOT].fill.g != 128.0::f32 / 255.0::f32) { ret 6; }
+
+    # paths, classes and the box painter reach it like any built-in kind
+    val c: opt[u32] = add_class(?ctx, "loud");
+    if (sel c.none)                                                     { ret 7; }
+    if (!set(?ctx, c.some, "gauge.*.border_w", th.of_length(4.0::f32))) { ret 8; }
+    var in: input.Input;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    push_class(?ctx, c.some);
+    if (th.style(?ctx.theme, k.ok).states[th.ACTIVE].border_w != 4.0::f32) { ret 9; }
+    context.box(?ctx, k.ok, th.NORMAL, 10.0::f32, 10.0::f32, 50.0::f32, 30.0::f32);
+    pop(?ctx);
+    var low: f32 = 0.0::f32;
+    if (!reaches(?ctx, 1.0::f32, 1.0::f32, ?low)) { ret 10; }
+    # the outline, its border_w the class's 4
+    val p:    *draw.Vert = context.draw_verts(?ctx);
+    var left: f32        = 100.0::f32;
+    var i:    usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (p[i].b == 1.0::f32 && p[i].x < left) { left = p[i].x; }
+        i = i + 1;
+    }
+    if (left != 10.0::f32) { ret 11; }
+    context.end(?ctx);
+
+    # and a save writes it back by name
+    val saved: res[str, allo.Error] = save_theme(?ctx);
+    if (sel saved.err) { ret 12; }
+    var found: bool  = false;
+    var j:     usize = 0;
+    for (!found && saved.ok[j] != 0) {
+        if (saved.ok[j] == '[' && saved.ok[j + 1] == 'g' && saved.ok[j + 2] == 'a' && saved.ok[j + 3] == 'u') { found = true; }
+        j = j + 1;
+    }
+    if (!found) { ret 13; }
+    val f: err[allo.Error] = context.free(?ctx);
+    ret 0;
+}
+
+# whether a vertex of the frame's draw list has a premultiplied color's red
+# and alpha, and how far down the lowest one lies
+#[testing]
+fun reaches(ctx: *context.Context, r: f32, a: f32, low: *f32) bool {
+    val p:     *draw.Vert = context.draw_verts(ctx);
+    var found: bool       = false;
+    var i:     usize      = 0;
+    for (i < context.draw_count(ctx)) {
+        if (p[i].r == r && p[i].a == a) {
+            if (!found || p[i].y > @low) { @low = p[i].y; }
+            found = true;
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+test box__paints_its_shadow_gradient_and_outline {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    val top: draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val bot: draw.Color = draw.rgba(0.5::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val rim: draw.Color = draw.rgba(0.25::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    # pushes made between frames are undone by begin, so push inside one
+    var in: input.Input;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    push_color(?ctx, "tooltip.normal.fill", top);
+    push_color(?ctx, "tooltip.normal.fill_to", bot);
+    push_color(?ctx, "tooltip.normal.border", rim);
+    push_length(?ctx, "tooltip.normal.border_w", 2.0::f32);
+    push_color(?ctx, "tooltip.normal.shadow", draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 0.5::f32));
+    push_length(?ctx, "tooltip.shadow_y", 6.0::f32);
+    context.box(?ctx, th.TOOLTIP, th.NORMAL, 10.0::f32, 10.0::f32, 50.0::f32, 30.0::f32);
+    var low: f32 = 0.0::f32;
+    # the face runs from its fill at the top to fill_to at the bottom
+    if (!reaches(?ctx, 1.0::f32, 1.0::f32, ?low)) { ret 2; }
+    if (low > 10.0::f32)                          { ret 3; }
+    if (!reaches(?ctx, 0.5::f32, 1.0::f32, ?low)) { ret 4; }
+    if (low < 30.0::f32)                          { ret 5; }
+    # the outline, and the shadow below the box by its offset
+    if (!reaches(?ctx, 0.25::f32, 1.0::f32, ?low)) { ret 6; }
+    var deep: f32        = 0.0::f32;
+    val p:    *draw.Vert = context.draw_verts(?ctx);
+    var i:    usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (p[i].b > 0.0::f32 && p[i].y > deep) { deep = p[i].y; }
+        i = i + 1;
+    }
+    if (deep < 35.0::f32) { ret 7; }
+    context.end(?ctx);
+    val f: err[allo.Error] = context.free(?ctx);
+    ret 0;
+}
