@@ -936,7 +936,10 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
 # a horizontal slider mapping @v linearly onto [lo, hi]
 #
 # while the handle is held, @v tracks the cursor's x within the track, wherever
-# the cursor goes. the label is drawn on the left of the track.
+# the cursor goes. the label is drawn on the left of the track. the theme's
+# slider_fill paints the track from its start to the handle's middle, clear in
+# the built-in themes, and a slider_handle min_w of 0 leaves the handle out for
+# a fill alone.
 # ---
 # ctx:   context
 # label: slider text
@@ -1012,7 +1015,9 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     var span: f32 = (x1 - x0) - hw;
     if (span < 0.0::f32) { span = 0.0::f32; }
     val hx: f32 = x0 + t_out * span;
-    anim.box(ctx, bid.child(id, "#handle"), theme.SLIDER_HANDLE, st, hx, y0, hx + hw, y1);
+    val fx: f32 = hx + hw / 2.0::f32;
+    if (fx > x0)       { anim.box(ctx, bid.child(id, "#fill"), theme.SLIDER_FILL, st, x0, y0, fx, y1); }
+    if (hw > 0.0::f32) { anim.box(ctx, bid.child(id, "#handle"), theme.SLIDER_HANDLE, st, hx, y0, hx + hw, y1); }
 
     val ty: f32          = text_top(ctx, y0, h);
     val p:  *theme.Paint = ink(ctx, theme.SLIDER, st);
@@ -1806,6 +1811,7 @@ pub fun dock_placed(ctx: *context.Context, dk: *Docked) bool {
 # hidden: 1 while an auto-sized window with no width yet lays out only to
 #         measure, drawing and claiming nothing
 # docked: 1 while it draws where its dock placed it
+# area:   the rect a docked window fills, its body padded within it
 # need_w: the width the titlebar needs
 # min_w:  least width
 # max_w:  greatest width
@@ -1824,6 +1830,7 @@ pub rec WindowArea {
     sc:     *Scroll;
     hidden: u8;
     docked: u8;
+    area:   context.Area;
     need_w: f32;
     min_w:  f32;
     max_w:  f32;
@@ -2013,7 +2020,8 @@ fun bound(v: f32) f32 {
 # a dock takes in (see blit.dock). a docked window instead draws in the rect
 # its dock last laid out (see Docked), in the docked band, with no chrome, its
 # body a scroll region whatever its flags, and has no body while another tab
-# of its stack is selected. its content and ids are the same either way.
+# of its stack is selected. its content, ids and body padding are the same
+# either way.
 # widgets placed while the returned body is 1 fill it, in screen pixels. the
 # window is an id scope for them. pair every begin_window with an end_window,
 # closed or not.
@@ -2195,8 +2203,9 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     ret r;
 }
 
-# begin_window for a window its dock holds: no chrome, a scroll region over
-# the rect the dock laid out, and nothing at all while another tab is selected
+# begin_window for a window its dock holds: no chrome, a scroll region padded
+# within the rect the dock laid out as a floating body is, and nothing at all
+# while another tab is selected
 fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked) WindowArea {
     var out:  WindowArea = r;
     val bare: u8         = (win.flags & WINDOW_NO_TITLE) != 0;
@@ -2214,9 +2223,14 @@ fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked)
     out.claim = context.reserve_claim(ctx, out.id);
     out.ch    = context.split(ctx, 2);
     context.set_channel(ctx, out.ch, 1);
-    val body_id: u64 = bid.child(out.id, "#body");
+    out.area = context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1};
+    val p:       theme.Edges  = padding(ctx, theme.WINDOW);
+    val body_id: u64          = bid.child(out.id, "#body");
+    val inner:   context.Area = context.Area{
+        x0: dk.x0 + p.l, y0: dk.y0 + p.t, x1: maxf(dk.x1 - p.r, dk.x0 + p.l), y1: maxf(dk.y1 - p.b, dk.y0 + p.t)
+    };
     out.sc     = state.get[Scroll](ctx, body_id);
-    out.scroll = scroll_in(ctx, body_id, out.sc, context.Area{x0: dk.x0, y0: dk.y0, x1: dk.x1, y1: dk.y1}, 0);
+    out.scroll = scroll_in(ctx, body_id, out.sc, inner, 0);
     ret out;
 }
 
@@ -2224,10 +2238,10 @@ fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked)
 fun end_docked(ctx: *context.Context, r: WindowArea) {
     end_scroll(ctx, r.sc, r.scroll);
     context.set_channel(ctx, r.ch, 0);
-    val x0: f32 = r.scroll.x;
-    val y0: f32 = r.scroll.y;
-    val x1: f32 = r.scroll.x + r.scroll.w;
-    val y1: f32 = r.scroll.y + r.scroll.h;
+    val x0: f32 = r.area.x0;
+    val y0: f32 = r.area.y0;
+    val x1: f32 = r.area.x1;
+    val y1: f32 = r.area.y1;
     if ((r.flags & WINDOW_NO_BACKGROUND) == 0) { context.box_face(ctx, theme.DOCK, theme.NORMAL, x0, y0, x1, y1, context.CORNERS_ALL, 0); }
     context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
@@ -2545,10 +2559,15 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     ret @open != 0;
 }
 
-# the side of a section's caret: the section style's min_w, or with none the
+# the side of a caret beside a caption: the kind's min_w, or with none the
 # caption's ascent, so it follows the caption's text style and never the line
-fun caret_size(ctx: *context.Context, ascent: f32) f32 {
-    val k: f32 = look(ctx, theme.SECTION).min_w;
+# ---
+# ctx:    context
+# kind:   the style kind that owns the caret
+# ascent: the caption's ascent in pixels
+# ret:    the caret's side in pixels
+pub fun caret_size(ctx: *context.Context, kind: u32, ascent: f32) f32 {
+    val k: f32 = look(ctx, kind).min_w;
     if (k > 0.0::f32) { ret context.px(ctx, k); }
     ret ascent;
 }
@@ -2558,7 +2577,7 @@ fun heading(ctx: *context.Context, title: str, open: *u8) u64 {
     val id: u64             = context.id_of(ctx, title);
     val lh: f32             = context.line_height(ctx);
     val m:  gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
-    val k:  f32             = caret_size(ctx, m.ascent);
+    val k:  f32             = caret_size(ctx, theme.SECTION, m.ascent);
     val in: theme.Edges     = inset(ctx, theme.SECTION);
     val r:  context.Area    = place(ctx, wide(), layout.fit(), label_width(ctx, title) + k + in.l * 2.0::f32 + in.r, row_of(ctx, theme.SECTION));
     val x0: f32             = r.x0;
@@ -4771,6 +4790,69 @@ test slider__drags_with_a_reading {
     val shown: usize = context.draw_count(?ctx);
     frame_reading(?ctx, input_at(300.0::f32, 90.0::f32, 0), ?v, nil);
     if (shown != context.draw_count(?ctx) + 8) { ret 6; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the least and greatest x of the last frame's vertices in opaque color c,
+# false if none is
+#[testing]
+fun x_span(ctx: *context.Context, c: draw.Color, lo: *f32, hi: *f32) bool {
+    val p:     *draw.Vert = context.draw_verts(ctx);
+    var found: bool       = false;
+    var i:     usize      = 0;
+    for (i < context.draw_count(ctx)) {
+        if (p[i].r == c.r && p[i].g == c.g && p[i].b == c.b && p[i].a == c.a) {
+            if (!found || p[i].x < @lo) { @lo = p[i].x; }
+            if (!found || p[i].x > @hi) { @hi = p[i].x; }
+            found = true;
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+test slider__fills_to_the_value_per_state_and_hides_its_handle {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    val rest: draw.Color   = draw.rgba(0.0::f32, 1.0::f32, 0.0::f32, 1.0::f32);
+    val hot:  draw.Color   = draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32);
+    val knob: draw.Color   = draw.rgba(1.0::f32, 0.0::f32, 1.0::f32, 1.0::f32);
+    val t:    *theme.Theme = context.theme_of(?ctx);
+    theme.fill_all(theme.style(t, theme.SLIDER_HANDLE), knob);
+    var v:  f32 = 5.0::f32;
+    var lo: f32 = 0.0::f32;
+    var hi: f32 = 0.0::f32;
+
+    # the built-in fill is clear: the handle alone shows the value
+    frame_reading(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?v, nil);
+    if (!x_span(?ctx, knob, ?lo, ?hi)) { ret 2; }
+
+    # a theme's fill runs from the track's start to the handle's middle, in
+    # the slider's state
+    val f: *theme.Style = theme.style(t, theme.SLIDER_FILL);
+    f.radius = draw.radii(0.0::f32);
+    theme.fills(f, rest, hot, hot, rest);
+    frame_reading(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?v, nil);
+    if (!x_span(?ctx, rest, ?lo, ?hi))     { ret 3; }
+    if (lo != 0.0::f32 || hi != 50.0::f32) { ret 4; }
+    frame_reading(?ctx, input_at(20.0::f32, 8.0::f32, 0), ?v, nil);
+    if (x_span(?ctx, rest, ?lo, ?hi)) { ret 5; }
+    if (!x_span(?ctx, hot, ?lo, ?hi)) { ret 6; }
+
+    # without a handle the fill alone shows the value, still to the middle
+    theme.style(t, theme.SLIDER_HANDLE).min_w = 0.0::f32;
+    frame_reading(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?v, nil);
+    if (x_span(?ctx, knob, ?lo, ?hi))      { ret 7; }
+    if (!x_span(?ctx, rest, ?lo, ?hi))     { ret 8; }
+    if (lo != 0.0::f32 || hi != 50.0::f32) { ret 9; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }

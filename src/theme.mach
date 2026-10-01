@@ -69,7 +69,7 @@ pub val SERIES: usize = 8;
 
 # how many built-in kinds init registers, the handles below; a kind
 # registered after them takes the next handle
-pub val BUILTIN_KINDS: u32 = 52;
+pub val BUILTIN_KINDS: u32 = 53;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -100,7 +100,7 @@ pub val TOGGLE: u32 = 10;
 pub val TOGGLE_KNOB: u32 = 11;
 # a slider's track: text the label, mark the reading
 pub val SLIDER: u32 = 12;
-# a slider's handle: min_w its width
+# a slider's handle: min_w its width, 0 for none
 pub val SLIDER_HANDLE: u32 = 13;
 # a dropdown's header, on while open
 pub val DROPDOWN: u32 = 14;
@@ -146,7 +146,7 @@ pub val PROGRESS: u32 = 33;
 pub val PROGRESS_BAR: u32 = 34;
 # a separator: border its rule and border_w its width, mark a label, inset.r between label and rule
 pub val SEPARATOR: u32 = 35;
-# a tree's row, on while selected: mark the caret
+# a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent
 pub val TREE_ITEM: u32 = 36;
 # where a drag would drop: fill and border
 pub val DROP_TARGET: u32 = 37;
@@ -178,6 +178,8 @@ pub val CHECKER: u32 = 49;
 pub val TOAST: u32 = 50;
 # the ring around the control the keyboard reached: border and border_w its stroke, radius its corners
 pub val FOCUS_RING: u32 = 51;
+# a slider's fill from the track's start to the value, transparent unless a theme gives it a fill
+pub val SLIDER_FILL: u32 = 52;
 
 # the kinds of motion a theme times (see motion)
 #
@@ -451,7 +453,7 @@ pub val FIELDS: [58]Field = [58]Field{
     Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows, cells and buttons in a row"},
     Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, doc: "container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content"},
     Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, doc: "control inset: between a control's edge and its text, and between a box and its label"},
-    Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, doc: "slider handle width"},
+    Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, doc: "slider handle width, 0 for none"},
     Field{group: GROUP_METRICS, name: "bar_w", unit: UNIT_LENGTH, off: $offset_of(Theme, bar_w), count: 1, doc: "scrollbar width"},
     Field{group: GROUP_METRICS, name: "thumb_min", unit: UNIT_LENGTH, off: $offset_of(Theme, thumb_min), count: 1, doc: "shortest scrollbar thumb"},
     Field{group: GROUP_METRICS, name: "corner", unit: UNIT_LENGTH, off: $offset_of(Theme, corner), count: 1, doc: "corner radius of controls and containers, 0 for square"},
@@ -497,7 +499,7 @@ pub rec Name {
 }
 
 # every built-in kind, in handle order: the names and meanings init registers
-val KIND_INFO: [52]Name = [52]Name{
+val KIND_INFO: [53]Name = [53]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -511,7 +513,7 @@ val KIND_INFO: [52]Name = [52]Name{
     Name{name: "toggle", doc: "a toggle's switch track and label, on while set: pad between the row and the track"},
     Name{name: "toggle_knob", doc: "a toggle's knob, in the toggle's state: margin between the knob and the track"},
     Name{name: "slider", doc: "a slider's track: text the label, mark the reading"},
-    Name{name: "slider_handle", doc: "a slider's handle: min_w its width"},
+    Name{name: "slider_handle", doc: "a slider's handle: min_w its width, 0 for none"},
     Name{name: "dropdown", doc: "a dropdown's header, on while open"},
     Name{name: "field", doc: "a text field: mark the hint, focused while it holds the keyboard"},
     Name{name: "field_caret", doc: "a text field's caret and its composition underline: fill, min_w the width"},
@@ -534,7 +536,7 @@ val KIND_INFO: [52]Name = [52]Name{
     Name{name: "progress", doc: "a progress bar's track and its text"},
     Name{name: "progress_bar", doc: "a progress bar's done part"},
     Name{name: "separator", doc: "a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule"},
-    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret"},
+    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent"},
     Name{name: "drop_target", doc: "where a drag would drop: fill and border"},
     Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"},
     Name{name: "menu_bar", doc: "a menu bar's background"},
@@ -549,7 +551,8 @@ val KIND_INFO: [52]Name = [52]Name{
     Name{name: "picker", doc: "a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label"},
     Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"},
     Name{name: "toast", doc: "a toast's card: pad around its text, margin between the stack and the surface's edges"},
-    Name{name: "focus_ring", doc: "the ring around the control the keyboard reached: border and border_w its stroke, radius its corners"}
+    Name{name: "focus_ring", doc: "the ring around the control the keyboard reached: border and border_w its stroke, radius its corners"},
+    Name{name: "slider_fill", doc: "a slider's fill from the track's start to the value, transparent unless a theme gives it a fill"}
 };
 
 # every state, indexed by the state constants

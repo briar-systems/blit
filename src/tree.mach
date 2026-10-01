@@ -50,6 +50,8 @@ use std.allocator.page;
 use blit.context;
 use blit.draw;
 use blit.driver;
+use blit.font;
+use gly: blit.glyph;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
@@ -205,7 +207,9 @@ rec Fold {
 # lo:     first row in view
 # hi:     row past the last in view
 # rh:     row height in pixels
-# lh:     line height in pixels, the indent of one level and the caret's side
+# lh:     line height in pixels, the indent of one level
+# asc:    the caption's ascent in pixels
+# k:      the caret's side in pixels, see widget.caret_size
 # x0:     left of the rows in the region's local pixels
 # x1:     right of the rows
 # y:      top of the first row
@@ -227,6 +231,8 @@ rec Walk {
     hi:     usize;
     rh:     f32;
     lh:     f32;
+    asc:    f32;
+    k:      f32;
     x0:     f32;
     x1:     f32;
     y:      f32;
@@ -309,7 +315,7 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool, up:
     val y0:  f32              = w.y + row::f32 * w.rh;
     val y1:  f32              = y0 + w.rh;
     val cx:  f32              = x0 + pad + depth::f32 * w.lh;
-    val tx:  f32              = cx + w.lh + pad;
+    val tx:  f32              = cx + w.k + pad;
 
     val h:    interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
     var flip: bool         = false;
@@ -358,7 +364,8 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool, up:
     val ink: *theme.Paint = context.paint_of(ctx, theme.TREE_ITEM, st);
     context.box(ctx, theme.TREE_ITEM, st, x0, y0, x1, y1);
     val ty: f32 = y0 + (w.rh - w.lh) / 2.0::f32;
-    if (!it.leaf)                    { widget.caret(ctx, cx, ty, w.lh, open, ink.mark); }
+    # the caret centred on the caption between its line's top and its baseline
+    if (!it.leaf)                    { widget.caret(ctx, cx, ty + (w.asc - w.k) / 2.0::f32, w.k, open, ink.mark); }
     if (it.label != nil)             { context.text_at(ctx, it.label, tx, ty, ink.text); }
     if (w.keyed && id == w.t.cursor) { context.box(ctx, theme.FOCUS_RING, theme.NORMAL, x0, y0, x1, y1); }
 
@@ -586,6 +593,9 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.stamp = t.epoch + 1;
     w.want  = NO_ROW;
     w.lh    = context.line_height(ctx);
+    val m: gly.LineMetrics = font.line(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx));
+    w.asc = m.ascent;
+    w.k   = widget.caret_size(ctx, theme.TREE_ITEM, m.ascent);
     val ts: *theme.Style = context.look_of(ctx, theme.TREE_ITEM);
     w.rh = context.px(ctx, ts.min_h);
     val fit: f32 = w.lh + context.px(ctx, ts.inset.t + ts.inset.b);
@@ -869,6 +879,65 @@ test tree__a_change_by_input_or_code_shows_in_the_frame_after {
     if (!driver.drawn(?d, leaf_id(?f, 1, 0))) { ret 10; }
     val rest: opt[f64] = context.next_frame(?d.ctx);
     if (!sel rest.none) { ret 11; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the top and bottom of every vertex drawn in pure red, the caret's ink in
+# tree__caret_follows_the_caption_not_the_line
+#[testing]
+fun red_span(d: *driver.Driver, top: *f32, bottom: *f32) {
+    val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    @top    = 1000000.0::f32;
+    @bottom = -1000000.0::f32;
+    var i: usize = 0;
+    for (i < context.draw_count(?d.ctx)) {
+        val v: draw.Vert = vs[i];
+        if (v.r == 1.0::f32 && v.g == 0.0::f32 && v.b == 0.0::f32 && v.a == 1.0::f32) {
+            if (v.y < @top)    { @top = v.y; }
+            if (v.y > @bottom) { @bottom = v.y; }
+        }
+        i = i + 1;
+    }
+}
+
+test tree__caret_follows_the_caption_not_the_line {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f: Fake;
+    fake(?f, 1, 0);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 400.0::f32, fake_ui, (?f)::ptr);
+    if (sel ie.err) { ret 1; }
+    val t:    *theme.Theme    = context.theme_of(?d.ctx);
+    val mark: opt[theme.Path] = theme.path(t, "tree_item.*.mark");
+    val size: opt[theme.Path] = theme.path(t, "tree_item.min_w");
+    if (sel mark.none) { ret 2; }
+    if (sel size.none) { ret 2; }
+    theme.set_path(t, mark.some, theme.of_color(draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32)));
+
+    # a larger body style: the caret spans the caption's line top to its
+    # baseline, never its descent and gap
+    if (!context.set_style(?d.ctx, font.STYLE_BODY, font.Style{source: 0, size: 3.0::f32})) { ret 3; }
+    driver.steps(?d, 2);
+    val r: opt[context.Area] = driver.rect(?d, top_id(?f, 0));
+    if (sel r.none) { ret 4; }
+    val m:      gly.LineMetrics = font.line(context.font_of(?d.ctx), font.STYLE_BODY, 1.0::f32);
+    val lh:     f32             = gly.line_height(m);
+    val line:   f32             = r.some.y0 + (r.some.y1 - r.some.y0 - lh) / 2.0::f32;
+    var top:    f32             = 0.0::f32;
+    var bottom: f32             = 0.0::f32;
+    red_span(?d, ?top, ?bottom);
+    if (top != line || bottom != line + m.ascent) { ret 5; }
+
+    # the tree item style's min_w sizes it whatever the text
+    theme.set_path(t, size.some, theme.of_length(6.0::f32));
+    driver.step(?d);
+    red_span(?d, ?top, ?bottom);
+    if (bottom - top != 6.0::f32) { ret 6; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
