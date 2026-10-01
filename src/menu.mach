@@ -21,6 +21,10 @@
 # no longer sees its keys, and the frame after it closes it gives the focus
 # back to the widget that held it before, which keeps it while it is drawn.
 #
+# a bar's headers are a group of tab stops (see blit.interact): tab reaches
+# the bar, left and right move between its headers, and enter, space or down
+# on a header opens its menu with the first item highlighted.
+#
 # the open menu deepest in a tree takes the arrow keys, enter and escape: up
 # and down move its highlight over the enabled items, enter fires the
 # highlighted item or opens its submenu, right opens a submenu and left
@@ -192,6 +196,7 @@ pub rec MenuState {
 # y1:     a bar's bottom
 # ch:     a bar's channels: its background beneath its headers
 # claim:  a bar's reserved claim
+# grp:    the tab stop group a bar's headers replaced
 pub rec Menu {
     id:     u64;
     kind:   u8;
@@ -225,6 +230,7 @@ pub rec Menu {
     y1:     f32;
     ch:     context.Channels;
     claim:  usize;
+    grp:    interact.Group;
 }
 
 # a plain enabled item with no shortcut, check or icon
@@ -506,6 +512,7 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
     m.ch    = context.split(ctx, 2);
     context.set_channel(ctx, m.ch, 1);
     context.push_id(ctx, id);
+    m.grp = interact.begin_group(ctx, id, interact.ROW);
     ret m;
 }
 
@@ -515,6 +522,7 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
 # ctx: context
 # m:   the value begin_bar returned
 pub fun end_bar(ctx: *context.Context, m: *Menu) {
+    interact.end_group(ctx, m.grp);
     context.pop_id(ctx);
     val st: *MenuState = m.st;
     if (st.child != 0 && !m.hopen) { st.child = 0; }
@@ -571,11 +579,15 @@ fun header(ctx: *context.Context, bar: *Menu, m: *Menu, label: str) {
     val y1: f32        = bar.y1;
     bar.x = x1;
 
-    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT | interact.FOCUS);
     if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
     if (h.pressed) {
         if (bs.child == m.id) { bs.child = 0; }
         or                    { bs.child = m.id; }
+    }
+    if (bs.child != m.id && (h.activated || (h.focused && interact.presses(ctx, input.KEY_DOWN) != 0))) {
+        bs.child   = m.id;
+        m.st.first = 1;
     }
     # the open menu's outside claim covers the bar, so a move onto another
     # header is read from the cursor itself

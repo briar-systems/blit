@@ -26,6 +26,11 @@
 # released over no target at all is torn off, which docking (#83) turns into
 # a floating window.
 #
+# the tabs are one group of tab stops (see blit.interact): tab reaches the
+# bar at the tab that last held the keyboard, left and right move between
+# its tabs, and enter or space selects the one holding it. a tab the keyboard
+# moves to is scrolled into view.
+#
 # tabs wider together than the bar shrink, down to a few characters of their
 # label. past that the strip scrolls: arrows step it a tab at a time, and a
 # list button opens a popup of every tab, hidden or not. a tab selected from
@@ -567,25 +572,31 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
     val strip: interact.Hit = interact.hit(ctx, bid.child(id, "#strip"), g.x0, g.y0, g.x1, g.y1, 0);
 
     # the tab under the pointer and the slot a drop there lands in
-    var over: interact.Hit;
-    var slot: usize = n;
-    var mark: f32   = g.x0 + g.total - s.scroll;
-    val seps: f32   = context.px(ctx, ctx.theme.edge_w);
-    var x:    f32   = g.x0 - s.scroll;
-    var i:    usize = 0;
+    var over:  interact.Hit;
+    var slot:  usize          = n;
+    var mark:  f32            = g.x0 + g.total - s.scroll;
+    val seps:  f32            = context.px(ctx, ctx.theme.edge_w);
+    var x:     f32            = g.x0 - s.scroll;
+    var i:     usize          = 0;
+    val grp:   interact.Group = interact.begin_group(ctx, id, interact.ROW);
+    val went:  opt[u32]       = context.moved_to(ctx);
+    val keyed: bool           = sel went.some;
     for (i < n) {
         val t:  *Tab = ?tabs[i];
         val x0: f32  = x;
         val x1: f32  = x + width(ctx, ?g, t);
         x = x1;
         val tid: u64          = tab_id(id, t.key);
-        val h:   interact.Hit = interact.hit(ctx, tid, x0, g.y0, x1 - seps, g.y1, input.BUTTON_LEFT | input.BUTTON_MIDDLE);
+        val h:   interact.Hit = interact.hit(ctx, tid, x0, g.y0, x1 - seps, g.y1, input.BUTTON_LEFT | input.BUTTON_MIDDLE | interact.FOCUS);
         val on:  bool         = s.has != 0 && s.key == t.key;
-        if (h.pressed && h.button == input.BUTTON_LEFT && !on) {
+        if (((h.pressed && h.button == input.BUTTON_LEFT) || h.activated) && !on) {
             s.key    = t.key;
             s.has    = 1;
             s.index  = i;
             s.follow = 1;
+        }
+        if (h.focused && keyed && (x0 < g.x0 || x1 > g.x1)) {
+            s.scroll = clampf(s.scroll + minf(x0 - g.x0, 0.0::f32) + maxf(x1 - g.x1, 0.0::f32), 0.0::f32, most(?g));
         }
         var bg:  draw.Color = ctx.theme.control;
         var ink: draw.Color = ctx.theme.text;
@@ -628,6 +639,7 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
         }
         i = i + 1;
     }
+    interact.end_group(ctx, grp);
     if (over.id == 0) { over = strip; }
 
     val half: f32      = maxf(seps, 1.0::f32);

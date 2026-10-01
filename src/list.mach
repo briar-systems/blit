@@ -18,6 +18,13 @@
 #
 # a row's id and hit are passed to its drawer, which is where a drag source or
 # a drop target for reordering rows attaches.
+#
+# the list is one tab stop over its region (see blit.interact.stop), focused
+# by tab or a press on a row. while it holds the keyboard, up and down move
+# the selection over the shown items, home and end to the first and last,
+# and page up and page down by a list's height of rows, scrolling the item
+# into view. with marks, a plain move selects the item alone and shift
+# extends the selection from the anchor, as clicks do.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -53,10 +60,13 @@ pub def Drawer: fun(*context.Context, ptr, Row);
 # scroll:   the list's scroll state
 # marks:    nil for single selection, else one byte per item, nonzero while
 #           it is selected, which makes the list a multiple selection
+# cursor:   with marks, the item the keyboard last moved to or a click
+#           landed on, where the arrows move from
 pub rec List {
     selected: usize;
     scroll:   widget.Scroll;
     marks:    *u8;
+    cursor:   usize;
 }
 
 # what a list shows this frame
@@ -213,7 +223,7 @@ fun natural_w(ctx: *context.Context, r: *Rows, i: usize) f32 {
 
 # a scrolling list of rows, h pixels tall, whose items can be selected
 #
-# only the items the matcher shows are laid out. clicking a shown row selects
+# the list holds the keyboard as described above. only the items the matcher shows are laid out. clicking a shown row selects
 # its item: with l.marks nil it becomes the one selected item, else the click
 # edits the multiple selection (a plain click selects it alone, ctrl or
 # command toggles it, shift selects the shown items from the anchor to it).
@@ -231,12 +241,33 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
     var rh:      f32               = r.row_h;
     var changed: bool              = false;
     if (rh <= 0.0::f32) { rh = widget.control_height(ctx); }
-    val top: f32 = l.scroll.offset;
+    val top: f32 = area.top;
+
+    # the list's own stop, over the region it scrolls in
+    val view:  context.Area = context.Area{x0: 0.0::f32, y0: area.top, x1: area.w, y1: area.top + area.h};
+    val keyed: bool         = interact.stop(ctx, area.id, view.x0, view.y0, view.x1, view.y1, interact.ARROWS);
+    var aim:   usize        = r.count;
+    if (keyed) { aim = aimed(ctx, l, ?r, h, rh); }
+    var pressed: bool = false;
 
     var i: usize = 0;
     for (i < r.count) {
         if (shown(?r, i)) {
             val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), natural_w(ctx, ?r, i), rh);
+            if (i == aim) {
+                if (l.marks != nil) {
+                    var mods: u8 = 0;
+                    if ((ctx.in.mods & input.MOD_SHIFT) != 0) { mods = input.MOD_SHIFT; }
+                    if (click_many(l, ?r, i, mods))           { changed = true; }
+                    l.cursor = i;
+                }
+                or (l.selected != i) {
+                    l.selected = i;
+                    changed    = true;
+                }
+                if (a.y0 < l.scroll.offset)     { l.scroll.offset = a.y0; }
+                if (a.y1 > l.scroll.offset + h) { l.scroll.offset = a.y1 - h; }
+            }
             if (a.y1 > top && a.y0 < top + area.h) {
                 var row: Row;
                 row.index = i;
@@ -246,7 +277,9 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
                 row.x1    = a.x1;
                 row.y1    = a.y1;
                 row.hit   = interact.hit(ctx, row.id, row.x0, row.y0, row.x1, row.y1, input.BUTTON_LEFT);
+                if (row.hit.pressed) { pressed = true; }
                 if (row.hit.clicked) {
+                    l.cursor = i;
                     if (l.marks != nil) {
                         if (click_many(l, ?r, i, ctx.in.mods)) { changed = true; }
                     }
@@ -269,12 +302,73 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
 
                 if (r.draw != nil) { r.draw(ctx, r.user, row); }
                 or                 { draw_labels(ctx, ?r, row); }
+                if (keyed && i == cursor_of(l) && context.focus_visible(ctx)) {
+                    context.stroke_rounded_rect(ctx, row.x0, row.y0, row.x1, row.y1, draw.radii(context.px(ctx, ctx.theme.corner)), context.px(ctx, ctx.theme.edge_w), ctx.theme.focus);
+                }
             }
         }
         i = i + 1;
     }
     widget.end_scroll(ctx, ?l.scroll, area);
+    if (pressed && !keyed) { context.focus(ctx, area.id); }
     ret changed;
+}
+
+# the item the keyboard cursor is on: the anchor of a multiple selection,
+# else the selected item
+fun cursor_of(l: *List) usize {
+    if (l.marks != nil) { ret l.cursor; }
+    ret l.selected;
+}
+
+# the shown item the frame's up, down, home, end, page up and page down
+# presses move the keyboard cursor to, r.count when they move it nowhere
+fun aimed(ctx: *context.Context, l: *List, r: *Rows, h: f32, rh: f32) usize {
+    val n:    usize = r.count;
+    val from: usize = cursor_of(l);
+    var page: i64   = 1;
+    if (rh > 0.0::f32 && h > rh) { page = (h / rh)::i64; }
+    var steps: i64 = interact.presses(ctx, input.KEY_DOWN)::i64 - interact.presses(ctx, input.KEY_UP)::i64;
+    steps = steps + page * (interact.presses(ctx, input.KEY_PAGE_DOWN)::i64 - interact.presses(ctx, input.KEY_PAGE_UP)::i64);
+    var to: usize = from;
+    if (interact.presses(ctx, input.KEY_HOME) != 0) { to = next_shown(r, n, 1); }
+    if (interact.presses(ctx, input.KEY_END) != 0)  { to = next_shown(r, n, -1); }
+    if (to >= n && steps != 0) {
+        if (steps > 0) {
+            to    = next_shown(r, n, 1);
+            steps = steps - 1;
+        }
+        or {
+            to    = next_shown(r, n, -1);
+            steps = steps + 1;
+        }
+    }
+    for (to < n && steps != 0) {
+        var dir: i64 = 1;
+        if (steps < 0) { dir = -1; }
+        val k: usize = next_shown(r, to, dir);
+        if (k >= n) { brk; }
+        to    = k;
+        steps = steps - dir;
+    }
+    if (to == from) { ret n; }
+    ret to;
+}
+
+# the first shown item past item i by dir (1 or -1), r.count when none; from
+# i at r.count, the first shown item (dir 1) or the last (dir -1)
+fun next_shown(r: *Rows, i: usize, dir: i64) usize {
+    val n: usize = r.count;
+    var k: i64   = i::i64 + dir;
+    if (i >= n) {
+        k = 0;
+        if (dir < 0) { k = n::i64 - 1; }
+    }
+    for (k >= 0 && k < n::i64) {
+        if (shown(r, k::usize)) { ret k::usize; }
+        k = k + dir;
+    }
+    ret n;
 }
 
 # a list in a 100 pixel panel at the screen's top left, and what its drawer saw
@@ -365,7 +459,7 @@ test list__selects_scrolls_and_searches {
 
     # the wheel scrolls the list and the rows follow
     driver.scroll(?d, row_id(?d, 1), 0.0::f32, -40.0::f32);
-    driver.step(?d);
+    driver.settle(?d);
     if (p.l.scroll.offset != 40.0::f32 || driver.drawn(?d, row_id(?d, 0))) { ret 6; }
     click_row(?d, 2, 0);
     if (p.l.selected != 2) { ret 7; }
@@ -543,7 +637,7 @@ test list__drawn_rows_keep_hit_selection_and_scrolling {
 
     # and scrolls: two rows down, the first drawn is the third
     driver.scroll(?d, row_id(?d, 1), 0.0::f32, -68.0::f32);
-    driver.step(?d);
+    driver.settle(?d);
     if (p.first != 2 || driver.drawn(?d, row_id(?d, 1))) { ret 6; }
     click_row(?d, 3, 0);
     if (p.l.selected != 3 || p.seen != 3) { ret 7; }
