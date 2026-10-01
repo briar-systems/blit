@@ -363,6 +363,10 @@ pub rec TextLine {
 # style_sp:     text style stack depth
 # style_ids:    saved parent text styles, grown on demand
 # style_cap:    styles allocated for style_ids
+# alpha:        opacity every color is painted at, the product of the open push_alpha scopes
+# alpha_sp:     open push_alpha scopes
+# alphas:       saved parent opacities, grown on demand
+# alphas_cap:   opacities allocated for alphas
 # scale:        interface scale theme metrics and text are sized at, 1.0 by default
 # theme:        the colors and unscaled metrics widgets draw with
 # srgb:         1 if colors are converted to linear light for an sRGB target, else 0
@@ -470,6 +474,10 @@ pub rec Context {
     style_sp:     usize;
     style_ids:    *u32;
     style_cap:    usize;
+    alpha:        f32;
+    alpha_sp:     usize;
+    alphas:       *f32;
+    alphas_cap:   usize;
     scale:        f32;
     theme:        th.Theme;
     srgb:         u8;
@@ -608,6 +616,10 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.style_sp     = 0;
     ctx.style_ids    = nil;
     ctx.style_cap    = 0;
+    ctx.alpha        = 1.0::f32;
+    ctx.alpha_sp     = 0;
+    ctx.alphas       = nil;
+    ctx.alphas_cap   = 0;
     ctx.scale        = 1.0::f32;
     ctx.theme        = th.default();
     ctx.srgb         = 0;
@@ -735,6 +747,10 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel et.err) { ret et; }
     ctx.style_ids = nil;
     ctx.style_cap = 0;
+    val ea: err[allo.Error] = allo.deallocate[f32](ctx.a, ctx.alphas, ctx.alphas_cap);
+    if (sel ea.err) { ret ea; }
+    ctx.alphas     = nil;
+    ctx.alphas_cap = 0;
     val ei: err[allo.Error] = allo.deallocate[u64](ctx.a, ctx.ids, ctx.ids_cap);
     if (sel ei.err) { ret ei; }
     ctx.ids     = nil;
@@ -837,6 +853,8 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
 
     ctx.style    = font.STYLE_BODY;
     ctx.style_sp = 0;
+    ctx.alpha    = 1.0::f32;
+    ctx.alpha_sp = 0;
     ctx.font.oom = 0;
     font.begin_frame(?ctx.font);
 
@@ -2294,10 +2312,47 @@ fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1
 }
 
 # a color as it is emitted: converted to linear light for an sRGB target,
-# then premultiplied by its alpha
+# faded by the open push_alpha scopes, then premultiplied by its alpha
 fun paint(ctx: *Context, c: draw.Color) draw.Color {
-    if (ctx.srgb != 0) { ret draw.premultiply(draw.linear_cached(?ctx.lin, c)); }
-    ret draw.premultiply(c);
+    var k: draw.Color = c;
+    if (ctx.srgb != 0) { k = draw.linear_cached(?ctx.lin, c); }
+    k.a = k.a * ctx.alpha;
+    ret draw.premultiply(k);
+}
+
+# paint everything until the matching pop_alpha at a fraction of its opacity
+#
+# scopes nest and multiply, so an overlay fading to half inside another at half
+# paints at a quarter. every color passes through it: quads, shapes, paths,
+# text and image tints. a consumer span (see custom) is drawn by the consumer
+# and is not faded. the stack grows with nesting; if it cannot, oom is set, the
+# parent is not saved and depth still balances.
+# ---
+# ctx: context
+# a:   opacity in [0, 1], clamped
+pub fun push_alpha(ctx: *Context, a: f32) {
+    ctx.alphas = room[f32](ctx, ctx.alphas, ?ctx.alphas_cap, ctx.alpha_sp + 1, CLIP_DEPTH);
+    if (ctx.alpha_sp < ctx.alphas_cap) { ctx.alphas[ctx.alpha_sp] = ctx.alpha; }
+    ctx.alpha_sp = ctx.alpha_sp + 1;
+    ctx.alpha    = ctx.alpha * minf(maxf(a, 0.0::f32), 1.0::f32);
+}
+
+# return to the opacity saved by the matching push_alpha
+# ---
+# ctx: context
+pub fun pop_alpha(ctx: *Context) {
+    if (ctx.alpha_sp == 0) { ret; }
+    ctx.alpha_sp = ctx.alpha_sp - 1;
+    if (ctx.alpha_sp < ctx.alphas_cap) { ctx.alpha = ctx.alphas[ctx.alpha_sp]; }
+    or                                 { ctx.alpha = 1.0::f32; }
+}
+
+# the opacity colors are painted at, 1 outside any push_alpha
+# ---
+# ctx: context
+# ret: the product of the open scopes' opacities
+pub fun alpha_of(ctx: *Context) f32 {
+    ret ctx.alpha;
 }
 
 # say whether the target encodes sRGB on write
@@ -3874,6 +3929,36 @@ test srgb__painter_emits_linear_colors {
     if (p[0].r != 0.25::f32)                  { ret 2; }
     if (p[4].r != want || p[4].a != 0.5::f32) { ret 3; }
     if (p[8].g != want)                       { ret 4; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test alpha__scopes_multiply_and_unwind {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    push_alpha(?ctx, 0.5::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
+    push_alpha(?ctx, 0.5::f32);
+    text_at(?ctx, "A", 0.0::f32, 0.0::f32, white);
+    pop_alpha(?ctx);
+    pop_alpha(?ctx);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
+
+    # premultiplied at half, then a quarter, then whole again
+    val p: *draw.Vert = draw_verts(?ctx);
+    if (p[0].r != 0.5::f32 || p[0].a != 0.5::f32)   { ret 2; }
+    if (p[4].r != 0.25::f32 || p[4].a != 0.25::f32) { ret 3; }
+    val n: usize = draw_count(?ctx);
+    if (p[n - 1].a != 1.0::f32 || alpha_of(?ctx) != 1.0::f32) { ret 4; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
