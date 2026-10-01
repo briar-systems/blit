@@ -478,6 +478,8 @@ pub rec TextLine {
 # pre_len:      bytes in the composition, 0 when there is none
 # pre_caret:    the composition's caret as a byte offset into pre
 # pre_owner:    id of the focus holder the composition was typed into
+# lent:         bytes borrow lends, kept across frames, nil before the first
+# lent_cap:     bytes allocated for lent
 # ids:          seeds of the open id scopes, innermost last
 # ids_cap:      seeds allocated for ids
 # id_sp:        open id scopes, saved or not
@@ -613,6 +615,8 @@ pub rec Context {
     pre_len:      usize;
     pre_caret:    usize;
     pre_owner:    u64;
+    lent:         ptr;
+    lent_cap:     usize;
     ids:          *u64;
     ids_cap:      usize;
     id_sp:        usize;
@@ -786,6 +790,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.pre_len      = 0;
     ctx.pre_caret    = 0;
     ctx.pre_owner    = 0;
+    ctx.lent         = nil;
+    ctx.lent_cap     = 0;
     ctx.ids          = nil;
     ctx.ids_cap      = 0;
     ctx.id_sp        = 0;
@@ -881,6 +887,12 @@ pub fun free(ctx: *Context) err[allo.Error] {
         ctx.pre     = nil;
         ctx.pre_cap = 0;
         ctx.pre_len = 0;
+    }
+    if (ctx.lent != nil) {
+        val el: err[allo.Error] = allo.deallocate_raw(ctx.a, ctx.lent, ctx.lent_cap, LENT_ALIGN);
+        if (sel el.err) { ret el; }
+        ctx.lent     = nil;
+        ctx.lent_cap = 0;
     }
     if (ctx.clip != nil) {
         val ec: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.clip, ctx.clip_cap);
@@ -2174,6 +2186,36 @@ fun room[T](ctx: *Context, items: *T, cap: *usize, need: usize, init: usize) *T 
         ret items;
     }
     @cap = n;
+    ret r.ok;
+}
+
+# alignment of the bytes borrow lends
+pub val LENT_ALIGN: usize = 16;
+
+# lend at least n bytes of scratch, aligned to LENT_ALIGN, for work within one
+# call that would otherwise allocate and free each frame
+#
+# the bytes are kept and grow only, so a steady frame allocates nothing. they
+# hold whatever the last borrower left and stay the caller's until the next
+# borrow, so a borrower must not call anything that borrows while it holds
+# them.
+# ---
+# ctx: context
+# n:   bytes needed
+# ret: the bytes, or nil with oom set when they could not grow
+pub fun borrow(ctx: *Context, n: usize) ptr {
+    if (n <= ctx.lent_cap) { ret ctx.lent; }
+    var cap: usize = ctx.lent_cap * 2;
+    if (cap < n) { cap = n; }
+    var r: res[ptr, allo.Error];
+    if (ctx.lent == nil) { r = allo.allocate_raw(ctx.a, cap, LENT_ALIGN); }
+    or                   { r = allo.reallocate_raw(ctx.a, ctx.lent, ctx.lent_cap, cap, LENT_ALIGN); }
+    if (sel r.err) {
+        ctx.oom = 1;
+        ret nil;
+    }
+    ctx.lent     = r.ok;
+    ctx.lent_cap = cap;
     ret r.ok;
 }
 
