@@ -209,7 +209,18 @@ pub fun advance(f: *Font, left: u32, cp: u32, scale: f32) f32 {
 # ret:   width in pixels
 pub fun measure(f: *Font, s: str, scale: f32) f32 {
     if (s == nil) { ret 0.0::f32; }
-    val n:      usize = str_len(s);
+    ret measure_span(f, s, str_len(s), scale);
+}
+
+# width of the widest line of the first n bytes of a string
+# ---
+# f:     font
+# s:     utf-8 text, at least n bytes
+# n:     bytes to measure, on a codepoint boundary
+# scale: interface scale
+# ret:   width in pixels
+pub fun measure_span(f: *Font, s: str, n: usize, scale: f32) f32 {
+    if (s == nil) { ret 0.0::f32; }
     var widest: f32   = 0.0::f32;
     var w:      f32   = 0.0::f32;
     var prev:   u32   = 0;
