@@ -18,6 +18,7 @@ fwd blit.glyph;
 fwd blit.input;
 fwd blit.hit;
 fwd blit.band;
+fwd blit.interact;
 fwd blit.id;
 fwd blit.field;
 fwd blit.theme;
@@ -26,6 +27,7 @@ fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
 fwd blit.chart;
+fwd blit.driver;
 
 # blit library version
 pub val VERSION: str = "0.9.0";

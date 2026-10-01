@@ -8,10 +8,11 @@
 #
 # each widget places itself at the layout cursor, advances the cursor for the
 # next one, emits its geometry through the context painter, and claims its
-# interactive rect through context.claim. interaction uses the classic hot/active
-# id pair: `hot` is the widget hovered this frame, meaning the topmost claimant
-# under the cursor (see blit.context), and `active` is the one being pressed or
-# dragged, which persists until the button releases.
+# interactive rect through interact.hit, the same call a custom control makes,
+# so hover, press, click and drag mean the same thing everywhere. a widget is
+# hot while it is the topmost claimant under the cursor (see blit.context), and
+# active while it owns the pointer after a press on it, until the button
+# releases.
 #
 # a widget's id is its label hashed in the current id scope (see blit.id and
 # context.id_of), so widgets appearing or vanishing before it never move it.
@@ -62,11 +63,13 @@ use std.types.string.str_len;
 use blit.band;
 use blit.context;
 use blit.draw;
+use blit.driver;
 use blit.field;
 use blit.font;
 use gly: blit.glyph;
 use bid: blit.id;
 use blit.input;
+use blit.interact;
 use blit.state;
 use rich_text: blit.text;
 use blit.theme;
@@ -276,27 +279,9 @@ pub fun end_columns(ctx: *context.Context, c: *Columns) {
     ctx.cy   = c.bottom;
 }
 
-# claim a widget's rect and apply the hot/active rules to it
-#
-# the widget becomes hot when hovered and active when pressed while hovered.
-# ---
-# ctx: context
-# id:  the widget's id
-# x0:  left x in pixels
-# y0:  top y in pixels
-# x1:  right x in pixels
-# y1:  bottom y in pixels
-# ret: 1 if the widget is hovered this frame, else 0
-fun interact(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val hov: u8 = context.claim(ctx, id, x0, y0, x1, y1);
-    if (hov != 0)                                                  { ctx.hot = id; }
-    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.active = id; }
-    ret hov;
-}
-
 # ask for the hand pointer over a clickable widget while it is hovered
-fun hand(ctx: *context.Context, hov: u8) {
-    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_HAND); }
+fun hand(ctx: *context.Context, h: interact.Hit) {
+    if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
 }
 
 # the handle begin_panel and begin_window return for their matching end
@@ -456,19 +441,13 @@ pub fun note(ctx: *context.Context, s: str) {
 # on:    true to draw the button chosen, in the theme's accent
 # ret:   true if the button was clicked this frame
 pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, y1: f32, on: bool) bool {
-    val id:  u64 = context.id_of(ctx, label);
-    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-
-    var clicked: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
-        clicked = true;
-    }
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, label), x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, h);
 
     var bg:  draw.Color = ctx.theme.control;
     var ink: draw.Color = ctx.theme.text;
-    if (ctx.hot == id)    { bg = ctx.theme.control_hot; }
-    if (ctx.active == id) { bg = ctx.theme.control_on; }
+    if (h.hot)    { bg = ctx.theme.control_hot; }
+    if (h.active) { bg = ctx.theme.control_on; }
     if (on) {
         bg  = ctx.theme.accent;
         ink = ctx.theme.accent_text;
@@ -479,7 +458,7 @@ pub fun button_at(ctx: *context.Context, label: str, x0: f32, y0: f32, x1: f32, 
     val tx: f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
     val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
     label_at(ctx, label, tx, ty, ink);
-    ret clicked;
+    ret h.clicked;
 }
 
 # a full-width clickable button with a centered label
@@ -561,13 +540,13 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     val bx1: f32 = x0 + box;
     val y1:  f32 = y0 + box;
 
-    val tw:  f32 = label_width(ctx, label);
-    val rx1: f32 = bx1 + pad(ctx) + tw;
-    val hov: u8  = interact(ctx, id, x0, y0, rx1, y1);
-    hand(ctx, hov);
+    val tw:  f32          = label_width(ctx, label);
+    val rx1: f32          = bx1 + pad(ctx) + tw;
+    val hc:  interact.Hit = interact.hit(ctx, id, x0, y0, rx1, y1, input.BUTTON_LEFT);
+    hand(ctx, hc);
 
     var toggled: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    if (hc.clicked) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -575,7 +554,7 @@ pub fun checkbox(ctx: *context.Context, label: str, state: *u8) bool {
     }
 
     var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
+    if (hc.hot) { bg = ctx.theme.control_hot; }
     face(ctx, x0, y0, bx1, y1, bg);
     if (@state != 0) {
         val in: f32 = pad(ctx);
@@ -606,11 +585,11 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hs);
 
     var flipped: bool = false;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    if (hs.clicked) {
         var nv: u8 = 1;
         if (@state != 0) { nv = 0; }
         @state  = nv;
@@ -628,7 +607,7 @@ pub fun toggle(ctx: *context.Context, label: str, state: *u8) bool {
     val sy: f32        = y0 + (h - sh) / 2.0::f32;
     var tc: draw.Color = ctx.theme.track;
     var kc: draw.Color = ctx.theme.handle;
-    if (ctx.hot == id) {
+    if (hs.hot) {
         tc = ctx.theme.control_hot;
         kc = ctx.theme.handle_on;
     }
@@ -686,13 +665,13 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
 
     var changed: bool = false;
-    if (ctx.active == id && input.held(ctx.in, input.BUTTON_LEFT) != 0) {
+    if (hs.held) {
         val track: f32 = x1 - x0;
         var t:     f32 = 0.0::f32;
-        if (track > 0.0::f32) { t = clampf((ctx.in.mx - ctx.lx - x0) / track, 0.0::f32, 1.0::f32); }
+        if (track > 0.0::f32) { t = clampf((hs.mx - x0) / track, 0.0::f32, 1.0::f32); }
         val nv: f32 = lo + t * (hi - lo);
         if (nv != @v) {
             @v      = nv;
@@ -710,7 +689,7 @@ pub fun slider(ctx: *context.Context, label: str, reading: str, v: *f32, lo: f32
     val hx: f32 = x0 + t_out * span;
 
     var hc: draw.Color = ctx.theme.handle;
-    if (ctx.active == id) { hc = ctx.theme.handle_on; }
+    if (hs.active) { hc = ctx.theme.handle_on; }
     face(ctx, hx, y0, hx + hw, y1, hc);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
@@ -791,8 +770,8 @@ fun popup_at(ctx: *context.Context, id: u64, open: u8, x: f32, y: f32, w: f32) P
     context.push_band(ctx, band.POPUPS, 0);
     context.push_id(ctx, id);
 
-    val out_hov: u8 = interact(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
-    if (out_hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { p.dismissed = 1; }
+    val out: interact.Hit = interact.hit(ctx, bid.child(id, "#outside"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, input.BUTTON_LEFT);
+    if (out.pressed) { p.dismissed = 1; }
 
     p.claim = context.reserve_claim(ctx, 0);
     ctx.ox  = sx;
@@ -863,16 +842,16 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     val x1: f32            = ctx.cx + ctx.pw;
     val y1: f32            = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    val hd: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hd);
+    if (hd.clicked) {
         if (st.open != 0) { st.open = 0; }
         or                { st.open = 1; }
     }
 
     var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
-    if (st.open != 0)  { bg = ctx.theme.control_on; }
+    if (hd.hot)       { bg = ctx.theme.control_hot; }
+    if (st.open != 0) { bg = ctx.theme.control_on; }
     face(ctx, x0, y0, x1, y1, bg);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
@@ -898,16 +877,16 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             val ox1: f32 = ctx.cx + ctx.pw;
             val oy1: f32 = oy0 + h;
 
-            val ohov: u8 = interact(ctx, oid, ox0, oy0, ox1, oy1);
-            hand(ctx, ohov);
-            if (ctx.active == oid && input.released(ctx.in, input.BUTTON_LEFT) != 0 && ohov != 0) {
+            val ho: interact.Hit = interact.hit(ctx, oid, ox0, oy0, ox1, oy1, input.BUTTON_LEFT);
+            hand(ctx, ho);
+            if (ho.clicked) {
                 @selected = i;
                 st.open   = 0;
                 changed   = 1;
             }
 
             var obg: draw.Color = ctx.theme.track;
-            if (ctx.hot == oid) { obg = ctx.theme.control_hot; }
+            if (ho.hot) { obg = ctx.theme.control_hot; }
             face(ctx, ox0, oy0, ox1, oy1, obg);
             context.text_at(ctx, options[i], ox0 + pad(ctx), oy0 + (h - context.line_height(ctx)) / 2.0::f32, ctx.theme.text);
 
@@ -1025,12 +1004,12 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val tx: f32 = x0 + pad(ctx);
     val tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    if (hov != 0) { context.set_cursor(ctx, input.CURSOR_TEXT); }
-    if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
+    val hf: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
+    if (hf.pressed) {
         context.focus(ctx, id);
         keep_in_view(ctx, f, tw);
-        val at: usize = caret_at(ctx, f, ctx.in.mx - ctx.lx - tx);
+        val at: usize = caret_at(ctx, f, hf.mx - tx);
         f.caret  = at;
         f.anchor = at;
     }
@@ -1039,7 +1018,7 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val on: bool = ctx.focus == id;
 
     var bg: draw.Color = ctx.theme.track;
-    if (ctx.hot == id && !on) { bg = ctx.theme.control_hot; }
+    if (hf.hot && !on) { bg = ctx.theme.control_hot; }
     if (on) {
         val ew: f32 = context.px(ctx, ctx.theme.edge_w);
         face(ctx, x0, y0, x1, y1, ctx.theme.accent);
@@ -1096,15 +1075,10 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
 # y1:  bottom y in pixels
 # ret: 1 if the rect was clicked this frame, else 0
 pub fun region_clicked(ctx: *context.Context, key: str, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
-    val id:  u64 = context.id_of(ctx, key);
-    val hov: u8  = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-
-    var clicked: u8 = 0;
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
-        clicked = 1;
-    }
-    ret clicked;
+    val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, key), x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, h);
+    if (h.clicked) { ret 1; }
+    ret 0;
 }
 
 # draw a region of a consumer texture w by h at the cursor and advance to the
@@ -1275,6 +1249,20 @@ pub rec Window {
     max_w: f32;
     max_h: f32;
     flags: u32;
+}
+
+# where a dragged part stood when the press on it began, kept in the state
+# store under the part's id
+# ---
+# x: the window's x, unused by a scrollbar thumb
+# y: the window's y, or the scroll offset under a scrollbar thumb
+# w: the window's width, for a resize grip
+# h: the window's height, for a resize grip
+rec Grab {
+    x: f32;
+    y: f32;
+    w: f32;
+    h: f32;
 }
 
 # a window declaration with no size bounds and no flags
@@ -1528,36 +1516,34 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     val close_id: u64 = bid.child(r.id, "#close");
     val movable:  u8  = ((win.flags & WINDOW_NO_MOVE) == 0 && st.locked == 0);
     val sizable:  u8  = ((win.flags & WINDOW_NO_RESIZE) == 0 && st.locked == 0);
-    val held:     u8  = input.held(ctx.in, input.BUTTON_LEFT);
 
-    # follow a drag or a resize before claiming, so the claims match where the
-    # window paints
-    if (movable != 0 && held != 0 && ctx.active == drag_id) {
-        st.x = ctx.in.mx - ctx.drag_off_x;
-        st.y = ctx.in.my - ctx.drag_off_y;
+    # follow a drag or a resize from where the window stood at the press,
+    # before claiming, so the claims match where the window paints
+    var dx: f32;
+    var dy: f32;
+    if (movable != 0 && interact.drag(ctx, drag_id, ?dx, ?dy)) {
+        val grab: *Grab = state.get[Grab](ctx, drag_id);
+        st.x = grab.x + dx;
+        st.y = grab.y + dy;
     }
-    if (sizable != 0 && held != 0) {
-        val gx: f32   = ctx.in.mx - ctx.drag_off_x;
-        val gy: f32   = ctx.in.my - ctx.drag_off_y;
-        var g:  usize = 0;
-        for (g < 8) {
-            val m: u32 = GRIPS[g];
-            if (ctx.active == grip_id(r.id, m)) {
-                if ((m & EDGE_L) != 0) {
-                    val right: f32 = st.x + st.w;
-                    st.w = clampf(right - gx, min_w, max_w);
-                    st.x = right - st.w;
-                }
-                if ((m & EDGE_R) != 0) { st.w = clampf(gx - st.x, min_w, max_w); }
-                if ((m & EDGE_T) != 0) {
-                    val bottom: f32 = st.y + st.h;
-                    st.h = clampf(bottom - gy, min_h, max_h);
-                    st.y = bottom - st.h;
-                }
-                if ((m & EDGE_B) != 0) { st.h = clampf(gy - st.y, min_h, max_h); }
+    var g: usize = 0;
+    for (sizable != 0 && g < 8) {
+        val m:   u32 = GRIPS[g];
+        val gid: u64 = grip_id(r.id, m);
+        if (interact.drag(ctx, gid, ?dx, ?dy)) {
+            val grab: *Grab = state.get[Grab](ctx, gid);
+            if ((m & EDGE_L) != 0) {
+                st.w = clampf(grab.w - dx, min_w, max_w);
+                st.x = grab.x + grab.w - st.w;
             }
-            g = g + 1;
+            if ((m & EDGE_R) != 0) { st.w = clampf(grab.w + dx, min_w, max_w); }
+            if ((m & EDGE_T) != 0) {
+                st.h = clampf(grab.h - dy, min_h, max_h);
+                st.y = grab.y + grab.h - st.h;
+            }
+            if ((m & EDGE_B) != 0) { st.h = clampf(grab.h + dy, min_h, max_h); }
         }
+        g = g + 1;
     }
     st.w = clampf(st.w, min_w, max_w);
     if ((win.flags & WINDOW_AUTO_SIZE) == 0) { st.h = clampf(st.h, min_h, max_h); }
@@ -1573,31 +1559,32 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         val close: u8  = (win.flags & WINDOW_NO_CLOSE) == 0;
         if (close != 0) { dx1 = x1 - th; }
 
-        val chov: u8 = interact(ctx, col_id, x0, y0, x0 + th, ty1);
-        hand(ctx, chov);
-        if (ctx.active == col_id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && chov != 0) {
+        val hc: interact.Hit = interact.hit(ctx, col_id, x0, y0, x0 + th, ty1, input.BUTTON_LEFT);
+        hand(ctx, hc);
+        if (hc.clicked) {
             if (st.collapsed == 0) { st.collapsed = 1; }
             or                     { st.collapsed = 0; }
         }
 
-        var xhov: u8 = 0;
+        var hx: interact.Hit;
         if (close != 0) {
-            xhov = interact(ctx, close_id, dx1, y0, x1, ty1);
-            hand(ctx, xhov);
-            if (ctx.active == close_id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && xhov != 0) { st.closed = 1; }
+            hx = interact.hit(ctx, close_id, dx1, y0, x1, ty1, input.BUTTON_LEFT);
+            hand(ctx, hx);
+            if (hx.clicked) { st.closed = 1; }
         }
 
-        val dhov: u8 = interact(ctx, drag_id, x0 + th, y0, dx1, ty1);
+        val hd: interact.Hit = interact.hit(ctx, drag_id, x0 + th, y0, dx1, ty1, input.BUTTON_LEFT);
         if (movable != 0) {
-            if (dhov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
-                ctx.drag_off_x = ctx.in.mx - st.x;
-                ctx.drag_off_y = ctx.in.my - st.y;
+            if (hd.pressed) {
+                val grab: *Grab = state.get[Grab](ctx, drag_id);
+                grab.x = st.x;
+                grab.y = st.y;
             }
-            if (dhov != 0 || ctx.active == drag_id) { context.set_cursor(ctx, input.CURSOR_MOVE); }
+            if (hd.hot || hd.active) { context.set_cursor(ctx, input.CURSOR_MOVE); }
         }
 
         var tbg: draw.Color = ctx.theme.header;
-        if (ctx.hot == drag_id || ctx.hot == col_id || ctx.hot == close_id) { tbg = ctx.theme.header_hot; }
+        if (hd.hot || hc.hot || hx.hot) { tbg = ctx.theme.header_hot; }
         var ends: u8 = context.CORNERS_ALL;
         if (st.collapsed == 0) { ends = context.CORNERS_TOP; }
         context.fill(ctx, x0, y0, x1, ty1, corner(ctx), ends, tbg);
@@ -1609,7 +1596,7 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         label_at(ctx, win.title, x0 + th + pad(ctx), gy, ctx.theme.text);
         if (close != 0) {
             var xc: draw.Color = ctx.theme.text_dim;
-            if (ctx.hot == close_id) { xc = ctx.theme.text; }
+            if (hx.hot) { xc = ctx.theme.text; }
             context.glyph(ctx, 'x', dx1 + pad(ctx), gy, xc);
         }
     }
@@ -1665,44 +1652,44 @@ pub fun end_window(ctx: *context.Context, r: WindowArea) {
     }
     context.fill_claim(ctx, r.claim, x0, y0, x1, y1);
 
-    # the grips straddle the edges, corners last so they win where they meet
+    # the grips run just outside the edges, so they never cover the window's
+    # own widgets, and meet in squares at the corners
     if (r.body != 0 && (r.flags & WINDOW_NO_RESIZE) == 0 && st.locked == 0) {
         val g: f32   = pad(ctx);
         var k: usize = 0;
         for (k < 8) {
             val m: u32 = GRIPS[k];
             if (grip_allowed(r.flags, m)) {
-                var gx0: f32 = x0 + g;
-                var gx1: f32 = x1 - g;
-                var gy0: f32 = y0 + g;
-                var gy1: f32 = y1 - g;
+                var gx0: f32 = x0;
+                var gx1: f32 = x1;
+                var gy0: f32 = y0;
+                var gy1: f32 = y1;
                 if ((m & EDGE_L) != 0) {
                     gx0 = x0 - g;
-                    gx1 = x0 + g;
+                    gx1 = x0;
                 }
                 if ((m & EDGE_R) != 0) {
-                    gx0 = x1 - g;
+                    gx0 = x1;
                     gx1 = x1 + g;
                 }
                 if ((m & EDGE_T) != 0) {
                     gy0 = y0 - g;
-                    gy1 = y0 + g;
+                    gy1 = y0;
                 }
                 if ((m & EDGE_B) != 0) {
-                    gy0 = y1 - g;
+                    gy0 = y1;
                     gy1 = y1 + g;
                 }
-                val gid: u64 = grip_id(r.id, m);
-                val hov: u8  = interact(ctx, gid, gx0, gy0, gx1, gy1);
-                if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) {
-                    ctx.drag_off_x = 0.0::f32;
-                    ctx.drag_off_y = 0.0::f32;
-                    if ((m & EDGE_L) != 0) { ctx.drag_off_x = ctx.in.mx - x0; }
-                    if ((m & EDGE_R) != 0) { ctx.drag_off_x = ctx.in.mx - x1; }
-                    if ((m & EDGE_T) != 0) { ctx.drag_off_y = ctx.in.my - y0; }
-                    if ((m & EDGE_B) != 0) { ctx.drag_off_y = ctx.in.my - y1; }
+                val gid: u64          = grip_id(r.id, m);
+                val gh:  interact.Hit = interact.hit(ctx, gid, gx0, gy0, gx1, gy1, input.BUTTON_LEFT);
+                if (gh.pressed) {
+                    val grab: *Grab = state.get[Grab](ctx, gid);
+                    grab.x = x0;
+                    grab.y = y0;
+                    grab.w = x1 - x0;
+                    grab.h = y1 - y0;
                 }
-                if (hov != 0 || ctx.active == gid) { context.set_cursor(ctx, grip_cursor(m)); }
+                if (gh.hot || gh.active) { context.set_cursor(ctx, grip_cursor(m)); }
             }
             k = k + 1;
         }
@@ -1853,22 +1840,23 @@ pub fun end_scroll(ctx: *context.Context, s: *Scroll, r: ScrollArea) {
     s.offset = clampf(s.offset, 0.0::f32, most);
 
     if (most > 0.0::f32) {
-        val tx0:     f32 = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
-        val tx1:     f32 = r.x + r.w;
-        val thumb_h: f32 = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
-        val travel:  f32 = r.h - thumb_h;
-        val my:      f32 = ctx.in.my - ctx.ly;
+        val tx0:     f32   = r.x + r.w - context.px(ctx, ctx.theme.bar_w);
+        val tx1:     f32   = r.x + r.w;
+        val thumb_h: f32   = clampf(r.h * r.h / s.content, context.px(ctx, ctx.theme.thumb_min), r.h);
+        val travel:  f32   = r.h - thumb_h;
+        val grab:    *Grab = state.get[Grab](ctx, r.thumb);
+        var dx:      f32;
+        var dy:      f32;
 
-        if (ctx.active == r.thumb && input.held(ctx.in, input.BUTTON_LEFT) != 0 && travel > 0.0::f32) {
-            val t: f32 = clampf((my - ctx.drag_off_y - r.y) / travel, 0.0::f32, 1.0::f32);
-            s.offset = t * most;
+        if (interact.drag(ctx, r.thumb, ?dx, ?dy) && travel > 0.0::f32) {
+            s.offset = clampf(grab.y + dy * most / travel, 0.0::f32, most);
         }
-        val ty:  f32 = r.y + travel * s.offset / most;
-        val hov: u8  = interact(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h);
-        if (hov != 0 && input.pressed(ctx.in, input.BUTTON_LEFT) != 0) { ctx.drag_off_y = my - ty; }
+        val ty: f32          = r.y + travel * s.offset / most;
+        val ht: interact.Hit = interact.hit(ctx, r.thumb, tx0, ty, tx1, ty + thumb_h, input.BUTTON_LEFT);
+        if (ht.pressed) { grab.y = s.offset; }
 
         var tc: draw.Color = ctx.theme.handle;
-        if (ctx.active == r.thumb) { tc = ctx.theme.handle_on; }
+        if (ht.active) { tc = ctx.theme.handle_on; }
         face(ctx, tx0, r.y, tx1, r.y + r.h, ctx.theme.track);
         face(ctx, tx0, ty, tx1, ty + thumb_h, tc);
     }
@@ -1893,16 +1881,16 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
 
-    val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-    hand(ctx, hov);
-    if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
+    val hs: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    hand(ctx, hs);
+    if (hs.clicked) {
         if (@open == 0) { @open = 1; }
         or              { @open = 0; }
     }
 
     var bg:  draw.Color = ctx.theme.header;
     var ink: draw.Color = ctx.theme.text_dim;
-    if (ctx.hot == id) {
+    if (hs.hot) {
         bg  = ctx.theme.header_hot;
         ink = ctx.theme.text;
     }
@@ -1998,8 +1986,8 @@ pub rec DockArea {
 # above the base content and beneath windows (see blit.band). its whole rect
 # stops input to what it covers, and its body scrolls when its widgets are
 # taller than it. call it at the root, outside surfaces and bands, and pair it
-# with end_dock. its body is an
-# id scope derived from the dock's key.
+# with end_dock. its body is the id scope of the dock's key, so a label path
+# through the dock is "<key>/<label>".
 # ---
 # ctx: context
 # key: the dock's key in the current id scope
@@ -2033,7 +2021,7 @@ pub fun begin_dock(ctx: *context.Context, key: str, d: *Dock) DockArea {
     ctx.cx = ctx.ox;
     ctx.cy = ctx.oy;
     ctx.pw = maxf(a.x1 - a.x0 - in * 2.0::f32, 0.0::f32);
-    r.body = scroll_at(ctx, bid.child(context.id_of(ctx, key), "#body"), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
+    r.body = scroll_at(ctx, context.id_of(ctx, key), ?d.scroll, a.y1 - a.y0 - in * 2.0::f32);
     ret r;
 }
 
@@ -2112,8 +2100,8 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
             val x1: f32 = ctx.cx + ctx.pw;
             val y1: f32 = y0 + rh;
             if (y1 > top && y0 < top + r.h) {
-                val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
-                if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0 && l.selected != i) {
+                val hi: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+                if (hi.clicked && l.selected != i) {
                     l.selected = i;
                     changed    = true;
                 }
@@ -2123,8 +2111,8 @@ pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usiz
                     face(ctx, x0, y0, x1, y1, ctx.theme.accent);
                     ink = ctx.theme.accent_text;
                 }
-                or (ctx.active == id) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
-                or (ctx.hot == id)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
+                or (hi.active) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
+                or (hi.hot)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
                 val ty: f32 = y0 + (rh - context.line_height(ctx)) / 2.0::f32;
                 context.text_at(ctx, items[i], x0 + pad(ctx), ty, ink);
             }
@@ -2158,101 +2146,55 @@ fun frame_button(ctx: *context.Context, in: input.Input) bool {
     ret clicked;
 }
 
-test button__clicks_on_release_inside_after_press {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # hover first: a widget is interactive from the frame after it first claims
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != false) { ret 2; }
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1)) != false) { ret 3; }
-    if (ctx.active != context.id_of(?ctx, "ok"))                       { ret 4; }
-    if (frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 0)) != true)  { ret 5; }
-
-    # a release outside after a press inside is no click
-    frame_button(?ctx, input_at(10.0::f32, 5.0::f32, 1));
-    if (frame_button(?ctx, input_at(500.0::f32, 500.0::f32, 0)) != false) { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame holding one panel with one checkbox
+# whether the context asks for a frame now
 #[testing]
-fun frame_checkbox(ctx: *context.Context, in: input.Input, st: *u8) bool {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val toggled: bool  = checkbox(ctx, "on", st);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret toggled;
+fun asks_now(ctx: *context.Context) bool {
+    val nf: opt[f64] = context.next_frame(ctx);
+    ret sel nf.some && nf.some == 0.0::f64;
 }
 
-test checkbox__toggles_on_click {
+test button__clicks_on_presses_and_releases_between_frames {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: context.Context;
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
+    val id: u64 = context.id_of(?ctx, "ok");
 
-    var st: u8 = 0;
-    frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st);
-    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 1), ?st) != false) { ret 2; }
-    if (st != 0)                                                             { ret 3; }
-    if (frame_checkbox(?ctx, input_at(5.0::f32, 5.0::f32, 0), ?st) != true)  { ret 4; }
-    if (st != 1)                                                             { ret 5; }
+    var in: input.Input = input_at(10.0::f32, 5.0::f32, 0);
+    input.init(?in, ?a);
+    frame_button(?ctx, in);
 
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
+    # a press and release on the button, the cursor gone by the frame: a
+    # press, then a release that clicks where it happened
+    in.mx = 500.0::f32;
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.release_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 2; }
+    if (!asks_now(?ctx))                                     { ret 3; }
+    input.clear_keys(?in);
+    if (frame_button(?ctx, in) != true) { ret 4; }
+    if (!asks_now(?ctx))                { ret 5; }
+    frame_button(?ctx, in);
+    if (asks_now(?ctx) || ctx.in.mx != 500.0::f32) { ret 6; }
 
-test slider__maps_cursor_linearly {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
+    # press, release, press: a click, then the button held
+    in.mx = 10.0::f32;
+    frame_button(?ctx, in);
+    in.down = input.BUTTON_LEFT;
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.release_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    input.press_button(?in, input.BUTTON_LEFT, 10.0::f32, 5.0::f32);
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 7; }
+    input.clear_keys(?in);
+    if (frame_button(?ctx, in) != true)                      { ret 8; }
+    if (frame_button(?ctx, in) != false || ctx.active != id) { ret 9; }
+    if (input.pressed(ctx.in, input.BUTTON_LEFT) != 1)       { ret 10; }
+    if (asks_now(?ctx))                                      { ret 11; }
 
-    var in: input.Input;
-    in.my        = 5.0::f32;
-    in.down      = 1;
-    in.prev_down = 1;
-
-    # left end -> lo
-    var v: f32 = 5.0::f32;
-    in.mx = 0.0::f32;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    ctx.active = context.id_of(?ctx, "x");
-    slider_f(?ctx, "x", ?v, 0.0::f32, 10.0::f32);
-    if (v != 0.0::f32) { ret 1; }
-    context.end(?ctx);
-
-    # middle -> midpoint
-    in.mx = 50.0::f32;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    ctx.active = context.id_of(?ctx, "x");
-    slider_f(?ctx, "x", ?v, 0.0::f32, 10.0::f32);
-    if (v != 5.0::f32) { ret 1; }
-    context.end(?ctx);
-
-    # right end -> hi
-    in.mx = 100.0::f32;
-    context.begin(?ctx, in, 200.0::f32, 200.0::f32);
-    begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    ctx.active = context.id_of(?ctx, "x");
-    slider_f(?ctx, "x", ?v, 0.0::f32, 10.0::f32);
-    if (v != 10.0::f32) { ret 1; }
-    context.end(?ctx);
-
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
@@ -2271,6 +2213,259 @@ fun set_dropdown_open(ctx: *context.Context, id: u64, open: u8) {
     st.open = open;
 }
 
+# what the probe panel's widgets reported, across frames
+# ---
+# clicks: times the ok button clicked
+# on:     the checkbox's state
+# flip:   the toggle's state
+# flips:  times the toggle flipped
+# choice: the segmented choice
+# chosen: times the segmented choice changed
+# v:      the slider's value, in [0, 10]
+# pick:   the dropdown's selection
+# picked: times the dropdown's selection changed
+#[testing]
+rec Probe {
+    clicks: usize;
+    on:     u8;
+    flip:   u8;
+    flips:  usize;
+    choice: usize;
+    chosen: usize;
+    v:      f32;
+    pick:   usize;
+    picked: usize;
+}
+
+# a 100 pixel panel of one of each control, the dropdown last so its options
+# cover nothing
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p:    *Probe = user::*Probe;
+    var segs: [3]str;
+    segs[0] = "a";
+    segs[1] = "b";
+    segs[2] = "c";
+    var opts: [3]str;
+    opts[0] = "one";
+    opts[1] = "two";
+    opts[2] = "three";
+    val b: Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    if (button(ctx, "ok")) { p.clicks = p.clicks + 1; }
+    checkbox(ctx, "on", ?p.on);
+    if (toggle(ctx, "flip", ?p.flip))           { p.flips = p.flips + 1; }
+    if (segmented(ctx, ?segs[0], 3, ?p.choice)) { p.chosen = p.chosen + 1; }
+    slider_f(ctx, "x", ?p.v, 0.0::f32, 10.0::f32);
+    if (dropdown(ctx, "pick", ?p.pick, ?opts[0], 3) != 0) { p.picked = p.picked + 1; }
+    end_panel(ctx, b);
+}
+
+# a driver over the probe panel on a 200 pixel screen, laid out once
+#[testing]
+fun probe(d: *driver.Driver, a: *allo.Allocator, p: *Probe) u8 {
+    val e: err[allo.Error] = driver.init(d, a, 200.0::f32, 200.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret 0; }
+    driver.step(d);
+    ret 1;
+}
+
+test button__clicks_on_release_inside_after_press {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # pressed it is active, and it clicks on the release
+    val ok: u64 = driver.find(?d, "ok");
+    if (!str_equals(driver.text_of(?d, ok), "ok")) { ret 2; }
+    driver.hover(?d, ok);
+    driver.press(?d, input.BUTTON_LEFT);
+    if (p.clicks != 0 || !driver.active(?d, ok)) { ret 3; }
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.clicks != 1) { ret 4; }
+
+    # a release outside after a press inside is no click
+    driver.hover(?d, ok);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.move(?d, 150.0::f32, 150.0::f32);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (p.clicks != 1 || driver.active(?d, ok)) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test checkbox__and_toggle_flip_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "on"));
+    if (p.on != 1) { ret 2; }
+    val flip: u64 = driver.find(?d, "flip");
+    driver.click(?d, flip);
+    if (p.flip != 1 || p.flips != 1) { ret 3; }
+
+    # a press dragged off the row and released there does not flip it back
+    driver.drag(?d, flip, 150.0::f32, 150.0::f32);
+    if (p.flip != 1 || p.flips != 1) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test segmented__chooses_on_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    driver.click(?d, driver.find(?d, "c"));
+    if (p.choice != 2 || p.chosen != 1) { ret 2; }
+    # choosing the chosen segment again is no change
+    driver.click(?d, driver.find(?d, "c"));
+    if (p.chosen != 1) { ret 3; }
+    # a press on the first released over the second chooses nothing
+    driver.drag_onto(?d, driver.find(?d, "a"), driver.find(?d, "b"));
+    if (p.choice != 2 || p.chosen != 1) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test slider__maps_cursor_linearly {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # the track spans the panel's width: its left end is lo, its right end hi
+    val x: u64               = driver.find(?d, "x");
+    val r: opt[context.Area] = driver.rect(?d, x);
+    if (sel r.none) { ret 2; }
+    val y: f32 = (r.some.y0 + r.some.y1) / 2.0::f32;
+    driver.drag(?d, x, r.some.x0, y);
+    if (p.v != 0.0::f32) { ret 3; }
+    driver.drag(?d, x, (r.some.x0 + r.some.x1) / 2.0::f32, y);
+    if (p.v != 5.0::f32) { ret 4; }
+    driver.drag(?d, x, r.some.x1 + 50.0::f32, y);
+    if (p.v != 10.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test dropdown__opens_and_selects {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # the header opens it without changing the selection
+    val pick: u64 = driver.find(?d, "pick");
+    val two:  u64 = bid.child_int(bid.child(pick, "#popup"), 1);
+    if (driver.drawn(?d, two)) { ret 2; }
+    driver.click(?d, pick);
+    if (p.picked != 0 || dropdown_open(?d.ctx, pick) == 0) { ret 3; }
+    if (!str_equals(driver.text_of(?d, two), "two"))       { ret 4; }
+
+    # an option selects and closes it
+    driver.click(?d, two);
+    if (p.pick != 1 || p.picked != 1)     { ret 5; }
+    if (dropdown_open(?d.ctx, pick) != 0) { ret 6; }
+    # the frame that chose still drew the options, the next one does not
+    driver.step(?d);
+    if (driver.drawn(?d, two)) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a dock and a window, each holding a widget a label path names
+# ---
+# side: the dock, holding "ok" above more than it can show
+# win:  the "Settings" window, holding the "name" field
+# f:    the field's state
+#[testing]
+rec Nest {
+    side: Dock;
+    win:  Window;
+    f:    field.Field;
+}
+
+#[testing]
+fun nest_ui(ctx: *context.Context, user: ptr) {
+    val n:  *Nest    = user::*Nest;
+    val dk: DockArea = begin_dock(ctx, "side", ?n.side);
+    button(ctx, "ok");
+    space(ctx, 1000.0::f32);
+    end_dock(ctx, ?n.side, dk);
+    val b: WindowArea = begin_window(ctx, n.win);
+    text_field(ctx, "name", ?n.f, nil);
+    end_window(ctx, b);
+}
+
+test driver__paths_keys_and_wheel_reach_nested_widgets {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var buf: [64]u8;
+    var n:   Nest;
+    n.side.side = context.Side.left{};
+    n.side.size = 80.0::f32;
+    n.win       = auto_window("Settings", 100.0::f32, 10.0::f32, 120.0::f32);
+    field.init(?n.f, ?buf[0], 64, 0, nil);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 300.0::f32, 200.0::f32, nest_ui, (?n)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.step(?d);
+
+    # a dock's and a window's widgets sit under their keys
+    val ok:   u64 = driver.find(?d, "side/ok");
+    val name: u64 = driver.find(?d, "Settings/name");
+    if (!driver.drawn(?d, ok) || !driver.drawn(?d, name)) { ret 2; }
+    val r: opt[context.Area] = driver.rect(?d, name);
+    if (sel r.none)                                                            { ret 3; }
+    if (r.some.x0 < 100.0::f32)                                                { ret 3; }
+    if (driver.at(?d, r.some.x0 + 1.0::f32, r.some.y0 + 1.0::f32) != name)     { ret 4; }
+    if (driver.inside(?d, r.some.x0, r.some.y0, r.some.x1, r.some.y1) != name) { ret 5; }
+    driver.hover(?d, ok);
+    if (!driver.hot(?d, ok) || driver.hot(?d, name)) { ret 6; }
+
+    # a clicked field takes typed text and keys
+    driver.click(?d, name);
+    if (!driver.focused(?d, name)) { ret 7; }
+    driver.type_text(?d, "hey");
+    driver.key(?d, input.KEY_BACKSPACE, 0);
+    if (!str_equals(field.text(?n.f), "he"))         { ret 8; }
+    if (!str_equals(driver.text_of(?d, name), "he")) { ret 9; }
+
+    # the wheel over the dock scrolls its body
+    driver.scroll(?d, ok, 0.0::f32, -30.0::f32);
+    driver.step(?d);
+    if (n.side.scroll.offset != 30.0::f32) { ret 10; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 # a frame holding one panel with one three-option dropdown
 #[testing]
 fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str) u8 {
@@ -2280,37 +2475,6 @@ fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts:
     end_panel(ctx, p);
     context.end(ctx);
     ret changed;
-}
-
-test dropdown__opens_and_selects {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var opts: [3]str;
-    opts[0] = "a";
-    opts[1] = "bb";
-    opts[2] = "ccc";
-    var picked: usize = 0;
-
-    # hover, press and release the header -> opens, no selection change
-    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]);
-    frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0]);
-    if (frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]) != 0) { ret 2; }
-    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0)                          { ret 3; }
-
-    # press and release the second option row (y in [40, 56))
-    frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 1), ?picked, ?opts[0]);
-    if (frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 0), ?picked, ?opts[0]) != 1) { ret 4; }
-    if (picked != 1)                                                                     { ret 5; }
-    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) != 0)                           { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
 }
 
 test dropdown__open_overlays_later_widgets {
@@ -2710,8 +2874,8 @@ test window__body_blocks_input_beneath {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    # the window body spans y [16, 44), its bottom grip y [40, 48) and its
-    # right grip x [56, 64)
+    # the window body spans y [16, 44), its bottom grip y [44, 48) and its
+    # right grip x [60, 64)
     val win: Window = auto_window("w", 0.0::f32, 0.0::f32, 60.0::f32);
 
     frame_covered(?ctx, input_at(50.0::f32, 35.0::f32, 0), win);
@@ -2808,37 +2972,37 @@ test window__resizes_from_edges_and_corners_within_bounds {
     win.max_w = 150.0::f32;
     val st: *WindowState = window_state(?ctx, "w");
 
-    # the right edge's grip spans x [146, 154): hover asks for the resize cursor
-    frame_window(?ctx, input_at(150.0::f32, 100.0::f32, 0), win);
-    frame_window(?ctx, input_at(150.0::f32, 100.0::f32, 0), win);
+    # the right edge's grip spans x [150, 154): hover asks for the resize cursor
+    frame_window(?ctx, input_at(152.0::f32, 100.0::f32, 0), win);
+    frame_window(?ctx, input_at(152.0::f32, 100.0::f32, 0), win);
     if (context.cursor(?ctx) != input.CURSOR_RESIZE_EW) { ret 2; }
-    frame_window(?ctx, input_at(150.0::f32, 100.0::f32, 1), win);
-    frame_window(?ctx, input_at(300.0::f32, 100.0::f32, 1), win);
+    frame_window(?ctx, input_at(152.0::f32, 100.0::f32, 1), win);
+    frame_window(?ctx, input_at(302.0::f32, 100.0::f32, 1), win);
     if (st.x != 50.0::f32 || st.w != 150.0::f32)        { ret 3; }
     if (context.cursor(?ctx) != input.CURSOR_RESIZE_EW) { ret 4; }
-    frame_window(?ctx, input_at(300.0::f32, 100.0::f32, 0), win);
+    frame_window(?ctx, input_at(302.0::f32, 100.0::f32, 0), win);
 
     # the top left corner moves both edges it holds, the others stay put
-    frame_window(?ctx, input_at(50.0::f32, 50.0::f32, 0), win);
+    frame_window(?ctx, input_at(48.0::f32, 48.0::f32, 0), win);
     if (context.cursor(?ctx) != input.CURSOR_RESIZE_NWSE) { ret 5; }
-    frame_window(?ctx, input_at(50.0::f32, 50.0::f32, 1), win);
-    frame_window(?ctx, input_at(80.0::f32, 70.0::f32, 1), win);
+    frame_window(?ctx, input_at(48.0::f32, 48.0::f32, 1), win);
+    frame_window(?ctx, input_at(78.0::f32, 68.0::f32, 1), win);
     if (st.x != 80.0::f32 || st.w != 120.0::f32) { ret 6; }
     if (st.y != 70.0::f32 || st.h != 60.0::f32)  { ret 7; }
-    frame_window(?ctx, input_at(80.0::f32, 70.0::f32, 0), win);
+    frame_window(?ctx, input_at(78.0::f32, 68.0::f32, 0), win);
 
     # the bottom right corner stops at the least width
-    frame_window(?ctx, input_at(200.0::f32, 130.0::f32, 0), win);
+    frame_window(?ctx, input_at(202.0::f32, 132.0::f32, 0), win);
     if (context.cursor(?ctx) != input.CURSOR_RESIZE_NWSE) { ret 8; }
-    frame_window(?ctx, input_at(200.0::f32, 130.0::f32, 1), win);
-    frame_window(?ctx, input_at(90.0::f32, 150.0::f32, 1), win);
+    frame_window(?ctx, input_at(202.0::f32, 132.0::f32, 1), win);
+    frame_window(?ctx, input_at(92.0::f32, 152.0::f32, 1), win);
     if (st.x != 80.0::f32 || st.w != 60.0::f32 || st.h != 80.0::f32) { ret 9; }
-    frame_window(?ctx, input_at(90.0::f32, 150.0::f32, 0), win);
+    frame_window(?ctx, input_at(92.0::f32, 152.0::f32, 0), win);
 
     # locked, the grips are gone and the titlebar no longer drags
     st.locked = 1;
-    frame_window(?ctx, input_at(140.0::f32, 120.0::f32, 0), win);
-    frame_window(?ctx, input_at(140.0::f32, 120.0::f32, 0), win);
+    frame_window(?ctx, input_at(142.0::f32, 120.0::f32, 0), win);
+    frame_window(?ctx, input_at(142.0::f32, 120.0::f32, 0), win);
     if (context.cursor(?ctx) != input.CURSOR_ARROW) { ret 10; }
     frame_window(?ctx, input_at(110.0::f32, 78.0::f32, 1), win);
     frame_window(?ctx, input_at(150.0::f32, 98.0::f32, 1), win);
@@ -2926,8 +3090,8 @@ test window__flags_shape_the_chrome {
     # without a background or a title an empty window paints nothing
     if (context.index_count(?ctx) != 0) { ret 3; }
     # without grips its edge keeps the arrow
-    frame_window(?ctx, input_at(100.0::f32, 30.0::f32, 0), bare);
-    frame_window(?ctx, input_at(100.0::f32, 30.0::f32, 0), bare);
+    frame_window(?ctx, input_at(102.0::f32, 30.0::f32, 0), bare);
+    frame_window(?ctx, input_at(102.0::f32, 30.0::f32, 0), bare);
     if (context.cursor(?ctx) != input.CURSOR_ARROW) { ret 4; }
 
     # no move: a titlebar drag leaves the window where it is
@@ -3463,89 +3627,6 @@ test layout__cells_space_advance_and_columns {
     ret 0;
 }
 
-# a frame holding a panel with a three-way segmented choice
-#[testing]
-fun frame_segmented(ctx: *context.Context, in: input.Input, choice: *usize) bool {
-    var labels: [3]str;
-    labels[0] = "a";
-    labels[1] = "b";
-    labels[2] = "c";
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val changed: bool  = segmented(ctx, ?labels[0], 3, choice);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret changed;
-}
-
-test segmented__chooses_on_click {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # the third segment spans x [69.3, 100)
-    var choice: usize = 0;
-    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice);
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice) != false) { ret 2; }
-    if (ctx.active != context.id_of(?ctx, "c"))                                    { ret 3; }
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != true)  { ret 4; }
-    if (choice != 2)                                                               { ret 5; }
-
-    # choosing the chosen segment again is no change
-    frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 1), ?choice);
-    if (frame_segmented(?ctx, input_at(80.0::f32, 8.0::f32, 0), ?choice) != false) { ret 6; }
-
-    # a press on the first released over the second chooses nothing
-    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?choice);
-    frame_segmented(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?choice);
-    frame_segmented(?ctx, input_at(50.0::f32, 8.0::f32, 0), ?choice);
-    if (choice != 2) { ret 7; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame holding a panel with one toggle
-#[testing]
-fun frame_toggle(ctx: *context.Context, in: input.Input, st: *u8) bool {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val p:       Block = begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
-    val flipped: bool  = toggle(ctx, "on", st);
-    end_panel(ctx, p);
-    context.end(ctx);
-    ret flipped;
-}
-
-test toggle__flips_on_click {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    # the whole row takes the click, label included
-    var st: u8 = 0;
-    frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st);
-    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?st) != false) { ret 2; }
-    if (frame_toggle(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?st) != true)  { ret 3; }
-    if (st != 1)                                                            { ret 4; }
-
-    # a press dragged off the row and released there does not flip it back
-    frame_toggle(?ctx, input_at(90.0::f32, 8.0::f32, 1), ?st);
-    frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 1), ?st);
-    if (frame_toggle(?ctx, input_at(150.0::f32, 150.0::f32, 0), ?st) != false) { ret 5; }
-    if (st != 1)                                                               { ret 6; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
 # a frame holding a panel with one slider showing reading
 #[testing]
 fun frame_reading(ctx: *context.Context, in: input.Input, v: *f32, reading: str) bool {
@@ -3920,6 +4001,13 @@ test text_field__types_edits_and_reports_enter {
     if (frame_field(?ctx, in, ?f, 1) != field.ENTERED) { ret 12; }
     if (context.typing(?ctx) || f.len != 3)            { ret 13; }
 
+    # a caller refusing the entry hands the keyboard straight back by the field's id
+    context.focus(?ctx, context.id_of(?ctx, "name"));
+    refill(?in, 13.0::f32, 8.0::f32);
+    input.type_text(?in, 'w');
+    if (frame_field(?ctx, in, ?f, 1) != field.EDITED) { ret 16; }
+    if (!context.typing(?ctx) || f.len != 4)          { ret 17; }
+
     # escape reports the same way
     click_field(?ctx, ?f, 13.0::f32);
     refill(?in, 13.0::f32, 8.0::f32);
@@ -4145,7 +4233,7 @@ test ids__scopes_nest_through_containers {
     val one:  u64 = context.id_of(?ctx, "one");
     val pop:  u64 = bid.of_label(one, "pop");
     val reg:  u64 = bid.of_label(pop, "reg");
-    val body: u64 = bid.child(context.id_of(?ctx, "dock"), "#body");
+    val body: u64 = context.id_of(?ctx, "dock");
 
     context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 400.0::f32, 400.0::f32);
     val dk: DockArea = begin_dock(?ctx, "dock", ?d);
