@@ -1,9 +1,12 @@
-# toasts: timed notifications stacked at an anchor of the surface
+# toasts: timed notifications stacked at an anchor of the surface or a rect
 #
 # post copies the text into storage the Toasts owns, from anywhere, and show
 # draws the stack each frame: each toast fades in, holds and fades out, and
-# asks for frames only while one fades. the stack here is drawn by the
-# section's root hook every frame, so toasts outlive the section.
+# asks for frames only while one fades. post_keyed names a toast by a key, so
+# a later post under it replaces that card in place, and withdraw takes it
+# down early. the window stack here is drawn by the section's root hook every
+# frame, so its toasts outlive the section, and show_in draws a second stack
+# inside a box in the section.
 
 use allo: std.allocator;
 use std.types.bool.bool;
@@ -15,23 +18,35 @@ use blit;
 
 # the toasts and where they stack
 # ---
-# toasts: the posted toasts
+# toasts: the toasts stacked in the window
+# boxed:  the toasts stacked in the box
 # corner: the anchor they stack at, as an index into the four corners
 # posted: toasts posted so far
 pub rec State {
     toasts: blit.toast.Toasts;
+    boxed:  blit.toast.Toasts;
     corner: usize;
     posted: usize;
 }
 
 pub fun init(s: *State, a: *allo.Allocator) {
     blit.toast.init(?s.toasts, a);
+    blit.toast.init(?s.boxed, a);
     s.corner = 3;
 }
 
 pub fun free(s: *State) bool {
     val e: err[allo.Error] = blit.toast.free(?s.toasts);
-    ret !sel e.err;
+    val b: err[allo.Error] = blit.toast.free(?s.boxed);
+    ret !(sel e.err) && !(sel b.err);
+}
+
+# the corner the toasts stack at
+fun anchor(s: *State) blit.overlay.Anchor {
+    if (s.corner == 0) { ret blit.overlay.TOP_LEFT; }
+    if (s.corner == 1) { ret blit.overlay.TOP_RIGHT; }
+    if (s.corner == 2) { ret blit.overlay.BOTTOM_LEFT; }
+    ret blit.overlay.BOTTOM_RIGHT;
 }
 
 pub fun show(ctx: *blit.context.Context, user: ptr) {
@@ -50,13 +65,32 @@ pub fun show(ctx: *blit.context.Context, user: ptr) {
         val e: err[allo.Error] = blit.toast.post(?s.toasts, "this one stays up for ten seconds", 10.0::f64);
         if (!sel e.err) { s.posted = s.posted + 1; }
     }
+
+    # one status card, replaced in place by key and withdrawn early
+    if (blit.widget.button(ctx, "Identify")) {
+        val e: err[allo.Error] = blit.toast.post_keyed(?s.toasts, "status", "identifying...", 30.0::f64);
+        if (!sel e.err) { s.posted = s.posted + 1; }
+    }
+    if (blit.widget.button(ctx, "Found it")) {
+        val e: err[allo.Error] = blit.toast.post_keyed(?s.toasts, "status", "it is a cat", 0.0::f64);
+        if (!sel e.err) { s.posted = s.posted + 1; }
+    }
+    if (blit.widget.button(ctx, "Withdraw")) {
+        val held: bool = blit.toast.withdraw(?s.toasts, "status");
+    }
+
+    # a stack anchored inside a rect of the section, as in a viewport
+    if (blit.widget.button(ctx, "In the box")) {
+        val e: err[allo.Error] = blit.toast.post(?s.boxed, "inside the box", 0.0::f64);
+        if (!sel e.err) { s.posted = s.posted + 1; }
+    }
+    val h: f32               = blit.context.px(ctx, 120.0::f32);
+    val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+    blit.context.box(ctx, blit.theme.LIST, blit.theme.NORMAL, r.x0, r.y0, r.x1, r.y1);
+    blit.toast.show_in(ctx, "boxed", ?s.boxed, r, anchor(s));
 }
 
 pub fun root(ctx: *blit.context.Context, user: ptr) {
-    val s:  *State              = user::*State;
-    var at: blit.overlay.Anchor = blit.overlay.BOTTOM_RIGHT;
-    if (s.corner == 0) { at = blit.overlay.TOP_LEFT; }
-    if (s.corner == 1) { at = blit.overlay.TOP_RIGHT; }
-    if (s.corner == 2) { at = blit.overlay.BOTTOM_LEFT; }
-    blit.toast.show(ctx, "toasts", ?s.toasts, at);
+    val s: *State = user::*State;
+    blit.toast.show(ctx, "toasts", ?s.toasts, anchor(s));
 }

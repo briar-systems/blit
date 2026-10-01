@@ -1460,25 +1460,41 @@ o.keep = 1;
   through, which nests by multiplying. A consumer span is drawn by the
   consumer and is not faded.
 
-`blit.toast` stacks timed notifications at an anchor of the surface:
+`blit.toast` stacks timed notifications at an anchor of the surface or of
+any rect:
 
 ```mach
 var toasts: blit.toast.Toasts;
 blit.toast.init(?toasts, ?a);                     # once
 val posted: err[allo.Error] = blit.toast.post(?toasts, "saved", 0.0); # anywhere: 0 for SECONDS
+val st: err[allo.Error] = blit.toast.post_keyed(?toasts, "status", "identifying...", 0.0); # one card per key
+val re: err[allo.Error] = blit.toast.post_keyed(?toasts, "status", "a cat", 2.0); # the same card, new text
+val held: bool = blit.toast.withdraw(?toasts, "status"); # take it down early
 blit.toast.show(?ctx, "toasts", ?toasts, blit.overlay.BOTTOM_RIGHT); # per frame
+blit.toast.show_in(?ctx, "toasts", ?toasts, viewport, blit.overlay.TOP_RIGHT); # or inside a rect
 ```
 
 - **Life.** A toast's clock starts the first frame `show` draws it. It fades
   in over its first `FADE` seconds and out over its last, and is dropped once
-  its time is up. `post` copies the text into storage the `Toasts` owns, and
-  `free` releases it.
+  its time is up. `post` copies the text into storage the `Toasts` owns, so a
+  transient buffer will do, and `free` releases it.
+- **Keys.** `post_keyed` names a toast by a key, copied like the text.
+  Posting under a key the stack holds replaces that toast in place: it keeps
+  its place in the stack, takes the new text and time, and its clock starts
+  over at the next show without fading in again if it was on screen.
+  `withdraw` takes a keyed toast down before its time is up, fading it out
+  over `FADE` from the next show, or dropping it unseen if no frame showed it
+  yet, and returns whether the stack held the key.
 - **Stack.** The cards stack away from the anchor's edge, up from a bottom
   anchor and down from any other, the newest nearest the anchor, lined up on
-  its side and kept off the edges by twice the theme's padding.
+  its side and kept off the edges by the `toast` style's margin. `show`
+  anchors to the surface, `show_in` to a rect in local pixels, such as a
+  viewport beside a docked panel, the stack inside it as `show`'s is inside
+  the surface.
 - **Frames.** `show` asks for frames only while a toast fades, and otherwise
   for the moment the next one starts to fade out, so once they are gone
-  `next_frame` is `none` again.
+  `next_frame` is `none` again. A post or withdraw between frames asks for
+  the next one with `blit.context.redraw`.
 
 `blit.tooltip` shows an overlay over a widget once the pointer has rested on
 it, named by id after the widget is drawn:
