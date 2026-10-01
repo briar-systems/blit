@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -502,6 +502,35 @@ x, y, w)`/`end_popup` opens an overlay column, and
 `blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` is a left click on an
 arbitrary rect for consumer-drawn affordances, the simplest use of
 `blit.interact.hit`.
+
+## Small controls
+
+`blit.controls` holds the small controls a tool expects, each placed at the
+layout cursor across the column like `blit.widget`'s:
+
+- **Radio buttons.** `radio(?ctx, label, ?choice, value)` is a circle beside
+  its label that sets `@choice` to `value` when clicked, filled in the accent
+  while chosen, so buttons sharing one choice make a group.
+  `radios(?ctx, ?labels[0], n, ?choice)` stacks n of them, button i standing
+  for i.
+- **Progress bars.** `progress(?ctx, frac, text)` fills to `frac` of the
+  column, and `progress_busy(?ctx, text)` sweeps a segment across it every
+  `BUSY_PERIOD` seconds of `in.time` for work of unknown length. A busy bar
+  asks for the frame its segment next moves a pixel in through `wake_at`, so
+  it animates while drawn and an interface without one still reports `none`
+  from `next_frame`. Either takes text to centre over the bar, nil for none.
+- **Separators.** `separator(?ctx)` is a rule across the column in the
+  theme's `edge` color, `edge_w` thick, and `separator_label(?ctx, label)` runs
+  the rule on from a dim label.
+- **Combo.** `combo(?ctx, label, ?selected, ?options[0], count)` is a select
+  whose popup holds a filter field that takes the keyboard when it opens.
+  Typing narrows the options to those holding the text, ignoring ASCII case,
+  up and down move the highlight among them, and enter or a click picks one.
+  Escape or a press outside closes it without a pick. `COMBO_ROWS` options
+  show at once and the rest scroll. Its open state, filter, highlight and
+  scroll live in the state store under its id, and its parts are reached by
+  path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
+  each option an index under it.
 
 ## Widget ids
 
