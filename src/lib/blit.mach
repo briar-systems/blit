@@ -26,6 +26,7 @@ fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
 fwd blit.chart;
+fwd blit.controls;
 fwd blit.driver;
 
 # blit library version
