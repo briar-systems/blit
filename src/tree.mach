@@ -24,8 +24,17 @@
 # a click selects a row, a double click or a click on its caret opens or
 # closes it. a Row hook sees every drawn row with its rect and its
 # interact.Hit inside the row's id scope, the point to hang context menus,
-# icons and drag and drop of nodes (reparenting) on. arrow-key navigation
-# waits for keyboard navigation (#88).
+# icons and drag and drop of nodes (reparenting) on.
+#
+# the tree is one tab stop over its region (see blit.interact.stop), focused
+# by tab or a press on a row, and keeps a keyboard cursor on a node (Tree.cursor).
+# while it holds the keyboard, up and down move the cursor a row, page up and
+# page down a tree's height of rows, home and end to the first and last row,
+# right opens a closed node or steps into an open one, left closes an open
+# node or steps out to its parent, enter activates the node as a double
+# click does, and space selects it as a click does. a move selects the node
+# it lands on, extending from the anchor with shift held, and scrolls it into
+# view. only the rows between the view and the cursor's target are asked for.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -131,6 +140,11 @@ pub rec Source {
 # anchor: id of the node a shift click selects from, 0 for none
 # epoch:  moved by every open, close and invalidate
 # id:     the tree's id, the parent of the top level's ids, set each frame
+# cursor: id of the node the keyboard is on, 0 for none
+# crow:   the cursor's row when it was last drawn
+# cup:    the row of the cursor's parent plus one, 0 at the top level
+# cleaf:  true when the cursor's node is a leaf
+# chand:  the cursor's handle
 pub rec Tree {
     root:   u64;
     mode:   u8;
@@ -138,6 +152,11 @@ pub rec Tree {
     anchor: u64;
     epoch:  u64;
     id:     u64;
+    cursor: u64;
+    crow:   usize;
+    cup:    usize;
+    cleaf:  bool;
+    chand:  u64;
 }
 
 # what a tree did this frame
@@ -195,6 +214,9 @@ rec Fold {
 # pick:   the node a click selects after the walk
 # picked: the picked node's selected state
 # mods:   the MOD_* bits held at the click
+# want:   the row the keys move the cursor to, NO_ROW for none
+# shift:  true when that move extends the selection
+# keyed:  true while the tree holds the keyboard and its ring shows
 rec Walk {
     ctx:    *context.Context;
     t:      *Tree;
@@ -213,7 +235,13 @@ rec Walk {
     pick:   u64;
     picked: bool;
     mods:   u8;
+    want:   usize;
+    shift:  bool;
+    keyed:  bool;
 }
+
+# no row: past any row a tree holds
+val NO_ROW: usize = 0xFFFFFFFFFFFFFFFF;
 
 # the id of a node with a key under its parent
 # ---
@@ -268,7 +296,7 @@ pub fun invalidate(t: *Tree) {
 }
 
 # draw one row and record what a click on it asks for
-fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
+fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool, up: usize) {
     val ctx: *context.Context = w.ctx;
     val pad: f32              = context.px(ctx, context.look_of(ctx, theme.TREE_ITEM).inset.l);
     val x0:  f32              = w.x0;
@@ -302,14 +330,32 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
         w.ev.clicked = true;
         w.ev.node    = id;
         w.ev.handle  = it.handle;
+        w.t.cursor   = id;
+    }
+    if (h.pressed && ctx.focus != w.t.id) { context.focus(ctx, w.t.id); }
+    if (row == w.want) {
+        w.t.cursor = id;
+        w.pick     = id;
+        w.picked   = it.selected;
+        w.mods     = 0;
+        if (w.shift) { w.mods = input.MOD_SHIFT; }
+        w.ev.node   = id;
+        w.ev.handle = it.handle;
+    }
+    if (id == w.t.cursor) {
+        w.t.crow  = row;
+        w.t.cup   = up;
+        w.t.cleaf = it.leaf;
+        w.t.chand = it.handle;
     }
 
     val st:  u8           = theme.pick(h.hot, h.active, it.selected, false);
     val ink: *theme.Paint = context.paint_of(ctx, theme.TREE_ITEM, st);
     context.box(ctx, theme.TREE_ITEM, st, x0, y0, x1, y1);
     val ty: f32 = y0 + (w.rh - w.lh) / 2.0::f32;
-    if (!it.leaf)        { widget.caret(ctx, cx, ty, w.lh, open, ink.mark); }
-    if (it.label != nil) { context.text_at(ctx, it.label, tx, ty, ink.text); }
+    if (!it.leaf)                    { widget.caret(ctx, cx, ty, w.lh, open, ink.mark); }
+    if (it.label != nil)             { context.text_at(ctx, it.label, tx, ty, ink.text); }
+    if (w.keyed && id == w.t.cursor) { context.box(ctx, theme.FOCUS_RING, theme.NORMAL, x0, y0, x1, y1); }
 
     if (w.src.row != nil) {
         var r: Row;
@@ -332,7 +378,7 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
 # place the closed children [i, o) of a node, drawing the ones in view
 #
 # ret: true when one of them turned out open, so the parent's record is stale
-fun run(w: *Walk, pid: u64, handle: u64, i: usize, o: usize, depth: usize) bool {
+fun run(w: *Walk, pid: u64, handle: u64, i: usize, o: usize, depth: usize, up: usize) bool {
     val n:     usize = o - i;
     var a:     usize = i;
     var b:     usize = o;
@@ -353,7 +399,7 @@ fun run(w: *Walk, pid: u64, handle: u64, i: usize, o: usize, depth: usize) bool 
         var open: bool = false;
         if (!it.leaf) { open = is_open(w.ctx, id); }
         if (open)     { stale = true; }
-        emit(w, ?it, id, depth, w.row + (k - i), open);
+        emit(w, ?it, id, depth, w.row + (k - i), open, up);
         k = k + 1;
     }
     w.row = w.row + n;
@@ -366,7 +412,7 @@ fun run(w: *Walk, pid: u64, handle: u64, i: usize, o: usize, depth: usize) bool 
 # with the fold measured this epoch over the same children, the walk jumps
 # between the open children its chain records. otherwise it asks for every
 # child and records the chain again.
-fun level(w: *Walk, pid: u64, handle: u64, pf: *Fold, depth: usize) {
+fun level(w: *Walk, pid: u64, handle: u64, pf: *Fold, depth: usize, up: usize) {
     val n:     usize = w.src.count(w.src.user, handle);
     var chain: bool  = pf.seen == w.stamp && pf.kids == n;
     var stale: bool  = false;
@@ -385,8 +431,8 @@ fun level(w: *Walk, pid: u64, handle: u64, pf: *Fold, depth: usize) {
                 o     = i;
             }
         }
-        if (run(w, pid, handle, i, o, depth)) { stale = true; }
-        if (o >= n)                           { brk; }
+        if (run(w, pid, handle, i, o, depth, up)) { stale = true; }
+        if (o >= n)                               { brk; }
 
         var it: Item;
         w.src.child(w.src.user, handle, o, ?it);
@@ -396,7 +442,7 @@ fun level(w: *Walk, pid: u64, handle: u64, pf: *Fold, depth: usize) {
         val open: bool = f != nil && f.open != 0;
         if (chain && (!open || f.at != o)) { chain = false; }
 
-        if (w.row >= w.lo && w.row < w.hi) { emit(w, ?it, id, depth, w.row, open); }
+        if (w.row >= w.lo && w.row < w.hi) { emit(w, ?it, id, depth, w.row, open, up); }
         w.row = w.row + 1;
         if (open) {
             cand = f.next;
@@ -408,7 +454,7 @@ fun level(w: *Walk, pid: u64, handle: u64, pf: *Fold, depth: usize) {
                 w.row = w.row + f.rows;
             }
             or {
-                level(w, id, it.handle, f, depth + 1);
+                level(w, id, it.handle, f, depth + 1, w.row);
             }
         }
         i = o + 1;
@@ -533,6 +579,7 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.t     = t;
     w.src   = src;
     w.stamp = t.epoch + 1;
+    w.want  = NO_ROW;
     w.lh    = context.line_height(ctx);
     val ts: *theme.Style = context.look_of(ctx, theme.TREE_ITEM);
     w.rh = context.px(ctx, ts.min_h);
@@ -543,17 +590,29 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.x1 = a.x1;
     w.y  = a.y0;
     if (w.rh > 0.0::f32) {
-        var from: f32 = t.scroll.offset - w.y;
+        var from: f32 = r.top - w.y;
         if (from < 0.0::f32) { from = 0.0::f32; }
         w.lo = (from / w.rh)::usize;
-        val end: f32 = (t.scroll.offset - w.y + r.h) / w.rh;
+        val end: f32 = (r.top - w.y + r.h) / w.rh;
         w.hi = end::usize;
         if (w.hi::f32 < end) { w.hi = w.hi + 1; }
     }
 
-    val root: *Fold = state.get[Fold](ctx, t.id);
-    level(?w, t.id, t.root, root, 0);
+    val root:  *Fold = state.get[Fold](ctx, t.id);
+    val keyed: bool  = interact.stop(ctx, t.id, 0.0::f32, r.top, r.w, r.top + r.h, interact.ARROWS);
+    w.keyed = keyed && context.focus_visible(ctx);
+    if (keyed) { keys(ctx, ?w, root.rows, r.h); }
+    if (w.want != NO_ROW) {
+        if (w.want < w.lo)  { w.lo = w.want; }
+        if (w.want >= w.hi) { w.hi = w.want + 1; }
+    }
+    level(?w, t.id, t.root, root, 0, 0);
     widget.space(ctx, w.row::f32 * w.rh);
+    if (w.want != NO_ROW && w.want < w.row) {
+        val y0: f32 = w.y + w.want::f32 * w.rh;
+        if (y0 < t.scroll.offset)              { t.scroll.offset = y0; }
+        if (y0 + w.rh > t.scroll.offset + r.h) { t.scroll.offset = y0 + w.rh - r.h; }
+    }
     widget.end_scroll(ctx, ?t.scroll, r);
 
     if (w.toggle != 0) {
@@ -562,6 +621,60 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     }
     if (w.pick != 0) { select_pick(?w); }
     ret w.ev;
+}
+
+# read the frame's keys into the walk: the row the cursor moves to, the node
+# right or left opens or closes, and enter and space on the cursor
+fun keys(ctx: *context.Context, w: *Walk, rows: usize, h: f32) {
+    val t:    *Tree = w.t;
+    val has:  bool  = t.cursor != 0 && t.crow < rows;
+    var page: i64   = 1;
+    if (w.rh > 0.0::f32 && h > w.rh) { page = (h / w.rh)::i64; }
+    var steps: i64 = interact.presses(ctx, input.KEY_DOWN)::i64 - interact.presses(ctx, input.KEY_UP)::i64;
+    steps = steps + page * (interact.presses(ctx, input.KEY_PAGE_DOWN)::i64 - interact.presses(ctx, input.KEY_PAGE_UP)::i64);
+    if (rows == 0) { ret; }
+
+    var to: i64 = -1;
+    if (has)                                        { to = t.crow::i64; }
+    if (steps > 0 && !has)                          { to = steps - 1; }
+    or (steps < 0 && !has)                          { to = rows::i64 + steps; }
+    or (steps != 0)                                 { to = to + steps; }
+    if (interact.presses(ctx, input.KEY_HOME) != 0) { to = 0; }
+    if (interact.presses(ctx, input.KEY_END) != 0)  { to = rows::i64 - 1; }
+    if (has) {
+        val open: bool = !t.cleaf && is_open(ctx, t.cursor);
+        if (interact.presses(ctx, input.KEY_RIGHT) != 0) {
+            if (open)     { to = t.crow::i64 + 1; }
+            or (!t.cleaf) { w.toggle = t.cursor; }
+        }
+        if (interact.presses(ctx, input.KEY_LEFT) != 0) {
+            if (open)      { w.toggle = t.cursor; }
+            or (t.cup > 0) { to = t.cup::i64 - 1; }
+        }
+        if (w.toggle != 0) {
+            w.ev.node   = t.cursor;
+            w.ev.handle = t.chand;
+        }
+        if (interact.presses(ctx, input.KEY_ENTER) != 0) {
+            w.ev.activated = true;
+            w.ev.node      = t.cursor;
+            w.ev.handle    = t.chand;
+            if (!t.cleaf) { w.toggle = t.cursor; }
+        }
+        if (interact.presses(ctx, ' ') != 0) {
+            w.pick       = t.cursor;
+            w.mods       = 0;
+            w.ev.clicked = true;
+            w.ev.node    = t.cursor;
+            w.ev.handle  = t.chand;
+        }
+    }
+    if (to < 0)                                                                                                        { to = 0; }
+    if (to >= rows::i64)                                                                                               { to = rows::i64 - 1; }
+    if (has && to == t.crow::i64)                                                                                      { ret; }
+    if (!has && steps == 0 && interact.presses(ctx, input.KEY_HOME) == 0 && interact.presses(ctx, input.KEY_END) == 0) { ret; }
+    w.want  = to::usize;
+    w.shift = (ctx.in.mods & input.MOD_SHIFT) != 0;
 }
 
 # a synthetic tree: top-level node k (0-based) has handle k + 1 and wide
@@ -771,6 +884,49 @@ test tree__selects_one_and_many {
     ret 0;
 }
 
+test tree__keys_move_open_and_activate {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f: Fake;
+    fake(?f, 3, 2);
+    f.t.mode = SELECT_ONE;
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 400.0::f32, fake_ui, (?f)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+
+    # tab reaches the tree, and down puts the cursor on the first row, selected
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, driver.find(?d, "tree"))) { ret 2; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (f.t.cursor != top_id(?f, 0) || !f.sel[0]) { ret 3; }
+
+    # right opens the node, then steps into it, and left steps back out and closes it
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (!is_open(?d.ctx, top_id(?f, 0))) { ret 4; }
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (f.t.cursor != leaf_id(?f, 0, 0)) { ret 5; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (f.t.cursor != top_id(?f, 0)) { ret 6; }
+    driver.key(?d, input.KEY_LEFT, 0);
+    if (is_open(?d.ctx, top_id(?f, 0))) { ret 7; }
+
+    # down moves a row, end to the last, and enter activates and opens a node
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (f.t.cursor != top_id(?f, 1) || !f.sel[1] || f.sel[0]) { ret 8; }
+    driver.key(?d, input.KEY_END, 0);
+    if (f.t.cursor != top_id(?f, 2)) { ret 9; }
+    driver.key(?d, input.KEY_ENTER, 0);
+    if (f.acts != 1 || !is_open(?d.ctx, top_id(?f, 2))) { ret 10; }
+    driver.key(?d, input.KEY_HOME, 0);
+    if (f.t.cursor != top_id(?f, 0)) { ret 11; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test tree__100k_nodes_draw_only_visible_rows {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
@@ -805,6 +961,7 @@ test tree__100k_nodes_draw_only_visible_rows {
     # deep in the middle: the 500th leaf of the 50th node is in view
     f.t.scroll.offset = (50 * 1000 + 1 + 500)::f32 * rh;
     driver.step(?d);
+    driver.settle(?d);
     f.rows   = 0;
     f.childs = 0;
     f.counts = 0;

@@ -21,6 +21,10 @@
 # no longer sees its keys, and the frame after it closes it gives the focus
 # back to the widget that held it before, which keeps it while it is drawn.
 #
+# a bar's headers are a group of tab stops (see blit.interact): tab reaches
+# the bar, left and right move between its headers, and enter, space or down
+# on a header opens its menu with the first item highlighted.
+#
 # the open menu deepest in a tree takes the arrow keys, enter and escape: up
 # and down move its highlight over the enabled items, enter fires the
 # highlighted item or opens its submenu, right opens a submenu and left
@@ -193,6 +197,7 @@ pub rec MenuState {
 # y1:     a bar's bottom
 # ch:     a bar's channels: its background beneath its headers
 # claim:  a bar's reserved claim
+# grp:    the tab stop group a bar's headers replaced
 pub rec Menu {
     id:     u64;
     kind:   u8;
@@ -226,6 +231,7 @@ pub rec Menu {
     y1:     f32;
     ch:     context.Channels;
     claim:  usize;
+    grp:    interact.Group;
 }
 
 # a plain enabled item with no shortcut, check or icon
@@ -517,6 +523,7 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
     m.ch    = context.split(ctx, 2);
     context.set_channel(ctx, m.ch, 1);
     context.push_id(ctx, id);
+    m.grp = interact.begin_group(ctx, id, interact.ROW);
     ret m;
 }
 
@@ -526,6 +533,7 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
 # ctx: context
 # m:   the value begin_bar returned
 pub fun end_bar(ctx: *context.Context, m: *Menu) {
+    interact.end_group(ctx, m.grp);
     context.pop_id(ctx);
     val st: *MenuState = m.st;
     if (st.child != 0 && !m.hopen) { st.child = 0; }
@@ -582,11 +590,15 @@ fun header(ctx: *context.Context, bar: *Menu, m: *Menu, label: str) {
     val y1: f32         = bar.y1;
     bar.x = x1;
 
-    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT | interact.FOCUS);
     if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
     if (h.pressed) {
         if (bs.child == m.id) { bs.child = 0; }
         or                    { bs.child = m.id; }
+    }
+    if (bs.child != m.id && (h.activated || (h.focused && interact.presses(ctx, input.KEY_DOWN) != 0))) {
+        bs.child   = m.id;
+        m.st.first = 1;
     }
     # the open menu's outside claim covers the bar, so a move onto another
     # header is read from the cursor itself
@@ -764,19 +776,21 @@ pub fun separator(ctx: *context.Context, m: *Menu) {
 # while highlighted, or by its shortcut whether the menu is open or not
 #
 # firing it flips @check for a checkable item. a click or enter also closes
-# the menu's whole tree. a disabled item never fires.
+# the menu's whole tree. a disabled item, or one in a disabled scope (see
+# context.begin_disabled), never fires.
 # ---
 # ctx: context
 # m:   the menu it belongs to
 # it:  the item
 # ret: true on the frame it fires
 pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
+    val off:   bool = it.disabled || context.disabled(ctx);
     var fired: bool = false;
     val quiet: bool = context.typing(ctx) && ctx.focus != m.rid;
-    if (!it.disabled && !quiet && struck(ctx, it.shortcut)) { fired = true; }
+    if (!off && !quiet && struck(ctx, it.shortcut)) { fired = true; }
 
     if (m.open != 0 && m.kind != KIND_BAR) {
-        val i:       u32          = row_index(m, !it.disabled);
+        val i:       u32          = row_index(m, !off);
         val id:      u64          = context.id_of(ctx, it.label);
         val p:       f32          = pad(ctx);
         val rh:      f32          = row_h(ctx);
@@ -786,27 +800,27 @@ pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
         val x1:      f32          = r.x1;
         val y1:      f32          = r.y1;
         var buttons: u8           = input.BUTTON_LEFT;
-        if (it.disabled) { buttons = 0; }
+        if (off) { buttons = 0; }
 
         val h: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, buttons);
         if (h.hot) {
-            if (it.disabled) { context.set_cursor(ctx, input.CURSOR_NOT_ALLOWED); }
-            or               { context.set_cursor(ctx, input.CURSOR_HAND); }
+            if (off) { context.set_cursor(ctx, input.CURSOR_NOT_ALLOWED); }
+            or       { context.set_cursor(ctx, input.CURSOR_HAND); }
         }
         if (h.hot && m.moved) {
             m.st.child = 0;
-            if (!it.disabled) { m.st.cursor = i + 1; }
+            if (!off) { m.st.cursor = i + 1; }
         }
-        val here:   bool = m.st.cursor == i + 1 && !it.disabled;
+        val here:   bool = m.st.cursor == i + 1 && !off;
         var picked: bool = h.clicked;
         if (here && (m.keys & K_ENTER) != 0) { picked = true; }
-        if (picked && !it.disabled) {
+        if (picked && !off) {
             fired = true;
             close(m.root);
         }
 
         var st: u8 = theme.pick(here, false, false, false);
-        if (it.disabled) { st = theme.DISABLED; }
+        if (off) { st = theme.DISABLED; }
         val ip:  *theme.Paint = context.paint_of(ctx, theme.MENU_ITEM, st);
         val ink: draw.Color   = ip.text;
         context.box(ctx, theme.MENU_ITEM, st, x0, y0, x1, y1);
@@ -1178,6 +1192,45 @@ test menu__keyboard_navigates_an_open_menu {
     driver.key(?d, input.KEY_ESCAPE, 0);
     driver.step(?d);
     if (driver.drawn(?d, driver.find(?d, "main/View/Grid"))) { ret 12; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test menu__tab_reaches_the_bar_and_the_open_menu_keeps_the_keys {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+    val file: u64 = driver.find(?d, "main/File");
+    val view: u64 = driver.find(?d, "main/View");
+
+    # the bar's headers are one stop, the arrows moving between them
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, file)) { ret 2; }
+    driver.key(?d, input.KEY_RIGHT, 0);
+    if (!driver.focused(?d, view)) { ret 3; }
+    driver.key(?d, input.KEY_LEFT, 0);
+
+    # enter opens the menu on its first item, and the open menu owns tab
+    driver.key(?d, input.KEY_ENTER, 0);
+    driver.step(?d);
+    val st: *MenuState = state.get[MenuState](?d.ctx, file);
+    if (!driver.drawn(?d, driver.find(?d, "main/File/New")) || st.cursor != 1) { ret 4; }
+    driver.key(?d, input.KEY_TAB, 0);
+    if (driver.focused(?d, driver.find(?d, "name"))) { ret 5; }
+    driver.key(?d, input.KEY_DOWN, 0);
+    if (st.cursor != 2) { ret 6; }
+
+    # escape closes it and hands the keyboard back to the header
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    driver.steps(?d, 2);
+    if (driver.drawn(?d, driver.find(?d, "main/File/New")) || !driver.focused(?d, file)) { ret 7; }
+    driver.key(?d, input.KEY_TAB, 0);
+    if (!driver.focused(?d, driver.find(?d, "name"))) { ret 8; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

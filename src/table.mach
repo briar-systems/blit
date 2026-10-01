@@ -30,7 +30,9 @@
 # persist through state.save and state.load.
 #
 # in the header, a header cell's right edge is a grip that resizes its column,
-# a click sorts by the column (ascending, then descending), a drag drops the
+# a click, or enter or space on a header cell the keyboard reached (the header
+# is a group of tab stops, see blit.interact), sorts by the column (ascending,
+# then descending), a drag drops the
 # column onto another's place (blit.dnd) and a right click opens a context
 # menu (blit.menu) that shows and hides columns. the header and the first
 # freeze_cols visible columns stay where they are while the rest scrolls under
@@ -642,7 +644,7 @@ fun head(ctx: *context.Context, t: *Table, st: *TableState, c: *Column, ci: usiz
     val y1: f32 = t.y0 + t.hh;
     context.push_clip(ctx, rx0, y0, rx1, y1);
 
-    val h: interact.Hit = interact.hit(ctx, c.id, x0, y0, x1, y1, input.BUTTON_LEFT | input.BUTTON_RIGHT);
+    val h: interact.Hit = interact.hit(ctx, c.id, x0, y0, x1, y1, input.BUTTON_LEFT | input.BUTTON_RIGHT | interact.FOCUS);
     if (h.pressed) { st.moved = 0; }
     if ((c.flags & NO_REORDER) == 0 && h.button != input.BUTTON_RIGHT) {
         var carry: Carry    = Carry{table: t.id, col: c.id};
@@ -699,16 +701,18 @@ fun head(ctx: *context.Context, t: *Table, st: *TableState, c: *Column, ci: usiz
     context.pop_clip(ctx);
 }
 
-# the header row across the table
+# the header row across the table, its cells one group of tab stops
 fun header(ctx: *context.Context, t: *Table, st: *TableState) {
     context.box(ctx, theme.TABLE_HEADER, theme.NORMAL, t.x0, t.y0, t.x1, t.y0 + t.hh);
-    var i: usize = 0;
+    val grp: interact.Group = interact.begin_group(ctx, bid.child(t.id, "#header"), interact.ROW);
+    var i:   usize          = 0;
     for (i < t.n) {
         val ci: usize   = t.cols[i].order;
         val c:  *Column = ?t.cols[ci];
         if (c.shown) { head(ctx, t, st, c, ci); }
         i = i + 1;
     }
+    interact.end_group(ctx, grp);
 }
 
 # close the open cell's frame, clip and scope
@@ -873,7 +877,8 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
 # draw the scrollbars
 #
 # the wheel goes to the table when the widget under the cursor is in it and
-# no scroll region inside took it first, and scrolls from the next frame.
+# no scroll region inside took it first, and scrolls from the next frame. a
+# table in a disabled scope (see context.begin_disabled) takes no wheel.
 # ---
 # ctx: context
 # t:   the table begin opened
@@ -908,7 +913,7 @@ pub fun end(ctx: *context.Context, t: *Table) {
 
     chooser(ctx, t, st);
 
-    if (ctx.wheel_taken == 0 && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
+    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
         st.sy           = st.sy - ctx.in.wheel::f64;
         st.sx           = st.sx + ctx.in.wheel_x;
         ctx.wheel_taken = 1;

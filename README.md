@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.ease`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.anim`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -131,7 +131,12 @@ least sizes and shadow, and a `Paint` per state (`NORMAL`, `HOT`, `ACTIVE`,
 `ON`, `DISABLED`, `FOCUSED`) with its fill, gradient end, text, secondary mark,
 border and shadow colors. Widgets draw from the styles alone, and no widget
 holds a color or a size of its own. Charts read the `plot` fields (`series`,
-`line_w`, `tick`, `area`) as they are.
+`line_w`, `tick`, `area`) as they are, and animation the `motion` fields
+(`hover_time`, `hover_ease`, `open_time`, `open_ease`, `scroll_time`,
+`scroll_ease`: seconds, and a `blit.ease` curve, 0 linear, 1 out, 2 in and
+out) through `blit.theme.motion` (see Animation). The tokens `focus` and
+`focus_w` derive the `focus_ring` kind, the ring the control the keyboard
+reached wears.
 
 `blit.theme.derive(?t)` builds every style from the tokens, so after changing
 tokens in code, derive. `theme.set` changes one field, and for a token it
@@ -320,10 +325,18 @@ shows.
 | `metrics.corner` | length | corner radius of controls and containers, 0 for square |
 | `metrics.edge_w` | length | width of an edge line: a dock's inner side, a chart's rules and a focused field's outline |
 | `metrics.caret_w` | length | width of a text field's caret |
+| `palette.focus` | color | the ring around the control the keyboard reached |
+| `metrics.focus_w` | length | width of the focus ring |
 | `plot.series` | color x 8 | chart series colors, series k drawing in series[k % 8] |
 | `plot.line_w` | length | width of a chart line |
 | `plot.tick` | length | length of a chart axis tick |
 | `plot.area` | factor | alpha factor of the area filled under a chart line, in [0, 1] |
+| `motion.hover_time` | factor | seconds a control's face takes to follow hover and press, 0 for at once |
+| `motion.hover_ease` | factor | the curve a hover or press transition eases by: 0 linear, 1 out, 2 in and out |
+| `motion.open_time` | factor | seconds a section takes to unfold or fold, 0 for at once |
+| `motion.open_ease` | factor | the curve a section folds by: 0 linear, 1 out, 2 in and out |
+| `motion.scroll_time` | factor | seconds a scroll region takes to glide to a new offset, 0 for at once |
+| `motion.scroll_ease` | factor | the curve a scroll glide eases by: 0 linear, 1 out, 2 in and out |
 | `<kind>.radius` | 4 lengths | corner radii: top-left, top-right, bottom-right, bottom-left |
 | `<kind>.pad` | 4 lengths | container padding between its edges and its content: left, top, right, bottom |
 | `<kind>.inset` | 4 lengths | control inset between its edges and its text: left, top, right, bottom |
@@ -394,6 +407,7 @@ shows.
 | `picker` | a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label |
 | `checker` | the checkerboard alpha shows through: fill and mark its two cells |
 | `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
+| `focus_ring` | the ring around the control the keyboard reached: border and border_w its stroke, radius its corners |
 
 | state | when |
 |---|---|
@@ -403,6 +417,47 @@ shows.
 | `on` | set: checked, chosen, selected or open |
 | `disabled` | drawn but not taking input |
 | `focused` | holding the keyboard |
+
+## Animation
+
+Motion is state: `blit.anim` keeps animated values in the store under ids
+(see State store), so a widget animates by asking each frame for its value
+with the target it wants, and the value eases from wherever it stands to the
+target on the host's clock (`in.time`).
+
+```mach
+val id:   u64 = blit.context.id_of(?ctx, "drawer");
+val open: f32 = blit.anim.value(?ctx, id, target, blit.theme.MOTION_OPEN); # eased toward target
+val hot:  f32 = blit.anim.fade(?ctx, blit.id.child(id, "#hot"), h.hot, blit.theme.MOTION_HOVER);
+val face: blit.draw.Color = blit.anim.mix(rest, hover, hot);
+```
+
+- **Built in.** A control's face eases between the paints of the states it
+  passes through (`anim.box(?ctx, id, kind, state, x0, y0, x1, y1)`, as
+  `context.box` paints one state, and `anim.paint` for the paint alone), a
+  toggle's knob slides, a section opened with
+  `begin_section` unfolds and folds (see Widgets & layout), and a scroll
+  region glides to where the wheel, a key or the keyboard focus sent it.
+- **Values.** `value(?ctx, id, target, kind)` is timed by the theme's motion
+  of a kind and `toward(?ctx, id, target, motion)` by a `theme.Motion` of the
+  caller's. A value seen for the first time starts at its target, and a new
+  target mid-run turns back from where the value stands, so nothing jumps.
+  `fade(?ctx, id, on, kind)` is a 0 to 1 value from 0 that keeps no state at
+  rest, for hovers. `snap` puts a value at once (a value dragged under the
+  pointer), `running` says whether one moves, and `lerp` and `mix` blend
+  numbers and colors.
+- **Timing.** Each kind of motion, `theme.MOTION_HOVER` (hover and press),
+  `MOTION_OPEN` (sections) and `MOTION_SCROLL` (scroll glides), takes its
+  duration and `blit.ease` curve (`LINEAR`, `OUT`, `IN_OUT`) from the theme's
+  `motion` fields, paths such as `motion.hover_time`, so TOML, overrides and
+  the editor reach them like any field. Every widget reads them through
+  `anim.timing(?ctx, kind)` alone.
+- **Reduced motion.** `blit.context.set_reduce_motion(?ctx, 1)` makes every
+  animation jump straight to its end, as a host passes on its platform's
+  setting. A host that never advances `in.time` gets the same.
+- **Sleeping.** A value asks for frames through `wake_at` only while it
+  moves, so an interface whose animations have all settled reports `none`
+  from `next_frame` and an idle host sleeps.
 
 ## Docking
 
@@ -490,7 +545,11 @@ A panel's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/
 open one as the next item of the layout on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
-innermost region holding the topmost claim under the cursor.
+innermost region holding the topmost claim under the cursor. The content
+glides to the new offset rather than jumping (`ScrollArea.top` is the offset
+it is drawn at this frame, which a region drawing only its rows in view
+reads), except under a held thumb, and a tab stop inside the region that the
+keyboard moved to is scrolled into view.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
 
@@ -579,9 +638,32 @@ blit.context.end(?ctx);
   `focus(?ctx, blit.context.id_of(?ctx, key))` hands it to a widget from code.
   A press that lands anywhere else takes it back, and so does a frame that does
   not draw the holder.
-  `blit.context.typing(?ctx)` is true exactly while a widget holds it: read it
-  before `begin` to keep the consumer's own key bindings quiet for the keys that
-  frame will type into a field.
+  `blit.context.typing(?ctx)` is true while a widget holds it for its keys: read
+  it before `begin` to keep the consumer's own key bindings quiet for the keys
+  that frame will type into a field. A control reached by tab, such as a button,
+  holds the focus without taking the keys a consumer binds, so it stays false
+  then.
+- **Keyboard navigation.** Every control is a tab stop. Tab and shift tab move
+  the focus through them in the order they are drawn, wrapping, across
+  windows, docked tabs and menu bars alike. Controls drawn as one row (a
+  button row or grid, a segmented choice, radios, a dropdown's options, a tab
+  bar, a menu bar's headers, a window's chrome, a value editor's cells, a
+  table's header) are a group: tab reaches the group once, at its chosen
+  member or the one that last held the keyboard, and the arrows move within
+  it. Enter and space activate the control holding the keyboard as a click
+  does. A slider takes left and right, home and end, a list and a tree their
+  arrows and pages, and a text field all its keys. A press focuses the control
+  it lands on as well. Keys move the focus by the previous frame's stops, as
+  the pointer routes by its claims.
+- **Focus ring.** The control the keyboard moved to wears a ring, the
+  `focus_ring` style (derived from the `focus` and `focus_w` tokens), drawn
+  above it on its layer
+  (`blit.context.focus_visible`), until a press. A window the keyboard moves
+  into comes to the front, and a scroll region brings the control into view.
+- **Owning the keyboard.** A focus held by something that is not a tab stop,
+  such as an open menu, keeps every key: tab and the arrows move nothing while
+  a menu is open. A modal keeps the keyboard inside it: tab moves from the
+  modal onto its controls and never past them (see Layers & input routing).
 - **Clipboard hand-off.** blit never reads the system clipboard. After `end`,
   `blit.context.copied(?ctx)` is text a copy or cut left for the consumer to put
   on the clipboard (nil when none), and `wants_paste(?ctx)` asks for the
@@ -729,6 +811,32 @@ if (h.held) { drag_by(h.dx, h.dy); }
   was drawn in, so a caller that refuses a text field's entry (`ENTERED` with
   text it will not take) calls `focus` with that id to hand the keyboard
   straight back, and `focused(?ctx, id)` says whether it holds it.
+- **Tab stops.** `blit.interact.FOCUS` among the buttons makes the widget a
+  tab stop (see Keyboard navigation), registered in call order even while
+  clipped out of sight: a left press focuses it, `focused` says it holds the
+  keyboard, and enter or space while it held the keyboard from the frame's
+  start set `activated` and `clicked`. `ARROWS` says it takes the arrow keys
+  itself while focused and `TEXT` that it takes typed text, which also keeps
+  enter and space its own. `interact.presses(?ctx, code)` counts a key's
+  presses for a widget reading its own keys. A widget whose claim is a
+  container's, as a list's or a tree's is its scroll region, registers its
+  stop with `interact.stop(?ctx, id, x0, y0, x1, y1, flags)`.
+- **Groups.** Stops placed between `g = interact.begin_group(?ctx, id, axis)`
+  and `end_group(?ctx, g)` are one group, and the arrows along `axis` (`ROW`,
+  `COLUMN` or `BOTH`) move between them. `blit.context.mark_current(?ctx, id)`
+  names the member tab enters the group at, such as the chosen segment.
+- **Disabled.** `blit.context.begin_disabled(?ctx, cond)` and
+  `end_disabled(?ctx)` wrap widgets that draw and lay out, keeping their ids
+  and state, but take no input when `cond` holds. Inside, `hit` still claims
+  the rect but reports nothing hot, pressed, clicked or dragged, the focus is
+  neither given nor kept (a holder that becomes disabled loses it), tab and
+  the arrows pass over it, scroll
+  regions and tables take no wheel, menu items and their shortcuts never fire,
+  and every kind paints in its `DISABLED` state through `box` and `paint_of`.
+  Scopes nest, and one with `cond` false inside a disabling one stays
+  disabled, so a caller writes one call, not a branch.
+  `blit.context.disabled(?ctx)` says whether the call site is disabled, for a
+  custom control that reads input other than through `hit`.
 
 ## Drag and drop
 
@@ -856,7 +964,11 @@ instead of `ox` and `pw`.
 
 - **Sections.** `section(?ctx, title, ?open)` is a heading with a caret,
   pointing right when closed and down when open, that returns whether to place
-  the rows beneath it.
+  the rows beneath it. `s = begin_section(?ctx, title, ?open)` is the same
+  heading over a body that unfolds and folds: place the rows while `s.body` is
+  true, then `end_section(?ctx, s)` whatever it is. Opening or closing, the
+  rows show in a clip that grows or shrinks to the height they last took
+  whole, over the theme's `MOTION_OPEN`, and the layout below follows it.
 - **Buttons.** `button` spans the column, `buttons(?ctx, ?labels[0], n)` is a
   row of n, and `button_grid(?ctx, ?labels[0], n, cols, on)` wraps them cols
   to a row with button `on` drawn chosen. Both return the index clicked, or n.
@@ -887,7 +999,16 @@ instead of `ox` and `pw`.
   a multiple selection: a click selects an item alone, ctrl (command on
   darwin) toggles it, and shift selects the shown items from the last one
   clicked. A row's id is its item index under the list's, so it keeps its hit
-  identity as the query or matcher changes.
+  identity as the query or matcher changes. The list is one tab stop, focused
+  by tab or a press on a row: up and down move the selection over the shown
+  items, home and end to either end and page up and page down by a list's
+  height, scrolling it into view, a plain move selecting alone and shift
+  extending from the anchor (`List.cursor` is where the keyboard is in a
+  multiple selection). A tree (`blit.tree`) is one tab stop the same way, its
+  keyboard cursor on a node (`Tree.cursor`): up, down, page up, page down,
+  home and end move it a row at a time, right opens a node or steps into it,
+  left closes one or steps out to its parent, enter activates the node as a
+  double click does and space selects it.
 
 `demo/panel/` builds a docked application panel from these widgets alone, in
 the shape of an application's side panel (a header, then run, view and files
@@ -1031,7 +1152,8 @@ blit.table.end(?ctx, ?t);
   widget in a cell keeps its id and its state however the rows scroll.
   `cell_id(?t, key, c)` is a cell's scope, the parent of its widgets' ids.
 - **The header.** Dragging the grip at a header cell's right edge resizes the
-  column. A click sorts by the column, ascending and then descending, and the
+  column. A click, or enter or space on a header the keyboard reached (the
+  header is a group of tab stops), sorts by the column, ascending and then descending, and the
   table reports it as `t.sort` (the column's index, the column count for
   none) and `t.dir`, with `t.sorted` set on the frame it changed: the table
   never sorts, the caller orders its rows. Dragging a header drops the column
@@ -1064,8 +1186,8 @@ reads back as exactly that value, and typed text is read exactly.
   per pixel dragged across it, `FINE` times as far while shift is held. An
   integer moves by whole steps and keeps the fraction for the next pixel, and
   a float lands on the decimals of its value at the press or of the speed, so
-  dragging 1.5 by 0.01 a pixel gives 1.6. A double click turns it into a text
-  field with the value selected: enter or a press elsewhere commits, escape
+  dragging 1.5 by 0.01 a pixel gives 1.6. A double click, or enter or space
+  while it holds the keyboard, turns it into a text field with the value selected: enter or a press elsewhere commits, escape
   leaves the value. `drag_n[T](?ctx, label, ?vec[0], n, speed, lo, hi)` edits
   2 to 4 values in one row, and `drag_range[T](?ctx, label, ?a, ?b, speed, lo,
   hi)` a low and a high value that never cross.
@@ -1207,7 +1329,9 @@ blit.menu.end_menu(?ctx, ?cm);
   and gives it back to the previous holder the frame after it closes.
 - **Keys.** The deepest open menu takes up and down (over enabled items),
   enter, right and left (into and out of submenus, and across a bar's headers)
-  and escape.
+  and escape. A bar's headers are a group of tab stops: left and right move
+  between them, and enter, space or down opens a header's menu on its first
+  item, the focus going back to the header when it closes.
 - **Closing.** A click or enter on an item closes the whole tree, and so does
   a press of any button outside it, which is consumed.
 - **Ids.** A bar's key, then each header and submenu label, then the item's
@@ -1248,7 +1372,8 @@ if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
   measured as it is drawn, so the frame it opens lays out hidden behind a scrim
   that already blocks.
 - **Closing.** Escape closes the top modal while it holds the keyboard itself
-  (escape in a text field inside it ends the edit first), and so does the close
+  or a control inside it that takes no text does (escape in a text field
+  inside it ends the edit first), and so does the close
   button in its titlebar (`MODAL_NO_CLOSE`, `MODAL_NO_TITLE`). A press on the
   scrim closes it only with `MODAL_SCRIM_CLOSES`. `ModalArea.closed` and `why`
   report the frame it closed.
@@ -1257,7 +1382,8 @@ if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
   the pointer and escape.
 - **Focus.** A modal takes the keyboard the frame it opens, so a field beneath
   stops seeing keys, and gives it back to the previous holder the frame after
-  it closes.
+  it closes. Tab moves from the modal onto its controls, and tab and the
+  arrows stay among the top modal's controls while it is open.
 - **Confirm.** `confirm` is a dialog with a message and a row of buttons. It
   returns the index chosen, closing itself, `CANCELLED` on the frame it is
   closed without a choice (escape, close button or scrim), and `NO_CHOICE`
@@ -1453,6 +1579,9 @@ click is always the one visibly on top.
   still paints over a window called after it, and sibling popups share a
   layer. `run_at` reports each run's `layer`. `push_layer` and `pop_layer`
   remain, deprecated, as `push_band(?ctx, band.POPUPS, 0)` and `pop_band`.
+- **Trapping the keyboard.** A band whose row sets `trap` (modals) keeps
+  keyboard navigation inside its topmost layer holding a tab stop, so tab
+  cycles through the top modal's controls alone.
 - **Window order.** The context keeps the windows' z order:
   `blit.context.raise` hands out a z above every window and `note_z` notes
   one a window kept. Once z passes `Z_RENUMBER`, the windows renumber every
@@ -1721,14 +1850,16 @@ blit.driver.free(?d);
   it in the next. `move`, `leave`, `press` and `release` drive the pointer and
   buttons by hand, a frame each, and a press or release is sent as a button
   event at the pointer as well as in `down`. An action on a widget the last frame did not draw runs
-  nothing and returns false.
+  nothing and returns false. `settle(?d)` runs frames while the interface
+  asks for the next one at once, so its animations and glides reach their
+  ends.
 - **Frames.** Each step carries the clock (`d.time`, advanced by `d.dt`, 1/60
   s by default) and clears the frame's key events, wheel and paste, so input
   set between steps lands in exactly one frame. `d.ctx` and `d.in` are the
   context and input, free to read and set between steps.
 - **Queries** read the last frame: `drawn`, `rect` (the screen rect the widget
   claimed, clipped, none when it was not visible), `hot`, `active` and
-  `focused`, and `text_in(?d, x0, y0, x1, y1)` and `text_of(?d, id)`, the
+  `focused`, `focus_of(?d)` (whichever widget holds the keyboard), and `text_in(?d, x0, y0, x1, y1)` and `text_of(?d, id)`, the
   text drawn inside a rect or a widget's rect. Text lines whose box has its
   centre inside are joined in drawing order: directly when one continues the
   last on its row, by a space further along the row, by a newline otherwise.
@@ -1781,10 +1912,12 @@ demo/panel/out/linux-x86_64/debug/bin/panel --snapshot > demo/panel/src/bin/pane
 
 `demo/bench/` measures blit's per-frame cost on a few representative
 interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
-line chart of 100,000 samples, and six overlapping windows each holding a
-section and a scroll region. Each scene runs with sRGB output off and then on,
-and the table reports the mean frame time, the vertices and runs the frame
-emits, the allocations a frame makes, and what sRGB adds. It is local only,
+line chart of 100,000 samples, six overlapping windows each holding a
+section and a scroll region, and one path of 10,000 edges filled. Each scene runs with sRGB output off and then on,
+and the table reports the median frame time over 21 timed batches with the
+spread between the fastest and slowest batch, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. The off and on
+batches are interleaved so drift in the machine's speed lands on both. It is local only,
 never a CI job. Build it in the release profile:
 
 ```
@@ -1793,18 +1926,24 @@ mach build demo/bench -p release
 demo/bench/out/linux-x86_64/release/bin/bench
 ```
 
-Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+Baseline on dev ahead of 0.10.0 (after #81), on an AMD Ryzen 7 5800X3D, to
+compare later work against. Run it on an idle machine and pinned to one core
+(`taskset -c 15`): other load shows up as a large spread, and a run whose
+spread is large is not worth comparing. Two consecutive runs recorded this way
+agreed within 1.5% on every scene.
 
 ```
-scene          srgb    us/frame  vertices  runs  allocs   srgb cost
-dense panel    off        292.4      5298     1       0
-dense panel    on         295.6      5298     1       0   +1.0%
-10k row list   off        123.6      1704     1       0
-10k row list   on         124.1      1704     1       0   +0.4%
-100k chart     off       1924.6     15738     1       0
-100k chart     on        1966.7     15738     1       0   +2.1%
-windows        off        273.9      5472     1       0
-windows        on         277.5      5472     1       0   +1.3%
+scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
+dense panel    off        495.7     0.3%      3532     3       2
+dense panel    on         501.1     0.4%      3532     3       2   +1.1%
+10k row list   off       5557.5     1.2%      1136     3       0
+10k row list   on        5555.7     1.0%      1136     3       0   +0.0%
+100k chart     off       1816.3     3.4%     10492     3       0
+100k chart     on        1854.3     4.9%     10492     3       0   +2.0%
+windows        off        424.7     1.6%      3672    18       0
+windows        on         430.0     2.7%      3672    18       0   +1.2%
+10k-edge fill  off      14532.5     0.7%    231520     1       0
+10k-edge fill  on       14539.1     2.3%    231520     1       0   +0.0%
 ```
 
 ## Conventions

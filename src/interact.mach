@@ -11,16 +11,31 @@
 # drag and the release wherever the cursor goes, and a release over it is a
 # click. a press while another button already owns the pointer takes nothing.
 #
+# a widget that takes the keyboard passes FOCUS with its buttons, which
+# registers it as a tab stop (see context.add_stop) in call order: tab reaches
+# it, a press on it focuses it, and enter or space while it holds the
+# keyboard activate it, reported as a click. ARROWS says it takes the arrow
+# keys itself while focused and TEXT that it takes typed text. stops placed
+# between begin_group and end_group form a group: tab counts it as one stop
+# and the arrows move between its members. a widget whose claim is a
+# container's registers its stop with stop instead.
+#
 # the context keeps each button's last press (see context.last_press): a
 # press on the same widget within the double-click time and distance (see
 # context.set_double_click) of the one before extends a run of clicks, and the
 # second of a run is a double click. the press that made a widget active is
 # also where its drag is measured from.
+#
+# inside a disabled scope (see context.begin_disabled) a widget still claims
+# its rect, so it hides what is under it, but reports nothing: never hot,
+# never pressed, never dragged. one that owned the pointer or held the
+# keyboard when it became disabled loses them.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.size.usize;
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -28,39 +43,67 @@ use std.allocator.page;
 use blit.context;
 use blit.input;
 
+# a tab stop: tab reaches it, a press focuses it, enter and space activate it
+pub val FOCUS: u8 = context.NAV_FOCUS;
+
+# it takes the arrow keys itself while focused
+pub val ARROWS: u8 = context.NAV_ARROWS;
+
+# it takes typed text while focused, and enter and space are its own
+pub val TEXT: u8 = context.NAV_TEXT;
+
+# the arrows that move within a group: left and right, up and down, or both
+pub val ROW:    u8 = context.AXIS_ROW;
+pub val COLUMN: u8 = context.AXIS_COLUMN;
+pub val BOTH:   u8 = context.AXIS_BOTH;
+
+# the group begin_group replaced, for end_group to restore
+# ---
+# id:   the enclosing group's id, 0 for none
+# axis: its axis
+pub rec Group {
+    id:   u64;
+    axis: u8;
+}
+
 # what one widget's pointer did this frame
 # ---
-# id:       the widget's id
-# hot:      true if it is the topmost claimant under the cursor
-# active:   true while it owns the pointer, from the press on it through the
-#           frame its button comes up
-# held:     true while it owns the pointer and the button is down
-# pressed:  true on the frame one of its buttons went down over it
-# released: true on the frame the button that pressed it came up, over it or not
-# clicked:  true when that release lands over it
-# double:   true when this frame's press is the second of a run of clicks
-# clicks:   presses in the run this frame's press extends: 1, 2 for a
-#           double, 3 for a triple, 0 on frames without a press
-# button:   the input.BUTTON_* bit it acted on, 0 when none
-# mx:       cursor x in the current local space
-# my:       cursor y in the current local space
-# dx:       cursor travel in x since the press, while active
-# dy:       cursor travel in y since the press, while active
+# id:        the widget's id
+# hot:       true if it is the topmost claimant under the cursor
+# active:    true while it owns the pointer, from the press on it through the
+#            frame its button comes up
+# held:      true while it owns the pointer and the button is down
+# pressed:   true on the frame one of its buttons went down over it
+# released:  true on the frame the button that pressed it came up, over it or not
+# clicked:   true when that release lands over it
+# double:    true when this frame's press is the second of a run of clicks
+# clicks:    presses in the run this frame's press extends: 1, 2 for a
+#            double, 3 for a triple, 0 on frames without a press
+# button:    the input.BUTTON_* bit it acted on, 0 when none
+# mx:        cursor x in the current local space
+# my:        cursor y in the current local space
+# dx:        cursor travel in x since the press, while active
+# dy:        cursor travel in y since the press, while active
+# focused:   true while it holds the keyboard, for a widget passing FOCUS
+# activated: true when enter or space activated it this frame, which also
+#            sets clicked
 pub rec Hit {
-    id:       u64;
-    hot:      bool;
-    active:   bool;
-    held:     bool;
-    pressed:  bool;
-    released: bool;
-    clicked:  bool;
-    double:   bool;
-    clicks:   u32;
-    button:   u8;
-    mx:       f32;
-    my:       f32;
-    dx:       f32;
-    dy:       f32;
+    id:        u64;
+    hot:       bool;
+    active:    bool;
+    held:      bool;
+    pressed:   bool;
+    released:  bool;
+    clicked:   bool;
+    double:    bool;
+    clicks:    u32;
+    button:    u8;
+    mx:        f32;
+    my:        f32;
+    dx:        f32;
+    dy:        f32;
+    focused:   bool;
+    activated: bool;
 }
 
 # the lowest input.BUTTON_* bit set in bits, 0 for none
@@ -84,11 +127,13 @@ fun lowest(bits: u8) u8 {
 # id:  the widget's id
 # dx:  set to the travel in x since the press, 0 when not dragged
 # dy:  set to the travel in y since the press, 0 when not dragged
-# ret: true while the id owns the pointer and its button is down
+# ret: true while the id owns the pointer and its button is down, never in
+#      a disabled scope
 pub fun drag(ctx: *context.Context, id: u64, dx: *f32, dy: *f32) bool {
     @dx = 0.0::f32;
     @dy = 0.0::f32;
     if (id == 0 || ctx.active != id)             { ret false; }
+    if (context.disabled(ctx))                   { ret false; }
     if (input.held(ctx.in, ctx.active_btn) == 0) { ret false; }
     val p: context.Press = context.last_press(ctx, ctx.active_btn);
     @dx = ctx.in.mx - p.x;
@@ -102,7 +147,12 @@ pub fun drag(ctx: *context.Context, id: u64, dx: *f32, dy: *f32) bool {
 # the rect is in the current local space, clipped and layered like geometry.
 # buttons are the input.BUTTON_* bits it answers to, combined with |. a
 # widget that only shows hover (a chart's read-out) passes 0 and never owns
-# the pointer.
+# the pointer. with FOCUS among them it is a tab stop as well (see above),
+# registered even while clipped out of sight, so tab can reach it and a
+# scroll region bring it into view: a left press focuses it, and enter or
+# space while it holds the keyboard from the frame's start set activated and
+# clicked, unless it takes TEXT. a key that hands it the keyboard mid-frame,
+# such as the enter opening a dropdown onto its options, never activates it.
 # ---
 # ctx:     context
 # id:      the widget's id (see context.id_of), 0 claims anonymously and
@@ -111,7 +161,7 @@ pub fun drag(ctx: *context.Context, id: u64, dx: *f32, dy: *f32) bool {
 # y0:      top y in pixels
 # x1:      right x in pixels
 # y1:      bottom y in pixels
-# buttons: the BUTTON_* bits it answers to
+# buttons: the BUTTON_* bits it answers to, with FOCUS, ARROWS and TEXT
 # ret:     this frame's interaction
 pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, buttons: u8) Hit {
     var h: Hit;
@@ -120,7 +170,13 @@ pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, 
     h.my  = context.local_my(ctx);
     h.hot = context.claim(ctx, id, x0, y0, x1, y1) != 0;
     if (id == 0) { ret h; }
-    if (h.hot)   { ctx.hot = id; }
+    if (context.disabled(ctx)) {
+        h.hot = false;
+        if (ctx.active == id) { ctx.active = 0; }
+        if (ctx.focus == id)  { context.unfocus(ctx); }
+        ret h;
+    }
+    if (h.hot) { ctx.hot = id; }
 
     # a press takes the pointer only while no button already owns it
     val free: bool = ctx.active == 0 || input.held(ctx.in, ctx.active_btn) == 0;
@@ -131,6 +187,14 @@ pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, 
         h.pressed      = true;
         h.clicks       = context.last_press(ctx, down).clicks;
         h.double       = h.clicks == 2;
+        if ((buttons & FOCUS) != 0 && down == input.BUTTON_LEFT && ctx.focus != id) { context.focus(ctx, id); }
+    }
+    if ((buttons & FOCUS) != 0) {
+        h.focused = context.add_stop(ctx, id, x0, y0, x1, y1, buttons & (FOCUS | ARROWS | TEXT));
+        if (h.focused && ctx.focus_start == id && (buttons & TEXT) == 0 && context.activate_pressed(ctx)) {
+            h.activated = true;
+            h.clicked   = true;
+        }
     }
 
     if (ctx.active != id) { ret h; }
@@ -141,9 +205,74 @@ pub fun hit(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, 
     }
     if (input.released(ctx.in, ctx.active_btn) != 0) {
         h.released = true;
-        h.clicked  = h.hot;
+        h.clicked  = h.hot || h.activated;
     }
     ret h;
+}
+
+# register a tab stop over a rect without claiming it, for a widget whose
+# claim is a container's, such as a list or a tree over its scroll region
+#
+# it is a stop as hit's FOCUS makes one, in the current group, but a press
+# does not focus it: the widget focuses itself (context.focus) when a press
+# lands on one of its parts.
+# ---
+# ctx:   context
+# id:    the widget's id
+# x0:    left x in pixels
+# y0:    top y in pixels
+# x1:    right x in pixels
+# y1:    bottom y in pixels
+# flags: ARROWS and TEXT as the widget takes them
+# ret:   true while it holds the keyboard
+pub fun stop(ctx: *context.Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32, flags: u8) bool {
+    ret context.add_stop(ctx, id, x0, y0, x1, y1, FOCUS | (flags & (ARROWS | TEXT)));
+}
+
+# open a group of tab stops: tab counts every stop registered until end_group
+# as one, and the arrows along axis move between them
+#
+# groups do not nest: a group opened inside another replaces it until its
+# end_group restores it.
+# ---
+# ctx:  context
+# id:   the group's id, usually the id of the widget drawing the members
+# axis: ROW, COLUMN or BOTH
+# ret:  the group it replaced, for end_group
+pub fun begin_group(ctx: *context.Context, id: u64, axis: u8) Group {
+    val was: Group = Group{id: ctx.group, axis: ctx.group_axis};
+    ctx.group      = id;
+    ctx.group_axis = axis;
+    ret was;
+}
+
+# close the group begin_group opened
+# ---
+# ctx: context
+# was: the value begin_group returned
+pub fun end_group(ctx: *context.Context, was: Group) {
+    ctx.group      = was.id;
+    ctx.group_axis = was.axis;
+}
+
+# whether the frame pressed a key with no modifier but shift, for a widget
+# holding the keyboard that takes keys of its own (ARROWS)
+# ---
+# ctx:  context
+# code: the key, a printable ascii character or an input.KEY_* constant
+# ret:  how many times it was pressed, repeats included
+pub fun presses(ctx: *context.Context, code: u32) u32 {
+    val other: u8    = input.MOD_CTRL | input.MOD_ALT | input.MOD_SUPER;
+    var n:     u32   = 0;
+    var e:     usize = 0;
+    for (e < ctx.in.events.len) {
+        val ev: input.Event = ctx.in.events.data[e];
+        e = e + 1;
+        if (sel ev.key) {
+            if (ev.key.code == code && (ev.key.mods & other) == 0) { n = n + 1; }
+        }
+    }
+    ret n;
 }
 
 # one frame's input at (mx, my) with buttons down at time t

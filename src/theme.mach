@@ -29,6 +29,10 @@
 # meaning, and TOML, overrides (see context.push_color), classes and the
 # theme editor all address fields through it.
 #
+# motion is data too: how long hover and press transitions, sections opening
+# and scroll glides take and how they ease are the motion fields, at
+# motion.<name> (see Motion), which blit.anim reads through motion alone.
+#
 # lengths are authored at scale 1.0. the context multiplies each by its
 # interface scale (see context.set_scale) when a widget reads it, the same
 # factor text is laid out at, so a theme never changes with the display.
@@ -48,6 +52,7 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use blit.draw;
+use blit.ease;
 use tw:   blit.writer;
 use allo: std.allocator;
 use std.allocator.page;
@@ -59,7 +64,7 @@ pub val SERIES: usize = 8;
 
 # how many built-in kinds init registers, the handles below; a kind
 # registered after them takes the next handle
-pub val BUILTIN_KINDS: u32 = 51;
+pub val BUILTIN_KINDS: u32 = 52;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -166,6 +171,30 @@ pub val PICKER: u32 = 48;
 pub val CHECKER: u32 = 49;
 # a toast's card: pad around its text, margin between the stack and the surface's edges
 pub val TOAST: u32 = 50;
+# the ring around the control the keyboard reached: border and border_w its stroke, radius its corners
+pub val FOCUS_RING: u32 = 51;
+
+# the kinds of motion a theme times (see motion)
+#
+# hover:  hover and press transitions of a control's face
+# open:   a section opening and closing
+# scroll: a scroll region gliding to where the wheel, a key or the keyboard
+#         focus sent it
+pub val MOTION_HOVER:  usize = 0;
+pub val MOTION_OPEN:   usize = 1;
+pub val MOTION_SCROLL: usize = 2;
+
+# how many kinds of motion a theme times
+pub val MOTIONS: usize = 3;
+
+# how one kind of motion moves
+# ---
+# dur:   seconds it takes, 0 to jump straight to the end
+# curve: a blit.ease curve
+pub rec Motion {
+    dur:   f32;
+    curve: u8;
+}
 
 # at rest
 pub val NORMAL: u8 = 0;
@@ -182,6 +211,9 @@ pub val FOCUSED: u8 = 5;
 
 # the state a widget paints in, the first that holds of on, focused, active
 # and hot, else normal
+#
+# inside a disabled scope the context paints whatever state is picked as
+# DISABLED (see context.begin_disabled), so widgets never pick it themselves.
 # ---
 # hot:     under the cursor
 # active:  pressed or dragged
@@ -309,10 +341,18 @@ pub rec Theme {
     corner:      f32;
     edge_w:      f32;
     caret_w:     f32;
+    focus:       draw.Color;
+    focus_w:     f32;
     series:      [8]draw.Color;
     line_w:      f32;
     tick:        f32;
     area:        f32;
+    hover_time:  f32;
+    hover_ease:  f32;
+    open_time:   f32;
+    open_ease:   f32;
+    scroll_time: f32;
+    scroll_ease: f32;
     a:           *allo.Allocator;
     names:       *str;
     docs:        *str;
@@ -355,6 +395,8 @@ pub val GROUP_PLOT: u8 = 2;
 pub val GROUP_STYLE: u8 = 3;
 # a paint field of a kind in a state, at <kind>.<state>.<name>
 pub val GROUP_PAINT: u8 = 4;
+# a motion field, at motion.<name>
+pub val GROUP_MOTION: u8 = 5;
 
 # one row of the field table
 # ---
@@ -374,11 +416,11 @@ pub rec Field {
 }
 
 # how many rows FIELDS has
-pub val FIELD_COUNT: usize = 50;
+pub val FIELD_COUNT: usize = 58;
 
 # every field of a theme: the one table TOML, overrides, classes, the editor
 # and the README's field table are built from
-pub val FIELDS: [50]Field = [50]Field{
+pub val FIELDS: [58]Field = [58]Field{
     Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background"},
     Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip and modal background"},
     Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
@@ -409,10 +451,18 @@ pub val FIELDS: [50]Field = [50]Field{
     Field{group: GROUP_METRICS, name: "corner", unit: UNIT_LENGTH, off: $offset_of(Theme, corner), count: 1, doc: "corner radius of controls and containers, 0 for square"},
     Field{group: GROUP_METRICS, name: "edge_w", unit: UNIT_LENGTH, off: $offset_of(Theme, edge_w), count: 1, doc: "width of an edge line: a dock's inner side, a chart's rules and a focused field's outline"},
     Field{group: GROUP_METRICS, name: "caret_w", unit: UNIT_LENGTH, off: $offset_of(Theme, caret_w), count: 1, doc: "width of a text field's caret"},
+    Field{group: GROUP_PALETTE, name: "focus", unit: UNIT_COLOR, off: $offset_of(Theme, focus), count: 1, doc: "the ring around the control the keyboard reached"},
+    Field{group: GROUP_METRICS, name: "focus_w", unit: UNIT_LENGTH, off: $offset_of(Theme, focus_w), count: 1, doc: "width of the focus ring"},
     Field{group: GROUP_PLOT, name: "series", unit: UNIT_COLOR, off: $offset_of(Theme, series), count: 8, doc: "chart series colors, series k drawing in series[k % 8]"},
     Field{group: GROUP_PLOT, name: "line_w", unit: UNIT_LENGTH, off: $offset_of(Theme, line_w), count: 1, doc: "width of a chart line"},
     Field{group: GROUP_PLOT, name: "tick", unit: UNIT_LENGTH, off: $offset_of(Theme, tick), count: 1, doc: "length of a chart axis tick"},
     Field{group: GROUP_PLOT, name: "area", unit: UNIT_FACTOR, off: $offset_of(Theme, area), count: 1, doc: "alpha factor of the area filled under a chart line, in [0, 1]"},
+    Field{group: GROUP_MOTION, name: "hover_time", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_time), count: 1, doc: "seconds a control's face takes to follow hover and press, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "hover_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, hover_ease), count: 1, doc: "the curve a hover or press transition eases by: 0 linear, 1 out, 2 in and out"},
+    Field{group: GROUP_MOTION, name: "open_time", unit: UNIT_FACTOR, off: $offset_of(Theme, open_time), count: 1, doc: "seconds a section takes to unfold or fold, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "open_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, open_ease), count: 1, doc: "the curve a section folds by: 0 linear, 1 out, 2 in and out"},
+    Field{group: GROUP_MOTION, name: "scroll_time", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_time), count: 1, doc: "seconds a scroll region takes to glide to a new offset, 0 for at once"},
+    Field{group: GROUP_MOTION, name: "scroll_ease", unit: UNIT_FACTOR, off: $offset_of(Theme, scroll_ease), count: 1, doc: "the curve a scroll glide eases by: 0 linear, 1 out, 2 in and out"},
     Field{group: GROUP_STYLE, name: "radius", unit: UNIT_QUAD, off: $offset_of(Style, radius), count: 1, doc: "corner radii: top-left, top-right, bottom-right, bottom-left"},
     Field{group: GROUP_STYLE, name: "pad", unit: UNIT_QUAD, off: $offset_of(Style, pad), count: 1, doc: "container padding between its edges and its content: left, top, right, bottom"},
     Field{group: GROUP_STYLE, name: "inset", unit: UNIT_QUAD, off: $offset_of(Style, inset), count: 1, doc: "control inset between its edges and its text: left, top, right, bottom"},
@@ -441,7 +491,7 @@ pub rec Name {
 }
 
 # every built-in kind, in handle order: the names and meanings init registers
-val KIND_INFO: [51]Name = [51]Name{
+val KIND_INFO: [52]Name = [52]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -492,7 +542,8 @@ val KIND_INFO: [51]Name = [51]Name{
     Name{name: "value", doc: "a value editor's drag cell: inset around its text and before its row's cells, min_w its least width"},
     Name{name: "picker", doc: "a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label"},
     Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"},
-    Name{name: "toast", doc: "a toast's card: pad around its text, margin between the stack and the surface's edges"}
+    Name{name: "toast", doc: "a toast's card: pad around its text, margin between the stack and the surface's edges"},
+    Name{name: "focus_ring", doc: "the ring around the control the keyboard reached: border and border_w its stroke, radius its corners"}
 };
 
 # every state, indexed by the state constants
@@ -721,6 +772,7 @@ fun group_named(seg: str, n: usize) opt[u8] {
     if (spells(seg, n, "palette")) { ret opt[u8].some{GROUP_PALETTE}; }
     if (spells(seg, n, "metrics")) { ret opt[u8].some{GROUP_METRICS}; }
     if (spells(seg, n, "plot"))    { ret opt[u8].some{GROUP_PLOT}; }
+    if (spells(seg, n, "motion"))  { ret opt[u8].some{GROUP_MOTION}; }
     ret opt[u8].none{};
 }
 
@@ -833,7 +885,7 @@ pub fun ref_at(p: Path, i: usize) Ref {
         elem = rest % f.count;
         rest = rest / f.count;
     }
-    if (f.group == GROUP_PALETTE || f.group == GROUP_METRICS || f.group == GROUP_PLOT) {
+    if (f.group == GROUP_PALETTE || f.group == GROUP_METRICS || f.group == GROUP_PLOT || f.group == GROUP_MOTION) {
         r.off = f.off + elem * unit_floats(f.unit) * 4;
         ret r;
     }
@@ -891,6 +943,7 @@ pub fun path_text(t: *Theme, p: Path, out: *u8, cap: usize) usize {
     if (f.group == GROUP_PALETTE) { j = put_seg(out, cap, j, "palette."); }
     or (f.group == GROUP_METRICS) { j = put_seg(out, cap, j, "metrics."); }
     or (f.group == GROUP_PLOT)    { j = put_seg(out, cap, j, "plot."); }
+    or (f.group == GROUP_MOTION)  { j = put_seg(out, cap, j, "motion."); }
     or {
         if (p.kind == ANY_KIND) { j = put_seg(out, cap, j, WILD); }
         or                      { j = put_seg(out, cap, j, t.names[p.kind]); }
@@ -1280,6 +1333,10 @@ fun builtin_style(t: *Theme, k: u32, s: *Style) {
             i                = i + 1;
         }
     }
+    or (k == FOCUS_RING) {
+        fill_all(s, clear());
+        outline_all(s, t.focus, t.focus_w);
+    }
     or (k == SCRIM) {
         square(s);
         fill_all(s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
@@ -1367,6 +1424,8 @@ fun default_tokens(t: *Theme) {
     t.corner      = 0.0::f32;
     t.edge_w      = 1.0::f32;
     t.caret_w     = 1.0::f32;
+    t.focus       = draw.rgba(0.40::f32, 0.65::f32, 1.0::f32, 1.0::f32);
+    t.focus_w     = 2.0::f32;
     t.series[0]   = draw.rgba(0.36::f32, 0.62::f32, 0.95::f32, 1.0::f32);
     t.series[1]   = draw.rgba(0.96::f32, 0.62::f32, 0.30::f32, 1.0::f32);
     t.series[2]   = draw.rgba(0.47::f32, 0.80::f32, 0.50::f32, 1.0::f32);
@@ -1378,6 +1437,41 @@ fun default_tokens(t: *Theme) {
     t.line_w      = 2.0::f32;
     t.tick        = 4.0::f32;
     t.area        = 0.25::f32;
+
+    t.hover_time  = 0.08::f32;
+    t.hover_ease  = ease.OUT::f32;
+    t.open_time   = 0.15::f32;
+    t.open_ease   = ease.IN_OUT::f32;
+    t.scroll_time = 0.12::f32;
+    t.scroll_ease = ease.OUT::f32;
+}
+
+# how a kind of motion moves under a theme: its motion fields read as a
+# duration and a curve, the one place they are read
+# ---
+# t:    the theme
+# kind: a MOTION_* kind
+# ret:  its duration, never below 0, and its curve, a zero duration for a
+#       kind out of range
+pub fun motion(t: *Theme, kind: usize) Motion {
+    var dur:   f32 = 0.0::f32;
+    var curve: f32 = 0.0::f32;
+    if (kind == MOTION_HOVER) {
+        dur   = t.hover_time;
+        curve = t.hover_ease;
+    }
+    or (kind == MOTION_OPEN) {
+        dur   = t.open_time;
+        curve = t.open_ease;
+    }
+    or (kind == MOTION_SCROLL) {
+        dur   = t.scroll_time;
+        curve = t.scroll_ease;
+    }
+    if (dur < 0.0::f32) { dur = 0.0::f32; }
+    var c: u8 = ease.LINEAR;
+    if (curve >= 0.5::f32 && curve < ease.COUNT::f32 - 0.5::f32) { c = (curve + 0.5::f32)::u8; }
+    ret Motion{dur: dur, curve: c};
 }
 
 # blit's own look: dark surfaces, square corners and 4 pixel spacing
@@ -2160,6 +2254,7 @@ pub fun save(w: *tw.Writer, t: *Theme) {
     save_group(w, t, GROUP_PALETTE, "palette");
     save_group(w, t, GROUP_METRICS, "metrics");
     save_group(w, t, GROUP_PLOT, "plot");
+    save_group(w, t, GROUP_MOTION, "motion");
     var k: u32 = 0;
     for (k < t.len) {
         var d: Style = built(t, k);
@@ -2195,6 +2290,7 @@ pub fun document(w: *tw.Writer, t: *Theme) {
         if (f.group == GROUP_PALETTE) { tw.put_text(w, "palette."); }
         or (f.group == GROUP_METRICS) { tw.put_text(w, "metrics."); }
         or (f.group == GROUP_PLOT)    { tw.put_text(w, "plot."); }
+        or (f.group == GROUP_MOTION)  { tw.put_text(w, "motion."); }
         or (f.group == GROUP_STYLE)   { tw.put_text(w, "<kind>."); }
         or                            { tw.put_text(w, "<kind>.<state>."); }
         tw.put_text(w, f.name);
@@ -2278,7 +2374,7 @@ test table__names_every_field_of_every_record {
     $each f in $fields(Theme) {
         if (f.offset < $offset_of(Theme, a)) {
             var ok: bool = has_row(GROUP_PALETTE, f.name, f.offset) || has_row(GROUP_METRICS, f.name, f.offset);
-            ok = ok || has_row(GROUP_PLOT, f.name, f.offset);
+            ok = ok || has_row(GROUP_PLOT, f.name, f.offset) || has_row(GROUP_MOTION, f.name, f.offset);
             if (!ok) { bad = 1; }
             rows = rows + 1;
         }
