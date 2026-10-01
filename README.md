@@ -295,9 +295,10 @@ rect for consumer-drawn affordances.
 ## Widget ids
 
 A widget's id is a 64-bit FNV-1a hash of its key folded into the seed of the
-current id scope, never its place in the call order. A widget drawn only some
-frames, a clipped row or a reordered window therefore moves no other widget's
-id, and the active drag, the focus holder and the open dropdown stay where they
+current id scope and finished with a 64-bit mixer, never its place in the call
+order. A widget drawn only some frames, a clipped row or a reordered window
+therefore moves no other widget's id, and the active drag, the focus holder and
+the open dropdown stay where they
 were. 0 is never an id: it means "no widget".
 
 - **Labels are keys.** A labelled widget (`button`, `checkbox`, `toggle`,

@@ -1,9 +1,9 @@
 # widget ids: hashed keys under a scope seed
 #
 # an id is the 64-bit FNV-1a hash of a key folded into the seed of the scope
-# it is made in, so it depends on what a widget is called and where, never on
-# how many widgets came before it. 0 is reserved for "no widget": a hash that
-# lands on it is moved to 1.
+# it is made in, finished with a 64-bit mixer, so it depends on what a widget
+# is called and where, never on how many widgets came before it. 0 is reserved
+# for "no widget": a hash that lands on it is moved to 1.
 #
 # a label is its own key, with two markers. text after "##" is hashed but not
 # drawn, so "Save##toolbar" shows "Save" and differs from another "Save". a
@@ -25,10 +25,20 @@ use fnv: std.crypto.hash.fnv1a;
 # the seed of the root scope
 pub val ROOT: u64 = fnv.FNV_OFFSET;
 
-# a hash moved off the reserved 0
-fun nonzero(h: u64) u64 {
-    if (h == 0) { ret 1; }
-    ret h;
+# a folded hash finished into an id: mixed (murmur3's fmix64) so the next
+# fold under it starts from a scrambled state, then moved off the reserved 0
+#
+# without the mix a scope and a key would hash as their concatenation, and
+# "x" then "ab" would equal "xa" then "b".
+fun finish(h: u64) u64 {
+    var x: u64 = h;
+    x = x ^ (x >> 33);
+    x = x * 0xff51afd7ed558ccd;
+    x = x ^ (x >> 33);
+    x = x * 0xc4ceb9fe1a85ec53;
+    x = x ^ (x >> 33);
+    if (x == 0) { ret 1; }
+    ret x;
 }
 
 # fold bytes [lo, hi) of s into h
@@ -61,8 +71,8 @@ fun find(s: str, n: usize, three: bool) usize {
 # s:    the key, nil for the empty key
 # ret:  a nonzero id
 pub fun of_str(seed: u64, s: str) u64 {
-    if (s == nil) { ret nonzero(seed); }
-    ret nonzero(fold(seed, s, 0, str_len(s)));
+    if (s == nil) { ret finish(seed); }
+    ret finish(fold(seed, s, 0, str_len(s)));
 }
 
 # the id of an integer key under a seed
@@ -77,7 +87,7 @@ pub fun of_int(seed: u64, n: u64) u64 {
         x = fnv.step_u8(x, ((n >> (k * 8)) & 0xFF)::u8);
         k = k + 1;
     }
-    ret nonzero(x);
+    ret finish(x);
 }
 
 # the id of a label under a seed, keyed by the text from "###" on when it holds
@@ -87,11 +97,11 @@ pub fun of_int(seed: u64, n: u64) u64 {
 # label: the label, nil for the empty key
 # ret:   a nonzero id
 pub fun of_label(seed: u64, label: str) u64 {
-    if (label == nil) { ret nonzero(seed); }
+    if (label == nil) { ret finish(seed); }
     val n:  usize = str_len(label);
     val at: usize = find(label, n, true);
-    if (at < n) { ret nonzero(fold(seed, label, at, n)); }
-    ret nonzero(fold(seed, label, 0, n));
+    if (at < n) { ret finish(fold(seed, label, at, n)); }
+    ret finish(fold(seed, label, 0, n));
 }
 
 # how many leading bytes of a label are drawn: all of it up to the first "##"
@@ -138,5 +148,10 @@ test id__labels_key_and_show {
     val w: u64 = of_label(ROOT, "w");
     if (child(w, "#thumb") == w || child_int(w, 0) == child_int(w, 1)) { ret 10; }
     if (of_int(ROOT, 7) == 0 || of_str(ROOT, nil) == 0)                { ret 11; }
+    # a scope and a key never hash as their concatenation
+    if (of_str(of_str(ROOT, "x"), "ab") == of_str(of_str(ROOT, "xa"), "b"))         { ret 12; }
+    if (of_label(of_label(ROOT, "x"), "ab") == of_label(of_label(ROOT, "xa"), "b")) { ret 13; }
+    if (child(of_label(ROOT, "x"), "ab") == child(of_label(ROOT, "xa"), "b"))       { ret 14; }
+    if (of_str(ROOT, nil) == ROOT)                                                  { ret 15; }
     ret 0;
 }
