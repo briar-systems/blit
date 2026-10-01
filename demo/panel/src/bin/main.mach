@@ -219,10 +219,11 @@ fun layers(ctx: *blit.context.Context, p: *Panel) {
     var i:  u64 = 0;
     for (i < 4) {
         val name: str               = p.order[i];
-        val x0:   f32               = ctx.cx;
-        val y0:   f32               = ctx.cy;
-        val x1:   f32               = ctx.cx + ctx.pw;
-        val y1:   f32               = ctx.cy + h;
+        val r:    blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
+        val x0:   f32               = r.x0;
+        val y0:   f32               = r.y0;
+        val x1:   f32               = r.x1;
+        val y1:   f32               = r.y1;
         val hit:  blit.interact.Hit = blit.interact.hit(ctx, blit.context.id_of(ctx, name), x0, y0, x1, y1, blit.input.BUTTON_LEFT);
         var bg:   blit.draw.Color   = ctx.theme.control;
         if (hit.hot) { bg = ctx.theme.control_hot; }
@@ -238,7 +239,6 @@ fun layers(ctx: *blit.context.Context, p: *Panel) {
         }
         val drop: blit.dnd.Drop = blit.dnd.target(ctx, hit, "layer", x0, y0, x1, y1);
         if (drop.dropped && drop.n == $size_of(u64)) { reorder(p, (@(drop.data::*u64))::usize, i::usize); }
-        blit.widget.advance(ctx, h);
         i = i + 1;
     }
 }

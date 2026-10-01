@@ -40,6 +40,7 @@ use blit.draw;
 use blit.driver;
 use blit.input;
 use blit.interact;
+use blit.layout;
 use blit.payload;
 use blit_widget: blit.widget;
 
@@ -302,12 +303,12 @@ rec Pair {
 # a row in the current window, claimed for the left button
 #[testing]
 fun row(ctx: *context.Context, key: str, x0: *f32, y0: *f32, x1: *f32, y1: *f32) interact.Hit {
-    @x0 = ctx.cx;
-    @y0 = ctx.cy;
-    @x1 = ctx.cx + ctx.pw;
-    @y1 = ctx.cy + 20.0::f32;
+    val r: context.Area = blit_widget.place(ctx, layout.fill(1.0::f32), layout.fixed(20.0::f32), 0.0::f32, 20.0::f32);
+    @x0 = r.x0;
+    @y0 = r.y0;
+    @x1 = r.x1;
+    @y1 = r.y1;
     val h: interact.Hit = interact.hit(ctx, context.id_of(ctx, key), @x0, @y0, @x1, @y1, input.BUTTON_LEFT);
-    blit_widget.advance(ctx, 20.0::f32);
     ret h;
 }
 
