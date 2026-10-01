@@ -53,7 +53,7 @@ rec Panel {
     trails:     u8;
     size:       usize;
     help:       u8;
-    files:      blit.widget.List;
+    files:      blit.list.List;
     query:      str;
 }
 
@@ -184,7 +184,9 @@ fun files(ctx: *blit.context.Context, p: *Panel) {
     names[3] = "r-pentomino";
     names[4] = "garden of eden";
     names[5] = "spaceship";
-    blit.widget.list(ctx, "files", ?p.files, ?names[0], 6, p.query, blit.context.px(ctx, 80.0::f32));
+    var listed: blit.list.Rows = blit.list.rows(?names[0], 6);
+    listed.query = p.query;
+    blit.list.show(ctx, "files", ?p.files, listed, blit.context.px(ctx, 80.0::f32));
     blit.widget.space(ctx, blit.context.px(ctx, 4.0::f32));
     blit.widget.button(ctx, "Screenshot");
 }

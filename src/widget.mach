@@ -1,6 +1,6 @@
 # the widgets: panel, window, popup, dock, scroll region, section, text, note,
 # button, button rows and grids, segmented choice, checkbox, toggle, slider,
-# dropdown, list, image, grid, text field
+# dropdown, image, grid, text field
 #
 # the layout helpers place rows by hand: space and advance move the cursor
 # down, cell_x0 and cell_x1 split the column into equal cells for widgets that
@@ -99,6 +99,12 @@ pub fun text_row_height(ctx: *context.Context) f32 {
 # vertical space consumed by one control row, including the following gap
 pub fun control_row_height(ctx: *context.Context) f32 {
     ret row_h(ctx) + gap(ctx);
+}
+
+# height of a control row without the gap below it: the theme's row height,
+# grown to fit a line of text with padding above and below
+pub fun control_height(ctx: *context.Context) f32 {
+    ret row_h(ctx);
 }
 
 # spacing between adjacent layout rows, at the context's theme and scale
@@ -1612,90 +1618,6 @@ pub fun end_dock(ctx: *context.Context, d: *Dock, r: DockArea) {
     ctx.pw = r.pw;
 }
 
-# consumer-owned state of a list, kept across frames
-# ---
-# selected: index of the selected item, at least the item count for none
-# scroll:   the list's scroll state
-pub rec List {
-    selected: usize;
-    scroll:   Scroll;
-}
-
-# an ascii letter folded to lower case, any other byte unchanged
-fun fold(b: u8) u8 {
-    if (b >= 'A' && b <= 'Z') { ret b + 32; }
-    ret b;
-}
-
-# whether s holds query, ignoring ascii case; an empty or nil query matches all
-fun matches(s: str, query: str) bool {
-    if (query == nil || query[0] == 0) { ret true; }
-    if (s == nil)                      { ret false; }
-    var i: usize = 0;
-    for (s[i] != 0) {
-        var j: usize = 0;
-        for (query[j] != 0 && s[i + j] != 0 && fold(s[i + j]) == fold(query[j])) { j = j + 1; }
-        if (query[j] == 0) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-# a scrolling list of items, h pixels tall, one of which can be selected
-#
-# only the items holding query (ignoring ascii case) are shown, so a search
-# box the caller keeps narrows the list. clicking a shown item selects it and
-# the selected one is drawn in the accent. the list scrolls by the wheel and a
-# scrollbar like any scroll region. an item's id is its index under the
-# list's, so an item keeps its hit identity as the query changes. items
-# scrolled out of view are skipped rather than emitted.
-# ---
-# ctx:   context
-# key:   the list's key in the current id scope
-# l:     the list's state
-# items: pointer to an array of count item strings (pass ?items[0])
-# count: number of items
-# query: text an item must hold to be shown, nil or empty for all
-# h:     list height in pixels
-# ret:   true if the selection changed this frame
-pub fun list(ctx: *context.Context, key: str, l: *List, items: *str, count: usize, query: str, h: f32) bool {
-    val r:       ScrollArea = begin_scroll(ctx, key, ?l.scroll, h);
-    val rh:      f32        = row_h(ctx);
-    val top:     f32        = l.scroll.offset;
-    var changed: bool       = false;
-    var i:       usize      = 0;
-    for (i < count) {
-        val id: u64 = bid.child_int(r.id, i::u64);
-        if (matches(items[i], query)) {
-            val x0: f32 = ctx.cx;
-            val y0: f32 = ctx.cy;
-            val x1: f32 = ctx.cx + ctx.pw;
-            val y1: f32 = y0 + rh;
-            if (y1 > top && y0 < top + r.h) {
-                val hi: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
-                if (hi.clicked && l.selected != i) {
-                    l.selected = i;
-                    changed    = true;
-                }
-
-                var ink: draw.Color = ctx.theme.text;
-                if (l.selected == i) {
-                    face(ctx, x0, y0, x1, y1, ctx.theme.accent);
-                    ink = ctx.theme.accent_text;
-                }
-                or (hi.active) { face(ctx, x0, y0, x1, y1, ctx.theme.control_on); }
-                or (hi.hot)    { face(ctx, x0, y0, x1, y1, ctx.theme.control_hot); }
-                val ty: f32 = y0 + (rh - context.line_height(ctx)) / 2.0::f32;
-                context.text_at(ctx, items[i], x0 + pad(ctx), ty, ink);
-            }
-            advance(ctx, rh);
-        }
-        i = i + 1;
-    }
-    end_scroll(ctx, ?l.scroll, r);
-    ret changed;
-}
-
 # one frame's input with the cursor at (mx, my) and the button in state down
 #[testing]
 fun input_at(mx: f32, my: f32, down: u8) input.Input {
@@ -3041,76 +2963,6 @@ test buttons__rows_and_grids_report_the_index {
     frame_grid(?ctx, input_at(20.0::f32, 65.0::f32, 0), ?row, ?grid);
     if (row != 2 || grid != 4)         { ret 4; }
     if (context.collisions(?ctx) != 0) { ret 5; }
-
-    val freed: err[allo.Error] = context.free(?ctx);
-    if (sel freed.err) { ret 1; }
-    ret 0;
-}
-
-# a frame holding a right dock with a 100 pixel list of 20 items
-#[testing]
-fun frame_list(ctx: *context.Context, in: input.Input, d: *Dock, l: *List, items: *str, query: str) bool {
-    context.begin(ctx, in, 200.0::f32, 200.0::f32);
-    val da:      DockArea = begin_dock(ctx, "dock", d);
-    val changed: bool     = list(ctx, "list", l, items, 20, query, 100.0::f32);
-    end_dock(ctx, d, da);
-    context.end(ctx);
-    ret changed;
-}
-
-test list__selects_scrolls_and_searches_in_a_dock {
-    var a:    allo.Allocator;
-    val made: err[allo.Error] = page.make(?a);
-    if (sel made.err) { ret 1; }
-    var ctx: context.Context;
-    val ie:  err[allo.Error] = context.init(?ctx, ?a);
-    if (sel ie.err) { ret 1; }
-
-    var items: [20]str;
-    var k:     usize = 0;
-    for (k < 20) {
-        items[k] = "item";
-        k        = k + 1;
-    }
-    items[0] = "apple";
-    items[1] = "banana";
-    items[2] = "cherry";
-    items[3] = "Date";
-
-    # the dock spans x [100, 200) and its body starts at (104, 4), where the
-    # list's rows are 16 tall at a 20 pixel pitch
-    var d: Dock;
-    d.side = context.Side.right{};
-    d.size = 100.0::f32;
-    var l: List;
-    l.selected = 20;
-
-    # hover, press and release the second row
-    frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 0), ?d, ?l, ?items[0], nil);
-    if (l.scroll.content != 400.0::f32)                                                        { ret 2; }
-    if (frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 1), ?d, ?l, ?items[0], nil) != false) { ret 3; }
-    if (frame_list(?ctx, input_at(120.0::f32, 32.0::f32, 0), ?d, ?l, ?items[0], nil) != true)  { ret 4; }
-    if (l.selected != 1)                                                                       { ret 5; }
-
-    # the wheel scrolls the list, not the dock around it, and the rows follow
-    var in: input.Input = input_at(120.0::f32, 32.0::f32, 0);
-    in.wheel = -40.0::f32;
-    frame_list(?ctx, in, ?d, ?l, ?items[0], nil);
-    if (l.scroll.offset != 40.0::f32 || d.scroll.offset != 0.0::f32) { ret 6; }
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], nil);
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 1), ?d, ?l, ?items[0], nil);
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], nil);
-    if (l.selected != 2) { ret 7; }
-
-    # a query shows only the items holding it, ignoring case, and an item's id
-    # is its index, so it is the same item. the list scrolls back as its content shrinks, so the match
-    # claims its row from the next frame
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT");
-    if (l.scroll.content != 20.0::f32 || l.scroll.offset != 0.0::f32) { ret 8; }
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT");
-    frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 1), ?d, ?l, ?items[0], "dAT");
-    if (frame_list(?ctx, input_at(120.0::f32, 12.0::f32, 0), ?d, ?l, ?items[0], "dAT") != true) { ret 10; }
-    if (l.selected != 3)                                                                        { ret 11; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
