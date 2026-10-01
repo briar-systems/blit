@@ -330,11 +330,10 @@ pub fun text(ctx: *context.Context, s: str) {
 # ---
 # ret: the byte the line ends at, with @resume set to where the next line starts
 fun wrap_line(ctx: *context.Context, s: str, n: usize, i: usize, w: f32, resume: *usize) usize {
-    val f:     *font.Font = context.font_of(ctx);
-    var width: f32        = 0.0::f32;
-    var prev:  u32        = 0;
-    var space: usize      = n;
-    var j:     usize      = i;
+    var width: f32   = 0.0::f32;
+    var prev:  u32   = 0;
+    var space: usize = n;
+    var j:     usize = i;
     for (j < n) {
         var cp:   u32   = 0;
         val used: usize = font.next(s, j, n, ?cp);
@@ -342,7 +341,7 @@ fun wrap_line(ctx: *context.Context, s: str, n: usize, i: usize, w: f32, resume:
             @resume = j + used;
             ret j;
         }
-        val adv: f32 = font.advance(f, prev, cp, ctx.scale);
+        val adv: f32 = context.glyph_advance(ctx, prev, cp);
         if (width + adv > w && j > i) {
             if (cp == ' ') {
                 @resume = j + used;
@@ -842,19 +841,10 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     ret changed;
 }
 
-# width of the field's bytes [lo, hi) laid out on one line at the context's scale
+# width of the field's bytes [lo, hi) laid out on one line in the current style
 fun span(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
-    val fnt:  *font.Font = context.font_of(ctx);
-    var w:    f32        = 0.0::f32;
-    var prev: u32        = 0;
-    var i:    usize      = lo;
-    for (i < hi) {
-        var cp: u32 = 0;
-        i    = i + font.next(f.buf, i, hi, ?cp);
-        w    = w + font.advance(fnt, prev, cp, ctx.scale);
-        prev = cp;
-    }
-    ret w;
+    if (hi <= lo) { ret 0.0::f32; }
+    ret context.text_width_n(ctx, ?f.buf[lo], hi - lo);
 }
 
 # scroll the field's shown text so the caret is in view in w pixels, showing
