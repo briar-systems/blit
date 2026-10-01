@@ -62,6 +62,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -76,6 +77,7 @@ use bid: blit.id;
 use blit.input;
 use blit.interact;
 use blit.layout;
+use blit.overlay;
 use blit.state;
 use blit.tabs;
 use blit.theme;
@@ -2336,6 +2338,96 @@ test scroll__wheel_stops_at_the_band_a_popup_opens {
     driver.scroll(?d, pick, 0.0::f32, -30.0::f32);
     driver.step(?d);
     if (w.side.scroll.offset != 30.0::f32) { ret 8; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# what the flow probe lays out: a docked window, a floating one and an
+# overlay, each holding the same flow, and the rects its items took in each
+#[testing]
+rec Flows {
+    wins: [2]widget.Window;
+    r:    [3][3]context.Area;
+}
+
+# a label wider than any row of the probe's flows
+#[testing]
+val LONG: str = "a label far too long to fit in any row of this flow";
+
+# a flow at most 100 wide, centered in its rows: two items sharing a row, a
+# button wider than a whole row, and an item after it
+#[testing]
+fun flow_of(ctx: *context.Context, r: *context.Area) {
+    var s: layout.Flow = widget.flow(ctx);
+    s.align = layout.Align.center{};
+    widget.size_next(ctx, layout.limit(layout.fit(), 0.0::f32, 100.0::f32), layout.auto());
+    widget.begin_flow(ctx, "flow", s);
+    r[0] = widget.place(ctx, layout.fit(), layout.fit(), 60.0::f32, 10.0::f32);
+    r[1] = widget.place(ctx, layout.fit(), layout.fit(), 30.0::f32, 20.0::f32);
+    widget.size_next(ctx, layout.fit(), layout.auto());
+    widget.button(ctx, LONG);
+    r[2] = widget.place(ctx, layout.fit(), layout.fit(), 20.0::f32, 10.0::f32);
+    widget.end_flow(ctx);
+}
+
+#[testing]
+fun flows_ui(ctx: *context.Context, user: ptr) {
+    val fl:  *Flows = user::*Flows;
+    val sid: u64    = context.id_of(ctx, "main");
+    if (empty(ctx, sid)) { add(ctx, root(ctx, sid), context.id_of(ctx, "A")); }
+    space(ctx, "main", context.Area{x0: 0.0::f32, y0: 0.0::f32, x1: 200.0::f32, y1: 300.0::f32});
+    var i: usize = 0;
+    for (i < 2) {
+        val w: widget.WindowArea = widget.begin_window(ctx, fl.wins[i]);
+        if (w.body != 0) { flow_of(ctx, ?fl.r[i][0]); }
+        widget.end_window(ctx, w);
+        i = i + 1;
+    }
+    var o:  overlay.Overlay = overlay.on_surface(overlay.BOTTOM_RIGHT);
+    val sh: overlay.Shown   = overlay.begin(ctx, "hud", o);
+    flow_of(ctx, ?fl.r[2][0]);
+    overlay.end(ctx, sh);
+}
+
+test flow__wraps_alike_in_a_docked_window_a_window_and_an_overlay {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var fl: Flows;
+    fl.wins[0] = widget.window("A", 0.0::f32, 0.0::f32, 160.0::f32, 160.0::f32);
+    fl.wins[1] = widget.window("B", 220.0::f32, 20.0::f32, 160.0::f32, 160.0::f32);
+    var d: driver.Driver;
+    val e: err[allo.Error] = driver.init(?d, ?al, 600.0::f32, 400.0::f32, flows_ui, (?fl)::ptr);
+    if (sel e.err) { ret 1; }
+    driver.step(?d);
+    driver.settle(?d);
+    if (node_of(?d.ctx, win(?d, "A")) == 0 || node_of(?d.ctx, win(?d, "B")) != 0) { ret 2; }
+
+    val g:     f32    = context.px(?d.ctx, context.look_of(?d.ctx, theme.LAYOUT).margin.r);
+    val rg:    f32    = context.px(?d.ctx, context.look_of(?d.ctx, theme.LAYOUT).margin.b);
+    val paths: [3]str = [3]str{"A", "B", "hud"};
+    var i:     usize  = 0;
+    for (i < 3) {
+        val r: *context.Area = ?fl.r[i][0];
+        val x: f32           = r[0].x0;
+        val y: f32           = r[1].y0;
+        # the first row is as tall as its taller item, the shorter centered in it
+        if (r[0].y0 != y + 5.0::f32 || r[1].x0 != x + 60.0::f32 + g) { ret 3; }
+        if (r[2].x0 != x)                                            { ret 4; }
+        # the button took the second row alone, cut to the flow's 100 pixels,
+        # and the last item the third row
+        val b:  u64               = bid.of_label(driver.find(?d, paths[i]), LONG);
+        val br: opt[context.Area] = driver.rect(?d, b);
+        if (sel br.none) { ret 5; }
+        val bh: f32 = br.some.y1 - br.some.y0;
+        if (br.some.x1 - br.some.x0 != 100.0::f32)   { ret 6; }
+        if (r[2].y0 != y + 20.0::f32 + rg + bh + rg) { ret 7; }
+        val shown: str = driver.text_of(?d, b);
+        if (str_len(shown) == 0 || str_len(shown) >= str_len(LONG)) { ret 8; }
+        i = i + 1;
+    }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
