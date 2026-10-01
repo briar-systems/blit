@@ -214,6 +214,27 @@ test hit__press_drag_release_and_click {
     ret 0;
 }
 
+test hit__no_clock_no_double_click {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    val L: u8 = input.BUTTON_LEFT;
+
+    frame(?ctx, at(5.0::f32, 5.0::f32, 0, 0.0::f64), L);
+    val a1: Hit = frame(?ctx, at(5.0::f32, 5.0::f32, L, 0.0::f64), L);
+    if (!a1.pressed || a1.clicks != 1) { ret 2; }
+    frame(?ctx, at(5.0::f32, 5.0::f32, 0, 0.0::f64), L);
+    val a2: Hit = frame(?ctx, at(5.0::f32, 5.0::f32, L, 0.0::f64), L);
+    if (a2.double || a2.clicks != 1) { ret 3; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test hit__double_click_within_time_and_distance {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);

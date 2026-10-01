@@ -11,7 +11,8 @@
 # text can change without changing the id: "Frames: 12###fps" and
 # "Frames: 13###fps" are one widget. parts of a widget (a scrollbar thumb, a
 # popup's outside claim) are children of its id under a fixed suffix or an
-# index.
+# index. a label path ("Settings/Audio/volume") folds its labels in as nested
+# scopes, naming a widget the way the containers around it scope it.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -90,6 +91,13 @@ pub fun of_int(seed: u64, n: u64) u64 {
     ret finish(x);
 }
 
+# the id of bytes [lo, hi) of s taken as a label under a seed
+fun label_range(seed: u64, s: str, lo: usize, hi: usize) u64 {
+    val at: usize = find((?s[lo])::str, hi - lo, true);
+    if (at < hi - lo) { ret finish(fold(seed, s, lo + at, hi)); }
+    ret finish(fold(seed, s, lo, hi));
+}
+
 # the id of a label under a seed, keyed by the text from "###" on when it holds
 # one, else by the whole label
 # ---
@@ -98,10 +106,32 @@ pub fun of_int(seed: u64, n: u64) u64 {
 # ret:   a nonzero id
 pub fun of_label(seed: u64, label: str) u64 {
     if (label == nil) { ret finish(seed); }
-    val n:  usize = str_len(label);
-    val at: usize = find(label, n, true);
-    if (at < n) { ret finish(fold(seed, label, at, n)); }
-    ret finish(fold(seed, label, 0, n));
+    ret label_range(seed, label, 0, str_len(label));
+}
+
+# the id a "/"-separated label path names under a seed
+#
+# each segment but the last is a scope a container opened under its label,
+# and the last is the widget's label, so "Settings/Audio/volume" is the
+# "volume" widget inside "Audio" inside "Settings". every segment is keyed as
+# a label, markers included. a key holding "/" cannot be named by a path.
+# ---
+# seed: the scope's seed
+# path: the label path, nil for the empty key
+# ret:  a nonzero id
+pub fun of_path(seed: u64, path: str) u64 {
+    if (path == nil) { ret finish(seed); }
+    val n:  usize = str_len(path);
+    var h:  u64   = seed;
+    var lo: usize = 0;
+    for {
+        var hi: usize = lo;
+        for (hi < n && path[hi] != '/') { hi = hi + 1; }
+        h = label_range(h, path, lo, hi);
+        if (hi >= n) { brk; }
+        lo = hi + 1;
+    }
+    ret h;
 }
 
 # how many leading bytes of a label are drawn: all of it up to the first "##"
@@ -153,5 +183,10 @@ test id__labels_key_and_show {
     if (of_label(of_label(ROOT, "x"), "ab") == of_label(of_label(ROOT, "xa"), "b")) { ret 13; }
     if (child(of_label(ROOT, "x"), "ab") == child(of_label(ROOT, "xa"), "b"))       { ret 14; }
     if (of_str(ROOT, nil) == ROOT)                                                  { ret 15; }
+    # a path is its labels nested as scopes
+    val path: u64 = of_label(of_label(of_label(ROOT, "Settings"), "Audio##x"), "volume");
+    if (of_path(ROOT, "Settings/Audio##x/volume") != path)      { ret 16; }
+    if (of_path(ROOT, "a###k/ok") != of_path(ROOT, "b###k/ok")) { ret 17; }
+    if (of_path(ROOT, "ok") != of_label(ROOT, "ok"))            { ret 18; }
     ret 0;
 }
