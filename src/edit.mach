@@ -1,0 +1,323 @@
+# what the text widgets share between the frame's input and a blit.field.Field
+#
+# the keyboard: event hands one keyboard event to a field, with shortcut C, X
+# and V going through the context's clipboard hand-off, and feed hands it the
+# whole frame. the pointer: press places the caret for a run of clicks (see
+# blit.interact.Hit.clicks), a word for a double click and a line for a
+# triple, and drag extends the selection by the same unit. the caret: touch
+# restarts its blink and caret_on says whether it shows, asking the host for
+# a frame when it next turns (see context.wake_at). a host whose input.time
+# stays 0 gets a steady caret. text: width and draw_text measure and draw a
+# field's bytes, hidden behind MASK_GLYPH in a MASKED field.
+#
+# the per-widget state behind drag and blink lives in the context's state
+# store under the widget's id (see blit.state).
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use blit.context;
+use blit.draw;
+use blit.field;
+use blit.input;
+use blit.state;
+
+# seconds the caret shows, then hides, while it blinks
+pub val BLINK: f64 = 0.53;
+
+# the glyph a MASKED field draws for each of its characters
+pub val MASK_GLYPH: u8 = '*';
+
+# what a text widget keeps between frames
+# ---
+# t:   input.time of the last press
+# x:   pointer x of the first press of the run, in screen pixels
+# y:   pointer y of the first press of the run, in screen pixels
+# n:   presses in the current run, 1 to 3
+# lo:  the selection the run's last press made, for dragging by words or lines
+# hi:  its end
+# act: input.time of the last press or keyboard event, which restarts the blink
+pub rec Pointer {
+    t:   f64;
+    x:   f32;
+    y:   f32;
+    n:   u8;
+    lo:  usize;
+    hi:  usize;
+    act: f64;
+}
+
+# the state a text widget keeps under its id
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: its state, valid until end
+pub fun pointer(ctx: *context.Context, id: u64) *Pointer {
+    ret state.get[Pointer](ctx, id);
+}
+
+# place a field's caret for a press that is the clicks-th of a run
+#
+# one click puts the caret there, or extends the selection to it with shift
+# held. two select the word and three the line, and a fourth starts over.
+# the selection is kept for drag to extend by the same unit.
+# ---
+# ctx:    context
+# id:     the pressed widget's id
+# f:      the field
+# at:     byte offset under the pointer
+# clicks: the press's place in its run of clicks, from interact.Hit.clicks
+pub fun press(ctx: *context.Context, id: u64, f: *field.Field, at: usize, clicks: u32) {
+    var n: u8 = 1;
+    if (clicks > 0)                           { n = ((clicks - 1) % 3 + 1)::u8; }
+    if (n == 2)                               { field.select_word(f, at); }
+    or (n == 3)                               { field.select_line(f, at); }
+    or ((ctx.in.mods & input.MOD_SHIFT) != 0) { field.place(f, at, f.anchor); }
+    or                                        { field.place(f, at, at); }
+    val p: *Pointer = pointer(ctx, id);
+    p.n   = n;
+    p.lo  = field.sel_lo(f);
+    p.hi  = field.sel_hi(f);
+    p.act = ctx.in.time;
+}
+
+# extend a field's selection to byte offset at while the button that pressed
+# it is held
+#
+# after a single click the caret follows the pointer. after a double or triple
+# click the selection grows by whole words or lines from the one the press
+# made.
+# ---
+# ctx: context
+# id:  the widget's id
+# f:   the field
+# at:  byte offset under the pointer
+pub fun drag(ctx: *context.Context, id: u64, f: *field.Field, at: usize) {
+    val p: *Pointer = pointer(ctx, id);
+    p.act = ctx.in.time;
+    if (p.n < 2) {
+        field.place(f, at, f.anchor);
+        ret;
+    }
+    if (p.n == 2) { field.select_word(f, at); }
+    or            { field.select_line(f, at); }
+    val lo: usize = field.sel_lo(f);
+    val hi: usize = field.sel_hi(f);
+    if (lo < p.lo) { field.place(f, lo, p.hi); }
+    or {
+        var end: usize = hi;
+        if (end < p.hi) { end = p.hi; }
+        field.place(f, end, p.lo);
+    }
+}
+
+# restart the caret's blink, shown, for a widget that just took input
+# ---
+# ctx: context
+# id:  the widget's id
+pub fun touch(ctx: *context.Context, id: u64) {
+    pointer(ctx, id).act = ctx.in.time;
+}
+
+# whether a widget's caret shows this frame
+#
+# it shows for BLINK seconds after the last touch, hides for as long, and so
+# on, and the context is asked for a frame when it next turns.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: true while the caret shows
+pub fun caret_on(ctx: *context.Context, id: u64) bool {
+    val now: f64 = ctx.in.time;
+    if (now <= 0.0::f64) { ret true; }
+    val p: *Pointer = pointer(ctx, id);
+    if (now < p.act) { p.act = now; }
+    val k: u64 = ((now - p.act) / BLINK)::u64;
+    context.wake_at(ctx, p.act + (k + 1)::f64 * BLINK);
+    ret (k & 1) == 0;
+}
+
+# hand one keyboard event to a focused field
+#
+# typed text goes in at the caret, shortcut C and X copy and cut the selection
+# to the clipboard hand-off (never from a MASKED field), shortcut V asks for
+# the clipboard, and other keys go to field.key. enter or escape ending the
+# edit give the keyboard back.
+# ---
+# ctx: context
+# f:   the field holding the keyboard
+# e:   the event
+# ret: the outcome bits it came to
+pub fun event(ctx: *context.Context, f: *field.Field, e: input.Event) u8 {
+    if (sel e.text) {
+        if (field.insert(f, e.text)) { ret field.EDITED; }
+        ret 0;
+    }
+    if (!sel e.key) { ret 0; }
+    val k:   input.Key = e.key;
+    val cmd: bool      = input.shortcut(k.mods);
+    if (cmd && (k.code == 'C' || k.code == 'X')) {
+        if (field.selected(f) && !field.has(f, field.MASKED)) {
+            val lo: usize = field.sel_lo(f);
+            context.set_copied(ctx, ?f.buf[lo], field.sel_hi(f) - lo);
+            if (k.code == 'X' && field.erase(f)) { ret field.EDITED; }
+        }
+        ret 0;
+    }
+    if (cmd && k.code == 'V') {
+        if (!field.has(f, field.READ_ONLY)) { context.request_paste(ctx); }
+        ret 0;
+    }
+    val r: u8 = field.key(f, k);
+    if ((r & (field.ENTERED | field.ESCAPED)) != 0) { context.unfocus(ctx); }
+    ret r;
+}
+
+# hand the frame's paste and keyboard events, in order, to a focused field
+#
+# events after one that ends the edit are left alone. any input restarts the
+# caret's blink.
+# ---
+# ctx: context
+# id:  the field's widget id
+# f:   the field holding the keyboard
+# ret: the outcome bits the frame came to
+pub fun feed(ctx: *context.Context, id: u64, f: *field.Field) u8 {
+    var out: u8 = 0;
+    if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val r: u8 = event(ctx, f, ctx.in.events.data[i]);
+        i   = i + 1;
+        out = out | r;
+        if ((r & (field.ENTERED | field.ESCAPED)) != 0) { brk; }
+    }
+    if (ctx.in.events.len > 0 || ctx.in.paste != nil) { touch(ctx, id); }
+    ret out;
+}
+
+# width of the field's bytes [lo, hi) laid out on one line in the current
+# style, as MASK_GLYPHs in a MASKED field
+# ---
+# ctx: context
+# f:   the field
+# lo:  first byte, on a boundary
+# hi:  end byte, on a boundary
+# ret: width in pixels
+pub fun width(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
+    if (hi <= lo) { ret 0.0::f32; }
+    if (field.has(f, field.MASKED)) {
+        ret context.glyph_advance(ctx, 0, MASK_GLYPH::u32) * utf8.count(?f.buf[lo], hi - lo)::f32;
+    }
+    ret context.text_width_n(ctx, ?f.buf[lo], hi - lo);
+}
+
+# draw the field's bytes [lo, hi) on one line with its top-left at (x, y), as
+# MASK_GLYPHs in a MASKED field
+# ---
+# ctx: context
+# f:   the field
+# lo:  first byte, on a boundary
+# hi:  end byte, on a boundary
+# x:   left x in pixels
+# y:   top y in pixels
+# c:   tint color
+pub fun draw_text(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize, x: f32, y: f32, c: draw.Color) {
+    if (hi <= lo) { ret; }
+    if (!field.has(f, field.MASKED)) {
+        context.text_span(ctx, ?f.buf[lo], hi - lo, x, y, c);
+        ret;
+    }
+    var stars: [32]u8;
+    var i:     usize = 0;
+    for (i < 32) {
+        stars[i] = MASK_GLYPH;
+        i        = i + 1;
+    }
+    val step: f32   = context.glyph_advance(ctx, 0, MASK_GLYPH::u32);
+    var left: usize = utf8.count(?f.buf[lo], hi - lo);
+    var at:   f32   = x;
+    for (left > 0) {
+        var n: usize = left;
+        if (n > 32) { n = 32; }
+        context.text_span(ctx, ?stars[0], n, at, y, c);
+        at   = at + step * n::f32;
+        left = left - n;
+    }
+}
+
+# write n in decimal at out[at], returning the offset past it
+fun put_num(out: *u8, at: usize, n: usize) usize {
+    var digits: [20]u8;
+    var k:      usize = 0;
+    var v:      usize = n;
+    for {
+        digits[k] = '0' + (v % 10)::u8;
+        k         = k + 1;
+        v         = v / 10;
+        if (v == 0) { brk; }
+    }
+    var i: usize = at;
+    for (k > 0) {
+        k      = k - 1;
+        out[i] = digits[k];
+        i      = i + 1;
+    }
+    ret i;
+}
+
+# the field's length for a COUNT field, "chars/max" or "chars" without a max
+# ---
+# f:   the field
+# out: room for at least 42 bytes, which receives the NUL-terminated text
+# ret: out
+pub fun count_text(f: *field.Field, out: *u8) str {
+    var i: usize = put_num(out, 0, f.chars);
+    if (f.max != 0) {
+        out[i] = '/';
+        i      = put_num(out, i + 1, f.max);
+    }
+    out[i] = 0;
+    ret out;
+}
+
+test edit__blinks_and_counts {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var in: input.Input;
+    in.present = 1;
+    in.mx      = 10.0::f32;
+    in.my      = 10.0::f32;
+    in.time    = 1.0::f64;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    # the caret shows, hides and asks for a frame when it turns
+    touch(?ctx, 7);
+    if (!caret_on(?ctx, 7)) { ret 8; }
+    ctx.in.time = 1.0::f64 + BLINK + 0.01::f64;
+    if (caret_on(?ctx, 7)) { ret 9; }
+    context.end(?ctx);
+
+    var out: [42]u8;
+    var buf: [16]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 16, 120, nil);
+    field.set(?f, "abc\xC3\xA9");
+    if (!str_equals(count_text(?f, ?out[0]), "4/120")) { ret 10; }
+    f.max = 0;
+    if (!str_equals(count_text(?f, ?out[0]), "4")) { ret 11; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

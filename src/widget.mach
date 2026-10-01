@@ -57,6 +57,7 @@ use std.types.string.str_len;
 use blit.context;
 use blit.draw;
 use blit.driver;
+use blit.edit;
 use blit.field;
 use blit.font;
 use gly: blit.glyph;
@@ -895,7 +896,7 @@ fun bytes_width(ctx: *context.Context, s: *u8, lo: usize, hi: usize) f32 {
 
 # width of the field's bytes [lo, hi) laid out on one line in the current style
 fun span(ctx: *context.Context, f: *field.Field, lo: usize, hi: usize) f32 {
-    ret bytes_width(ctx, f.buf, lo, hi);
+    ret edit.width(ctx, f, lo, hi);
 }
 
 # scroll the field's shown text so the caret is in view in w pixels, showing
@@ -906,8 +907,10 @@ fun keep_in_view(ctx: *context.Context, f: *field.Field, w: f32) {
     for (f.first > 0 && span(ctx, f, field.before(f, f.first), f.len) <= w) { f.first = field.before(f, f.first); }
 }
 
-# the character boundary nearest x pixels right of the field's shown text start
+# the character boundary nearest x pixels right of the field's shown text
+# start, one before it when x is left of it so a drag scrolls back
 fun caret_at(ctx: *context.Context, f: *field.Field, x: f32) usize {
+    if (x < 0.0::f32) { ret field.before(f, f.first); }
     var at: f32   = 0.0::f32;
     var i:  usize = f.first;
     for (i < f.len) {
@@ -920,60 +923,27 @@ fun caret_at(ctx: *context.Context, f: *field.Field, x: f32) usize {
     ret i;
 }
 
-# hand the frame's paste and keyboard events, in order, to a focused field
-#
-# copy and cut go to the context's clipboard hand-off and paste asks it for
-# the clipboard. enter or escape drop the focus, and events after them are
-# left alone.
-fun feed(ctx: *context.Context, f: *field.Field) u8 {
-    var out: u8 = 0;
-    if (field.paste(f, ctx.in.paste)) { out = out | field.EDITED; }
-    var i: usize = 0;
-    for (i < ctx.in.events.len) {
-        val e: input.Event = ctx.in.events.data[i];
-        i = i + 1;
-        if (sel e.text) {
-            if (field.insert(f, e.text)) { out = out | field.EDITED; }
-            cnt;
-        }
-        if (!sel e.key) { cnt; }
-        val k:   input.Key = e.key;
-        val cmd: bool      = input.shortcut(k.mods);
-        if (cmd && (k.code == 'C' || k.code == 'X')) {
-            if (field.selected(f)) {
-                val lo: usize = field.sel_lo(f);
-                context.set_copied(ctx, ?f.buf[lo], field.sel_hi(f) - lo);
-                if (k.code == 'X' && field.erase(f)) { out = out | field.EDITED; }
-            }
-            cnt;
-        }
-        if (cmd && k.code == 'V') {
-            context.request_paste(ctx);
-            cnt;
-        }
-        val r: u8 = field.key(f, k);
-        out = out | r;
-        if ((r & (field.ENTERED | field.ESCAPED)) != 0) {
-            context.unfocus(ctx);
-            brk;
-        }
-    }
-    ret out;
-}
-
 # a full-width, one-line text field editing @f
 #
 # a press on it gives it the keyboard (see context.focus) and puts the caret
-# under the cursor; a press elsewhere, or a frame it is not drawn in, takes the
-# keyboard back. while it holds the keyboard it takes the frame's typed text
-# and editing keys (see field.key) in order: shortcut C and X copy and cut the
-# selection to the clipboard hand-off (see context.copied), shortcut V asks for
-# the clipboard (see context.wants_paste) and takes the next frame's
-# input.paste, and enter or escape end the edit and give the keyboard back.
-# the text scrolls to keep the caret in view. while it holds the keyboard it
-# shows the IME's composition (see context.preedit) inline at the caret,
-# underlined, and places the IME's candidate window at the caret (see
-# context.ime_rect). it asks for the text pointer while hovered.
+# under the cursor, or extends the selection to it with shift held; a double
+# click selects the word and a triple click the line (see blit.edit.click),
+# and dragging extends the selection by the same unit. a press elsewhere, or
+# a frame it is not drawn in, takes the keyboard back. while it holds the
+# keyboard it takes the frame's typed text and editing keys (see field.key)
+# in order: shortcut C and X copy and cut the selection to the clipboard
+# hand-off (see context.copied), shortcut V asks for the clipboard (see
+# context.wants_paste) and takes the next frame's input.paste, and enter or
+# escape end the edit and give the keyboard back. the text scrolls to keep
+# the caret in view, and the caret blinks (see edit.caret_on). while it holds
+# the keyboard it shows the IME's composition (see context.preedit) inline at
+# the caret, underlined, and places the IME's candidate window at the caret
+# (see context.ime_rect). it asks for the text pointer while hovered.
+#
+# the field's flags shape it: a MASKED field draws edit.MASK_GLYPH for each
+# character, never copies and takes no composition, a READ_ONLY one moves and
+# selects but takes no edit or composition, and a COUNT one shows its length
+# (see edit.count_text) at its right end.
 # ---
 # ctx:  context
 # key:  the field's key in the current id scope, so id_of(ctx, key) gives it the
@@ -989,20 +959,32 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     val x1: f32 = ctx.cx + ctx.pw;
     val y1: f32 = y0 + h;
     val tx: f32 = x0 + pad(ctx);
-    val tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
+    var tw: f32 = maxf(x1 - x0 - pad(ctx) * 2.0::f32, 0.0::f32);
+
+    var counted: [42]u8;
+    var count:   str = nil;
+    var count_w: f32 = 0.0::f32;
+    if (field.has(f, field.COUNT)) {
+        count   = edit.count_text(f, ?counted[0]);
+        count_w = context.text_width(ctx, count);
+        tw      = maxf(tw - count_w - pad(ctx), 0.0::f32);
+    }
 
     val hf: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
     if (hf.hot) { context.set_cursor(ctx, input.CURSOR_TEXT); }
     if (hf.pressed) {
         context.focus(ctx, id);
         keep_in_view(ctx, f, tw);
-        val at: usize = caret_at(ctx, f, hf.mx - tx);
-        f.caret  = at;
-        f.anchor = at;
+        edit.press(ctx, id, f, caret_at(ctx, f, hf.mx - tx), hf.clicks);
+    }
+    or (hf.held && ctx.focus == id) {
+        keep_in_view(ctx, f, tw);
+        edit.drag(ctx, id, f, caret_at(ctx, f, hf.mx - tx));
     }
     var out: u8 = 0;
-    if (context.focused(ctx, id)) { out = feed(ctx, f); }
-    val on: bool = ctx.focus == id;
+    if (context.focused(ctx, id)) { out = edit.feed(ctx, id, f); }
+    val on:    bool = ctx.focus == id;
+    val quiet: bool = field.has(f, field.MASKED) || field.has(f, field.READ_ONLY);
 
     var bg: draw.Color = ctx.theme.track;
     if (hf.hot && !on) { bg = ctx.theme.control_hot; }
@@ -1016,6 +998,7 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
     keep_in_view(ctx, f, tw);
     val lh: f32 = context.line_height(ctx);
     val ty: f32 = y0 + (h - lh) / 2.0::f32;
+    if (count != nil) { context.text_at(ctx, count, x1 - pad(ctx) - count_w, ty, ctx.theme.text_faint); }
     context.push_clip(ctx, tx, y0, tx + tw, y1);
     if (f.len == 0 && !on) { context.text_at(ctx, hint, tx, ty, ctx.theme.text_faint); }
     if (on && field.selected(f)) {
@@ -1026,21 +1009,22 @@ pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) 
         context.quad(ctx, sx0, ty, sx1, ty + lh, ctx.theme.select);
     }
     val cw:  f32 = context.px(ctx, ctx.theme.caret_w);
-    val pre: str = context.preedit(ctx, id);
-    var cx:  f32 = tx + span(ctx, f, f.first, f.caret);
-    if (pre == nil) { context.text_at(ctx, ?f.buf[f.first], tx, ty, ctx.theme.text); }
+    var pre: str = nil;
+    if (!quiet) { pre = context.preedit(ctx, id); }
+    var cx: f32 = tx + span(ctx, f, f.first, f.caret);
+    if (pre == nil) { edit.draw_text(ctx, f, f.first, f.len, tx, ty, ctx.theme.text); }
     or {
         val pw: f32 = bytes_width(ctx, pre, 0, str_len(pre));
-        context.text_span(ctx, ?f.buf[f.first], f.caret - f.first, tx, ty, ctx.theme.text);
+        edit.draw_text(ctx, f, f.first, f.caret, tx, ty, ctx.theme.text);
         context.text_at(ctx, pre, cx, ty, ctx.theme.text);
         context.quad(ctx, cx, ty + lh - cw, cx + pw, ty + lh, ctx.theme.text);
-        context.text_at(ctx, ?f.buf[f.caret], cx + pw, ty, ctx.theme.text);
+        edit.draw_text(ctx, f, f.caret, f.len, cx + pw, ty, ctx.theme.text);
         cx = cx + bytes_width(ctx, pre, 0, context.preedit_caret(ctx));
     }
     context.pop_clip(ctx);
     if (on) {
-        context.quad(ctx, cx, ty, cx + cw, ty + lh, ctx.theme.text);
-        context.set_ime_rect(ctx, cx, ty, cx + cw, ty + lh);
+        if (edit.caret_on(ctx, id)) { context.quad(ctx, cx, ty, cx + cw, ty + lh, ctx.theme.text); }
+        if (!quiet)                 { context.set_ime_rect(ctx, cx, ty, cx + cw, ty + lh); }
     }
 
     advance(ctx, h);
@@ -3277,7 +3261,10 @@ test text_field__types_edits_and_reports_enter {
 
     # a click puts the caret under the cursor: the bitmap font's cells are 8
     # wide after 4 of padding, so x = 13 is nearest the boundary after 'c'
-    click_field(?ctx, ?f, 13.0::f32);
+    # later than a double click after the first
+    frame_timed(?ctx, ?f, 13.0::f32, 0, 0, 5.0::f64);
+    frame_timed(?ctx, ?f, 13.0::f32, 1, 0, 5.0::f64);
+    frame_timed(?ctx, ?f, 13.0::f32, 0, 0, 5.0::f64);
     if (f.caret != 1 || field.selected(?f)) { ret 7; }
 
     # select all and cut hands the text to the clipboard, paste asks for it
@@ -3404,6 +3391,117 @@ test text_field__shows_the_composition_at_the_caret {
     val ended: opt[context.Area] = context.ime_rect(?ctx);
     if (!(sel ended.some && ended.some.x0 == 20.0::f32)) { ret 7; }
     if (context.preedit(?ctx, ctx.focus) != nil)         { ret 8; }
+
+    val fi: err[allo.Error] = input.free(?in);
+    if (sel fi.err) { ret 1; }
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame of the one-field panel with the cursor at x, the button in state
+# down, mods held and the clock at t
+#[testing]
+fun frame_timed(ctx: *context.Context, f: *field.Field, x: f32, down: u8, mods: u8, t: f64) {
+    var in: input.Input = input_at(x, 8.0::f32, down);
+    in.mods = mods;
+    in.time = t;
+    frame_field(ctx, in, f, 1);
+}
+
+test text_field__selects_by_click_double_click_triple_click_and_drag {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [32]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 32, 0, nil);
+    field.set(?f, "alpha beta");
+
+    # the bitmap font's cells are 8 wide after 4 of padding, so x = 62 is
+    # inside 'e' of beta, nearest offset 7
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 1.0::f64);
+    frame_timed(?ctx, ?f, 62.0::f32, 1, 0, 1.0::f64);
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 1.05::f64);
+    if (f.caret != 7 || field.selected(?f)) { ret 2; }
+    frame_timed(?ctx, ?f, 62.0::f32, 1, 0, 1.1::f64);
+    if (field.sel_lo(?f) != 6 || field.sel_hi(?f) != 10) { ret 3; }
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 1.15::f64);
+    frame_timed(?ctx, ?f, 62.0::f32, 1, 0, 1.2::f64);
+    if (field.sel_lo(?f) != 0 || field.sel_hi(?f) != 10) { ret 4; }
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 1.25::f64);
+
+    # a later press is a single click again, and dragging extends from it
+    frame_timed(?ctx, ?f, 13.0::f32, 0, 0, 3.0::f64);
+    frame_timed(?ctx, ?f, 13.0::f32, 1, 0, 3.0::f64);
+    frame_timed(?ctx, ?f, 44.0::f32, 1, 0, 3.1::f64);
+    if (field.sel_lo(?f) != 1 || field.sel_hi(?f) != 5 || f.caret != 5) { ret 5; }
+    frame_timed(?ctx, ?f, 44.0::f32, 0, 0, 3.2::f64);
+    if (field.sel_lo(?f) != 1 || field.sel_hi(?f) != 5) { ret 6; }
+
+    # shift extends the selection to a click
+    frame_timed(?ctx, ?f, 68.0::f32, 1, input.MOD_SHIFT, 5.0::f64);
+    if (field.sel_lo(?f) != 1 || f.caret != 8) { ret 7; }
+    frame_timed(?ctx, ?f, 68.0::f32, 0, 0, 5.1::f64);
+
+    # dragging after a double click grows by words
+    frame_timed(?ctx, ?f, 13.0::f32, 1, 0, 7.0::f64);
+    frame_timed(?ctx, ?f, 13.0::f32, 0, 0, 7.05::f64);
+    frame_timed(?ctx, ?f, 13.0::f32, 1, 0, 7.1::f64);
+    if (field.sel_lo(?f) != 0 || field.sel_hi(?f) != 5) { ret 8; }
+    frame_timed(?ctx, ?f, 62.0::f32, 1, 0, 7.2::f64);
+    if (field.sel_lo(?f) != 0 || field.sel_hi(?f) != 10) { ret 9; }
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 7.3::f64);
+
+    # the caret blinks off after a while and asks for the frame it turns in
+    frame_timed(?ctx, ?f, 62.0::f32, 0, 0, 7.3::f64 + edit.BLINK + 0.01::f64);
+    val wake: opt[f64] = context.next_frame(?ctx);
+    if (!(sel wake.some && wake.some > 7.3::f64 + edit.BLINK)) { ret 10; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test text_field__masks_counts_and_reads_only {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var buf: [32]u8;
+    var f:   field.Field;
+    field.init(?f, ?buf[0], 32, 8, nil);
+    field.set(?f, "pw");
+    f.flags = field.MASKED | field.COUNT;
+    var in: input.Input;
+    input.init(?in, ?a);
+
+    # a masked field copies nothing
+    click_field(?ctx, ?f, 10.0::f32);
+    refill(?in, 10.0::f32, 8.0::f32);
+    input.press_key(?in, 'A', input.MOD_CTRL);
+    input.press_key(?in, 'C', input.MOD_CTRL);
+    input.type_text(?in, 'x');
+    frame_field(?ctx, in, ?f, 1);
+    if (context.copied(?ctx) != nil || !str_equals(field.text(?f), "x")) { ret 2; }
+
+    # a read-only one copies but takes no edit, paste or composition
+    f.flags = field.READ_ONLY;
+    refill(?in, 10.0::f32, 8.0::f32);
+    input.press_key(?in, 'A', input.MOD_CTRL);
+    input.press_key(?in, 'X', input.MOD_CTRL);
+    input.press_key(?in, 'V', input.MOD_CTRL);
+    input.type_text(?in, 'y');
+    input.compose(?in, "ka", 1);
+    if (frame_field(?ctx, in, ?f, 1) != 0 || !str_equals(field.text(?f), "x")) { ret 3; }
+    if (!str_equals(context.copied(?ctx), "x") || context.wants_paste(?ctx))   { ret 4; }
+    val ime: opt[context.Area] = context.ime_rect(?ctx);
+    if (!sel ime.none) { ret 5; }
 
     val fi: err[allo.Error] = input.free(?in);
     if (sel fi.err) { ret 1; }
