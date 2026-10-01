@@ -1,20 +1,31 @@
 # the glyph-source contract: where blit's text gets its metrics and coverage
 #
-# a source answers four questions about a face at a scale: how tall a line is,
-# what one codepoint measures, how a pair of codepoints kerns, and what a
-# codepoint's coverage bitmap looks like. blit owns everything else: utf-8
-# decoding, layout, the glyph cache and the atlas the bitmaps are packed into.
+# a source answers five questions about a face at a scale: how tall a line is,
+# which glyphs a run of codepoints becomes, what one glyph measures, how a pair
+# of glyphs kerns, and what a glyph's coverage bitmap looks like. blit owns
+# everything else: utf-8 decoding, line breaking, the glyph cache and the atlas
+# the bitmaps are packed into.
 #
-# the contract is shaped for a scalable outline face, the hardest member.
+# the contract is shaped for its hardest member, a shaping outline face. a
+# shaper maps a run of codepoints to glyph ids and positions, many to one for
+# a ligature and one to many for a decomposed mark, so everything after
+# shaping is keyed on glyph id, never on codepoint. a source that does not
+# shape leaves `shape` nil, and blit maps codepoints to glyph ids one to one
+# (a glyph id is then the codepoint), kerning each pair through `kern`, as the
+# bitmap font and a simple TrueType face do. such a source fills the same
+# record as before shaping existed, with `shape` nil.
+#
 # every metric is a float in pixels at the scale asked for, so advances can be
 # fractional and text scaled to 200% is rasterised at that size rather than
-# stretched. a source is asked for a codepoint only when blit first needs it,
-# so nothing assumes a fixed glyph set, and a source that lacks a codepoint
-# says so and blit falls back to a replacement glyph.
+# stretched. scale folds together the interface scale and a text style's size,
+# so one source serves body text, headings and small print at once. a source
+# is asked for a glyph only when blit first needs it, so nothing assumes a
+# fixed glyph set. a non-shaping source that lacks a codepoint says so and
+# blit falls back to a replacement glyph. a shaping source falls back itself,
+# and its glyph id 0 is the missing glyph by convention.
 #
 # coordinates are y-down, relative to the pen on the baseline: a glyph's top
-# above the baseline is a negative y. scale is the interface scale, 1.0 for
-# the face's own size.
+# above the baseline is a negative y. scale is 1.0 for the face's own size.
 #
 # blit.bitmap is the built-in implementation and the zero-configuration
 # default. a host plugs in its own, such as a TrueType face, by filling a
@@ -34,7 +45,7 @@ pub rec LineMetrics {
     gap:     f32;
 }
 
-# what one codepoint measures at one scale
+# what one glyph measures at one scale
 #
 # x0..y1 is the rect its bitmap covers on screen, relative to the pen on the
 # baseline, and w x h is the bitmap in texels. the two differ when a source
@@ -58,23 +69,50 @@ pub rec Glyph {
     h:       u32;
 }
 
+# one glyph a shaper placed, in run order
+#
+# the pen starts at the run's origin and moves by each glyph's advance in
+# turn. a glyph's bitmap is drawn at the pen offset by (dx, dy). kerning and
+# any other pair adjustment are already in the advances.
+# ---
+# id:      glyph id, passed back to glyph and raster
+# cluster: index in the run of the first codepoint the glyph came from, not decreasing along the run
+# advance: pen movement after the glyph, in pixels
+# dx:      x offset of the glyph from the pen, in pixels
+# dy:      y offset of the glyph from the pen, in pixels, positive downward
+pub rec Shaped {
+    id:      u32;
+    cluster: u32;
+    advance: f32;
+    dx:      f32;
+    dy:      f32;
+}
+
 # a face blit draws text from, as functions over the source's own state
 #
 # every function takes `self` first. glyph and raster must agree: raster
-# writes exactly the w x h bitmap glyph reported for the same codepoint and
-# scale. kern may be nil for a face without kerning.
+# writes exactly the w x h bitmap glyph reported for the same glyph id and
+# scale. kern may be nil for a face without kerning, and shape nil for a face
+# whose glyph ids are its codepoints. blit never calls kern on a source that
+# shapes, since its shaper has already kerned.
+#
+# shape writes at most cap glyphs to out and returns how many the run makes.
+# a run of n codepoints may make more glyphs than n, and a return above cap
+# asks blit to call it again with room for that many.
 # ---
 # self:   opaque pointer to the source's state, passed back to every function
 # line:   (self, scale) -> the line metrics at scale
-# glyph:  (self, codepoint, scale, out) -> whether the face has the codepoint, filling out when it does
-# kern:   (self, left, right, scale) -> the pen adjustment between the pair, in pixels, or nil for none
-# raster: (self, codepoint, scale, coverage, stride) -> whether it wrote h rows of w coverage bytes, stride bytes apart
+# glyph:  (self, id, scale, out) -> whether the face has the glyph, filling out when it does
+# kern:   (self, left, right, scale) -> the pen adjustment between two glyph ids, in pixels, or nil for none
+# raster: (self, id, scale, coverage, stride) -> whether it wrote h rows of w coverage bytes, stride bytes apart
+# shape:  (self, run, n, scale, out, cap) -> glyphs the n codepoints of run make, or nil to map codepoints one to one
 pub rec GlyphSource {
     self:   ptr;
     line:   fun(ptr, f32) LineMetrics;
     glyph:  fun(ptr, u32, f32, *Glyph) bool;
     kern:   fun(ptr, u32, u32, f32) f32;
     raster: fun(ptr, u32, f32, *u8, usize) bool;
+    shape:  fun(ptr, *u32, usize, f32, *Shaped, usize) usize;
 }
 
 # the height of one line box: ascent, descent and gap

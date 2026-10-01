@@ -1,0 +1,663 @@
+# the per-id state store the context owns, independent of the context itself
+#
+# an entry is keyed by a widget id and a kind, the type id of the state it
+# holds, so one id can carry several kinds of state and an id's state never
+# changes shape under a reader. each entry is its own allocation, so the table
+# growing never moves an entry's bytes. an entry records the frame it was last
+# reached in, and sweep drops every unpinned entry left untouched for max_age
+# frames. a request the allocator refuses yields nothing here, and the caller
+# hands back the store's scratch bytes instead (see blit.state).
+#
+# persistence is per kind: a kind registers a name and a save and a load hook.
+# save writes one TOML document holding a [<kind>.<id>] table per entry of a
+# registered kind, each table filled by the kind's save hook through a Writer.
+# load reads such a document through std.data.toml and runs each kind's load
+# hook over a zeroed entry. std.data.toml only parses, so the emitter is here.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+use fmt: std.format;
+use io:  std.io.writer;
+use std.memory;
+
+# bytes of scratch state handed back for a refused entry, the largest state
+# type an entry can hold
+pub val SCRATCH: usize = 1024;
+
+# widest alignment a state type can ask for
+pub val SCRATCH_ALIGN: usize = 16;
+
+# frames an unpinned entry survives untouched by default
+pub val MAX_AGE: u64 = 60;
+
+# slots the table allocates on its first entry
+val INIT_SLOTS: usize = 64;
+
+# kinds the registry allocates on its first registration
+val INIT_KINDS: usize = 8;
+
+# bytes the save text allocates on its first save
+val INIT_TEXT: usize = 256;
+
+# the bytes handed back for a refused entry
+#[align(16)]
+pub rec Scratch {
+    bytes: [1024]u8;
+}
+
+# one slot of the table
+# ---
+# id:     widget id the entry belongs to
+# kind:   type id of the state the entry holds
+# data:   the entry's state, its own allocation
+# size:   bytes allocated at data
+# align:  alignment data was allocated at
+# seen:   frame the entry was last reached in
+# pinned: 1 if sweep keeps the entry however old it is, else 0
+# used:   1 if the slot holds an entry, else 0
+pub rec Entry {
+    id:     u64;
+    kind:   u64;
+    data:   ptr;
+    size:   usize;
+    align:  usize;
+    seen:   u64;
+    pinned: u8;
+    used:   u8;
+}
+
+# a kind's save hook: write the entry's fields through the writer
+pub def SaveFun: fun(ptr, *Writer);
+
+# a kind's load hook: read the entry's fields from its table
+pub def LoadFun: fun(ptr, *toml.Table);
+
+# a registered kind of entry, the unit of persistence
+# ---
+# kind:  type id of the state
+# name:  the kind's table name in a saved document, borrowed
+# size:  bytes of the state
+# align: alignment of the state
+# save:  writes one entry
+# load:  reads one entry
+pub rec Kind {
+    kind:  u64;
+    name:  str;
+    size:  usize;
+    align: usize;
+    save:  SaveFun;
+    load:  LoadFun;
+}
+
+# why a registration did not complete
+# ---
+# alloc: the registry could not grow
+# taken: another kind already registered the name
+pub tag Error: u8 {
+    alloc: allo.Error;
+    taken;
+}
+
+# the text a save writes, handed to save hooks
+# ---
+# a:      allocator backing buf
+# buf:    the text so far, NUL-terminated, nil before the first save
+# len:    bytes written, not counting the NUL
+# cap:    bytes allocated at buf
+# failed: 1 once a write was refused, after which writes are dropped
+# why:    the refusal, when failed
+# sink:   buf as a std.io writer, for std.format
+pub rec Writer {
+    a:      *allo.Allocator;
+    buf:    *u8;
+    len:    usize;
+    cap:    usize;
+    failed: u8;
+    why:    allo.Error;
+    sink:   io.Writer;
+}
+
+# typed state keyed by widget id
+# ---
+# a:        allocator backing the table, the entries, the registry and the text
+# slots:    the table, a power of two of slots, nil before the first entry
+# cap:      slots allocated
+# len:      slots in use
+# frame:    frames swept so far
+# max_age:  frames an unpinned entry survives untouched, 0 to keep every entry
+# kinds:    registered kinds
+# kind_cap: kinds allocated
+# kind_len: kinds registered
+# out:      the text the last save wrote
+# scratch:  the state handed back for a refused entry
+pub rec Store {
+    a:        *allo.Allocator;
+    slots:    *Entry;
+    cap:      usize;
+    len:      usize;
+    frame:    u64;
+    max_age:  u64;
+    kinds:    *Kind;
+    kind_cap: usize;
+    kind_len: usize;
+    out:      Writer;
+    scratch:  Scratch;
+}
+
+# set a store up empty; it allocates on first use, so this cannot fail
+# ---
+# s: store to initialize
+# a: allocator to back it
+pub fun init(s: *Store, a: *allo.Allocator) {
+    s.a        = a;
+    s.slots    = nil;
+    s.cap      = 0;
+    s.len      = 0;
+    s.frame    = 0;
+    s.max_age  = MAX_AGE;
+    s.kinds    = nil;
+    s.kind_cap = 0;
+    s.kind_len = 0;
+    s.out.a    = a;
+    s.out.buf  = nil;
+    s.out.len  = 0;
+    s.out.cap  = 0;
+}
+
+# release every entry, the table, the registry and the saved text
+# ---
+# s:   store to free
+# ret: ok, or the first refusal; the store is empty either way
+pub fun free(s: *Store) err[allo.Error] {
+    var first: err[allo.Error] = err[allo.Error].ok{};
+    var i:     usize           = 0;
+    for (i < s.cap) {
+        if (s.slots[i].used != 0) {
+            keep_first(?first, allo.deallocate_raw(s.a, s.slots[i].data, s.slots[i].size, s.slots[i].align));
+        }
+        i = i + 1;
+    }
+    if (s.slots != nil)   { keep_first(?first, allo.deallocate[Entry](s.a, s.slots, s.cap)); }
+    if (s.kinds != nil)   { keep_first(?first, allo.deallocate[Kind](s.a, s.kinds, s.kind_cap)); }
+    if (s.out.buf != nil) { keep_first(?first, allo.deallocate[u8](s.a, s.out.buf, s.out.cap)); }
+    s.slots    = nil;
+    s.cap      = 0;
+    s.len      = 0;
+    s.kinds    = nil;
+    s.kind_cap = 0;
+    s.kind_len = 0;
+    s.out.buf  = nil;
+    s.out.len  = 0;
+    s.out.cap  = 0;
+    ret first;
+}
+
+# keep the first refusal a release walk meets
+fun keep_first(first: *err[allo.Error], next: err[allo.Error]) {
+    if (sel next.err) {
+        if (sel first.ok) { @first = next; }
+    }
+}
+
+# the slot an (id, kind) pair probes from
+fun home(id: u64, kind: u64, mask: usize) usize {
+    var h: u64 = id ^ (kind * 0x9E3779B97F4A7C15u64);
+    h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9u64;
+    h = (h ^ (h >> 27)) * 0x94D049BB133111EBu64;
+    h = h ^ (h >> 31);
+    ret h::usize & mask;
+}
+
+# the slot holding (id, kind), or cap when there is none
+fun find(s: *Store, id: u64, kind: u64) usize {
+    if (s.cap == 0) { ret 0; }
+    val mask: usize = s.cap - 1;
+    var i:    usize = home(id, kind, mask);
+    for (s.slots[i].used != 0) {
+        if (s.slots[i].id == id && s.slots[i].kind == kind) { ret i; }
+        i = (i + 1) & mask;
+    }
+    ret s.cap;
+}
+
+# place an entry in the first free slot of its probe run
+fun place(slots: *Entry, cap: usize, e: Entry) {
+    val mask: usize = cap - 1;
+    var i:    usize = home(e.id, e.kind, mask);
+    for (slots[i].used != 0) { i = (i + 1) & mask; }
+    slots[i] = e;
+}
+
+# double the table, rehashing every entry
+fun grow(s: *Store) err[allo.Error] {
+    var n: usize = s.cap * 2;
+    if (n == 0) { n = INIT_SLOTS; }
+    val r: res[*Entry, allo.Error] = allo.allocate[Entry](s.a, n);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    memory.zero[Entry](r.ok, n);
+    var i: usize = 0;
+    for (i < s.cap) {
+        if (s.slots[i].used != 0) { place(r.ok, n, s.slots[i]); }
+        i = i + 1;
+    }
+    if (s.slots != nil) {
+        val f: err[allo.Error] = allo.deallocate[Entry](s.a, s.slots, s.cap);
+        if (sel f.err) {
+            # the old table stays allocated; the new one holds every entry
+            s.slots = r.ok;
+            s.cap   = n;
+            ret f;
+        }
+    }
+    s.slots = r.ok;
+    s.cap   = n;
+    ret err[allo.Error].ok{};
+}
+
+# empty slot i, shifting the rest of its probe run back so no lookup breaks
+fun remove(s: *Store, i: usize) {
+    val mask: usize = s.cap - 1;
+    var hole: usize = i;
+    var j:    usize = (i + 1) & mask;
+    for (s.slots[j].used != 0) {
+        val h: usize = home(s.slots[j].id, s.slots[j].kind, mask);
+        if (((j + s.cap - h) & mask) >= ((j + s.cap - hole) & mask)) {
+            s.slots[hole] = s.slots[j];
+            hole          = j;
+        }
+        j = (j + 1) & mask;
+    }
+    var empty: Entry;
+    s.slots[hole] = empty;
+    s.len         = s.len - 1;
+}
+
+# the entry for (id, kind), zeroed on first use and marked reached this frame
+# ---
+# s:     store
+# id:    widget id
+# kind:  type id of the state
+# size:  bytes of the state
+# align: alignment of the state, a power of two
+# ret:   the entry's state, or the refusal with nothing added
+pub fun slot(s: *Store, id: u64, kind: u64, size: usize, align: usize) res[ptr, allo.Error] {
+    val at: usize = find(s, id, kind);
+    if (at < s.cap) {
+        s.slots[at].seen = s.frame;
+        ret res[ptr, allo.Error].ok{s.slots[at].data};
+    }
+    if ((s.len + 1) * 2 > s.cap) {
+        val g: err[allo.Error] = grow(s);
+        if (sel g.err) { ret res[ptr, allo.Error].err{g.err}; }
+    }
+    var n: usize = size;
+    if (n == 0) { n = 1; }
+    val r: res[ptr, allo.Error] = allo.allocate_raw(s.a, n, align);
+    if (sel r.err) { ret r; }
+    memory.raw_zero(r.ok, n);
+
+    var e: Entry;
+    e.id    = id;
+    e.kind  = kind;
+    e.data  = r.ok;
+    e.size  = n;
+    e.align = align;
+    e.seen  = s.frame;
+    e.used  = 1;
+    place(s.slots, s.cap, e);
+    s.len = s.len + 1;
+    ret r;
+}
+
+# the slot record for (id, kind), nil when there is none
+# ---
+# s:    store
+# id:   widget id
+# kind: type id of the state
+# ret:  the entry, valid until the store next changes
+pub fun entry(s: *Store, id: u64, kind: u64) *Entry {
+    val at: usize = find(s, id, kind);
+    if (at >= s.cap) { ret nil; }
+    ret ?s.slots[at];
+}
+
+# the scratch state handed back for a refused entry, zeroed
+# ---
+# s:   store
+# ret: SCRATCH bytes aligned to SCRATCH_ALIGN, shared by every refused entry
+pub fun scratch(s: *Store) ptr {
+    memory.raw_zero(?s.scratch.bytes[0], SCRATCH);
+    ret ?s.scratch.bytes[0];
+}
+
+# end a frame: drop every unpinned entry untouched for max_age frames
+# ---
+# s:   store
+# ret: 1 if releasing an entry was refused, else 0
+pub fun sweep(s: *Store) u8 {
+    var failed: u8 = 0;
+    if (s.max_age != 0) {
+        var i: usize = 0;
+        for (i < s.cap) {
+            val e: *Entry = ?s.slots[i];
+            if (e.used != 0 && e.pinned == 0 && s.frame - e.seen >= s.max_age) {
+                val f: err[allo.Error] = allo.deallocate_raw(s.a, e.data, e.size, e.align);
+                if (sel f.err) { failed = 1; }
+                remove(s, i);
+                # the shift may have moved an unvisited entry into slot i
+                cnt;
+            }
+            i = i + 1;
+        }
+    }
+    s.frame = s.frame + 1;
+    ret failed;
+}
+
+# the registered kind with a type id, nil when there is none
+fun kind_of(s: *Store, kind: u64) *Kind {
+    var i: usize = 0;
+    for (i < s.kind_len) {
+        if (s.kinds[i].kind == kind) { ret ?s.kinds[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the registered kind with a name, nil when there is none
+fun kind_named(s: *Store, name: str) *Kind {
+    var i: usize = 0;
+    for (i < s.kind_len) {
+        if (str_equals(s.kinds[i].name, name)) { ret ?s.kinds[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# register a kind for persistence, replacing its hooks when already registered
+# ---
+# s:   store
+# k:   the kind; its name must outlive the store
+# ret: ok, taken when another kind holds the name, or the registry's refusal
+pub fun register(s: *Store, k: Kind) err[Error] {
+    val named: *Kind = kind_named(s, k.name);
+    if (named != nil && named.kind != k.kind) { ret err[Error].err{Error.taken{}}; }
+    val have: *Kind = kind_of(s, k.kind);
+    if (have != nil) {
+        @have = k;
+        ret err[Error].ok{};
+    }
+    if (s.kind_len >= s.kind_cap) {
+        var n: usize = s.kind_cap * 2;
+        if (n == 0) { n = INIT_KINDS; }
+        val r: res[*Kind, allo.Error] = allo.reallocate[Kind](s.a, s.kinds, s.kind_cap, n);
+        if (sel r.err) { ret err[Error].err{Error.alloc{r.err}}; }
+        s.kinds    = r.ok;
+        s.kind_cap = n;
+    }
+    s.kinds[s.kind_len] = k;
+    s.kind_len          = s.kind_len + 1;
+    ret err[Error].ok{};
+}
+
+# append bytes to the text, keeping it NUL-terminated
+fun put_bytes(w: *Writer, b: *u8, n: usize) u8 {
+    if (w.failed != 0) { ret 0; }
+    val need: usize = w.len + n + 1;
+    if (need > w.cap) {
+        var c: usize = w.cap * 2;
+        if (c < INIT_TEXT) { c = INIT_TEXT; }
+        for (c < need) { c = c * 2; }
+        val r: res[*u8, allo.Error] = allo.reallocate[u8](w.a, w.buf, w.cap, c);
+        if (sel r.err) {
+            w.failed = 1;
+            w.why    = r.err;
+            ret 0;
+        }
+        w.buf = r.ok;
+        w.cap = c;
+    }
+    if (n > 0) { memory.raw_copy((w.buf::usize + w.len)::ptr, b::ptr, n); }
+    w.len        = w.len + n;
+    w.buf[w.len] = 0;
+    ret 1;
+}
+
+fun put_text(w: *Writer, s: str) {
+    put_bytes(w, s::*u8, str_len(s));
+}
+
+fun put_byte(w: *Writer, b: u8) {
+    var one: u8 = b;
+    put_bytes(w, ?one, 1);
+}
+
+# the writer's std.io sink
+fun sink_write(c: ptr, b: *u8, n: usize) res[usize, io.WriteError] {
+    val w: *Writer = c::*Writer;
+    if (put_bytes(w, b, n) == 0) { ret res[usize, io.WriteError].err{io.WriteError.stalled{0}}; }
+    ret res[usize, io.WriteError].ok{n};
+}
+
+# write s as a TOML basic string
+fun put_quoted(w: *Writer, s: str) {
+    val hex: str = "0123456789ABCDEF";
+    put_byte(w, '"');
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (c == '"')  { put_text(w, "\\\""); }
+        or (c == '\\') { put_text(w, "\\\\"); }
+        or (c == '\n') { put_text(w, "\\n"); }
+        or (c == '\t') { put_text(w, "\\t"); }
+        or (c == '\r') { put_text(w, "\\r"); }
+        or (c < 0x20u8 || c == 0x7Fu8) {
+            put_text(w, "\\u00");
+            put_byte(w, hex[c >> 4]);
+            put_byte(w, hex[c & 0x0Fu8]);
+        }
+        or { put_byte(w, c); }
+        i = i + 1;
+    }
+    put_byte(w, '"');
+}
+
+# whether s is a non-empty TOML bare key
+fun bare(s: str) u8 {
+    if (s[0] == 0) { ret 0; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c:  u8 = s[i];
+        val ok: u8 = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (ok == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# write a key, bare when it can be and quoted otherwise
+fun put_key(w: *Writer, key: str) {
+    if (bare(key) != 0) { put_text(w, key); }
+    or                  { put_quoted(w, key); }
+}
+
+fun put_assign(w: *Writer, key: str) {
+    put_key(w, key);
+    put_text(w, " = ");
+}
+
+# write `key = v` into the entry being saved
+# ---
+# w:   the writer a save hook was handed
+# key: the field's key
+# v:   value
+pub fun put_int(w: *Writer, key: str, v: i64) {
+    put_assign(w, key);
+    val r: res[usize, io.WriteError] = fmt.write_i64(?w.sink, v);
+    put_byte(w, '\n');
+}
+
+# write `key = v` into the entry being saved, a float that reads back exactly
+# ---
+# w:   the writer a save hook was handed
+# key: the field's key
+# v:   value; an f32 widens exactly
+pub fun put_float(w: *Writer, key: str, v: f64) {
+    put_assign(w, key);
+    val mark: usize                     = w.len;
+    val r:    res[usize, io.WriteError] = fmt.write_f64(?w.sink, v);
+    # toml reads a float without a point or exponent as an integer
+    var point: u8    = 0;
+    var i:     usize = mark;
+    for (w.failed == 0 && i < w.len) {
+        val c: u8 = w.buf[i];
+        if (c == '.' || c == 'e' || c == 'E' || c == 'n' || c == 'i') { point = 1; }
+        i = i + 1;
+    }
+    if (point == 0) { put_text(w, ".0"); }
+    put_byte(w, '\n');
+}
+
+# write `key = true` or `key = false` into the entry being saved
+# ---
+# w:   the writer a save hook was handed
+# key: the field's key
+# v:   nonzero for true
+pub fun put_bool(w: *Writer, key: str, v: u8) {
+    put_assign(w, key);
+    if (v != 0) { put_text(w, "true\n"); }
+    or          { put_text(w, "false\n"); }
+}
+
+# write `key = "v"` into the entry being saved, escaped
+# ---
+# w:   the writer a save hook was handed
+# key: the field's key
+# v:   utf-8 text
+pub fun put_str(w: *Writer, key: str, v: str) {
+    put_assign(w, key);
+    put_quoted(w, v);
+    put_byte(w, '\n');
+}
+
+# write every entry of a registered kind as one TOML document
+#
+# each entry is a [<kind>.<id>] table its kind's save hook fills. entries of
+# kinds never registered are not written.
+# ---
+# s:   store
+# ret: the document, NUL-terminated and owned by the store until the next save
+#      or free, or the refusal that cut it short
+pub fun save(s: *Store) res[str, allo.Error] {
+    val w: *Writer = ?s.out;
+    w.a      = s.a;
+    w.len    = 0;
+    w.failed = 0;
+    w.sink   = io.Writer{ctx: w::ptr, f_write: sink_write};
+    put_bytes(w, nil, 0);
+
+    var k: usize = 0;
+    for (k < s.kind_len) {
+        val kd: *Kind = ?s.kinds[k];
+        var i:  usize = 0;
+        for (i < s.cap) {
+            val e: *Entry = ?s.slots[i];
+            if (e.used != 0 && e.kind == kd.kind) {
+                put_byte(w, '[');
+                put_key(w, kd.name);
+                put_byte(w, '.');
+                val r: res[usize, io.WriteError] = fmt.write_u64(?w.sink, e.id);
+                put_text(w, "]\n");
+                kd.save(e.data, w);
+                put_byte(w, '\n');
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    if (w.failed != 0) { ret res[str, allo.Error].err{w.why}; }
+    ret res[str, allo.Error].ok{w.buf::str};
+}
+
+# a TOML key spelling a u64 in decimal
+fun parse_id(s: str) opt[u64] {
+    if (s[0] == 0) { ret opt[u64].none{}; }
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (c < '0' || c > '9') { ret opt[u64].none{}; }
+        val d: u64 = (c - '0')::u64;
+        if (v > (0xFFFFFFFFFFFFFFFFu64 - d) / 10) { ret opt[u64].none{}; }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    ret opt[u64].some{v};
+}
+
+# load every entry of one kind's table
+fun load_kind(s: *Store, kd: *Kind, t: *toml.Table) err[toml.TomlError] {
+    var i: usize = 0;
+    for (i < toml.table_len(t)) {
+        val ko: opt[str]         = toml.table_key(t, i);
+        val vo: opt[*toml.Value] = toml.table_value(t, i);
+        if (sel ko.none) { ret err[toml.TomlError].ok{}; }
+        if (sel vo.none) { ret err[toml.TomlError].ok{}; }
+        val v:  *toml.Value = vo.some;
+        val id: opt[u64]    = parse_id(ko.some);
+        if (sel id.none)              { ret err[toml.TomlError].err{toml.TomlError.syntax{v.key.at}}; }
+        if (v.tag != toml.TYPE_TABLE) { ret err[toml.TomlError].err{toml.TomlError.conflict{v.span.at}}; }
+        val p: res[ptr, allo.Error] = slot(s, id.some, kd.kind, kd.size, kd.align);
+        if (sel p.err) { ret err[toml.TomlError].err{toml.TomlError.alloc{p.err}}; }
+        memory.raw_zero(p.ok, kd.size);
+        kd.load(p.ok, ?v.data.table);
+        i = i + 1;
+    }
+    ret err[toml.TomlError].ok{};
+}
+
+# read a document save wrote, loading every entry of a registered kind
+#
+# each entry is zeroed before its kind's load hook runs, and counts as reached
+# this frame. tables of kinds never registered are skipped. on a failure the
+# entries loaded before it stay.
+# ---
+# s:    store
+# text: the document, NUL-terminated
+# ret:  ok, the parse's failure, a key that is not an id (syntax at the key), an
+#       entry that is not a table (conflict at the value), or a refused entry
+pub fun load(s: *Store, text: str) err[toml.TomlError] {
+    val pr: res[toml.Table, toml.TomlError] = toml.parse(s.a, text);
+    if (sel pr.err) { ret err[toml.TomlError].err{pr.err}; }
+    var root: toml.Table          = pr.ok;
+    var out:  err[toml.TomlError] = err[toml.TomlError].ok{};
+    var i:    usize               = 0;
+    for (i < toml.table_len(?root)) {
+        val ko: opt[str]         = toml.table_key(?root, i);
+        val vo: opt[*toml.Value] = toml.table_value(?root, i);
+        if (sel ko.none) { brk; }
+        if (sel vo.none) { brk; }
+        val kd: *Kind       = kind_named(s, ko.some);
+        val v:  *toml.Value = vo.some;
+        if (kd != nil) {
+            if (v.tag != toml.TYPE_TABLE) {
+                out = err[toml.TomlError].err{toml.TomlError.conflict{v.span.at}};
+                brk;
+            }
+            out = load_kind(s, kd, ?v.data.table);
+            if (sel out.err) { brk; }
+        }
+        i = i + 1;
+    }
+    val d: err[allo.Error] = toml.dnit(s.a, ?root);
+    ret out;
+}

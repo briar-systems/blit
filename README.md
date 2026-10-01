@@ -29,50 +29,101 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.widget`, `blit.chart`. A submodule can also be
+`blit.input`, `blit.hit`, `blit.field`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.chart`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
 
-Text comes from a glyph source, a record of functions over the source's own
-state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, layout, the glyph
-cache and the atlas, and asks the source only for what a face knows:
+Text comes from glyph sources, records of functions over each source's own
+state (`blit.glyph.GlyphSource`). blit owns UTF-8 decoding, line breaking, the
+glyph cache and the atlas, and asks a source only for what a face knows:
 
 ```mach
 pub rec GlyphSource {
     self:   ptr;
-    line:   fun(ptr, f32) LineMetrics;              # (self, scale)
-    glyph:  fun(ptr, u32, f32, *Glyph) bool;        # (self, codepoint, scale, out)
-    kern:   fun(ptr, u32, u32, f32) f32;            # (self, left, right, scale), or nil
-    raster: fun(ptr, u32, f32, *u8, usize) bool;    # (self, codepoint, scale, coverage, stride)
+    line:   fun(ptr, f32) LineMetrics;                        # (self, scale)
+    glyph:  fun(ptr, u32, f32, *Glyph) bool;                  # (self, glyph id, scale, out)
+    kern:   fun(ptr, u32, u32, f32) f32;                      # (self, left id, right id, scale), or nil
+    raster: fun(ptr, u32, f32, *u8, usize) bool;              # (self, glyph id, scale, coverage, stride)
+    shape:  fun(ptr, *u32, usize, f32, *Shaped, usize) usize; # (self, run, n, scale, out, cap), or nil
 }
 ```
 
+- **Glyph ids, with an optional shaper.** Everything past shaping is keyed on
+  glyph id. A shaping source (ligatures, combining marks, complex scripts)
+  turns a line's codepoints into `Shaped` glyphs: an id, the cluster it came
+  from, an advance with kerning included and an offset. A source with `shape`
+  nil has glyph ids that are its codepoints, one to one, kerned pair by pair
+  through `kern`, as the bitmap font and a simple TrueType face do. Such a
+  source only adds `shape: nil` to the record it filled before.
 - **Metrics are floats** in pixels at the scale asked for: `LineMetrics` is
   ascent, descent and gap, and a `Glyph` is its advance, the rect its bitmap
   covers relative to the pen on the baseline (y down), and the bitmap's size in
-  texels. Scale is the interface scale (`ctx.scale`, 1.0 by default), so text at
-  200% is rasterised at that size, not stretched.
-- **Glyphs come on demand.** A codepoint is measured the first time it is laid
-  out and rasterised the first time it is drawn, then cached per scale.
-  Measuring never rasterises.
-- **Codepoints, not bytes.** Text is UTF-8. A codepoint the source lacks draws
-  as U+FFFD, or `?` when it lacks that too. Control codepoints take no space and
-  a newline starts the next line.
-- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is the
-  default, so a context needs no configuration. `blit.context.set_glyph_source`
-  plugs in another between frames, such as a TrueType face from the host. blit
-  itself never depends on one.
+  texels. Scale is a text style's size times the interface scale (`ctx.scale`,
+  1.0 by default), so text at 200% is rasterised at that size, not stretched.
+- **Glyphs come on demand.** A glyph is measured the first time it is laid
+  out and rasterised the first time it is drawn, then cached by source, glyph
+  id and scale. Measuring never rasterises.
+- **Codepoints, not bytes.** Text is UTF-8. A codepoint a non-shaping source
+  lacks draws as U+FFFD, or `?` when it lacks that too. A shaper falls back
+  itself, its glyph id 0 being the missing glyph. Control codepoints take no
+  space and a newline starts the next line.
+- **Bitmap by default.** `blit.bitmap.source()`, the built-in 8x8 font, is
+  source 0, so a context needs no configuration. `blit.context.set_glyph_source`
+  replaces source 0 between frames, such as with a TrueType face from the host,
+  and `add_glyph_source` holds more. blit itself never depends on one.
+- **The atlas evicts.** When every page is full, the page least recently drawn
+  from is cleared and refilled. A page drawn from this frame is never evicted,
+  so a glyph drawn this frame is never dropped, and a glyph whose page was
+  evicted is rasterised again when it is next drawn.
 
-`blit.context.text_width` and `line_height` measure at the context's scale, and
-`blit.font.advance` steps one codepoint at a time for layout built outside
-blit.
+### Text styles
+
+A style (`blit.font.Style`) names a glyph source and a size relative to that
+source's own, so one face serves body text, headings and small print. Style 0,
+`blit.font.STYLE_BODY`, is source 0 at size 1.0. Register more with
+`blit.context.add_style`, change one with `set_style`, and draw in one with
+`push_style`/`pop_style`. Every text call, `text_at`, `text_span`, `glyph`,
+`text_width`, `line_height`, and every widget that draws text, uses the
+current style, and every frame starts in the body style.
+
+```mach
+val heading: opt[u32] = blit.context.add_style(?ctx, blit.font.Style{source: 0, size: 2.0::f32});
+blit.context.push_style(?ctx, heading.some);
+blit.widget.text(?ctx, "Simulation");
+blit.context.pop_style(?ctx);
+```
+
+`blit.context.text_width_n` measures a byte range, and `glyph_advance` steps
+one codepoint at a time for layout built outside blit, without a shaper's
+ligatures.
+
+### Truncation and rich spans
+
+`blit.text.fit` cuts one line to a width with an ellipsis at the end
+(`CUT_END`), at the start for paths (`CUT_START`) or in the middle
+(`CUT_MIDDLE`), as byte offsets into the caller's string, and `fit_at` draws
+it. The ellipsis is U+2026 when the style's source has it, else `...`.
+
+A rich line is a run of `blit.text.Span`s, each text in its own style and
+color, on one shared baseline: `spans_at` draws it, `spans_width` and
+`spans_line` measure it, and `blit.widget.rich` draws it at the cursor.
+
+```mach
+var sp: [4]blit.text.Span;
+sp[0] = blit.text.Span{s: "gen ",   style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[1] = blit.text.Span{s: "13",     style: bold,                 color: t.text};
+sp[2] = blit.text.Span{s: "  pop ", style: blit.font.STYLE_BODY, color: t.text_dim};
+sp[3] = blit.text.Span{s: "9,252",  style: bold,                 color: t.text};
+blit.widget.rich(?ctx, ?sp[0], 4);
+```
 
 ## Theme & scale
 
 Every color and length a widget draws with comes from a theme, a plain record
 (`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
-`window`, `dock`, `header`, `header_hot`), `edge`, `text` and `text_dim`,
+`window`, `dock`, `header`, `header_hot`), `edge`, three text tiers `text`,
+`text_dim` and `text_faint` (hints and placeholders),
 `accent` and `accent_text` (text on an accent fill), `warn`, control states (`control`, `control_hot`, `control_on`,
 `track`, `handle`, `handle_on`), the text selection highlight `select`, and the
 metrics `row`, `gap`, `pad`, `handle_w`, `bar_w`, `thumb_min`, `corner`,
@@ -108,36 +159,87 @@ blit.context.set_scale(?ctx, 2.0::f32);
 
 ## Docked containers
 
-Alongside floating windows, `blit.widget.begin_dock`/`end_dock` attach a panel
-to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
+Alongside floating windows, `blit.widget.begin_dock(?ctx, key, ?d)`/`end_dock`
+attach a panel to a screen edge (`blit.context.Side`: left, right, top or bottom). Each dock
 takes a strip from the frame's free area, so docks opened in turn stack inward,
 and `blit.context.free_area` reports what they leave for the rest of the screen,
 such as a world view. Call docks at the root.
 
-A dock's body is a scroll region. `blit.widget.begin_scroll`/`end_scroll` open
-one at the layout cursor on its own: its column is clipped and scrolls by the
+A dock's body is a scroll region. `blit.widget.begin_scroll(?ctx, key, ?s, h)`/`end_scroll`
+open one at the layout cursor on its own: its column is clipped and scrolls by the
 wheel (`Input.wheel`, pixels, positive turned away from the user) and by a
 draggable scrollbar when its content is taller than it. The wheel goes to the
 innermost region holding the topmost claim under the cursor.
 `blit.widget.section(?ctx, title, ?open)` is a collapsible heading that returns
 whether the rows beneath it should be placed.
 
+## Input & the host contract
+
+blit never touches a window. Each frame the consumer fills a
+`blit.input.Input`, plain data written against the hardest host (a desktop
+window with an IME, high-resolution wheels and several pointer buttons), and
+hands it to `begin`. A simpler host leaves what it lacks zeroed.
+
+```mach
+var in: blit.input.Input;
+blit.input.init(?in, ?a);           # once: the events grow in storage `in` owns
+# per frame:
+blit.input.clear_keys(?in);
+in.time    = clock_seconds();       # the host's monotonic clock, as f64
+in.present = 1;                     # 0 while the pointer is off the surface
+in.mx      = x;
+in.my      = y;
+in.down    = blit.input.BUTTON_LEFT; # BUTTON_* bits held this frame
+in.mods    = blit.input.MOD_SHIFT;   # MOD_* bits held this frame
+in.wheel   = dy_pixels;             # both wheels in pixels
+in.wheel_x = dx_pixels;
+blit.input.type_text(?in, cp);      # then every event, in arrival order
+blit.context.begin(?ctx, in, w, h);
+# ... widgets ...
+blit.context.end(?ctx);
+# blit.input.free(?in) at shutdown
+```
+
+- **Time.** `in.time` is the host's monotonic clock in seconds, and
+  `blit.context.dt(?ctx)` is the time since the previous frame (0 on the
+  first).
+- **Pointer.** `down` and `prev_down` are bitmasks of `BUTTON_LEFT`,
+  `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
+  `blit.input.pressed`, `released` and `held` take the button. The context
+  carries `prev_down` across frames. With `present` 0 nothing is hovered and
+  `in_rect` misses. Widgets act on the left button.
+- **Keyboard events.** `type_text(?in, cp)` for each typed codepoint,
+  `press_key(?in, code, mods)` for each key press or repeat,
+  `release_key(?in, code, mods)` for each release and `compose(?in, text,
+  caret)` for the IME's composition in progress (an empty one ends it; the
+  committed text arrives as typed text). They live in storage the `Input`
+  owns, bound to an allocator by `init`, so a frame holds any number of them,
+  and passing the `Input` by value copies only the view. A key that types a
+  printable ASCII character is that character, letters in uppercase (`'A'`,
+  `'7'`, `' '`); every other key is a `KEY_*` constant (`KEY_ENTER`,
+  `KEY_ESCAPE`, `KEY_BACKSPACE`, `KEY_DELETE`, the arrows, `KEY_HOME`,
+  `KEY_END`, ...). Modifiers are `MOD_SHIFT`, `MOD_CTRL`, `MOD_ALT` and
+  `MOD_SUPER` bits, both held (`in.mods`) and carried by each key event, and
+  `blit.input.shortcut(mods)` is ctrl, or super as darwin's command, without
+  alt.
+- **Back to the host.** After `end`, `blit.context.cursor(?ctx)` is the
+  pointer shape to show (`CURSOR_ARROW`, `TEXT`, `HAND`, `MOVE`, `RESIZE_EW`,
+  `RESIZE_NS`, `RESIZE_NWSE`, `RESIZE_NESW`, `NOT_ALLOWED`), which widgets set
+  while hovered, and `ime_rect(?ctx)` is where to put the IME's candidate
+  window, in screen pixels, none while nothing takes text.
+- **Scheduling.** Widgets call `blit.context.wake_at(?ctx, t)` for a time they
+  need a frame by (a hover delay, an animation, a caret blink). After `end`,
+  `next_frame(?ctx)` is `some(0)` to draw again now, `some(t)` to draw by time
+  `t`, or `none` to draw only on input, so an idle tool can sleep instead of
+  redrawing every frame.
+
 ## Keyboard, focus & text fields
 
-The keyboard is plain data in `Input` like the mouse, so blit still never
-touches a window. Each frame the consumer empties it (`blit.input.clear_keys`)
-and fills it in arrival order: `type_text(?in, cp)` for each typed codepoint and
-`press_key(?in, code, mods)` for each key press or repeat (releases are not
-events). A key that types a printable ASCII character is that character, letters
-in uppercase (`'A'`, `'7'`, `' '`); every other key is a `KEY_*` constant
-(`KEY_ENTER`, `KEY_ESCAPE`, `KEY_BACKSPACE`, `KEY_DELETE`, the arrows,
-`KEY_HOME`, `KEY_END`, ...). Modifiers are `MOD_SHIFT`, `MOD_CTRL`, `MOD_ALT`
-and `MOD_SUPER` bits, and `blit.input.shortcut(mods)` is ctrl, or super as
-darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
-
 - **Focus.** One widget at a time holds the keyboard, by id across frames
-  (`blit.context.focus`, `focused`, `unfocus`). A press that lands anywhere
-  else takes it back, and so does a frame that does not draw the holder.
+  (`blit.context.focus`, `focused`, `unfocus`), so
+  `focus(?ctx, blit.context.id_of(?ctx, key))` hands it to a widget from code.
+  A press that lands anywhere else takes it back, and so does a frame that does
+  not draw the holder.
   `blit.context.typing(?ctx)` is true exactly while a widget holds it: read it
   before `begin` to keep the consumer's own key bindings quiet for the keys that
   frame will type into a field.
@@ -145,7 +247,7 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   `blit.context.copied(?ctx)` is text a copy or cut left for the consumer to put
   on the clipboard (nil when none), and `wants_paste(?ctx)` asks for the
   clipboard's text, which the consumer hands to the next frame as `in.paste`.
-- **Text field.** `blit.widget.text_field(?ctx, ?f, hint)` edits a
+- **Text field.** `blit.widget.text_field(?ctx, key, ?f, hint)` edits a
   `blit.field.Field`: UTF-8 in a buffer the consumer owns, with a caret, a
   selection, a maximum length in characters and a per-field filter.
   ```mach
@@ -153,7 +255,7 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   var name: blit.field.Field;
   blit.field.init(?name, ?buf[0], 64, 24, nil); # 24 characters, any printable
   # per frame, inside a panel:
-  val did: u8 = blit.widget.text_field(?ctx, ?name, "name");
+  val did: u8 = blit.widget.text_field(?ctx, "name", ?name, "name");
   if ((did & blit.field.ENTERED) != 0) { ... }
   ```
   A press on the field focuses it and puts the caret under the cursor. It takes
@@ -161,6 +263,8 @@ darwin's command, without alt. A frame holds up to `EVENT_CAP` events.
   the selection), shortcut A to select all, shortcut C, X and V through the
   clipboard hand-off, and enter or escape, which end the edit and give the
   keyboard back. It returns this frame's `EDITED`, `ENTERED` and `ESCAPED` bits.
+  While focused it shows the IME's composition inline at the caret, underlined,
+  and places the candidate window at the caret.
   The edit model in `blit.field` needs no context, so it can be driven
   directly.
 
@@ -201,9 +305,7 @@ Coordinates compose one way:
 
 Every widget places itself at the layout cursor, spans the column, advances
 the cursor and draws through the painter, so each one clips and scrolls like
-any geometry and works inside surfaces, docks and windows alike. A widget takes
-the same ids every frame whatever it shows, so later widgets keep their hit
-identity.
+any geometry and works inside surfaces, docks and windows alike.
 
 - **Layout.** `advance(?ctx, h)` moves past a row placed by hand and
   `space(?ctx, h)` leaves room. `cell_x0`/`cell_x1(?ctx, i, n)` split the
@@ -225,7 +327,7 @@ identity.
   same without one.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
-- **Lists.** `list(?ctx, ?l, ?items[0], count, query, h)` is a scrolling list
+- **Lists.** `list(?ctx, key, ?l, ?items[0], count, query, h)` is a scrolling list
   `h` pixels tall. Clicking an item selects it (`List.selected`, the count for
   none), and only the items holding `query`, ignoring ASCII case, are shown,
   so a search box the caller keeps narrows it.
@@ -235,10 +337,82 @@ the shape of an application's side panel (a header, then run, view and files
 sections), and drives it headlessly through `blit.input`.
 
 Beyond the v0 widgets, `blit.widget.dropdown` is a select whose options open in
-a popup over later widgets, `blit.widget.begin_window`/`end_window` is a
-draggable, collapsible titled window, `blit.widget.begin_popup`/`end_popup`
-opens an overlay column, and `blit.widget.region_clicked` hit-tests an arbitrary
+a popup over later widgets, its open state kept in the state store under its
+id, `blit.widget.begin_window`/`end_window` is a
+draggable, collapsible titled window, `blit.widget.begin_popup(?ctx, key, open,
+x, y, w)`/`end_popup` opens an overlay column, and
+`blit.widget.region_clicked(?ctx, key, x0, y0, x1, y1)` hit-tests an arbitrary
 rect for consumer-drawn affordances.
+
+## Widget ids
+
+A widget's id is a 64-bit FNV-1a hash of its key folded into the seed of the
+current id scope and finished with a 64-bit mixer, never its place in the call
+order. A widget drawn only some frames, a clipped row or a reordered window
+therefore moves no other widget's id, and the active drag, the focus holder and
+the open dropdown stay where they
+were. 0 is never an id: it means "no widget".
+
+- **Labels are keys.** A labelled widget (`button`, `checkbox`, `toggle`,
+  `slider`, `dropdown`, `section`, a window's title) is keyed by its label.
+  Text after `##` is hashed but not drawn, so `"Save##toolbar"` shows `Save`
+  and is a different widget from another `"Save"`. A label holding `###` is
+  keyed by the text from `###` on alone, so what it shows can change without
+  changing its id: `"Frames: 12###fps"` and `"Frames: 13###fps"` are one
+  widget. Widgets without a label (`text_field`, `region_clicked`, popups,
+  scroll regions, docks, lists and charts) take a key argument the same way.
+- **Scopes.** `blit.context.push_id_str(?ctx, s)` and `push_id_int(?ctx, n)`
+  open a scope and `pop_id(?ctx)` closes it, and a pop with no scope open is
+  ignored. Windows, open popups and scroll regions (so docks and lists too)
+  open their own scope for what they hold, so two windows can each hold a
+  button called `ok`. Repeated rows built from one label, such as buttons in a
+  loop, take `push_id_int` with their index. The stack grows from the
+  context's allocator.
+- **Parts.** A widget's internal parts (a window's title and collapse box, a
+  scrollbar thumb, a popup's outside claim, a dropdown's options, a list's
+  items) take ids derived from the widget's id with a fixed suffix or index.
+- **Looking ids up.** `blit.context.id_of(?ctx, key)` is the id a widget with
+  that label or key gets in the current scope, for `focus`, state lookups and
+  tests.
+- **Collisions.** Two claims with one id in a frame are recorded:
+  `blit.context.collisions(?ctx)` counts them after `end` and
+  `collision_at(?ctx, i)` names each repeated id, until the next `begin`.
+
+This is a breaking change from call-order ids: `blit.context.next_id` and
+`Context.seq` are gone, and `begin_popup`, `begin_scroll`, `begin_dock`,
+`list`, `text_field`, `region_clicked`, `blit.chart.line`, `bars` and
+`sparkline` take a key argument after the context.
+
+## State store
+
+State that must outlive a frame can live on the context, keyed by widget id.
+`blit.state.get[T](?ctx, id)` returns the `T` that id keeps, zeroed the first
+time it is asked for. One id can keep several types of state, each its own
+entry, so a widget never reads another's bytes.
+
+- **Lifetime.** The pointer is valid until `end`. Each `get` marks the entry
+  reached, and `end` drops every entry no frame reached for `max_age` frames
+  (`blit.state.MAX_AGE`, 60, by default; `set_max_age(?ctx, n)` changes it and
+  0 keeps everything), so state for widgets that stopped drawing does not pile
+  up. A `get` between frames counts toward the next frame.
+  `pin[T](?ctx, id, 1)` keeps an entry however long it goes untouched, and
+  `pin[T](?ctx, id, 0)` lets it age out again.
+- **Failure.** Entries are allocator-backed and the store grows. When it cannot,
+  `get` sets the context's oom (see `context.ok`) and hands back zeroed scratch
+  state that every refused entry shares, never a dangling pointer. A state type
+  is at most 1 KiB and 16-byte aligned, a compile error otherwise.
+- **Persistence.** `register[T](?ctx, name, save, load)` makes `T` a persisted
+  kind. `save(?ctx)` writes every entry of a registered kind into one TOML
+  document, a `[<name>.<id>]` table per entry that the kind's save hook fills
+  through `put_int`, `put_float`, `put_bool` and `put_str`. The text stays the
+  context's until the next save. `load(?ctx, text)` reads such a document
+  through `std.data.toml`, zeroes each entry and runs the kind's load hook over
+  its table. Tables of unregistered kinds are skipped. A load hook copies any
+  string it keeps, since the parsed document is freed when `load` returns.
+
+The store is one owner, not the only one. Widgets that take a caller-owned
+record (`Window`, `Scroll`, `List`, `Field`) keep taking it, so an app can own
+its state where it wants to.
 
 ## Charts
 
@@ -251,11 +425,11 @@ var income: [64]f32;
 var series: [2]blit.chart.Series;
 series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
 series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-val hov: blit.chart.Hover = blit.chart.line(?ctx, x, y, w, h, ?series[0], 2, 64, blit.chart.options());
+val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, 64, blit.chart.options());
 if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
 
-blit.chart.bars(?ctx, x, y, w, h, ?net[0], count, blit.chart.options());
-blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
+blit.chart.bars(?ctx, "net", x, y, w, h, ?net[0], count, blit.chart.options());
+blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
 ```
 
 - **Line.** One or more series share x: sample `i` of every series sits at the
@@ -271,7 +445,7 @@ blit.chart.sparkline(?ctx, x, y, w, h, ?energy[0], 64);
   sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
   labels come from the glyph source, with k, M, G or T for large steps.
   `Options.axes = 0` gives the whole rect to the plot.
-- **Hover.** A chart takes one id in call order and claims its plot, so it
+- **Hover.** A chart takes its id from its key and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
   widget. A line reports the sample nearest the cursor and the series nearest it
   there, bars report the slot under the cursor, and both draw a read-out of the
@@ -328,7 +502,7 @@ click is always the one visibly on top.
 blit draws textures it does not own. A consumer texture is named by an opaque
 `u64` handle, whatever the renderer understands (a GL texture name, an index
 into its own table). blit never creates, owns or binds one, it only passes the
-handle through to the draw list's spans. `0` is reserved for the atlas.
+handle through to the draw list's runs. `0` is reserved for the atlas.
 
 - **Image.** `blit.draw.Image` is a handle, a source rect in uv and a filter.
   `blit.draw.region(tex, tw, th, x, y, w, h, filter)` builds one from a rect in
@@ -423,18 +597,22 @@ cell. Colors and texels are premultiplied.
 - **Atlas.** `blit.context.atlas_of(?ctx)` is the glyph atlas: `page_count`
   pages, each an RGBA8 square of `blit.atlas.PAGE_SIDE` (512) texels at
   `page_pixels(at, i)`, premultiplied (a glyph's coverage in all four channels,
-  the white block opaque). Pages open as glyphs arrive and never resize. Each
-  has a `page_version` bumped on every write and a `page_dirty` rect: upload the
-  dirty rect of each changed page before drawing, then `page_clean` it. Every
-  glyph has a transparent gutter, so linear filtering is safe. The built-in
-  font at whole scales looks sharpest with nearest.
+  the white block opaque). Pages open as glyphs arrive and never resize, and
+  past `blit.atlas.PAGE_MAX` (16) the least recently drawn one is cleared and
+  reused, wholly dirty. Each has a `page_version` bumped on every write and a
+  `page_dirty` rect: upload the dirty rect of each changed page before drawing,
+  then `page_clean` it. Every glyph has a transparent gutter, so linear
+  filtering is safe. The built-in font at whole scales looks sharpest with
+  nearest.
 - **Consumer textures** are sampled as premultiplied alpha: upload them
   premultiplied.
 - **Color.** Colors are authored as straight rgba and premultiplied as they are
   emitted. When the target encodes sRGB on write, call
   `blit.context.set_srgb(?ctx, 1)`: every color is then converted to linear
   light before premultiplying, so the encoding brings it back to what was
-  authored. Alpha is never converted. Gradients interpolate the emitted colors.
+  authored. Alpha is never converted. Each distinct color is converted once and
+  cached on the context (`blit.draw.LinearCache`), so sRGB output costs next to
+  nothing. Gradients interpolate the emitted colors.
 - **Vertex.** `blit.draw.Vert` is 8 `f32`, 32-byte stride: `aPos` (vec2) at 0,
   `aUV` (vec2) at 8, `aColor` (vec4) at 16. Positions in pixels, uv in [0, 1],
   premultiplied rgba.
@@ -479,6 +657,36 @@ demo/harness/out/linux-x86_64/debug/bin/harness
 ```
 
 `demo/panel/` builds and runs the same way.
+
+## Benchmark
+
+`demo/bench/` measures blit's per-frame cost on a few representative
+interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
+line chart of 100,000 samples, and six overlapping windows each holding a
+section and a scroll region. Each scene runs with sRGB output off and then on,
+and the table reports the mean frame time, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. It is local only,
+never a CI job. Build it in the release profile:
+
+```
+mach dep pull demo/bench
+mach build demo/bench -p release
+demo/bench/out/linux-x86_64/release/bin/bench
+```
+
+Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+
+```
+scene          srgb    us/frame  vertices  runs  allocs   srgb cost
+dense panel    off        292.4      5298     1       0
+dense panel    on         295.6      5298     1       0   +1.0%
+10k row list   off        123.6      1704     1       0
+10k row list   on         124.1      1704     1       0   +0.4%
+100k chart     off       1924.6     15738     1       0
+100k chart     on        1966.7     15738     1       0   +2.1%
+windows        off        273.9      5472     1       0
+windows        on         277.5      5472     1       0   +1.3%
+```
 
 ## Conventions
 

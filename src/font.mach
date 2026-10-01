@@ -1,14 +1,24 @@
-# text: a glyph source, the glyph cache over it and the atlas its bitmaps live in
+# text: glyph sources, the styles drawn with them, the glyph cache over them
+# and the atlas their bitmaps live in
 #
-# a Font lays out utf-8 text through a blit.glyph source. it decodes text by
-# codepoint, asks the source for each codepoint's metrics once per scale and
-# caches them, and rasterises a glyph into the atlas the first time it is
-# drawn, never when it is only measured. a codepoint the source lacks draws as
-# U+FFFD, or as '?' when the source lacks that too, and one neither has keeps
-# no advance. control codepoints take no space, and a newline breaks the line.
+# a Font lays out utf-8 text through blit.glyph sources. it holds several,
+# source 0 being the built-in bitmap font until set_source swaps in another,
+# and a set of text styles, each naming a source and a size. style 0 is
+# source 0 at its own size, so a Font needs no configuration.
 #
-# the built-in bitmap font is the default source, so a Font needs no
-# configuration. set_source swaps in any other, such as a TrueType face.
+# layout shapes each line: a source with a shaper turns the line's codepoints
+# into glyph ids and positions itself, and any other source maps codepoints to
+# glyph ids one to one, kerned pair by pair. a codepoint a non-shaping source
+# lacks draws as U+FFFD, or as '?' when the source lacks that too, and one
+# neither has keeps no advance. control codepoints take no space, and a
+# newline breaks the line.
+#
+# glyphs are cached by source, glyph id and scale, the style's size times the
+# interface scale, so any number of styles and scales mix within a frame. a
+# glyph's metrics are asked for once and its bitmap rasterised into the atlas
+# the first time it is drawn, never when it is only measured. the atlas evicts
+# pages not drawn from this frame when it is full, and a glyph whose page was
+# evicted is rasterised again when next drawn (see blit.atlas).
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -28,11 +38,29 @@ use std.allocator.page;
 use gmap: std.collections.map;
 use std.text.utf8;
 
-# the codepoint drawn for one the source lacks
+# the codepoint drawn for one a non-shaping source lacks
 pub val REPLACEMENT: u32 = 0xFFFD;
 
 # the one control codepoint layout acts on
 pub val NEWLINE: u32 = 10;
+
+# most glyph sources one font holds
+pub val SOURCE_MAX: usize = 16;
+
+# most text styles one font holds
+pub val STYLE_MAX: usize = 32;
+
+# the style every font starts with: source 0 at its own size
+pub val STYLE_BODY: u32 = 0;
+
+# a text style: which source text is drawn from, and at what size
+# ---
+# source: index of a source from add_source, 0 for the default
+# size:   the face's own size times this, before the interface scale, above zero
+pub rec Style {
+    source: u32;
+    size:   f32;
+}
 
 # a glyph resolved at one scale, ready to lay out and draw
 # ---
@@ -53,57 +81,96 @@ pub rec Placed {
     v1:    f32;
 }
 
-# one cached codepoint at one scale
+# what a cached glyph is keyed on
+# ---
+# source: source index
+# id:     glyph id, the codepoint for a non-shaping source
+# scale:  bits of the scale the source was asked at
+rec Key {
+    source: u32;
+    id:     u32;
+    scale:  u32;
+}
+
+# one cached glyph at one scale
 # ---
 # placed: its metrics and, once drawn, its atlas cell
-# drawn:  the codepoint the source rasterises for it, after fallback
-# state:  0 until first drawn, 1 once packed or blank, 2 when packing failed
+# drawn:  the glyph id the source rasterises for it, after fallback
+# state:  0 until drawn, 1 once packed or blank, 2 when rasterising failed, 3 when the atlas refused it
+# gen:    generation of the page it was packed on, stale once that page is evicted
+# at:     the frame the atlas refused it in
 rec Entry {
     placed: Placed;
     drawn:  u32;
     state:  u8;
+    gen:    u32;
+    at:     u64;
 }
 
-# a glyph source with its cache and atlas
+# glyph sources and text styles with their cache and atlas
 # ---
-# a:       allocator for the cache, the atlas and raster scratch
-# src:     the glyph source
+# a:       allocator for the cache, the atlas and the scratch buffers
+# srcs:    the glyph sources, `nsrc` of them
+# nsrc:    sources held
+# styles:  the text styles, `nstyle` of them
+# nstyle:  styles held
 # atlas:   the pages glyph bitmaps are packed into
-# cache:   (scale bits << 32 | codepoint) to entry
+# cache:   (source, glyph id, scale) to entry
 # scratch: coverage buffer a glyph is rasterised into before packing
 # cap:     bytes scratch holds
+# cps:     codepoints of the line being shaped
+# cps_cap: codepoints cps holds
+# run:     glyphs the last shape made
+# run_cap: glyphs run holds
 # missing: glyphs that could not be rasterised or packed, which draw blank
+# oom:     1 once a scratch buffer could not grow and text went unmeasured or undrawn, until its owner clears it
 pub rec Font {
     a:       *allo.Allocator;
-    src:     glyph.GlyphSource;
+    srcs:    [16]glyph.GlyphSource;
+    nsrc:    usize;
+    styles:  [32]Style;
+    nstyle:  usize;
     atlas:   atlas.Atlas;
-    cache:   gmap.Map[u64, Entry];
+    cache:   gmap.Map[Key, Entry];
     scratch: *u8;
     cap:     usize;
+    cps:     *u32;
+    cps_cap: usize;
+    run:     *glyph.Shaped;
+    run_cap: usize;
     missing: usize;
+    oom:     u8;
 }
 
-# open a font over the built-in bitmap source
+# open a font over the built-in bitmap source, with the one body style
 # ---
 # f:   font to initialize
-# a:   allocator for the cache, the atlas and raster scratch
+# a:   allocator for the cache, the atlas and the scratch buffers
 # ret: ok, or the allocator's refusal with nothing allocated
 pub fun init(f: *Font, a: *allo.Allocator) err[allo.Error] {
-    f.a       = a;
-    f.src     = bitmap.source();
-    f.cache   = gmap.init[u64, Entry](a);
-    f.scratch = nil;
-    f.cap     = 0;
-    f.missing = 0;
+    f.a         = a;
+    f.srcs[0]   = bitmap.source();
+    f.nsrc      = 1;
+    f.styles[0] = Style{source: 0, size: 1.0::f32};
+    f.nstyle    = 1;
+    f.cache     = gmap.init[Key, Entry](a);
+    f.scratch   = nil;
+    f.cap       = 0;
+    f.cps       = nil;
+    f.cps_cap   = 0;
+    f.run       = nil;
+    f.run_cap   = 0;
+    f.missing   = 0;
+    f.oom       = 0;
     ret atlas.init(?f.atlas, a);
 }
 
-# release the cache, the atlas and the scratch buffer
+# release the cache, the atlas and the scratch buffers
 # ---
 # f:   font to free
 # ret: ok, or the first refusal
 pub fun free(f: *Font) err[allo.Error] {
-    val c: err[allo.Error] = gmap.dnit[u64, Entry](?f.cache);
+    val c: err[allo.Error] = gmap.dnit[Key, Entry](?f.cache);
     if (sel c.err) { ret c; }
     if (f.scratch != nil) {
         val s: err[allo.Error] = allo.deallocate[u8](f.a, f.scratch, f.cap);
@@ -111,10 +178,22 @@ pub fun free(f: *Font) err[allo.Error] {
         f.scratch = nil;
         f.cap     = 0;
     }
+    if (f.cps != nil) {
+        val p: err[allo.Error] = allo.deallocate[u32](f.a, f.cps, f.cps_cap);
+        if (sel p.err) { ret p; }
+        f.cps     = nil;
+        f.cps_cap = 0;
+    }
+    if (f.run != nil) {
+        val r: err[allo.Error] = allo.deallocate[glyph.Shaped](f.a, f.run, f.run_cap);
+        if (sel r.err) { ret r; }
+        f.run     = nil;
+        f.run_cap = 0;
+    }
     ret atlas.free(?f.atlas);
 }
 
-# draw text from another source from now on
+# draw source 0, the default every style starts on, from another source
 #
 # the cache is dropped and the atlas pages cleared, so every page is dirty and
 # must be uploaded again. call it between frames: vertices already emitted
@@ -123,28 +202,99 @@ pub fun free(f: *Font) err[allo.Error] {
 # f:   font
 # src: the new source
 pub fun set_source(f: *Font, src: glyph.GlyphSource) {
-    f.src = src;
-    gmap.clear[u64, Entry](?f.cache);
+    f.srcs[0] = src;
+    gmap.clear[Key, Entry](?f.cache);
     atlas.reset(?f.atlas);
     f.missing = 0;
 }
 
-# the line metrics at a scale
+# hold one more glyph source for styles to name
 # ---
-# f:     font
-# scale: interface scale
-# ret:   line metrics in pixels
-pub fun line(f: *Font, scale: f32) glyph.LineMetrics {
-    ret f.src.line(f.src.self, scale);
+# f:   font
+# src: the source
+# ret: its index, or none once SOURCE_MAX are held
+pub fun add_source(f: *Font, src: glyph.GlyphSource) opt[u32] {
+    if (f.nsrc >= SOURCE_MAX) { ret opt[u32].none{}; }
+    f.srcs[f.nsrc] = src;
+    f.nsrc         = f.nsrc + 1;
+    ret opt[u32].some{(f.nsrc - 1)::u32};
 }
 
-# the height of one line box at a scale
+# whether a style names a held source at a usable size
+fun valid(f: *Font, st: Style) bool {
+    ret st.source::usize < f.nsrc && st.size > 0.0::f32;
+}
+
+# hold one more text style
+# ---
+# f:   font
+# st:  the style
+# ret: its id, or none once STYLE_MAX are held or for a source not held or a size not above zero
+pub fun add_style(f: *Font, st: Style) opt[u32] {
+    if (f.nstyle >= STYLE_MAX || !valid(f, st)) { ret opt[u32].none{}; }
+    f.styles[f.nstyle] = st;
+    f.nstyle           = f.nstyle + 1;
+    ret opt[u32].some{(f.nstyle - 1)::u32};
+}
+
+# change a held style, such as resizing the body text
+#
+# glyphs already cached at the old size stay until the atlas evicts them.
+# ---
+# f:   font
+# id:  the style's id
+# st:  what it becomes
+# ret: false for an id not held, a source not held or a size not above zero
+pub fun set_style(f: *Font, id: u32, st: Style) bool {
+    if (id::usize >= f.nstyle || !valid(f, st)) { ret false; }
+    f.styles[id] = st;
+    ret true;
+}
+
+# a held style, or the body style for an id not held
+# ---
+# f:   font
+# id:  the style's id
+# ret: the style
+pub fun style(f: *Font, id: u32) Style {
+    if (id::usize >= f.nstyle) { ret f.styles[0]; }
+    ret f.styles[id];
+}
+
+# start a frame, so atlas pages not drawn from since can be evicted
+# ---
+# f: font
+pub fun begin_frame(f: *Font) {
+    atlas.tick(?f.atlas);
+}
+
+# the source index and scale a style asks for at an interface scale
+fun face(f: *Font, id: u32, scale: f32, sc: *f32) u32 {
+    val st: Style = style(f, id);
+    @sc = st.size * scale;
+    ret st.source;
+}
+
+# the line metrics of a style at a scale
 # ---
 # f:     font
+# id:    style id
+# scale: interface scale
+# ret:   line metrics in pixels
+pub fun line(f: *Font, id: u32, scale: f32) glyph.LineMetrics {
+    var sc:  f32                = 0.0::f32;
+    val src: *glyph.GlyphSource = ?f.srcs[face(f, id, scale, ?sc)];
+    ret src.line(src.self, sc);
+}
+
+# the height of one line box of a style at a scale
+# ---
+# f:     font
+# id:    style id
 # scale: interface scale
 # ret:   line height in pixels
-pub fun line_height(f: *Font, scale: f32) f32 {
-    ret glyph.line_height(line(f, scale));
+pub fun line_height(f: *Font, id: u32, scale: f32) f32 {
+    ret glyph.line_height(line(f, id, scale));
 }
 
 # decode the codepoint at a byte offset, always making progress
@@ -175,106 +325,259 @@ pub fun is_control(cp: u32) bool {
     ret cp < 0x20 || cp == 0x7F;
 }
 
-# the pen adjustment between two codepoints, 0 without kerning
-# ---
-# f:     font
-# left:  the codepoint before, 0 at the start of a line
-# right: the codepoint after
-# scale: interface scale
-# ret:   adjustment in pixels
-pub fun kern(f: *Font, left: u32, right: u32, scale: f32) f32 {
-    if (left == 0 || f.src.kern == nil) { ret 0.0::f32; }
-    ret f.src.kern(f.src.self, left, right, scale);
-}
-
-# how far the pen moves over one codepoint after another, kerning included
-#
-# for layout built outside blit, such as a caret walking a text field.
-# ---
-# f:     font
-# left:  the codepoint before on the line, 0 for none
-# cp:    the codepoint
-# scale: interface scale
-# ret:   pen movement in pixels, 0 for a control codepoint
-pub fun advance(f: *Font, left: u32, cp: u32, scale: f32) f32 {
-    if (is_control(cp) || cp == NEWLINE) { ret 0.0::f32; }
-    ret kern(f, left, cp, scale) + glyph_of(f, cp, scale).g.advance;
-}
-
-# width of the widest line of a string
-# ---
-# f:     font
-# s:     utf-8 text
-# scale: interface scale
-# ret:   width in pixels
-pub fun measure(f: *Font, s: str, scale: f32) f32 {
-    if (s == nil) { ret 0.0::f32; }
-    val n:      usize = str_len(s);
-    var widest: f32   = 0.0::f32;
-    var w:      f32   = 0.0::f32;
-    var prev:   u32   = 0;
-    var i:      usize = 0;
-    for (i < n) {
-        var cp: u32 = 0;
-        i = i + next(s, i, n, ?cp);
-        if (cp == NEWLINE) {
-            if (w > widest) { widest = w; }
-            w    = 0.0::f32;
-            prev = 0;
-        }
-        or (!is_control(cp)) {
-            w    = w + advance(f, prev, cp, scale);
-            prev = cp;
-        }
-    }
-    if (w > widest) { widest = w; }
-    ret widest;
-}
-
-# the cache key of a codepoint at a scale
-fun key(cp: u32, scale: f32) u64 {
-    ret ((scale:~u32)::u64 << 32) | cp::u64;
-}
-
-# resolve a codepoint's metrics, falling back to the replacement glyph
-fun resolve(f: *Font, cp: u32, scale: f32) Entry {
+# resolve a glyph's metrics, a non-shaping source falling back to the
+# replacement glyph
+fun resolve(src: *glyph.GlyphSource, id: u32, scale: f32) Entry {
     var e: Entry;
     var g: glyph.Glyph;
-    if (f.src.glyph(f.src.self, cp, scale, ?g)) {
+    if (src.glyph(src.self, id, scale, ?g)) {
         e.placed.g = g;
-        e.drawn    = cp;
+        e.drawn    = id;
         ret e;
     }
-    if (f.src.glyph(f.src.self, REPLACEMENT, scale, ?g)) {
-        e.placed.g = g;
-        e.drawn    = REPLACEMENT;
-        ret e;
-    }
-    if (f.src.glyph(f.src.self, '?', scale, ?g)) {
-        e.placed.g = g;
-        e.drawn    = '?';
-        ret e;
+    if (src.shape == nil) {
+        if (src.glyph(src.self, REPLACEMENT, scale, ?g)) {
+            e.placed.g = g;
+            e.drawn    = REPLACEMENT;
+            ret e;
+        }
+        if (src.glyph(src.self, '?', scale, ?g)) {
+            e.placed.g = g;
+            e.drawn    = '?';
+            ret e;
+        }
     }
     # nothing to draw it with: no advance and no bitmap
     e.state = 1;
     ret e;
 }
 
-# the cached entry for a codepoint at a scale, resolving it the first time
+# the cached entry for a glyph at a scale, resolving it the first time
 #
 # returned by value: resolving can grow the map, which moves its entries.
-fun entry(f: *Font, cp: u32, scale: f32) Entry {
-    var k:     u64         = key(cp, scale);
-    val known: opt[*Entry] = gmap.get[u64, Entry](?f.cache, ?k);
+fun entry(f: *Font, si: u32, id: u32, scale: f32) Entry {
+    var k:     Key         = Key{source: si, id: id, scale: scale:~u32};
+    val known: opt[*Entry] = gmap.get[Key, Entry](?f.cache, ?k);
     if (sel known.some) { ret @known.some; }
-    val e:    Entry                 = resolve(f, cp, scale);
-    val kept: res[bool, allo.Error] = gmap.insert[u64, Entry](?f.cache, k, e);
+    val e:    Entry                 = resolve(?f.srcs[si], id, scale);
+    val kept: res[bool, allo.Error] = gmap.insert[Key, Entry](?f.cache, k, e);
     ret e;
 }
 
-# a codepoint's metrics at a scale, without rasterising it
-fun glyph_of(f: *Font, cp: u32, scale: f32) Placed {
-    ret entry(f, cp, scale).placed;
+# make sure cps holds at least n codepoints and run at least n glyphs
+fun reserve_run(f: *Font, n: usize) u8 {
+    if (n > f.cps_cap) {
+        if (f.cps != nil) {
+            val freed: err[allo.Error] = allo.deallocate[u32](f.a, f.cps, f.cps_cap);
+            f.cps     = nil;
+            f.cps_cap = 0;
+            if (sel freed.err) { ret 0; }
+        }
+        val r: res[*u32, allo.Error] = allo.allocate[u32](f.a, n);
+        if (sel r.err) { ret 0; }
+        f.cps     = r.ok;
+        f.cps_cap = n;
+    }
+    ret reserve_glyphs(f, n);
+}
+
+# make sure run holds at least n glyphs, keeping none of what it held
+fun reserve_glyphs(f: *Font, n: usize) u8 {
+    if (n <= f.run_cap) { ret 1; }
+    if (f.run != nil) {
+        val freed: err[allo.Error] = allo.deallocate[glyph.Shaped](f.a, f.run, f.run_cap);
+        f.run     = nil;
+        f.run_cap = 0;
+        if (sel freed.err) { ret 0; }
+    }
+    val r: res[*glyph.Shaped, allo.Error] = allo.allocate[glyph.Shaped](f.a, n);
+    if (sel r.err) { ret 0; }
+    f.run     = r.ok;
+    f.run_cap = n;
+    ret 1;
+}
+
+# shape the m codepoints in cps into run
+fun shape_cps(f: *Font, si: u32, sc: f32, m: usize) usize {
+    if (m == 0) { ret 0; }
+    val src: *glyph.GlyphSource = ?f.srcs[si];
+    if (src.shape != nil) {
+        var g: usize = src.shape(src.self, f.cps, m, sc, f.run, f.run_cap);
+        if (g > f.run_cap) {
+            if (reserve_glyphs(f, g) == 0) {
+                f.oom = 1;
+                ret 0;
+            }
+            g = src.shape(src.self, f.cps, m, sc, f.run, f.run_cap);
+            if (g > f.run_cap) { g = f.run_cap; }
+        }
+        ret g;
+    }
+    var prev: u32   = 0;
+    var i:    usize = 0;
+    for (i < m) {
+        val cp: u32   = f.cps[i];
+        val e:  Entry = entry(f, si, cp, sc);
+        var id: u32   = cp;
+        if (e.state == 0)             { id = e.drawn; }
+        if (i > 0 && src.kern != nil) { f.run[i - 1].advance = f.run[i - 1].advance + src.kern(src.self, prev, id, sc); }
+        f.run[i] = glyph.Shaped{id: id, cluster: i::u32, advance: e.placed.g.advance, dx: 0.0::f32, dy: 0.0::f32};
+        prev     = id;
+        i        = i + 1;
+    }
+    ret m;
+}
+
+# shape the first n bytes of utf-8 text as one line in a style at a scale
+#
+# control codepoints and newlines are left out, so a caller breaks lines
+# first. the glyphs stay in shaped(f) until the next shape or measure.
+# ---
+# f:     font
+# id:    style id
+# scale: interface scale
+# s:     utf-8 text, at least n bytes
+# n:     bytes to shape, on a codepoint boundary
+# ret:   glyphs made
+pub fun shape(f: *Font, id: u32, scale: f32, s: str, n: usize) usize {
+    if (s == nil || n == 0) { ret 0; }
+    if (reserve_run(f, n) == 0) {
+        f.oom = 1;
+        ret 0;
+    }
+    var m: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        var cp: u32 = 0;
+        i = i + next(s, i, n, ?cp);
+        if (cp != NEWLINE && !is_control(cp)) {
+            f.cps[m] = cp;
+            m        = m + 1;
+        }
+    }
+    var sc: f32 = 0.0::f32;
+    val si: u32 = face(f, id, scale, ?sc);
+    ret shape_cps(f, si, sc, m);
+}
+
+# the glyphs the last shape made, in run order
+# ---
+# f:   font
+# ret: the glyphs, as many as shape returned
+pub fun shaped(f: *Font) *glyph.Shaped {
+    ret f.run;
+}
+
+# how far the pen moves over one codepoint after another, kerning included
+#
+# for layout built outside blit, such as a caret walking a text field. a
+# shaping source shapes the codepoint alone, so a ligature or contextual form
+# it would make with its neighbours is not seen: measure a byte range for that.
+# ---
+# f:     font
+# id:    style id
+# scale: interface scale
+# left:  the codepoint before on the line, 0 for none
+# cp:    the codepoint
+# ret:   pen movement in pixels, 0 for a control codepoint
+pub fun advance(f: *Font, id: u32, scale: f32, left: u32, cp: u32) f32 {
+    if (is_control(cp) || cp == NEWLINE) { ret 0.0::f32; }
+    var sc:  f32                = 0.0::f32;
+    val si:  u32                = face(f, id, scale, ?sc);
+    val src: *glyph.GlyphSource = ?f.srcs[si];
+    if (src.shape == nil) {
+        val e: Entry = entry(f, si, cp, sc);
+        var w: f32   = e.placed.g.advance;
+        if (left != 0 && left != NEWLINE && !is_control(left) && src.kern != nil) {
+            w = w + src.kern(src.self, glyph_id(f, si, left, sc), glyph_id(f, si, cp, sc), sc);
+        }
+        ret w;
+    }
+    if (reserve_run(f, 1) == 0) {
+        f.oom = 1;
+        ret 0.0::f32;
+    }
+    f.cps[0] = cp;
+    ret run_width(f, shape_cps(f, si, sc, 1));
+}
+
+# the glyph id a non-shaping source draws a codepoint with, after fallback
+fun glyph_id(f: *Font, si: u32, cp: u32, sc: f32) u32 {
+    val e: Entry = entry(f, si, cp, sc);
+    if (e.state == 0) { ret e.drawn; }
+    ret cp;
+}
+
+# whether a style's source has its own glyph for a codepoint, rather than a
+# fallback or a shaper's missing glyph
+# ---
+# f:     font
+# id:    style id
+# scale: interface scale
+# cp:    codepoint
+# ret:   true when the source covers it
+pub fun covers(f: *Font, id: u32, scale: f32, cp: u32) bool {
+    var sc:  f32                = 0.0::f32;
+    val si:  u32                = face(f, id, scale, ?sc);
+    val src: *glyph.GlyphSource = ?f.srcs[si];
+    if (src.shape == nil) { ret entry(f, si, cp, sc).drawn == cp; }
+    if (reserve_run(f, 1) == 0) {
+        f.oom = 1;
+        ret false;
+    }
+    f.cps[0] = cp;
+    val g: usize = shape_cps(f, si, sc, 1);
+    var k: usize = 0;
+    for (k < g) {
+        if (f.run[k].id == 0) { ret false; }
+        k = k + 1;
+    }
+    ret g > 0;
+}
+
+# width of one line laid out from shaped glyphs
+fun run_width(f: *Font, g: usize) f32 {
+    var w: f32   = 0.0::f32;
+    var k: usize = 0;
+    for (k < g) {
+        w = w + f.run[k].advance;
+        k = k + 1;
+    }
+    ret w;
+}
+
+# width of the widest line of the first n bytes of a string
+# ---
+# f:     font
+# id:    style id
+# scale: interface scale
+# s:     utf-8 text, at least n bytes
+# n:     bytes to measure, on a codepoint boundary
+# ret:   width in pixels
+pub fun measure_n(f: *Font, id: u32, scale: f32, s: str, n: usize) f32 {
+    if (s == nil) { ret 0.0::f32; }
+    var widest: f32   = 0.0::f32;
+    var a:      usize = 0;
+    for (a <= n) {
+        var b: usize = a;
+        for (b < n && s[b] != '\n') { b = b + 1; }
+        val w: f32 = run_width(f, shape(f, id, scale, ?s[a], b - a));
+        if (w > widest) { widest = w; }
+        a = b + 1;
+    }
+    ret widest;
+}
+
+# width of the widest line of a string
+# ---
+# f:     font
+# id:    style id
+# scale: interface scale
+# s:     utf-8 text
+# ret:   width in pixels
+pub fun measure(f: *Font, id: u32, scale: f32, s: str) f32 {
+    if (s == nil) { ret 0.0::f32; }
+    ret measure_n(f, id, scale, s, str_len(s));
 }
 
 # make sure scratch holds at least n bytes
@@ -294,23 +597,27 @@ fun reserve(f: *Font, n: usize) u8 {
 }
 
 # rasterise an entry's glyph and pack it, leaving it blank on failure
-fun rasterise(f: *Font, e: *Entry, scale: f32) {
-    e.state = 1;
+fun rasterise(f: *Font, si: u32, e: *Entry, scale: f32) {
+    val src: *glyph.GlyphSource = ?f.srcs[si];
+    e.state        = 1;
+    e.placed.drawn = 0;
     val w: usize = e.placed.g.w::usize;
     val h: usize = e.placed.g.h::usize;
     if (w == 0 || h == 0) { ret; }
-    if (reserve(f, w * h) == 0 || !f.src.raster(f.src.self, e.drawn, scale, f.scratch, w)) {
+    if (reserve(f, w * h) == 0 || !src.raster(src.self, e.drawn, scale, f.scratch, w)) {
         e.state   = 2;
         f.missing = f.missing + 1;
         ret;
     }
     val slot: opt[atlas.Slot] = atlas.pack(?f.atlas, f.scratch, w, w, h);
     if (sel slot.none) {
-        e.state   = 2;
+        e.state   = 3;
+        e.at      = f.atlas.frame;
         f.missing = f.missing + 1;
         ret;
     }
     val side: f32 = atlas.PAGE_SIDE::f32;
+    e.gen          = atlas.page_gen(?f.atlas, slot.some.page::usize);
     e.placed.drawn = 1;
     e.placed.page  = slot.some.page;
     e.placed.u0    = slot.some.x::f32 / side;
@@ -319,24 +626,42 @@ fun rasterise(f: *Font, e: *Entry, scale: f32) {
     e.placed.v1    = (slot.some.y::usize + h)::f32 / side;
 }
 
-# a codepoint ready to draw at a scale, rasterising it into the atlas the first
-# time it is asked for
+# a glyph of a source ready to draw, rasterising it when it has no cell
+fun place_in(f: *Font, si: u32, id: u32, sc: f32) Placed {
+    var e: Entry = entry(f, si, id, sc);
+    # a fallback shares the cell of the glyph it falls back to
+    if (e.state == 0 && e.drawn != id) { ret place_in(f, si, e.drawn, sc); }
+    if (e.state == 1) {
+        if (e.placed.drawn == 0) { ret e.placed; }
+        if (atlas.page_gen(?f.atlas, e.placed.page::usize) == e.gen) {
+            atlas.touch(?f.atlas, e.placed.page::usize);
+            ret e.placed;
+        }
+    }
+    or (e.state == 2)                          { ret e.placed; }
+    or (e.state == 3 && e.at == f.atlas.frame) { ret e.placed; }
+    rasterise(f, si, ?e, sc);
+    var k:    Key                   = Key{source: si, id: id, scale: sc:~u32};
+    val kept: res[bool, allo.Error] = gmap.insert[Key, Entry](?f.cache, k, e);
+    ret e.placed;
+}
+
+# a glyph ready to draw in a style at a scale, rasterising it into the atlas
+# when it has no cell, the first time or after its page was evicted
 #
 # a glyph that could not be rasterised or packed keeps its advance and draws
-# nothing, counted in missing.
+# nothing, counted in missing. a packed glyph keeps its page from eviction
+# for the rest of the frame.
 # ---
 # f:     font
-# cp:    codepoint
+# id:    style id
 # scale: interface scale
+# g:     glyph id, from shape
 # ret:   its metrics and atlas cell
-pub fun place(f: *Font, cp: u32, scale: f32) Placed {
-    var e: Entry = entry(f, cp, scale);
-    if (e.state != 0) { ret e.placed; }
-    # a fallback shares the cell of the glyph it falls back to
-    if (e.drawn != cp) { ret place(f, e.drawn, scale); }
-    rasterise(f, ?e, scale);
-    val kept: res[bool, allo.Error] = gmap.insert[u64, Entry](?f.cache, key(cp, scale), e);
-    ret e.placed;
+pub fun place(f: *Font, id: u32, scale: f32, g: u32) Placed {
+    var sc: f32 = 0.0::f32;
+    val si: u32 = face(f, id, scale, ?sc);
+    ret place_in(f, si, g, sc);
 }
 
 # glyphs that could not be rasterised or packed since the source was set
@@ -397,30 +722,38 @@ test font__fractional_kerned_utf8_with_fallback {
 
     var rasters: u64 = 0;
     set_source(?f, glyph.GlyphSource{
-        self: (?rasters)::ptr, line: test_line, glyph: test_glyph, kern: test_kern, raster: test_raster
+        self: (?rasters)::ptr, line: test_line, glyph: test_glyph, kern: test_kern, raster: test_raster, shape: nil
     });
+    val one: f32 = 1.0::f32;
 
-    if (line_height(?f, 1.0::f32) != 10.75::f32) { ret 2; }
+    if (line_height(?f, STYLE_BODY, one) != 10.75::f32) { ret 2; }
     # fractional advances and the AV pair kerned
-    if (measure(?f, "AV", 1.0::f32) != 9.75::f32) { ret 3; }
-    if (measure(?f, "VA", 1.0::f32) != 11.0::f32) { ret 4; }
+    if (measure(?f, STYLE_BODY, one, "AV") != 9.75::f32)     { ret 3; }
+    if (measure(?f, STYLE_BODY, one, "VA") != 11.0::f32)     { ret 4; }
+    if (advance(?f, STYLE_BODY, one, 'A', 'V') != 4.25::f32) { ret 4; }
     # the widest line wins, and a control takes no space
-    if (measure(?f, "A\nAVA\t", 1.0::f32) != 15.25::f32) { ret 5; }
+    if (measure(?f, STYLE_BODY, one, "A\nAVA\t") != 15.25::f32) { ret 5; }
     # the face lacks U+FFFD, so 'é' (two utf-8 bytes) falls back to '?', which
     # it lacks too, and takes no space
-    if (measure(?f, "A\xC3\xA9", 1.0::f32) != 5.5::f32) { ret 6; }
-    # metrics scale with the interface scale
-    if (measure(?f, "AV", 2.0::f32) != 19.5::f32) { ret 7; }
+    if (measure(?f, STYLE_BODY, one, "A\xC3\xA9") != 5.5::f32) { ret 6; }
+    # metrics scale with the interface scale, and a style's size multiplies it
+    if (measure(?f, STYLE_BODY, 2.0::f32, "AV") != 19.5::f32) { ret 7; }
+    val big: opt[u32] = add_style(?f, Style{source: 0, size: 2.0::f32});
+    if (sel big.none)                                  { ret 7; }
+    if (measure(?f, big.some, one, "AV") != 19.5::f32) { ret 7; }
     # measuring never rasterises
     if (rasters != 0) { ret 8; }
 
-    # drawing rasterises once per glyph and scale, into distinct cells
-    val p1: Placed = place(?f, 'A', 1.0::f32);
-    val p2: Placed = place(?f, 'A', 1.0::f32);
-    val p3: Placed = place(?f, 'A', 2.0::f32);
+    # drawing rasterises once per glyph and scale, into distinct cells, and the
+    # style at 2x shares the interface scale 2x's cells
+    val p1: Placed = place(?f, STYLE_BODY, one, 'A');
+    val p2: Placed = place(?f, STYLE_BODY, one, 'A');
+    val p3: Placed = place(?f, STYLE_BODY, 2.0::f32, 'A');
+    val p4: Placed = place(?f, big.some, one, 'A');
     if (rasters != 2)                                   { ret 9; }
     if (p1.drawn != 1 || p1.u0 != p2.u0)                { ret 10; }
     if (p3.g.h != 10 || p3.v1 - p3.v0 <= p1.v1 - p1.v0) { ret 11; }
+    if (p4.u0 != p3.u0 || p4.v0 != p3.v0)               { ret 11; }
     val px: *u8   = atlas.page_pixels(?f.atlas, 0);
     val tx: usize = (p1.u0 * atlas.PAGE_SIDE::f32)::usize + 1;
     val ty: usize = (p1.v0 * atlas.PAGE_SIDE::f32)::usize;
@@ -439,13 +772,160 @@ test font__bitmap_default_replaces_missing {
     val ie: err[allo.Error] = init(?f, ?a);
     if (sel ie.err) { ret 1; }
 
-    if (line_height(?f, 1.0::f32) != 8.0::f32)    { ret 2; }
-    if (measure(?f, "ok", 1.0::f32) != 16.0::f32) { ret 3; }
+    if (line_height(?f, STYLE_BODY, 1.0::f32) != 8.0::f32)    { ret 2; }
+    if (measure(?f, STYLE_BODY, 1.0::f32, "ok") != 16.0::f32) { ret 3; }
     # U+00E9 is missing from the bitmap font and draws as its replacement box
-    val miss: Placed = place(?f, 0x00E9, 1.0::f32);
-    val box:  Placed = place(?f, REPLACEMENT, 1.0::f32);
+    val miss: Placed = place(?f, STYLE_BODY, 1.0::f32, 0x00E9);
+    val box:  Placed = place(?f, STYLE_BODY, 1.0::f32, REPLACEMENT);
     if (miss.drawn != 1 || miss.g.advance != 8.0::f32) { ret 4; }
     if (miss.u0 != box.u0 || miss.v0 != box.v0)        { ret 5; }
+
+    val freed: err[allo.Error] = free(?f);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a test face whose every glyph is a 120x120 block, a sixteenth of a page,
+# filled with a byte naming the glyph and the scale it was drawn at
+#[testing]
+fun big_line(self: ptr, scale: f32) glyph.LineMetrics {
+    ret glyph.LineMetrics{ascent: 120.0::f32, descent: 0.0::f32, gap: 0.0::f32};
+}
+
+#[testing]
+fun big_glyph(self: ptr, id: u32, scale: f32, out: *glyph.Glyph) bool {
+    out.advance = 120.0::f32;
+    out.x0      = 0.0::f32;
+    out.y0      = -120.0::f32;
+    out.x1      = 120.0::f32;
+    out.y1      = 0.0::f32;
+    out.w       = 120;
+    out.h       = 120;
+    ret true;
+}
+
+#[testing]
+fun big_mark(id: u32, scale: f32) u8 {
+    ret ((id * 7 + (scale * 8.0::f32)::u32) & 0x7F)::u8 | 0x80;
+}
+
+#[testing]
+fun big_raster(self: ptr, id: u32, scale: f32, cov: *u8, stride: usize) bool {
+    var i: usize = 0;
+    for (i < 120 * 120) {
+        cov[(i / 120) * stride + i % 120] = big_mark(id, scale);
+        i                                 = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun big_present(f: *Font, p: Placed, id: u32, scale: f32) bool {
+    if (p.drawn == 0) { ret false; }
+    val tx: usize = (p.u0 * atlas.PAGE_SIDE::f32)::usize + 60;
+    val ty: usize = (p.v0 * atlas.PAGE_SIDE::f32)::usize + 60;
+    ret atlas.page_pixels(?f.atlas, p.page::usize)[(ty * atlas.PAGE_SIDE + tx) * 4 + 3] == big_mark(id, scale);
+}
+
+test font__atlas_evicts_without_dropping_this_frame {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f:  Font;
+    val ie: err[allo.Error] = init(?f, ?a);
+    if (sel ie.err) { ret 1; }
+    set_source(?f, glyph.GlyphSource{
+        self: nil, line: big_line, glyph: big_glyph, kern: nil, raster: big_raster, shape: nil
+    });
+
+    # 40 frames of 20 glyphs at a new scale each is 50 pages' worth, past
+    # PAGE_MAX, and every frame also draws glyph 'A' at scale 1 again
+    var drawn: [21]Placed;
+    var frame: u32 = 0;
+    for (frame < 40) {
+        begin_frame(?f);
+        val sc: f32 = 1.0::f32 + frame::f32 / 8.0::f32;
+        var k:  u32 = 0;
+        for (k < 20) {
+            drawn[k] = place(?f, STYLE_BODY, sc, 'A'::u32 + k);
+            k        = k + 1;
+        }
+        drawn[20] = place(?f, STYLE_BODY, 1.0::f32, 'A');
+        k         = 0;
+        for (k < 20) {
+            if (!big_present(?f, drawn[k], 'A'::u32 + k, sc)) { ret 2; }
+            k = k + 1;
+        }
+        if (!big_present(?f, drawn[20], 'A', 1.0::f32)) { ret 3; }
+        frame = frame + 1;
+    }
+    if (atlas.page_count(?f.atlas) != atlas.PAGE_MAX) { ret 4; }
+    if (missing(?f) != 0)                             { ret 5; }
+
+    val freed: err[allo.Error] = free(?f);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a test shaper over the 'A'/'V' face: "AV" forms one ligature glyph, id 1,
+# and every other codepoint is its own glyph
+#[testing]
+fun liga_glyph(self: ptr, id: u32, scale: f32, out: *glyph.Glyph) bool {
+    if (id == 1) {
+        val ok: bool = test_glyph(self, 'A', scale, out);
+        out.advance = 8.0::f32 * scale;
+        ret ok;
+    }
+    ret test_glyph(self, id, scale, out);
+}
+
+#[testing]
+fun liga_shape(self: ptr, run: *u32, n: usize, scale: f32, out: *glyph.Shaped, cap: usize) usize {
+    var g: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        var id:   u32   = run[i];
+        var used: usize = 1;
+        if (run[i] == 'A' && i + 1 < n && run[i + 1] == 'V') {
+            id   = 1;
+            used = 2;
+        }
+        var e:   glyph.Glyph;
+        val has: bool = liga_glyph(self, id, scale, ?e);
+        if (g < cap) { out[g] = glyph.Shaped{id: id, cluster: i::u32, advance: e.advance, dx: 0.0::f32, dy: 0.0::f32}; }
+        g = g + 1;
+        i = i + used;
+    }
+    ret g;
+}
+
+test font__shaper_forms_a_ligature {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f:  Font;
+    val ie: err[allo.Error] = init(?f, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var rasters: u64      = 0;
+    val src:     opt[u32] = add_source(?f, glyph.GlyphSource{
+        self: (?rasters)::ptr, line: test_line, glyph: liga_glyph, kern: test_kern, raster: test_raster, shape: liga_shape
+    });
+    if (sel src.none) { ret 2; }
+    val st: opt[u32] = add_style(?f, Style{source: src.some, size: 1.0::f32});
+    if (sel st.none) { ret 2; }
+
+    # "VAV": 'V', then the AV ligature at cluster 1, with no kerning applied
+    val n: usize         = shape(?f, st.some, 1.0::f32, "VAV", 3);
+    val g: *glyph.Shaped = shaped(?f);
+    if (n != 2)                                             { ret 3; }
+    if (g[0].id != 'V' || g[1].id != 1)                     { ret 4; }
+    if (g[1].cluster != 1)                                  { ret 5; }
+    if (measure(?f, st.some, 1.0::f32, "VAV") != 13.5::f32) { ret 6; }
+    # the body style still draws from the bitmap font
+    if (measure(?f, STYLE_BODY, 1.0::f32, "AV") != 16.0::f32) { ret 7; }
+    val p: Placed = place(?f, st.some, 1.0::f32, g[1].id);
+    if (p.drawn != 1 || rasters != 1) { ret 8; }
 
     val freed: err[allo.Error] = free(?f);
     if (sel freed.err) { ret 1; }

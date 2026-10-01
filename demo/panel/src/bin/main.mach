@@ -189,7 +189,7 @@ fun files(ctx: *blit.context.Context, p: *Panel) {
     names[3] = "r-pentomino";
     names[4] = "garden of eden";
     names[5] = "spaceship";
-    blit.widget.list(ctx, ?p.files, ?names[0], 6, p.query, blit.context.px(ctx, 80.0::f32));
+    blit.widget.list(ctx, "files", ?p.files, ?names[0], 6, p.query, blit.context.px(ctx, 80.0::f32));
     blit.widget.space(ctx, blit.context.px(ctx, 4.0::f32));
     blit.widget.button(ctx, "Screenshot");
 }
@@ -197,7 +197,7 @@ fun files(ctx: *blit.context.Context, p: *Panel) {
 # one frame of the panel, docked to the right of an 800 by 600 screen
 fun frame(ctx: *blit.context.Context, p: *Panel, in: blit.input.Input) {
     blit.context.begin(ctx, in, 800.0::f32, 600.0::f32);
-    val dock: blit.widget.DockArea = blit.widget.begin_dock(ctx, ?p.side);
+    val dock: blit.widget.DockArea = blit.widget.begin_dock(ctx, "panel", ?p.side);
     header(ctx, p);
     run(ctx, p);
     view(ctx, p);
@@ -209,9 +209,10 @@ fun frame(ctx: *blit.context.Context, p: *Panel, in: blit.input.Input) {
 # a frame's input with the cursor at (x, y) and the button in state down
 fun at(x: f32, y: f32, down: u8) blit.input.Input {
     var in: blit.input.Input;
-    in.mx   = x;
-    in.my   = y;
-    in.down = down;
+    in.mx      = x;
+    in.my      = y;
+    in.present = 1;
+    in.down    = down;
     ret in;
 }
 
