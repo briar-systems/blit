@@ -492,7 +492,7 @@ instead of `ox` and `pw`.
   fields add the rest. `details` holds a secondary label per row, drawn
   right-aligned in the dim text color, with the label clipped short of it.
   `match(user, index, query)` decides which items are shown, defaulting to the
-  items whose label holds `query`, ignoring ASCII case (`blit.list.matches`,
+  items whose label holds `query`, ignoring ASCII case (`blit.widget.matches`,
   for a matcher to build on). `draw(ctx, user, row)` paints a row's content in
   place of the labels: the list still claims the row, paints its hover and
   selection face beneath and scrolls it, so a drawn row keeps hit, selection
