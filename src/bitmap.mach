@@ -126,7 +126,7 @@ val FONT: [768]u8 = [768]u8{
 # ret: the source
 pub fun source() glyph.GlyphSource {
     ret glyph.GlyphSource{
-        self: nil, line: bitmap_line, glyph: bitmap_glyph, kern: nil, raster: bitmap_raster
+        self: nil, line: bitmap_line, glyph: bitmap_glyph, kern: nil, raster: bitmap_raster, shape: nil
     };
 }
 

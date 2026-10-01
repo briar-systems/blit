@@ -1,0 +1,295 @@
+# text helpers over the context's painter: truncation and rich spans
+#
+# truncation fits one line of text into a width by cutting it at the end, at
+# the start (for a path, whose end matters most) or in the middle, and putting
+# an ellipsis where it cut. the cut is a pair of byte offsets into the
+# caller's string, so nothing is copied: the text drawn is the bytes before
+# the head, the ellipsis, then the bytes from the tail. the ellipsis is U+2026
+# when the style's glyph source has it, else three full stops.
+#
+# a rich line is a run of spans, each with its own text style and color, laid
+# out left to right on one shared baseline, for labels like `gen 13  pop 9,252`
+# with the numbers in a heavier style.
+#
+# both measure and draw in the context's current text style and scale, and a
+# span pushes its own style for its text.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use blit.context;
+use blit.draw;
+use blit.font;
+use gly: blit.glyph;
+use blit.input;
+use allo: std.allocator;
+use std.allocator.page;
+
+# cut the end off, keeping the start
+pub val CUT_END: u8 = 0;
+
+# cut the start off, keeping the end, as a path wants
+pub val CUT_START: u8 = 1;
+
+# cut the middle out, keeping both ends
+pub val CUT_MIDDLE: u8 = 2;
+
+# where a line of text is cut to fit a width
+#
+# the text drawn is bytes [0, head), then the ellipsis when cut, then bytes
+# [tail, n). a line that fits is not cut, with head and tail both n.
+# ---
+# head: bytes kept from the start
+# tail: first byte kept at the end
+# cut:  true when the ellipsis goes between them
+pub rec Fit {
+    head: usize;
+    tail: usize;
+    cut:  bool;
+}
+
+# a run of text in its own style and color, one part of a rich line
+# ---
+# s:     utf-8 text, one line
+# style: text style id, font.STYLE_BODY for the body style
+# color: tint color
+pub rec Span {
+    s:     str;
+    style: u32;
+    color: draw.Color;
+}
+
+# the ellipsis drawn where text is cut, in the current style
+# ---
+# ctx: context
+# ret: U+2026 when the current style's source has it, else "..."
+pub fun ellipsis(ctx: *context.Context) str {
+    if (font.covers(context.font_of(ctx), context.style_of(ctx), context.scale_of(ctx), 0x2026)) { ret "\xE2\x80\xA6"; }
+    ret "...";
+}
+
+# whether byte i of s starts a codepoint
+fun boundary(s: str, i: usize) bool {
+    ret (s[i]::u8 & 0xC0) != 0x80;
+}
+
+# the byte offset of the k-th codepoint boundary of the first n bytes, n past the last
+fun offset(s: str, n: usize, k: usize) usize {
+    var i: usize = 0;
+    var c: usize = 0;
+    for (i < n) {
+        if (boundary(s, i)) {
+            if (c == k) { ret i; }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# codepoints in the first n bytes of s
+fun count(s: str, n: usize) usize {
+    var i: usize = 0;
+    var c: usize = 0;
+    for (i < n) {
+        if (boundary(s, i)) { c = c + 1; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+# the most codepoints from the start of s whose width is within w
+fun keep_head(ctx: *context.Context, s: str, n: usize, m: usize, w: f32) usize {
+    var lo: usize = 0;
+    var hi: usize = m;
+    for (lo < hi) {
+        val mid: usize = (lo + hi + 1) / 2;
+        if (context.text_width_n(ctx, s, offset(s, n, mid)) <= w) { lo = mid; }
+        or                                                        { hi = mid - 1; }
+    }
+    ret lo;
+}
+
+# the first codepoint from which the rest of s, no earlier than from, is within w
+fun keep_tail(ctx: *context.Context, s: str, n: usize, m: usize, from: usize, w: f32) usize {
+    var lo: usize = from;
+    var hi: usize = m;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        val at:  usize = offset(s, n, mid);
+        if (context.text_width_n(ctx, ?s[at], n - at) <= w) { hi = mid; }
+        or                                                  { lo = mid + 1; }
+    }
+    ret lo;
+}
+
+# where to cut one line of text so it and its ellipsis fit a width, in the
+# current style
+#
+# a cut falls between codepoints, and an ellipsis wider than w leaves no text.
+# ---
+# ctx:  context
+# s:    utf-8 text, one line
+# w:    width to fit, in pixels
+# mode: CUT_END, CUT_START or CUT_MIDDLE
+# ret:  the cut
+pub fun fit(ctx: *context.Context, s: str, w: f32, mode: u8) Fit {
+    var n: usize = 0;
+    if (s != nil)                                       { n = str_len(s); }
+    if (n == 0 || context.text_width_n(ctx, s, n) <= w) { ret Fit{head: n, tail: n, cut: false}; }
+    val room: f32   = w - context.text_width(ctx, ellipsis(ctx));
+    val m:    usize = count(s, n);
+    if (mode == CUT_START) {
+        ret Fit{head: 0, tail: offset(s, n, keep_tail(ctx, s, n, m, 0, room)), cut: true};
+    }
+    if (mode == CUT_MIDDLE) {
+        val k:    usize = keep_head(ctx, s, n, m, room / 2.0::f32);
+        val head: usize = offset(s, n, k);
+        val left: f32   = room - context.text_width_n(ctx, s, head);
+        ret Fit{head: head, tail: offset(s, n, keep_tail(ctx, s, n, m, k, left)), cut: true};
+    }
+    ret Fit{head: offset(s, n, keep_head(ctx, s, n, m, room)), tail: n, cut: true};
+}
+
+# draw one line of text cut to fit a width, with its line box's top-left at
+# (x, y), in the current style
+# ---
+# ctx:  context
+# s:    utf-8 text, one line
+# x:    left x in pixels
+# y:    top y in pixels
+# w:    width to fit, in pixels
+# mode: CUT_END, CUT_START or CUT_MIDDLE
+# c:    tint color
+# ret:  the width drawn, at most w unless the ellipsis alone is wider
+pub fun fit_at(ctx: *context.Context, s: str, x: f32, y: f32, w: f32, mode: u8, c: draw.Color) f32 {
+    if (s == nil) { ret 0.0::f32; }
+    val n:  usize = str_len(s);
+    val ft: Fit   = fit(ctx, s, w, mode);
+    var px: f32   = x;
+    context.text_span(ctx, s, ft.head, px, y, c);
+    px = px + context.text_width_n(ctx, s, ft.head);
+    if (ft.cut) {
+        val e: str = ellipsis(ctx);
+        context.text_at(ctx, e, px, y, c);
+        px = px + context.text_width(ctx, e);
+    }
+    if (ft.tail < n) {
+        context.text_span(ctx, ?s[ft.tail], n - ft.tail, px, y, c);
+        px = px + context.text_width_n(ctx, ?s[ft.tail], n - ft.tail);
+    }
+    ret px - x;
+}
+
+# the line metrics a run of spans shares: the largest ascent, descent and gap
+# of their styles
+# ---
+# ctx: context
+# sp:  the spans
+# n:   how many
+# ret: the shared line metrics in pixels
+pub fun spans_line(ctx: *context.Context, sp: *Span, n: usize) gly.LineMetrics {
+    var m: gly.LineMetrics = gly.LineMetrics{ascent: 0.0::f32, descent: 0.0::f32, gap: 0.0::f32};
+    var i: usize           = 0;
+    for (i < n) {
+        val l: gly.LineMetrics = font.line(context.font_of(ctx), sp[i].style, context.scale_of(ctx));
+        if (l.ascent > m.ascent)   { m.ascent = l.ascent; }
+        if (l.descent > m.descent) { m.descent = l.descent; }
+        if (l.gap > m.gap)         { m.gap = l.gap; }
+        i = i + 1;
+    }
+    ret m;
+}
+
+# width of a run of spans laid end to end
+# ---
+# ctx: context
+# sp:  the spans
+# n:   how many
+# ret: width in pixels
+pub fun spans_width(ctx: *context.Context, sp: *Span, n: usize) f32 {
+    var w: f32   = 0.0::f32;
+    var i: usize = 0;
+    for (i < n) {
+        context.push_style(ctx, sp[i].style);
+        w = w + context.text_width(ctx, sp[i].s);
+        context.pop_style(ctx);
+        i = i + 1;
+    }
+    ret w;
+}
+
+# draw a run of spans end to end on one baseline, with the shared line box's
+# top-left at (x, y)
+# ---
+# ctx: context
+# sp:  the spans
+# n:   how many
+# x:   left x in pixels
+# y:   top y in pixels
+# ret: the width drawn
+pub fun spans_at(ctx: *context.Context, sp: *Span, n: usize, x: f32, y: f32) f32 {
+    val base: f32   = y + spans_line(ctx, sp, n).ascent;
+    var px:   f32   = x;
+    var i:    usize = 0;
+    for (i < n) {
+        context.push_style(ctx, sp[i].style);
+        val asc: f32 = font.line(context.font_of(ctx), sp[i].style, context.scale_of(ctx)).ascent;
+        context.text_at(ctx, sp[i].s, px, base - asc, sp[i].color);
+        px = px + context.text_width(ctx, sp[i].s);
+        context.pop_style(ctx);
+        i = i + 1;
+    }
+    ret px - x;
+}
+
+test text__cuts_and_spans {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    var in: input.Input;
+    context.begin(?ctx, in, 200.0::f32, 100.0::f32);
+
+    # the bitmap font is 8px a codepoint and lacks U+2026, so the ellipsis is
+    # "..." at 24px, leaving 16px of a 40px width for text
+    val s:  str = "abcdefghij";
+    val e:  Fit = fit(?ctx, s, 40.0::f32, CUT_END);
+    val st: Fit = fit(?ctx, s, 40.0::f32, CUT_START);
+    val md: Fit = fit(?ctx, s, 40.0::f32, CUT_MIDDLE);
+    val no: Fit = fit(?ctx, s, 80.0::f32, CUT_END);
+    if (!e.cut || e.head != 2 || e.tail != 10)   { ret 2; }
+    if (!st.cut || st.head != 0 || st.tail != 8) { ret 3; }
+    if (!md.cut || md.head != 1 || md.tail != 9) { ret 4; }
+    if (no.cut || no.head != 10)                 { ret 5; }
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    if (fit_at(?ctx, s, 0.0::f32, 0.0::f32, 40.0::f32, CUT_MIDDLE, white) != 40.0::f32) { ret 6; }
+
+    # a body span and one at twice the size share a baseline: the small
+    # glyphs' tops sit lower by the difference in ascent
+    val big: opt[u32] = context.add_style(?ctx, font.Style{source: 0, size: 2.0::f32});
+    if (sel big.none) { ret 7; }
+    var sp: [2]Span;
+    sp[0] = Span{s: "ab", style: font.STYLE_BODY, color: white};
+    sp[1] = Span{s: "cd", style: big.some, color: white};
+    if (spans_width(?ctx, ?sp[0], 2) != 48.0::f32) { ret 8; }
+    val before: usize = context.draw_count(?ctx);
+    if (spans_at(?ctx, ?sp[0], 2, 0.0::f32, 50.0::f32) != 48.0::f32) { ret 9; }
+    val p: *draw.Vert = context.draw_verts(?ctx);
+    if (context.draw_count(?ctx) != before + 24)   { ret 10; }
+    if (p[before].y != 57.0::f32)                  { ret 11; }
+    if (p[before + 12].y != 50.0::f32)             { ret 12; }
+    if (context.style_of(?ctx) != font.STYLE_BODY) { ret 13; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

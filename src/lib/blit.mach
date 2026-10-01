@@ -20,6 +20,7 @@ fwd blit.field;
 fwd blit.theme;
 fwd blit.context;
 fwd blit.state;
+fwd blit.text;
 fwd blit.widget;
 fwd blit.chart;
 

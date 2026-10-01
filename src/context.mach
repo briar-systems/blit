@@ -8,8 +8,12 @@
 # draw-list growth failure is recorded in `oom` rather than silently dropping
 # geometry; check ok().
 #
-# text comes from a glyph source (see blit.glyph), the built-in bitmap font
+# text comes from glyph sources (see blit.glyph), the built-in bitmap font
 # unless set_glyph_source swaps in another, laid out at the context's scale.
+# text is drawn in a style, a source at a size (see blit.font.Style): the
+# caller registers styles with add_style and every text call draws in the
+# current one, which push_style and pop_style change. style 0, the body
+# style, is current at the start of every frame.
 # colors are emitted as authored unless set_srgb says the target encodes sRGB,
 # in which case they are converted to linear light first.
 #
@@ -81,6 +85,7 @@ use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
 use std.math.float.sqrt_f32;
+use std.text.utf8;
 
 # capacity the clip, origin and layer stacks start with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
@@ -198,7 +203,11 @@ pub rec Area {
 # layer_sp:     layer stack depth
 # layers:       saved parent layers, grown on demand
 # layers_cap:   layers allocated for layers
-# font:         the glyph source, its glyph cache and its atlas
+# font:         the glyph sources, the text styles, the glyph cache and the atlas
+# style:        id of the text style text is drawn in
+# style_sp:     text style stack depth
+# style_ids:    saved parent text styles, grown on demand
+# style_cap:    styles allocated for style_ids
 # scale:        interface scale theme metrics and text are sized at, 1.0 by default
 # theme:        the colors and unscaled metrics widgets draw with
 # srgb:         1 if colors are converted to linear light for an sRGB target, else 0
@@ -270,6 +279,10 @@ pub rec Context {
     layers:       *u32;
     layers_cap:   usize;
     font:         font.Font;
+    style:        u32;
+    style_sp:     usize;
+    style_ids:    *u32;
+    style_cap:    usize;
     scale:        f32;
     theme:        th.Theme;
     srgb:         u8;
@@ -378,6 +391,10 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.layer_sp     = 0;
     ctx.layers       = nil;
     ctx.layers_cap   = 0;
+    ctx.style        = font.STYLE_BODY;
+    ctx.style_sp     = 0;
+    ctx.style_ids    = nil;
+    ctx.style_cap    = 0;
     ctx.scale        = 1.0::f32;
     ctx.theme        = th.default();
     ctx.srgb         = 0;
@@ -444,6 +461,10 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel ey.err) { ret ey; }
     ctx.layers     = nil;
     ctx.layers_cap = 0;
+    val et: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.style_ids, ctx.style_cap);
+    if (sel et.err) { ret et; }
+    ctx.style_ids = nil;
+    ctx.style_cap = 0;
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
     val e1: err[allo.Error] = draw.free(?ctx.out);
@@ -516,6 +537,11 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.layer    = 0;
     ctx.ordinal  = 0;
     ctx.layer_sp = 0;
+
+    ctx.style    = font.STYLE_BODY;
+    ctx.style_sp = 0;
+    ctx.font.oom = 0;
+    font.begin_frame(?ctx.font);
 
     if (input.pressed(ctx.in, input.BUTTON_LEFT) != 0 && ctx.hover != ctx.focus) { ctx.focus = 0; }
     ctx.focus_drawn  = 0;
@@ -796,7 +822,7 @@ pub fun next_id(ctx: *Context) u64 {
 # ctx: context
 # ret: 1 if no allocation failed this frame, else 0
 pub fun ok(ctx: *Context) u8 {
-    if (ctx.oom != 0) { ret 0; }
+    if (ctx.oom != 0 || ctx.font.oom != 0) { ret 0; }
     ret 1;
 }
 
@@ -1324,7 +1350,7 @@ pub fun set_srgb(ctx: *Context, on: u8) {
     ctx.srgb = on;
 }
 
-# draw text from another glyph source from now on
+# draw source 0, which the body style starts on, from another glyph source
 #
 # every atlas page is cleared and must be uploaded again. call it between
 # frames. see blit.glyph for the contract a source implements.
@@ -1333,6 +1359,66 @@ pub fun set_srgb(ctx: *Context, on: u8) {
 # src: the glyph source
 pub fun set_glyph_source(ctx: *Context, src: gly.GlyphSource) {
     font.set_source(?ctx.font, src);
+}
+
+# hold one more glyph source for text styles to name
+# ---
+# ctx: context
+# src: the glyph source
+# ret: its index for font.Style.source, or none once font.SOURCE_MAX are held
+pub fun add_glyph_source(ctx: *Context, src: gly.GlyphSource) opt[u32] {
+    ret font.add_source(?ctx.font, src);
+}
+
+# register a text style, such as a heading, small print or monospace
+# ---
+# ctx: context
+# st:  a source index and a size relative to that source's own
+# ret: the style's id for push_style, or none once font.STYLE_MAX are held or for a bad source or size
+pub fun add_style(ctx: *Context, st: font.Style) opt[u32] {
+    ret font.add_style(?ctx.font, st);
+}
+
+# change a registered style, such as the body style's size
+# ---
+# ctx: context
+# id:  the style's id, font.STYLE_BODY for the body style
+# st:  what it becomes
+# ret: false for an id not registered or a bad source or size
+pub fun set_style(ctx: *Context, id: u32, st: font.Style) bool {
+    ret font.set_style(?ctx.font, id, st);
+}
+
+# draw text in a style until the matching pop_style
+#
+# the stack grows with nesting; if it cannot, oom is set, the parent is not
+# saved and depth still balances, the pop returning to the body style.
+# ---
+# ctx: context
+# id:  the style's id from add_style, font.STYLE_BODY for the body style
+pub fun push_style(ctx: *Context, id: u32) {
+    ctx.style_ids = room[u32](ctx, ctx.style_ids, ?ctx.style_cap, ctx.style_sp + 1, CLIP_DEPTH);
+    if (ctx.style_sp < ctx.style_cap) { ctx.style_ids[ctx.style_sp] = ctx.style; }
+    ctx.style_sp = ctx.style_sp + 1;
+    ctx.style    = id;
+}
+
+# return to the text style saved by the matching push_style
+# ---
+# ctx: context
+pub fun pop_style(ctx: *Context) {
+    if (ctx.style_sp == 0) { ret; }
+    ctx.style_sp = ctx.style_sp - 1;
+    if (ctx.style_sp < ctx.style_cap) { ctx.style = ctx.style_ids[ctx.style_sp]; }
+    or                                { ctx.style = font.STYLE_BODY; }
+}
+
+# the id of the text style text is drawn in
+# ---
+# ctx: context
+# ret: the current style's id
+pub fun style_of(ctx: *Context) u32 {
+    ret ctx.style;
 }
 
 # the atlas the consumer uploads, one texture per page (see blit.atlas)
@@ -1351,21 +1437,45 @@ pub fun font_of(ctx: *Context) *font.Font {
     ret ?ctx.font;
 }
 
-# the height of one line of text at the context's scale
+# the height of one line of text in the current style at the context's scale
 # ---
 # ctx: context
 # ret: line height in pixels
 pub fun line_height(ctx: *Context) f32 {
-    ret font.line_height(?ctx.font, ctx.scale);
+    ret font.line_height(?ctx.font, ctx.style, ctx.scale);
 }
 
-# width of the widest line of a string at the context's scale
+# width of the widest line of a string in the current style at the context's scale
 # ---
 # ctx: context
 # s:   utf-8 text
 # ret: width in pixels
 pub fun text_width(ctx: *Context, s: str) f32 {
-    ret font.measure(?ctx.font, s, ctx.scale);
+    ret font.measure(?ctx.font, ctx.style, ctx.scale, s);
+}
+
+# width of the widest line of the first n bytes of a string, as text_width
+# measures the whole string
+# ---
+# ctx: context
+# s:   utf-8 text, at least n bytes
+# n:   bytes to measure, on a codepoint boundary
+# ret: width in pixels
+pub fun text_width_n(ctx: *Context, s: str, n: usize) f32 {
+    ret font.measure_n(?ctx.font, ctx.style, ctx.scale, s, n);
+}
+
+# how far the pen moves over one codepoint after another in the current style
+#
+# for layout that walks text a codepoint at a time, such as wrapping. a
+# shaping source's ligatures are not seen (see font.advance).
+# ---
+# ctx:  context
+# left: the codepoint before on the line, 0 for none
+# cp:   the codepoint
+# ret:  pen movement in pixels
+pub fun glyph_advance(ctx: *Context, left: u32, cp: u32) f32 {
+    ret font.advance(?ctx.font, ctx.style, ctx.scale, left, cp);
 }
 
 # draw widgets with another theme from now on
@@ -1596,20 +1706,19 @@ pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f
     }
 }
 
-# emit one glyph with its pen at x on the baseline, sampling its atlas page
-# ---
-# ret: the glyph's advance
-fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
-    val p: font.Placed = font.place(?ctx.font, cp, ctx.scale);
-    if (p.drawn == 0) { ret p.g.advance; }
+# emit one glyph of the current style with its pen at x on the baseline,
+# sampling its atlas page
+fun pen_glyph(ctx: *Context, id: u32, x: f32, base: f32, c: draw.Color) {
+    val p: font.Placed = font.place(?ctx.font, ctx.style, ctx.scale, id);
+    if (p.drawn == 0) { ret; }
     retarget(ctx, draw.ATLAS, p.page, draw.FILTER_NEAREST);
     emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
-    ret p.g.advance;
 }
 
 # emit one codepoint in a line box whose top-left is (x, y), tinted by c
 #
-# a codepoint the glyph source lacks draws as its replacement glyph.
+# a codepoint the glyph source lacks draws as its replacement glyph. it is
+# shaped alone, so a shaping source draws its standalone form.
 # ---
 # ctx: context
 # cp:  codepoint to draw
@@ -1617,15 +1726,18 @@ fun pen_glyph(ctx: *Context, cp: u32, x: f32, base: f32, c: draw.Color) f32 {
 # y:   line top y in pixels
 # c:   tint color
 pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
-    if (font.is_control(cp)) { ret; }
-    val m:   gly.LineMetrics = font.line(?ctx.font, ctx.scale);
-    val adv: f32             = pen_glyph(ctx, cp, x, y + m.ascent, paint(ctx, c));
+    if (font.is_control(cp) || cp == font.NEWLINE) { ret; }
+    var buf:  [5]u8;
+    val used: usize = utf8.encode(cp, ?buf[0], 4);
+    if (used == 0) { ret; }
+    text_span(ctx, (?buf[0])::str, used, x, y, c);
 }
 
-# draw utf-8 text with its first line box's top-left at (x, y)
+# draw utf-8 text in the current style with its first line box's top-left at
+# (x, y)
 #
-# kerning comes from the glyph source, control codepoints take no space and a
-# newline starts the next line box at x.
+# each line is shaped by the style's glyph source, control codepoints take no
+# space and a newline starts the next line box at x.
 # ---
 # ctx: context
 # s:   utf-8 text
@@ -1635,6 +1747,20 @@ pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
 pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
     if (s == nil) { ret; }
     text_span(ctx, s, str_len(s), x, y, c);
+}
+
+# draw one line of shaped glyphs with the pen starting at x on the baseline
+fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) {
+    val g:  usize       = font.shape(?ctx.font, ctx.style, ctx.scale, s, n);
+    val sh: *gly.Shaped = font.shaped(?ctx.font);
+    var px: f32         = x;
+    var k:  usize       = 0;
+    for (k < g) {
+        val one: gly.Shaped = sh[k];
+        pen_glyph(ctx, one.id, px + one.dx, base + one.dy, ink);
+        px = px + one.advance;
+        k  = k + 1;
+    }
 }
 
 # draw the first n bytes of utf-8 text with its first line box's top-left at
@@ -1651,26 +1777,17 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
 # c:   tint color
 pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color) {
     if (s == nil) { ret; }
-    val m:    gly.LineMetrics = font.line(?ctx.font, ctx.scale);
+    val m:    gly.LineMetrics = font.line(?ctx.font, ctx.style, ctx.scale);
     val lh:   f32             = gly.line_height(m);
     val ink:  draw.Color      = paint(ctx, c);
     var base: f32             = y + m.ascent;
-    var px:   f32             = x;
-    var prev: u32             = 0;
-    var i:    usize           = 0;
-    for (i < n) {
-        var cp: u32 = 0;
-        i = i + font.next(s, i, n, ?cp);
-        if (cp == font.NEWLINE) {
-            base = base + lh;
-            px   = x;
-            prev = 0;
-        }
-        or (!font.is_control(cp)) {
-            px   = px + font.kern(?ctx.font, prev, cp, ctx.scale);
-            px   = px + pen_glyph(ctx, cp, px, base, ink);
-            prev = cp;
-        }
+    var a:    usize           = 0;
+    for (a <= n) {
+        var b: usize = a;
+        for (b < n && s[b] != '\n') { b = b + 1; }
+        if (b > a) { pen_line(ctx, ?s[a], b - a, x, base, ink); }
+        base = base + lh;
+        a    = b + 1;
     }
 }
 
@@ -1805,7 +1922,7 @@ test clip__glyph_uvs_interpolate {
     # left edge and its u untouched
     if (p[0].x != 0.0::f32) { ret 1; }
 
-    val g: font.Placed = font.place(?ctx.font, 'A', 1.0::f32);
+    val g: font.Placed = font.place(?ctx.font, font.STYLE_BODY, 1.0::f32, 'A');
     if (p[0].u != g.u0) { ret 1; }
     # clipped edge u interpolated to the cell midpoint
     if (p[1].u != (g.u0 + g.u1) / 2.0::f32) { ret 1; }
