@@ -2660,6 +2660,8 @@ pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
 #
 # each line is shaped by the style's glyph source, control codepoints take no
 # space and a newline starts the next line box at x.
+# a codepoint that stands for an icon (see blit.icon) draws the icon in its
+# place, a line tall and tinted c, and text_width measures it the same way.
 # ---
 # ctx: context
 # s:   utf-8 text
