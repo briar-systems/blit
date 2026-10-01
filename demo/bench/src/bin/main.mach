@@ -1,8 +1,9 @@
 # a local benchmark of blit's per-frame cost
 #
 # builds a few representative interfaces headless, each with sRGB output off
-# and on, and prints a table of the mean frame time, the vertices and runs a
-# frame emits and the allocations it makes. build it in the release profile
+# and on, and prints a table of the median frame time over several timed
+# batches with its spread, the vertices and runs a frame emits and the
+# allocations it makes. build it in the release profile
 # for numbers worth comparing. it is never a CI job.
 
 use allo: std.allocator;
@@ -20,13 +21,19 @@ use std.types.string.str;
 use blit;
 
 # frames run before timing, so caches and buffers have settled
-val WARMUP: usize = 10;
+val WARMUP: usize = 20;
 
-# a scene is timed for at least this long
-val BUDGET: Duration = 300000000;
+# a scene warms up for at least this long
+val WARM_BUDGET: Duration = 300000000;
+
+# timed batches a scene runs in each sRGB mode, the median is reported
+val BATCHES: usize = 21;
+
+# a batch runs for about this long
+val BATCH_BUDGET: Duration = 20000000;
 
 # and for at least this many frames
-val MIN_FRAMES: usize = 20;
+val MIN_FRAMES: usize = 4;
 
 # rows in the list scene
 val ROWS: usize = 10000;
@@ -187,46 +194,105 @@ fun frame(ctx: *blit.context.Context, s: *State, scene: fun(*blit.context.Contex
 
 # what timing a scene measured
 # ---
-# frames: frames timed
-# ns:     mean nanoseconds a frame
+# ns:     median nanoseconds a frame across the timed batches
+# spread: slowest batch minus fastest, in tenths of a percent of the median
 # verts:  vertices the last frame emitted
 # runs:   runs the last frame divided into
-# allocs: allocations over the timed frames
+# allocs: allocations a frame makes
 rec Result {
-    frames: usize;
     ns:     i64;
+    spread: i64;
     verts:  usize;
     runs:   usize;
     allocs: u64;
 }
 
-# time a scene with sRGB output set to srgb
-fun measure(ctx: *blit.context.Context, s: *State, c: *Counter, scene: fun(*blit.context.Context, *State), srgb: u8) res[Result, u8] {
-    blit.context.set_srgb(ctx, srgb);
+# the batches of one scene, one set per sRGB mode
+# ---
+# ns:     nanoseconds a frame, one entry per batch
+# allocs: allocations over all the batches
+rec Batches {
+    ns:     [21]i64;
+    allocs: u64;
+}
+
+# run frames of a scene and return the mean nanoseconds a frame, or -1 if the clock fails
+fun batch(ctx: *blit.context.Context, s: *State, scene: fun(*blit.context.Context, *State), frames: usize) i64 {
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret -1; }
     var i: usize = 0;
-    for (i < WARMUP) {
+    for (i < frames) {
         frame(ctx, s, scene);
         i = i + 1;
     }
+    val e: time.Elapsed = time.elapsed(start.ok);
+    if (sel e.err) { ret -1; }
+    ret e.ok / frames::i64;
+}
 
-    var r:      Result;
-    val before: u64               = c.allocs;
-    val start:  time.InstantClock = time.instant();
-    if (sel start.err) { ret res[Result, u8].err{1}; }
-    var spent: Duration = 0;
-    for (r.frames < MIN_FRAMES || spent < BUDGET) {
-        frame(ctx, s, scene);
-        r.frames = r.frames + 1;
-        val e: time.Elapsed = time.elapsed(start.ok);
-        if (sel e.err) { ret res[Result, u8].err{1}; }
-        spent = e.ok;
+# sort a batch set ascending
+fun sort(v: *i64, n: usize) {
+    var i: usize = 1;
+    for (i < n) {
+        val x: i64   = v[i];
+        var j: usize = i;
+        for (j > 0 && v[j - 1] > x) {
+            v[j] = v[j - 1];
+            j    = j - 1;
+        }
+        v[j] = x;
+        i    = i + 1;
     }
-    r.ns     = spent / r.frames::i64;
+}
+
+# reduce a batch set to its median and spread
+fun summarize(b: *Batches, frames: usize, ctx: *blit.context.Context, r: *Result) {
+    sort(?b.ns[0], BATCHES);
+    r.ns     = b.ns[BATCHES / 2];
+    r.spread = (b.ns[BATCHES - 1] - b.ns[0]) * 1000 / r.ns;
     r.verts  = blit.context.draw_count(ctx);
     r.runs   = blit.context.run_count(ctx);
-    r.allocs = c.allocs - before;
-    if (blit.context.ok(ctx) == 0) { ret res[Result, u8].err{2}; }
-    ret res[Result, u8].ok{r};
+    r.allocs = b.allocs / (frames * BATCHES)::u64;
+}
+
+# time a scene with sRGB output off and on, batches interleaved so drift in the
+# machine's speed lands on both modes alike
+fun measure(ctx: *blit.context.Context, s: *State, c: *Counter, scene: fun(*blit.context.Context, *State), off: *Result, on: *Result) u8 {
+    var warm:  usize             = 0;
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret 1; }
+    var spent: Duration = 0;
+    for (warm < WARMUP || spent < WARM_BUDGET) {
+        blit.context.set_srgb(ctx, (warm % 2)::u8);
+        frame(ctx, s, scene);
+        warm = warm + 1;
+        val e: time.Elapsed = time.elapsed(start.ok);
+        if (sel e.err) { ret 1; }
+        spent = e.ok;
+    }
+
+    var frames: usize = (BATCH_BUDGET / (spent / warm::i64))::usize;
+    if (frames < MIN_FRAMES) { frames = MIN_FRAMES; }
+
+    var bs: [2]Batches;
+    var k:  usize = 0;
+    for (k < BATCHES) {
+        var m: usize = 0;
+        for (m < 2) {
+            blit.context.set_srgb(ctx, m::u8);
+            val before: u64 = c.allocs;
+            val ns:     i64 = batch(ctx, s, scene, frames);
+            if (ns < 0) { ret 1; }
+            bs[m].ns[k]  = ns;
+            bs[m].allocs = bs[m].allocs + (c.allocs - before);
+            m            = m + 1;
+        }
+        k = k + 1;
+    }
+    if (blit.context.ok(ctx) == 0) { ret 2; }
+    summarize(?bs[0], frames, ctx, off);
+    summarize(?bs[1], frames, ctx, on);
+    ret 0;
 }
 
 # print one row of the table
@@ -235,7 +301,7 @@ fun row(name: str, srgb: u8, r: Result, base: i64) {
     if (srgb != 0) { mode = "on"; }
     val us:   i64 = r.ns / 1000;
     val frac: i64 = (r.ns % 1000) / 100;
-    print.printf("{:<14} {:<5} {:8}.{} {:9} {:5} {:7}", name, mode, us, frac, r.verts, r.runs, r.allocs / r.frames::u64);
+    print.printf("{:<14} {:<5} {:8}.{} {:5}.{}% {:9} {:5} {:7}", name, mode, us, frac, r.spread / 10, r.spread % 10, r.verts, r.runs, r.allocs);
     if (base > 0) {
         var pct:  i64 = (r.ns - base) * 1000 / base;
         var sign: str = "+";
@@ -250,12 +316,12 @@ fun row(name: str, srgb: u8, r: Result, base: i64) {
 
 # time a scene with sRGB off and on and print both rows
 fun bench(ctx: *blit.context.Context, s: *State, c: *Counter, name: str, scene: fun(*blit.context.Context, *State)) u8 {
-    val off: res[Result, u8] = measure(ctx, s, c, scene, 0);
-    if (sel off.err) { ret off.err; }
-    val on: res[Result, u8] = measure(ctx, s, c, scene, 1);
-    if (sel on.err) { ret on.err; }
-    row(name, 0, off.ok, 0);
-    row(name, 1, on.ok, off.ok.ns);
+    var off: Result;
+    var on:  Result;
+    val bad: u8 = measure(ctx, s, c, scene, ?off, ?on);
+    if (bad != 0) { ret bad; }
+    row(name, 0, off, 0);
+    row(name, 1, on, off.ns);
     ret 0;
 }
 
@@ -346,8 +412,8 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 1;
     }
 
-    print.printf("blit {} bench, {} ms a scene\n\n", blit.VERSION, BUDGET / 1000000);
-    print.println("scene          srgb    us/frame  vertices  runs  allocs   srgb cost");
+    print.printf("blit {} bench, median of {} batches\n\n", blit.VERSION, BATCHES);
+    print.println("scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost");
     var failed: u8 = 0;
     if (failed == 0) { failed = bench(?ctx, ?s, ?c, "dense panel", dense); }
     if (failed == 0) { failed = bench(?ctx, ?s, ?c, "10k row list", rows); }

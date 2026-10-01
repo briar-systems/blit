@@ -583,8 +583,10 @@ demo/harness/out/linux-x86_64/debug/bin/harness
 interfaces: a dock of eight open sections of controls, a list of 10,000 rows, a
 line chart of 100,000 samples, and six overlapping windows each holding a
 section and a scroll region. Each scene runs with sRGB output off and then on,
-and the table reports the mean frame time, the vertices and runs the frame
-emits, the allocations a frame makes, and what sRGB adds. It is local only,
+and the table reports the median frame time over 21 timed batches with the
+spread between the fastest and slowest batch, the vertices and runs the frame
+emits, the allocations a frame makes, and what sRGB adds. The off and on
+batches are interleaved so drift in the machine's speed lands on both. It is local only,
 never a CI job. Build it in the release profile:
 
 ```
@@ -593,18 +595,21 @@ mach build demo/bench -p release
 demo/bench/out/linux-x86_64/release/bin/bench
 ```
 
-Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
+Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against.
+Run it on an idle machine and pinned to one core (`taskset -c 15`): other load
+shows up as a large spread, and a run whose spread is large is not worth
+comparing.
 
 ```
-scene          srgb    us/frame  vertices  runs  allocs   srgb cost
-dense panel    off        292.4      5298     1       0
-dense panel    on         295.6      5298     1       0   +1.0%
-10k row list   off        123.6      1704     1       0
-10k row list   on         124.1      1704     1       0   +0.4%
-100k chart     off       1924.6     15738     1       0
-100k chart     on        1966.7     15738     1       0   +2.1%
-windows        off        273.9      5472     1       0
-windows        on         277.5      5472     1       0   +1.3%
+scene          srgb    us/frame    spread  vertices  runs  allocs   srgb cost
+dense panel    off        466.9    22.7%      5298     1       0
+dense panel    on         483.4    18.5%      5298     1       0   +3.5%
+10k row list   off        463.6    29.5%      1704     1       0
+10k row list   on         457.9    26.6%      1704     1       0   -1.2%
+100k chart     off       2704.2    38.5%     15738     1       0
+100k chart     on        2846.7    43.4%     15738     1       0   +5.2%
+windows        off        437.6    49.4%      5472     1       0
+windows        on         443.2    26.3%      5472     1       0   +1.2%
 ```
 
 ## Conventions
