@@ -1736,7 +1736,7 @@ pub fun section(ctx: *context.Context, title: str, open: *u8) bool {
 # k:    square side in pixels
 # open: true to point down
 # c:    fill color
-fun caret(ctx: *context.Context, x: f32, y: f32, k: f32, open: bool, c: draw.Color) {
+pub fun caret(ctx: *context.Context, x: f32, y: f32, k: f32, open: bool, c: draw.Color) {
     if (k <= 0.0::f32) { ret; }
     # closed: a vertical edge k tall at the quarter, its tip half as far right.
     # open:   a horizontal edge k wide at the quarter, its tip half as far down.

@@ -204,7 +204,9 @@ blit.context.end(?ctx);
 
 - **Time.** `in.time` is the host's monotonic clock in seconds, and
   `blit.context.dt(?ctx)` is the time since the previous frame (0 on the
-  first).
+  first). Double clicks, caret blink and every other timed behaviour need it:
+  a host that never advances `in.time` gets single clicks only and a caret
+  that does not blink.
 - **Pointer.** `down` and `prev_down` are bitmasks of `BUTTON_LEFT`,
   `BUTTON_RIGHT`, `BUTTON_MIDDLE`, `BUTTON_X1` and `BUTTON_X2`, and
   `blit.input.pressed`, `released` and `held` take the button. The context
