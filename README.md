@@ -617,8 +617,9 @@ segment count follows their size on screen and the interface scale.
   A fill takes the nonzero rule, so a hole is a contour wound against its
   outline and crossing contours fill their union. Contours that overlap still
   show the faint feathers of the edges they hide, so icons are cleanest drawn
-  as contours that meet without overlapping. Filling costs the square of the
-  edge count, which suits icons and small shapes.
+  as contours that meet without overlapping. A fill sweeps its edges once,
+  sorted, so a large path such as a chart area or a text outline costs
+  e log e in its edge count rather than e squared.
 - **Gradients.** `blit.draw.gradient(x0, y0, c0, x1, y1, c1)` is a linear
   gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
   `rounded_rect_gradient` and `fill_path_gradient`.
