@@ -17,11 +17,13 @@ use blit;
 
 # what the section keeps
 # ---
-# danger: the class handle, 0 before it is made
+# danger: the class's id, an index from 0
+# made:   the class has been made
 # scale:  the interface scale chosen
 # saved:  bytes the last save wrote
 pub rec State {
     danger: u32;
+    made:   u8;
     scale:  usize;
     saved:  usize;
 }
@@ -42,10 +44,11 @@ pub fun show(ctx: *blit.context.Context, user: ptr) {
 
     # a class is made once and applied to any scope
     blit.controls.separator_label(ctx, "Classes");
-    if (s.danger == 0) {
+    if (s.made == 0) {
         val c: opt[u32] = blit.style.add_class(ctx, "danger");
         if (sel c.some) {
             s.danger = c.some;
+            s.made   = 1;
             blit.style.set(ctx, s.danger, "button.*.fill", blit.theme.of_color(blit.draw.hex(0xB03030, 1.0::f32)));
             blit.style.set(ctx, s.danger, "button.hot.fill", blit.theme.of_color(blit.draw.hex(0xD04040, 1.0::f32)));
         }
