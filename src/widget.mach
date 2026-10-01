@@ -59,6 +59,7 @@ use blit.field;
 use blit.font;
 use bid: blit.id;
 use blit.input;
+use blit.state;
 use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
@@ -799,11 +800,19 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
     ctx.pw = p.pw;
 }
 
+# the state a dropdown keeps in the context's store under its header's id
+# ---
+# open: 1 while the option list is shown, else 0
+pub rec DropdownState {
+    open: u8;
+}
+
 # a select: shows the current option and, while open, lists the options in a
 # popup directly beneath it
 #
-# clicking the header opens it (the open state lives on the context, so only one
-# dropdown is open at a time). clicking an option sets @selected and closes it,
+# clicking the header opens it. the open state is a DropdownState the context's
+# state store keeps under the header's id (see blit.state), so each dropdown
+# opens and closes on its own. clicking an option sets @selected and closes it,
 # and a press anywhere else closes it without reaching what lies beneath. the
 # option list overlays later widgets rather than pushing them down.
 # ---
@@ -814,23 +823,24 @@ pub fun end_popup(ctx: *context.Context, p: Popup) {
 # count:    number of options
 # ret:      1 if the selection changed this frame, else 0
 pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *str, count: usize) u8 {
-    val id: u64 = context.id_of(ctx, label);
-    val x0: f32 = ctx.cx;
-    val y0: f32 = ctx.cy;
-    val h:  f32 = row_h(ctx);
-    val x1: f32 = ctx.cx + ctx.pw;
-    val y1: f32 = y0 + h;
+    val id: u64            = context.id_of(ctx, label);
+    val st: *DropdownState = state.get[DropdownState](ctx, id);
+    val x0: f32            = ctx.cx;
+    val y0: f32            = ctx.cy;
+    val h:  f32            = row_h(ctx);
+    val x1: f32            = ctx.cx + ctx.pw;
+    val y1: f32            = y0 + h;
 
     val hov: u8 = interact(ctx, id, x0, y0, x1, y1);
     hand(ctx, hov);
     if (ctx.active == id && input.released(ctx.in, input.BUTTON_LEFT) != 0 && hov != 0) {
-        if (ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
-        or                           { ctx.open_dropdown = id; }
+        if (st.open != 0) { st.open = 0; }
+        or                { st.open = 1; }
     }
 
     var bg: draw.Color = ctx.theme.control;
-    if (ctx.hot == id)           { bg = ctx.theme.control_hot; }
-    if (ctx.open_dropdown == id) { bg = ctx.theme.control_on; }
+    if (ctx.hot == id) { bg = ctx.theme.control_hot; }
+    if (st.open != 0)  { bg = ctx.theme.control_on; }
     face(ctx, x0, y0, x1, y1, bg);
 
     val ty: f32 = y0 + (h - context.line_height(ctx)) / 2.0::f32;
@@ -843,10 +853,8 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
 
     advance(ctx, h);
 
-    var open: u8 = 0;
-    if (ctx.open_dropdown == id) { open = 1; }
     val pid: u64   = bid.child(id, "#popup");
-    val pop: Popup = popup_at(ctx, pid, open, ctx.cx, ctx.cy, ctx.pw);
+    val pop: Popup = popup_at(ctx, pid, st.open, ctx.cx, ctx.cy, ctx.pw);
 
     var changed: u8    = 0;
     var i:       usize = 0;
@@ -861,9 +869,9 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
             val ohov: u8 = interact(ctx, oid, ox0, oy0, ox1, oy1);
             hand(ctx, ohov);
             if (ctx.active == oid && input.released(ctx.in, input.BUTTON_LEFT) != 0 && ohov != 0) {
-                @selected         = i;
-                ctx.open_dropdown = 0;
-                changed           = 1;
+                @selected = i;
+                st.open   = 0;
+                changed   = 1;
             }
 
             var obg: draw.Color = ctx.theme.track;
@@ -877,7 +885,7 @@ pub fun dropdown(ctx: *context.Context, label: str, selected: *usize, options: *
     }
     end_popup(ctx, pop);
 
-    if (pop.dismissed != 0 && ctx.open_dropdown == id) { ctx.open_dropdown = 0; }
+    if (pop.dismissed != 0) { st.open = 0; }
     ret changed;
 }
 
@@ -1825,6 +1833,19 @@ test slider__maps_cursor_linearly {
     ret 0;
 }
 
+# whether the dropdown with header id is open
+#[testing]
+fun dropdown_open(ctx: *context.Context, id: u64) u8 {
+    ret state.get[DropdownState](ctx, id).open;
+}
+
+# open or close the dropdown with header id
+#[testing]
+fun set_dropdown_open(ctx: *context.Context, id: u64, open: u8) {
+    val st: *DropdownState = state.get[DropdownState](ctx, id);
+    st.open = open;
+}
+
 # a frame holding one panel with one three-option dropdown
 #[testing]
 fun frame_dropdown(ctx: *context.Context, in: input.Input, picked: *usize, opts: *str) u8 {
@@ -1854,13 +1875,13 @@ test dropdown__opens_and_selects {
     frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]);
     frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0]);
     if (frame_dropdown(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0]) != 0) { ret 2; }
-    if (ctx.open_dropdown != context.id_of(?ctx, "pick"))                               { ret 3; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0)                          { ret 3; }
 
     # press and release the second option row (y in [40, 56))
     frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 1), ?picked, ?opts[0]);
     if (frame_dropdown(?ctx, input_at(10.0::f32, 48.0::f32, 0), ?picked, ?opts[0]) != 1) { ret 4; }
     if (picked != 1)                                                                     { ret 5; }
-    if (ctx.open_dropdown != 0)                                                          { ret 6; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) != 0)                           { ret 6; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -1881,7 +1902,7 @@ test dropdown__open_overlays_later_widgets {
     opts[2] = "c";
     var picked: usize = 0;
 
-    ctx.open_dropdown = context.id_of(?ctx, "pick");
+    set_dropdown_open(?ctx, context.id_of(?ctx, "pick"), 1);
     context.begin(?ctx, input_at(0.0::f32, 0.0::f32, 0), 200.0::f32, 200.0::f32);
     begin_panel(?ctx, 0.0::f32, 0.0::f32, 100.0::f32);
     dropdown(?ctx, "pick", ?picked, ?opts[0], 3);
@@ -1915,7 +1936,7 @@ test dropdown__open_keeps_ids_apart {
 
     # two open dropdowns with the same options claim no id twice, and the open
     # one stays open whichever is drawn first
-    ctx.open_dropdown = context.id_of(?ctx, "first");
+    set_dropdown_open(?ctx, context.id_of(?ctx, "first"), 1);
     var k: usize = 0;
     for (k < 2) {
         context.begin(?ctx, in, 200.0::f32, 200.0::f32);
@@ -1924,8 +1945,9 @@ test dropdown__open_keeps_ids_apart {
         dropdown(?ctx, "second", ?second, ?opts[0], 3);
         if (k == 1) { dropdown(?ctx, "first", ?first, ?opts[0], 3); }
         context.end(?ctx);
-        if (context.collisions(?ctx) != 0)                     { ret 2; }
-        if (ctx.open_dropdown != context.id_of(?ctx, "first")) { ret 3; }
+        if (context.collisions(?ctx) != 0)                           { ret 2; }
+        if (dropdown_open(?ctx, context.id_of(?ctx, "first")) == 0)  { ret 3; }
+        if (dropdown_open(?ctx, context.id_of(?ctx, "second")) != 0) { ret 4; }
         k = k + 1;
     }
 
@@ -2042,7 +2064,7 @@ test routing__open_dropdown_beats_later_window {
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
-    if (ctx.open_dropdown != context.id_of(?ctx, "pick")) { ret 2; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0) { ret 2; }
 
     # the option rows paint after the window despite being called before it
     if (vert_at(?ctx, 0.0::f32, 30.0::f32) >= vert_at(?ctx, 0.0::f32, 40.0::f32)) { ret 3; }
@@ -2056,7 +2078,7 @@ test routing__open_dropdown_beats_later_window {
     if (ctx.active != opt1)                                                                           { ret 6; }
     if (frame_dropdown_window(?ctx, input_at(50.0::f32, 42.0::f32, 0), ?picked, ?opts[0], ?win) != 1) { ret 7; }
     if (picked != 1)                                                                                  { ret 8; }
-    if (ctx.open_dropdown != 0)                                                                       { ret 9; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) != 0)                                        { ret 9; }
     if (win.x != 0.0::f32 || win.y != 30.0::f32 || win.open != 1)                                     { ret 10; }
 
     val freed: err[allo.Error] = context.free(?ctx);
@@ -2088,15 +2110,15 @@ test dropdown__outside_press_closes_and_is_swallowed {
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 1), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(10.0::f32, 8.0::f32, 0), ?picked, ?opts[0], ?win);
-    if (ctx.open_dropdown != context.id_of(?ctx, "pick")) { ret 2; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0) { ret 2; }
 
     # press on the titlebar right of the option rows: the dropdown closes and
     # the window beneath does not start a drag
     frame_dropdown_window(?ctx, input_at(120.0::f32, 38.0::f32, 0), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(120.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
     val outside: u64 = bid.child(bid.child(context.id_of(?ctx, "pick"), "#popup"), "#outside");
-    if (ctx.open_dropdown != 0) { ret 3; }
-    if (ctx.active != outside)  { ret 4; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) != 0) { ret 3; }
+    if (ctx.active != outside)                                 { ret 4; }
     frame_dropdown_window(?ctx, input_at(130.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
     frame_dropdown_window(?ctx, input_at(130.0::f32, 38.0::f32, 0), ?picked, ?opts[0], ?win);
     if (win.x != 0.0::f32 || win.y != 30.0::f32) { ret 5; }
@@ -2107,6 +2129,73 @@ test dropdown__outside_press_closes_and_is_swallowed {
     if (ctx.active != bid.child(context.id_of(?ctx, "w"), "#drag")) { ret 7; }
     frame_dropdown_window(?ctx, input_at(140.0::f32, 38.0::f32, 1), ?picked, ?opts[0], ?win);
     if (win.x != 10.0::f32) { ret 8; }
+
+    val freed: err[allo.Error] = context.free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a frame holding two windows side by side, each with a three-option dropdown
+# whose header id lands in @ida and @idb
+#[testing]
+fun frame_two_dropdowns(ctx: *context.Context, in: input.Input, wa: *Window, wb: *Window, picked: *usize, opts: *str, ida: *u64, idb: *u64) {
+    context.begin(ctx, in, 400.0::f32, 400.0::f32);
+    val ba: Block = begin_window(ctx, wa);
+    @ida = context.id_of(ctx, "a");
+    dropdown(ctx, "a", picked, opts, 3);
+    end_window(ctx, wa, ba);
+    val bb: Block = begin_window(ctx, wb);
+    @idb = context.id_of(ctx, "b");
+    dropdown(ctx, "b", picked, opts, 3);
+    end_window(ctx, wb, bb);
+    context.end(ctx);
+}
+
+test dropdown__two_open_in_two_windows {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: context.Context;
+    val ie:  err[allo.Error] = context.init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    var opts: [3]str;
+    opts[0] = "a";
+    opts[1] = "b";
+    opts[2] = "c";
+    var picked: usize = 0;
+
+    var wa: Window;
+    wa.x     = 0.0::f32;
+    wa.w     = 100.0::f32;
+    wa.open  = 1;
+    wa.title = "a";
+    var wb: Window;
+    wb.x     = 200.0::f32;
+    wb.w     = 100.0::f32;
+    wb.open  = 1;
+    wb.title = "b";
+
+    var ida: u64 = 0;
+    var idb: u64 = 0;
+    frame_two_dropdowns(?ctx, input_at(390.0::f32, 390.0::f32, 0), ?wa, ?wb, ?picked, ?opts[0], ?ida, ?idb);
+    if (ida == idb) { ret 2; }
+
+    # both popups open at once, each in its own entry
+    set_dropdown_open(?ctx, ida, 1);
+    set_dropdown_open(?ctx, idb, 1);
+    frame_two_dropdowns(?ctx, input_at(390.0::f32, 390.0::f32, 0), ?wa, ?wb, ?picked, ?opts[0], ?ida, ?idb);
+    if (dropdown_open(?ctx, ida) == 0 || dropdown_open(?ctx, idb) == 0) { ret 3; }
+
+    # a press on bare screen reaches only the topmost popup: b closes, a stays
+    frame_two_dropdowns(?ctx, input_at(390.0::f32, 390.0::f32, 1), ?wa, ?wb, ?picked, ?opts[0], ?ida, ?idb);
+    if (dropdown_open(?ctx, ida) == 0) { ret 4; }
+    if (dropdown_open(?ctx, idb) != 0) { ret 5; }
+
+    # the next press closes a
+    frame_two_dropdowns(?ctx, input_at(390.0::f32, 390.0::f32, 0), ?wa, ?wb, ?picked, ?opts[0], ?ida, ?idb);
+    frame_two_dropdowns(?ctx, input_at(390.0::f32, 390.0::f32, 1), ?wa, ?wb, ?picked, ?opts[0], ?ida, ?idb);
+    if (dropdown_open(?ctx, ida) != 0) { ret 6; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -2538,7 +2627,7 @@ test scale__doubles_metrics_text_and_hit_rects {
     if (vert_at(?ctx, 0.0::f32, 32.0::f32) >= context.draw_count(?ctx)) { ret 7; }
     frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 1), ?picked, ?opts[0]);
     frame_dropdown(?ctx, input_at(10.0::f32, 16.0::f32, 0), ?picked, ?opts[0]);
-    if (ctx.open_dropdown != context.id_of(?ctx, "pick")) { ret 8; }
+    if (dropdown_open(?ctx, context.id_of(?ctx, "pick")) == 0) { ret 8; }
 
     # the second option row spans y [80, 112), twice its place at scale 1.0
     frame_dropdown(?ctx, input_at(10.0::f32, 96.0::f32, 1), ?picked, ?opts[0]);
