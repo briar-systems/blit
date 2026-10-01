@@ -735,7 +735,10 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.in           = in;
     ctx.in.prev_down = prev;
     ctx.delta        = 0.0::f64;
-    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; ctx.clocked = 1; }
+    if (ctx.timed != 0 && in.time > then) {
+        ctx.delta   = in.time - then;
+        ctx.clocked = 1;
+    }
     ctx.timed = 1;
 
     ctx.sw  = sw;
