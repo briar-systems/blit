@@ -25,6 +25,7 @@ use std.types.string.str;
 use blit.context;
 use blit.draw;
 use blit.input;
+use blit.interact;
 use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
@@ -575,18 +576,9 @@ fun area(ctx: *context.Context, p: *Plot, values: *f32, c: draw.Color) {
     }
 }
 
-# the local cursor
-fun cursor(ctx: *context.Context, mx: *f32, my: *f32) {
-    @mx = ctx.in.mx - ctx.lx;
-    @my = ctx.in.my - ctx.ly;
-}
-
 # claim the plot for the next frame and report whether the cursor is over it
-fun hovered(ctx: *context.Context, key: str, p: *Plot) u8 {
-    val id:  u64 = context.id_of(ctx, key);
-    val hov: u8  = context.claim(ctx, id, p.x0, p.y0, p.x1, p.y1);
-    if (hov != 0) { ctx.hot = id; }
-    ret hov;
+fun hovered(ctx: *context.Context, key: str, p: *Plot) interact.Hit {
+    ret interact.hit(ctx, context.id_of(ctx, key), p.x0, p.y0, p.x1, p.y1, 0);
 }
 
 # the sample nearest local x
@@ -660,7 +652,7 @@ pub fun line(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, se
 
     context.push_clip(ctx, x, y, x + w, y + h);
     if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
-    val hov: u8 = hovered(ctx, key, ?p);
+    val hov: interact.Hit = hovered(ctx, key, ?p);
 
     val width: f32 = context.px(ctx, ctx.theme.line_w);
     val half:  f32 = width / 2.0::f32;
@@ -686,10 +678,9 @@ pub fun line(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, se
     }
 
     var out: Hover;
-    if (hov != 0 && count > 0 && ns > 0) {
-        var mx: f32;
-        var my: f32;
-        cursor(ctx, ?mx, ?my);
+    if (hov.hot && count > 0 && ns > 0) {
+        val mx: f32 = hov.mx;
+        val my: f32 = hov.my;
         out.hot   = 1;
         out.index = nearest(?p, mx);
         var best: f32 = 0.0::f32;
@@ -740,7 +731,7 @@ pub fun bars(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, va
 
     context.push_clip(ctx, x, y, x + w, y + h);
     if (opt.axes != 0) { draw_axes(ctx, ?p, x, y, w, h); }
-    val hov: u8 = hovered(ctx, key, ?p);
+    val hov: interact.Hit = hovered(ctx, key, ?p);
 
     context.push_clip(ctx, p.x0, p.y0, p.x1, p.y1);
     val c:    draw.Color = series_color(ctx, 0);
@@ -759,11 +750,10 @@ pub fun bars(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, va
     context.pop_clip(ctx);
 
     var out: Hover;
-    if (hov != 0 && count > 0) {
-        var mx: f32;
-        var my: f32;
-        cursor(ctx, ?mx, ?my);
-        var k: f32 = floorf((mx - p.x0) / p.b);
+    if (hov.hot && count > 0) {
+        val mx: f32 = hov.mx;
+        val my: f32 = hov.my;
+        var k:  f32 = floorf((mx - p.x0) / p.b);
         k         = clampf(k, 0.0::f32, (count - 1)::f32);
         out.hot   = 1;
         out.index = k::usize;
@@ -812,14 +802,13 @@ pub fun sparkline(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f3
     if (count > 1) { p.b = (p.x1 - p.x0) / (count - 1)::f32; }
 
     context.push_clip(ctx, x, y, x + w, y + h);
-    val hov: u8         = hovered(ctx, key, ?p);
-    val c:   draw.Color = series_color(ctx, 0);
+    val hov: interact.Hit = hovered(ctx, key, ?p);
+    val c:   draw.Color   = series_color(ctx, 0);
     trace(ctx, ?p, values, width, c);
     var out: Hover;
-    if (hov != 0 && count > 0) {
-        var mx: f32;
-        var my: f32;
-        cursor(ctx, ?mx, ?my);
+    if (hov.hot && count > 0) {
+        val mx: f32 = hov.mx;
+        val my: f32 = hov.my;
         out.hot   = 1;
         out.index = nearest(?p, mx);
         out.value = values[out.index];
