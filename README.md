@@ -877,6 +877,56 @@ blit.menu.end_menu(?ctx, ?cm);
 - **Ids.** A bar's key, then each header and submenu label, then the item's
   label: `driver.find(?d, "main/File/Recent/notes.txt")`.
 
+## Modals
+
+`blit.modal` puts up a dialog that blocks everything beneath it until it
+closes. Its open state lives in the state store under its title's id, so
+`open` and `close` take it up and down from anywhere in the same id scope,
+and `begin_modal` and `end_modal` run every frame, open or not:
+
+```mach
+if (blit.widget.button(?ctx, "Delete")) { blit.modal.open(?ctx, "Delete file"); }
+
+val m: blit.modal.ModalArea = blit.modal.begin_modal(?ctx, blit.modal.dialog("Delete file"));
+if (m.shown != 0) {
+    blit.widget.text(?ctx, "notes.txt goes for good.");
+    if (blit.widget.button(?ctx, "Delete")) { ...; blit.modal.close(?ctx, "Delete file"); }
+}
+blit.modal.end_modal(?ctx, m);
+
+var labels: [2]str = [2]str{"Save", "Discard"};
+val c: usize = blit.modal.confirm(?ctx, "Unsaved", "Save the changes first?", ?labels[0], 2);
+if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
+```
+
+- **Blocking.** A modal paints and claims in the modals band, above docks,
+  windows, overlays and popups, behind a scrim over the whole screen. The scrim
+  claims every button, so nothing beneath it is hovered, pressed or scrolled,
+  while the widgets inside the modal work as usual. Popups, dropdowns and menus
+  opened inside a modal stack above it.
+- **Placement.** A `Modal` declares a title, a width (0 to fit its widgets),
+  a greatest width and `MODAL_*` flags. It opens centred, or with its top left
+  at `x`, `y` under `MODAL_ANCHORED`, and stays on the screen. Its size is
+  measured as it is drawn, so the frame it opens lays out hidden behind a scrim
+  that already blocks.
+- **Closing.** Escape closes the top modal while it holds the keyboard itself
+  (escape in a text field inside it ends the edit first), and so does the close
+  button in its titlebar (`MODAL_NO_CLOSE`, `MODAL_NO_TITLE`). A press on the
+  scrim closes it only with `MODAL_SCRIM_CLOSES`. `ModalArea.closed` and `why`
+  report the frame it closed.
+- **Stacking.** A modal opened inside another's body nests above it, and
+  modals called one after another stack by call order. Only the top one takes
+  the pointer and escape.
+- **Focus.** A modal takes the keyboard the frame it opens, so a field beneath
+  stops seeing keys, and gives it back to the previous holder the frame after
+  it closes.
+- **Confirm.** `confirm` is a dialog with a message and a row of buttons. It
+  returns the index chosen, closing itself, `CANCELLED` on the frame it is
+  closed without a choice (escape, close button or scrim), and `NO_CHOICE`
+  otherwise.
+- **Ids.** A modal is the id scope of its widgets:
+  `driver.find(?d, "Delete file/Delete")`.
+
 ## Charts
 
 `blit.chart` plots columns of values into a rect you give it, in the current
@@ -959,7 +1009,8 @@ click is always the one visibly on top.
   on a layer of band `b`, in screen coordinates with the clip reset to the
   screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
   band shares one slot, a nesting band (popups, modals) stacks a child one
-  slot above a parent of the same band, and an ordered band (windows) takes
+  slot above a parent of the same band or, opened inside a higher band, one
+  slot above its parent in that band, and an ordered band (windows) takes
   the slot given, a window's z. `end()` composes the draw list by layer,
   keeping call order within a layer, so a popup opened early in the frame
   still paints over a window called after it, and sibling popups share a
