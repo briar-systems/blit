@@ -38,6 +38,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use blit.theme;
 use blit.widget;
 use allo: std.allocator;
 use std.allocator.page;
@@ -79,13 +80,15 @@ pub rec Fade {
     far:  f32;
 }
 
-# what an overlay's chrome draws with
-pub val KIND_OVERLAY: u32 = 0;
-pub val KIND_TOAST:   u32 = 1;
-pub val KIND_TOOLTIP: u32 = 2;
+# what an overlay's chrome draws with: the style of a theme kind
+pub val KIND_OVERLAY: u32 = theme.OVERLAY;
+pub val KIND_TOAST:   u32 = theme.TOAST;
+pub val KIND_TOOLTIP: u32 = theme.TOOLTIP;
 
-# an overlay's look, lengths at the context's scale
+# an overlay's look, lengths at the context's scale, read from its kind's
+# style at rest
 # ---
+# kind:     the theme kind it is read from, which paint draws
 # fill:     background, transparent for none
 # border:   outline, transparent for none
 # border_w: outline width in pixels
@@ -93,6 +96,7 @@ pub val KIND_TOOLTIP: u32 = 2;
 # pad:      space between its edges and its content, in pixels
 # corner:   corner radius in pixels
 pub rec Chrome {
+    kind:     u32;
     fill:     draw.Color;
     border:   draw.Color;
     border_w: f32;
@@ -175,28 +179,30 @@ fun clampf(v: f32, lo: f32, hi: f32) f32 {
     ret maxf(lo, minf(v, hi));
 }
 
-# what an overlay of a kind draws with, from the context's theme
+# what an overlay of a kind draws with, from its style in the context's theme
 #
 # the one place overlays, toasts and tooltips read their look: a bare overlay
-# draws nothing of its own, and toasts and tooltips take the window surface,
-# the edge line, the text color and the theme's padding and corners.
+# draws nothing of its own unless its style gives it a fill or an outline,
+# and toasts and tooltips take theirs (see theme.OVERLAY, TOAST and TOOLTIP).
 # ---
 # ctx:  context
 # kind: KIND_OVERLAY, KIND_TOAST or KIND_TOOLTIP
 # ret:  the look, lengths scaled
 pub fun chrome(ctx: *context.Context, kind: u32) Chrome {
+    val s: *theme.Style = context.look_of(ctx, kind);
+    val p: *theme.Paint = ?s.states[theme.NORMAL];
     var c: Chrome;
-    c.text = ctx.theme.text;
-    if (kind == KIND_OVERLAY) { ret c; }
-    c.fill     = ctx.theme.window;
-    c.border   = ctx.theme.edge;
-    c.border_w = context.px(ctx, ctx.theme.edge_w);
-    c.pad      = context.px(ctx, ctx.theme.pad);
-    c.corner   = context.px(ctx, ctx.theme.corner);
+    c.kind     = kind;
+    c.text     = p.text;
+    c.fill     = p.fill;
+    c.border   = p.border;
+    c.border_w = context.px(ctx, p.border_w);
+    c.pad      = context.px(ctx, s.pad.l);
+    c.corner   = context.px(ctx, s.radius.tl);
     ret c;
 }
 
-# paint a chrome's background and outline over a rect in local pixels
+# paint a chrome's box, its kind's style at rest, over a rect in local pixels
 # ---
 # ctx: context
 # c:   the chrome
@@ -205,10 +211,7 @@ pub fun chrome(ctx: *context.Context, kind: u32) Chrome {
 # x1:  right in pixels
 # y1:  bottom in pixels
 pub fun paint(ctx: *context.Context, c: Chrome, x0: f32, y0: f32, x1: f32, y1: f32) {
-    if (c.fill.a > 0.0::f32)                              { context.fill(ctx, x0, y0, x1, y1, c.corner, context.CORNERS_ALL, c.fill); }
-    if (c.border.a <= 0.0::f32 || c.border_w <= 0.0::f32) { ret; }
-    if (c.corner > 0.0::f32)                              { context.stroke_rounded_rect(ctx, x0, y0, x1, y1, draw.radii(c.corner), c.border_w, c.border); }
-    or                                                    { context.frame(ctx, x0, y0, x1, y1, c.border_w, c.border); }
+    context.box(ctx, c.kind, theme.NORMAL, x0, y0, x1, y1);
 }
 
 # an overlay anchored to the surface at a point, the same point of the
@@ -334,7 +337,7 @@ pub fun begin_id(ctx: *context.Context, id: u64, o: Overlay) Shown {
     s.ch = context.split(ctx, 2);
     context.set_channel(ctx, s.ch, 1);
 
-    var f: layout.Frame = layout.column(s.x0 + c.pad, s.y0 + c.pad, m.w - c.pad * 2.0::f32, 0.0::f32, context.px(ctx, ctx.theme.gap));
+    var f: layout.Frame = layout.column(s.x0 + c.pad, s.y0 + c.pad, m.w - c.pad * 2.0::f32, 0.0::f32, context.px(ctx, context.look_of(ctx, theme.LAYOUT).margin.b));
     f.open  = layout.OPEN_W | layout.OPEN_H;
     f.align = o.align;
     context.push_layout(ctx, f);

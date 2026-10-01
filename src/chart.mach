@@ -377,6 +377,21 @@ fun snap_y(ctx: *context.Context, y: f32) f32 {
     ret roundf(y + ctx.ly) - ctx.ly;
 }
 
+# the chart style's paint: border the grid, mark the axes, ticks and labels
+fun axes(ctx: *context.Context) *theme.Paint {
+    ret context.paint_of(ctx, theme.CHART, theme.NORMAL);
+}
+
+# the width of a rule, the chart style's border width, at least a pixel
+fun rule_w(ctx: *context.Context) f32 {
+    ret maxf(context.px(ctx, axes(ctx).border_w), 1.0::f32);
+}
+
+# the space between a label and what it labels, the chart style's inset
+fun label_pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, context.look_of(ctx, theme.CHART).inset.l);
+}
+
 # a series color from the theme
 fun series_color(ctx: *context.Context, k: usize) draw.Color {
     ret ctx.theme.series[k % theme.SERIES];
@@ -848,7 +863,7 @@ fun tick(s: *Scale, k: usize, c: *f64, out: *u8) u8 {
 # lay out the plot within the rect: margins for the labels and the value axis
 fun lay_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32, opt: *Options, ys: *Span) {
     val lh:     f32 = context.line_height(ctx);
-    val pad:    f32 = context.px(ctx, ctx.theme.pad);
+    val pad:    f32 = label_pad(ctx);
     val tick_l: f32 = context.px(ctx, ctx.theme.tick);
     val half:   f32 = context.px(ctx, ctx.theme.line_w) / 2.0::f32;
 
@@ -885,7 +900,7 @@ fun lay_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32, opt
 # place the x axis on the plot and space its ticks by the width of its labels
 fun lay_out_x(ctx: *context.Context, p: *Plot) {
     val lh:  f32 = context.line_height(ctx);
-    val pad: f32 = context.px(ctx, ctx.theme.pad);
+    val pad: f32 = label_pad(ctx);
     val pw:  f32 = p.x1 - p.x0;
     p.sx.p0 = p.x0;
     p.sx.p1 = p.x1;
@@ -905,14 +920,14 @@ fun lay_out_x(ctx: *context.Context, p: *Plot) {
 
 # a horizontal rule of the theme's edge width centered on y
 fun rule_h(ctx: *context.Context, x0: f32, x1: f32, y: f32, c: draw.Color) {
-    val ew: f32 = maxf(context.px(ctx, ctx.theme.edge_w), 1.0::f32);
+    val ew: f32 = rule_w(ctx);
     val t:  f32 = snap_y(ctx, y - ew / 2.0::f32);
     context.quad(ctx, snap_x(ctx, x0), t, snap_x(ctx, x1), t + ew, c);
 }
 
 # a vertical rule of the theme's edge width centered on x
 fun rule_v(ctx: *context.Context, x: f32, y0: f32, y1: f32, c: draw.Color) {
-    val ew: f32 = maxf(context.px(ctx, ctx.theme.edge_w), 1.0::f32);
+    val ew: f32 = rule_w(ctx);
     val l:  f32 = snap_x(ctx, x - ew / 2.0::f32);
     context.quad(ctx, l, snap_y(ctx, y0), l + ew, snap_y(ctx, y1), c);
 }
@@ -920,16 +935,16 @@ fun rule_v(ctx: *context.Context, x: f32, y0: f32, y1: f32, c: draw.Color) {
 # grid, axes, ticks and labels around the plot, within the chart's rect
 fun draw_axes(ctx: *context.Context, p: *Plot, x: f32, y: f32, w: f32, h: f32) {
     val lh:  f32        = context.line_height(ctx);
-    val pad: f32        = context.px(ctx, ctx.theme.pad);
+    val pad: f32        = label_pad(ctx);
     val tl:  f32        = context.px(ctx, ctx.theme.tick);
-    val dim: draw.Color = ctx.theme.text_dim;
+    val dim: draw.Color = axes(ctx).mark;
     var buf: [32]u8;
     var c:   f64        = 0.0;
 
     var k: usize = 0;
     for (k < TICK_MAX && tick(?p.sy, k, ?c, ?buf[0]) != 0) {
         val ty: f32 = pixel(?p.sy, c);
-        rule_h(ctx, p.x0, p.x1, ty, ctx.theme.grid);
+        rule_h(ctx, p.x0, p.x1, ty, axes(ctx).border);
         rule_h(ctx, p.x0 - tl, p.x0, ty, dim);
         val tw: f32 = context.text_width(ctx, ?buf[0]);
         val lx: f32 = snap_x(ctx, p.x0 - tl - pad - tw);
@@ -1540,7 +1555,7 @@ fun read_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, xv: Num, yv: Num) 
     format_num(?buf[0], n + m, yv, ?p.sy);
 
     val lh:  f32 = context.line_height(ctx);
-    val pad: f32 = context.px(ctx, ctx.theme.pad);
+    val pad: f32 = context.px(ctx, context.look_of(ctx, theme.TOOLTIP).inset.l);
     val bw:  f32 = context.text_width(ctx, ?buf[0]) + pad * 2.0::f32;
     val bh:  f32 = lh + pad * 2.0::f32;
     var bx:  f32 = x + pad * 2.0::f32;
@@ -1551,8 +1566,8 @@ fun read_out(ctx: *context.Context, p: *Plot, x: f32, y: f32, xv: Num, yv: Num) 
     by = maxf(minf(by, p.y1 - bh), p.y0);
     bx = snap_x(ctx, bx);
     by = snap_y(ctx, by);
-    context.fill(ctx, bx, by, bx + bw, by + bh, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, ctx.theme.window);
-    context.text_at(ctx, ?buf[0], bx + pad, by + pad, ctx.theme.text);
+    context.box(ctx, theme.TOOLTIP, theme.NORMAL, bx, by, bx + bw, by + bh);
+    context.text_at(ctx, ?buf[0], bx + pad, by + pad, context.paint_of(ctx, theme.TOOLTIP, theme.NORMAL).text);
 }
 
 # show a cursor on sample i of series k: a guide at local x gx, a marker and a
@@ -1570,7 +1585,7 @@ fun show(ctx: *context.Context, p: *Plot, series: *Series, k: usize, i: usize, g
     out.series = k;
     out.x      = x_of(s, i);
     out.value  = cell(?s.y, i);
-    rule_v(ctx, gx, p.y0, p.y1, ctx.theme.text_dim);
+    rule_v(ctx, gx, p.y0, p.y1, axes(ctx).mark);
     marker(ctx, mx, my, series_color(ctx, k));
     read_out(ctx, p, mx, my, out.x, out.value);
     ret out;
@@ -1744,7 +1759,7 @@ pub fun bars(ctx: *context.Context, key: str, x: f32, y: f32, w: f32, h: f32, va
     context.push_clip(ctx, p.x0, p.y0, p.x1, p.y1);
     val b:   f32        = (p.x1 - p.x0) / n::f32;
     val c:   draw.Color = series_color(ctx, 0);
-    var gap: f32        = minf(context.px(ctx, ctx.theme.gap), b / 4.0::f32);
+    var gap: f32        = minf(context.px(ctx, context.look_of(ctx, theme.CHART).margin.r), b / 4.0::f32);
     if (opt.flush != 0) { gap = 0.0::f32; }
     val bot: f32 = base_y(ctx, ?p);
     i = 0;

@@ -1,10 +1,33 @@
-# blit's look as data: the colors and metrics every widget draws from
+# blit's look as data: the tokens a theme is authored from and the style
+# record every widget kind draws with
 #
-# a theme is a plain record of colors and lengths, so a consumer can build one
-# in code, load it from a file or fill it from another language, and any
-# renderer draws it the same way. the context holds one (see
-# context.set_theme), and a context that is never given one draws with
-# default(), so zero configuration still works.
+# a theme is built in code (init, then the built-in looks or token edits and
+# derive) or loaded from TOML (see load and save), and any renderer draws it
+# the same way. the context holds one (see context.theme_of), set up with the
+# default look, so zero configuration still works.
+#
+# a theme has two layers. the tokens are a palette of colors and a set of
+# metrics, the handful of values a look is designed in. the styles are one
+# Style per registered widget kind: its corner radii, padding,
+# inset, margins, least sizes and shadow, and a Paint per state (normal, hot,
+# active, on, disabled, focused) with its fill, gradient, text, mark, border
+# and shadow colors. widgets draw from the styles alone. derive builds every
+# style from the tokens, and rederive moves the styles to new tokens while
+# keeping every style field that was set by hand, so changing the accent
+# recolors every widget that took its color from it and nothing else.
+#
+# kinds are a registry on the theme. register_kind adds one by name with the
+# derive that builds its style from the tokens, and returns its handle; the
+# built-in kinds are registered the same way by init, in the order of the
+# kind constants, which are their handles. a registered kind is addressable
+# by its name everywhere a built-in one is: paths, TOML, classes and the
+# editor.
+#
+# every field has a path, such as palette.accent, metrics.gap, plot.series.3,
+# button.radius or button.hot.fill, with * standing for every kind or every
+# state. FIELDS is the one table naming each field with its path, unit and
+# meaning, and TOML, overrides (see context.push_color), classes and the
+# theme editor all address fields through it.
 #
 # lengths are authored at scale 1.0. the context multiplies each by its
 # interface scale (see context.set_scale) when a widget reads it, the same
@@ -13,48 +36,248 @@
 # colors are straight rgba as authored in sRGB, like every color passed to the
 # painter (see context.set_srgb).
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use blit.draw;
+use tw:   blit.writer;
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+use std.memory;
 
 # how many series colors a theme holds
 pub val SERIES: usize = 8;
 
-# the colors and unscaled metrics widgets draw with
+# how many built-in kinds init registers, the handles below; a kind
+# registered after them takes the next handle
+pub val BUILTIN_KINDS: u32 = 51;
+
+# how many states a style paints
+pub val STATES: u8 = 6;
+
+# a line of text and a wrapped note: text, and mark for a note
+pub val LABEL: u32 = 0;
+# layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row
+pub val LAYOUT: u32 = 1;
+# a panel's background and padding
+pub val PANEL: u32 = 2;
+# a window's body and its shadow: margin the resize grips outside its edges
+pub val WINDOW: u32 = 3;
+# a window's titlebar: text the title, mark the collapse glyph
+pub val WINDOW_TITLE: u32 = 4;
+# a docked panel: fill the body, border its inner edge, pad around its column
+pub val DOCK: u32 = 5;
+# a popup's body
+pub val POPUP: u32 = 6;
+# a button, on when drawn chosen
+pub val BUTTON: u32 = 7;
+# a checkbox's box: pad around the mark, inset.l between box and label
+pub val CHECKBOX: u32 = 8;
+# a checkbox's mark, drawn in its on state
+pub val CHECKBOX_MARK: u32 = 9;
+# a toggle's track and label: pad between the row and the track, on while set
+pub val TOGGLE: u32 = 10;
+# a toggle's knob: margin between it and the track, painted in the toggle's state
+pub val TOGGLE_KNOB: u32 = 11;
+# a slider's track: text the label, mark the reading
+pub val SLIDER: u32 = 12;
+# a slider's handle: min_w its width
+pub val SLIDER_HANDLE: u32 = 13;
+# a dropdown's header, on while open
+pub val DROPDOWN: u32 = 14;
+# a text field: mark the hint, focused while it holds the keyboard
+pub val FIELD: u32 = 15;
+# a text field's caret and the composition's underline: fill, min_w the width
+pub val FIELD_CARET: u32 = 16;
+# the highlight behind selected text: fill
+pub val FIELD_SELECT: u32 = 17;
+# a collapsible section heading: mark the caret
+pub val SECTION: u32 = 18;
+# a scrollbar's track: min_w its width, margin.l between it and the content
+pub val SCROLLBAR: u32 = 19;
+# a scrollbar's thumb: min_h its least length
+pub val SCROLLBAR_THUMB: u32 = 20;
+# a list's body
+pub val LIST: u32 = 21;
+# a list's row, on while selected
+pub val LIST_ITEM: u32 = 22;
+# a chart: border the grid, mark the axes, ticks and labels, inset around labels, margin.r between bars
+pub val CHART: u32 = 23;
+# a tab, on while chosen, and a tab bar's overflow buttons: margin.r between tabs
+pub val TAB: u32 = 24;
+# a tooltip, and a chart's read-out: pad around its content, margin.t below the widget it describes
+pub val TOOLTIP: u32 = 25;
+# a menu's body: pad around its rows, min_w its least width
+pub val MENU: u32 = 26;
+# a row of a menu, on while its submenu is open: mark its shortcut and arrow
+pub val MENU_ITEM: u32 = 27;
+# an overlay, chrome-free unless its style gives it a fill
+pub val OVERLAY: u32 = 28;
+# a modal dialog's body
+pub val MODAL: u32 = 29;
+# the scrim behind a modal dialog
+pub val SCRIM: u32 = 30;
+# a radio button's ring: pad around the dot, inset.l between ring and label
+pub val RADIO: u32 = 31;
+# a radio button's dot, drawn in its on state
+pub val RADIO_MARK: u32 = 32;
+# a progress bar's track and its text
+pub val PROGRESS: u32 = 33;
+# a progress bar's done part
+pub val PROGRESS_BAR: u32 = 34;
+# a separator: border its rule and border_w its width, mark a label, inset.r between label and rule
+pub val SEPARATOR: u32 = 35;
+# a tree's row, on while selected: mark the caret
+pub val TREE_ITEM: u32 = 36;
+# where a drag would drop: fill and border
+pub val DROP_TARGET: u32 = 37;
+# what a drag carries, drawn at the cursor
+pub val DRAG_PREVIEW: u32 = 38;
+# a menu bar's background
+pub val MENU_BAR: u32 = 39;
+# a menu's header in a menu bar, on while its menu is open
+pub val MENU_TITLE: u32 = 40;
+# a row of a dropdown's or a tab list's options, on while chosen
+pub val OPTION: u32 = 41;
+# a tab bar's strip behind its tabs
+pub val TAB_BAR: u32 = 42;
+# a tab's close box: fill under the cursor, border_w the cross's stroke
+pub val TAB_CLOSE: u32 = 43;
+# a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width
+pub val TABLE_HEADER: u32 = 44;
+# a table's body cell: inset around its widgets, its row height from min_h and inset
+pub val TABLE_CELL: u32 = 45;
+# a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width
+pub val TABLE_RULE: u32 = 46;
+# a value editor's drag cell: inset around its text and before its row's cells, min_w its least width
+pub val VALUE: u32 = 47;
+# a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label
+pub val PICKER: u32 = 48;
+# the checkerboard alpha shows through: fill and mark its two cells
+pub val CHECKER: u32 = 49;
+# a toast's card: pad around its text, margin between the stack and the surface's edges
+pub val TOAST: u32 = 50;
+
+# at rest
+pub val NORMAL: u8 = 0;
+# under the cursor
+pub val HOT: u8 = 1;
+# pressed or dragged
+pub val ACTIVE: u8 = 2;
+# set: checked, chosen, selected or open
+pub val ON: u8 = 3;
+# drawn but not taking input
+pub val DISABLED: u8 = 4;
+# holding the keyboard
+pub val FOCUSED: u8 = 5;
+
+# the state a widget paints in, the first that holds of on, focused, active
+# and hot, else normal
 # ---
-# panel:       panel background
-# window:      window and popup body background
-# dock:        docked container background
-# header:      window titlebar and section heading
-# header_hot:  a titlebar or heading under the cursor
-# edge:        the edge line a dock draws on its inner side
-# text:        text
-# text_dim:    secondary text and glyphs, such as a collapse marker
-# text_faint:  the faintest text, for hints and placeholders such as an empty text field's hint
-# accent:      a mark that is on, such as a checked box, a chosen segment or a selected row, and a focused text field's outline
-# accent_text: text and marks drawn on an accent fill
-# warn:        warnings, for consumers drawing their own content; no widget uses it
-# control:     a control's face at rest
-# control_hot: a control under the cursor
-# control_on:  a control pressed, or a dropdown open
-# track:       a slider or scrollbar track, a dropdown option at rest and a text field's face
-# handle:      a slider handle or scrollbar thumb at rest
-# handle_on:   a slider handle or scrollbar thumb being dragged
-# select:      the highlight behind selected text
-# row:         least height of a control row, which grows to fit a line of text and its padding
-# gap:         space between layout rows
-# pad:         space inside chrome, around text and at a container's bottom
-# handle_w:    slider handle width
-# bar_w:       scrollbar width
-# thumb_min:   shortest scrollbar thumb
-# corner:      corner radius of controls and containers, 0 for square
-# edge_w:      width of an edge line: a dock's inner side, a chart's axes, grid and ticks, and a focused text field's outline
-# caret_w:     width of a text field's caret
-# series:      chart series colors, series k drawing in series[k % SERIES]
-# grid:        chart grid lines
-# line_w:      width of a chart line
-# tick:        length of a chart axis tick
-# area:        alpha factor of the area filled under a chart line, in [0, 1]
+# hot:     under the cursor
+# active:  pressed or dragged
+# on:      set: checked, chosen, selected or open
+# focused: holding the keyboard
+# ret:     NORMAL, HOT, ACTIVE, ON or FOCUSED
+pub fun pick(hot: bool, active: bool, on: bool, focused: bool) u8 {
+    if (on)      { ret ON; }
+    if (focused) { ret FOCUSED; }
+    if (active)  { ret ACTIVE; }
+    if (hot)     { ret HOT; }
+    ret NORMAL;
+}
+
+# a length on each side of a rect, in unscaled pixels
+# ---
+# l: left
+# t: top
+# r: right
+# b: bottom
+pub rec Edges {
+    l: f32;
+    t: f32;
+    r: f32;
+    b: f32;
+}
+
+# the same length on every side
+# ---
+# v:   length
+# ret: the edges
+pub fun edges(v: f32) Edges {
+    ret Edges{l: v, t: v, r: v, b: v};
+}
+
+# how a style draws in one state
+# ---
+# fill:     the face, at its top when it is a gradient
+# fill_to:  the face at its bottom: the same as fill for a flat face, else a vertical gradient
+# text:     text drawn on the face
+# mark:     secondary ink: a glyph, a caret, a reading or a hint
+# border:   the outline, transparent for none
+# border_w: the outline's width, in unscaled pixels
+# shadow:   the shadow's color, transparent for none
+pub rec Paint {
+    fill:     draw.Color;
+    fill_to:  draw.Color;
+    text:     draw.Color;
+    mark:     draw.Color;
+    border:   draw.Color;
+    border_w: f32;
+    shadow:   draw.Color;
+}
+
+# how one widget kind draws, lengths unscaled
+# ---
+# radius:      corner radii
+# pad:         a container's space between its edges and its content
+# inset:       a control's space between its edges and its text
+# margin:      space left around the widget, the right side between cells and the bottom between rows
+# min_w:       least width
+# min_h:       least height, a control's row height before it grows to fit its text
+# shadow_x:    shadow offset right
+# shadow_y:    shadow offset down
+# shadow_blur: how far the shadow fades out
+# states:      the paint for each state, indexed by NORMAL .. FOCUSED
+pub rec Style {
+    radius:      draw.Radii;
+    pad:         Edges;
+    inset:       Edges;
+    margin:      Edges;
+    min_w:       f32;
+    min_h:       f32;
+    shadow_x:    f32;
+    shadow_y:    f32;
+    shadow_blur: f32;
+    states:      [6]Paint;
+}
+
+# the tokens a look is designed in, and a style per widget kind built from them
+#
+# the color and metric fields are tokens: widgets never read them, derive
+# builds the styles from them, so after changing tokens in code call derive
+# (or rederive to keep styles set by hand). a consumer drawing its own content
+# reads them as its palette. the plot fields are read by charts as they are.
+# FIELDS documents every field. the rest is the kind registry, owned by the
+# theme: init sets it up, register_kind grows it, copy duplicates it and free
+# releases it.
+# ---
+# a:       allocator backing the registry
+# names:   each kind's name, borrowed, by handle
+# docs:    each kind's meaning, borrowed, by handle
+# derives: each kind's derive, by handle
+# styles:  each kind's style, by handle
+# len:     kinds registered
+# cap:     kinds allocated
 pub rec Theme {
     panel:       draw.Color;
     window:      draw.Color;
@@ -75,9 +298,11 @@ pub rec Theme {
     handle:      draw.Color;
     handle_on:   draw.Color;
     select:      draw.Color;
+    grid:        draw.Color;
     row:         f32;
     gap:         f32;
     pad:         f32;
+    inset:       f32;
     handle_w:    f32;
     bar_w:       f32;
     thumb_min:   f32;
@@ -85,17 +310,1033 @@ pub rec Theme {
     edge_w:      f32;
     caret_w:     f32;
     series:      [8]draw.Color;
-    grid:        draw.Color;
     line_w:      f32;
     tick:        f32;
     area:        f32;
+    a:           *allo.Allocator;
+    names:       *str;
+    docs:        *str;
+    derives:     *Hook;
+    styles:      *Style;
+    len:         u32;
+    cap:         u32;
 }
 
-# blit's own look: dark surfaces, square corners and 4 pixel spacing
+# builds one kind's style from a theme's tokens
+#
+# called with the theme, the kind's handle and the style to adjust, which
+# arrives as base(t). a derive reads the tokens alone, never the styles, so
+# it builds the same style whenever the tokens are the same.
+pub def Derive: fun(*Theme, u32, *Style);
+
+# a kind's derive as the registry stores it
 # ---
-# ret: the default theme
-pub fun default() Theme {
-    var t: Theme;
+# f: the derive
+pub rec Hook {
+    f: Derive;
+}
+
+# a field holding a color, four floats
+pub val UNIT_COLOR: u8 = 0;
+# a field holding one length, scaled with the interface
+pub val UNIT_LENGTH: u8 = 1;
+# a field holding four lengths, radii or edges, scaled with the interface
+pub val UNIT_QUAD: u8 = 2;
+# a field holding one factor, not scaled
+pub val UNIT_FACTOR: u8 = 3;
+
+# a palette token, at palette.<name>
+pub val GROUP_PALETTE: u8 = 0;
+# a metric token, at metrics.<name>
+pub val GROUP_METRICS: u8 = 1;
+# a chart field, at plot.<name>
+pub val GROUP_PLOT: u8 = 2;
+# a style field of a kind, at <kind>.<name>
+pub val GROUP_STYLE: u8 = 3;
+# a paint field of a kind in a state, at <kind>.<state>.<name>
+pub val GROUP_PAINT: u8 = 4;
+
+# one row of the field table
+# ---
+# group: GROUP_*, which record the offset is into
+# name:  the field's last path segment
+# unit:  UNIT_*
+# off:   byte offset in Theme (palette, metrics, plot), Style or Paint
+# count: elements, 1 except for an array such as plot.series
+# doc:   what the field means
+pub rec Field {
+    group: u8;
+    name:  str;
+    unit:  u8;
+    off:   usize;
+    count: usize;
+    doc:   str;
+}
+
+# how many rows FIELDS has
+pub val FIELD_COUNT: usize = 50;
+
+# every field of a theme: the one table TOML, overrides, classes, the editor
+# and the README's field table are built from
+pub val FIELDS: [50]Field = [50]Field{
+    Field{group: GROUP_PALETTE, name: "panel", unit: UNIT_COLOR, off: $offset_of(Theme, panel), count: 1, doc: "panel background"},
+    Field{group: GROUP_PALETTE, name: "window", unit: UNIT_COLOR, off: $offset_of(Theme, window), count: 1, doc: "window, popup, menu, tooltip and modal background"},
+    Field{group: GROUP_PALETTE, name: "dock", unit: UNIT_COLOR, off: $offset_of(Theme, dock), count: 1, doc: "docked container background"},
+    Field{group: GROUP_PALETTE, name: "header", unit: UNIT_COLOR, off: $offset_of(Theme, header), count: 1, doc: "window titlebar and section heading"},
+    Field{group: GROUP_PALETTE, name: "header_hot", unit: UNIT_COLOR, off: $offset_of(Theme, header_hot), count: 1, doc: "a titlebar or heading under the cursor"},
+    Field{group: GROUP_PALETTE, name: "edge", unit: UNIT_COLOR, off: $offset_of(Theme, edge), count: 1, doc: "a dock's inner edge and a separator's rule"},
+    Field{group: GROUP_PALETTE, name: "text", unit: UNIT_COLOR, off: $offset_of(Theme, text), count: 1, doc: "text"},
+    Field{group: GROUP_PALETTE, name: "text_dim", unit: UNIT_COLOR, off: $offset_of(Theme, text_dim), count: 1, doc: "secondary text and glyphs: notes, readings, carets, axis labels"},
+    Field{group: GROUP_PALETTE, name: "text_faint", unit: UNIT_COLOR, off: $offset_of(Theme, text_faint), count: 1, doc: "the faintest text: hints, placeholders and disabled text"},
+    Field{group: GROUP_PALETTE, name: "accent", unit: UNIT_COLOR, off: $offset_of(Theme, accent), count: 1, doc: "a mark that is on (a checked box, a chosen button, a selected row) and a focused field's outline"},
+    Field{group: GROUP_PALETTE, name: "accent_text", unit: UNIT_COLOR, off: $offset_of(Theme, accent_text), count: 1, doc: "text and marks drawn on an accent fill"},
+    Field{group: GROUP_PALETTE, name: "warn", unit: UNIT_COLOR, off: $offset_of(Theme, warn), count: 1, doc: "warnings, for consumers drawing their own content; no widget uses it"},
+    Field{group: GROUP_PALETTE, name: "control", unit: UNIT_COLOR, off: $offset_of(Theme, control), count: 1, doc: "a control's face at rest"},
+    Field{group: GROUP_PALETTE, name: "control_hot", unit: UNIT_COLOR, off: $offset_of(Theme, control_hot), count: 1, doc: "a control under the cursor"},
+    Field{group: GROUP_PALETTE, name: "control_on", unit: UNIT_COLOR, off: $offset_of(Theme, control_on), count: 1, doc: "a control pressed, a dropdown open or a menu's header open"},
+    Field{group: GROUP_PALETTE, name: "track", unit: UNIT_COLOR, off: $offset_of(Theme, track), count: 1, doc: "a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face"},
+    Field{group: GROUP_PALETTE, name: "handle", unit: UNIT_COLOR, off: $offset_of(Theme, handle), count: 1, doc: "a slider handle, toggle knob or scrollbar thumb at rest"},
+    Field{group: GROUP_PALETTE, name: "handle_on", unit: UNIT_COLOR, off: $offset_of(Theme, handle_on), count: 1, doc: "a handle, knob or thumb being dragged or hovered"},
+    Field{group: GROUP_PALETTE, name: "select", unit: UNIT_COLOR, off: $offset_of(Theme, select), count: 1, doc: "the highlight behind selected text"},
+    Field{group: GROUP_PALETTE, name: "grid", unit: UNIT_COLOR, off: $offset_of(Theme, grid), count: 1, doc: "chart grid lines"},
+    Field{group: GROUP_METRICS, name: "row", unit: UNIT_LENGTH, off: $offset_of(Theme, row), count: 1, doc: "least height of a control row, which grows to fit a line of text and its inset"},
+    Field{group: GROUP_METRICS, name: "gap", unit: UNIT_LENGTH, off: $offset_of(Theme, gap), count: 1, doc: "space between layout rows, cells and buttons in a row"},
+    Field{group: GROUP_METRICS, name: "pad", unit: UNIT_LENGTH, off: $offset_of(Theme, pad), count: 1, doc: "container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content"},
+    Field{group: GROUP_METRICS, name: "inset", unit: UNIT_LENGTH, off: $offset_of(Theme, inset), count: 1, doc: "control inset: between a control's edge and its text, and between a box and its label"},
+    Field{group: GROUP_METRICS, name: "handle_w", unit: UNIT_LENGTH, off: $offset_of(Theme, handle_w), count: 1, doc: "slider handle width"},
+    Field{group: GROUP_METRICS, name: "bar_w", unit: UNIT_LENGTH, off: $offset_of(Theme, bar_w), count: 1, doc: "scrollbar width"},
+    Field{group: GROUP_METRICS, name: "thumb_min", unit: UNIT_LENGTH, off: $offset_of(Theme, thumb_min), count: 1, doc: "shortest scrollbar thumb"},
+    Field{group: GROUP_METRICS, name: "corner", unit: UNIT_LENGTH, off: $offset_of(Theme, corner), count: 1, doc: "corner radius of controls and containers, 0 for square"},
+    Field{group: GROUP_METRICS, name: "edge_w", unit: UNIT_LENGTH, off: $offset_of(Theme, edge_w), count: 1, doc: "width of an edge line: a dock's inner side, a chart's rules and a focused field's outline"},
+    Field{group: GROUP_METRICS, name: "caret_w", unit: UNIT_LENGTH, off: $offset_of(Theme, caret_w), count: 1, doc: "width of a text field's caret"},
+    Field{group: GROUP_PLOT, name: "series", unit: UNIT_COLOR, off: $offset_of(Theme, series), count: 8, doc: "chart series colors, series k drawing in series[k % 8]"},
+    Field{group: GROUP_PLOT, name: "line_w", unit: UNIT_LENGTH, off: $offset_of(Theme, line_w), count: 1, doc: "width of a chart line"},
+    Field{group: GROUP_PLOT, name: "tick", unit: UNIT_LENGTH, off: $offset_of(Theme, tick), count: 1, doc: "length of a chart axis tick"},
+    Field{group: GROUP_PLOT, name: "area", unit: UNIT_FACTOR, off: $offset_of(Theme, area), count: 1, doc: "alpha factor of the area filled under a chart line, in [0, 1]"},
+    Field{group: GROUP_STYLE, name: "radius", unit: UNIT_QUAD, off: $offset_of(Style, radius), count: 1, doc: "corner radii: top-left, top-right, bottom-right, bottom-left"},
+    Field{group: GROUP_STYLE, name: "pad", unit: UNIT_QUAD, off: $offset_of(Style, pad), count: 1, doc: "container padding between its edges and its content: left, top, right, bottom"},
+    Field{group: GROUP_STYLE, name: "inset", unit: UNIT_QUAD, off: $offset_of(Style, inset), count: 1, doc: "control inset between its edges and its text: left, top, right, bottom"},
+    Field{group: GROUP_STYLE, name: "margin", unit: UNIT_QUAD, off: $offset_of(Style, margin), count: 1, doc: "space around the widget: left, top, right (between cells), bottom (between rows)"},
+    Field{group: GROUP_STYLE, name: "min_w", unit: UNIT_LENGTH, off: $offset_of(Style, min_w), count: 1, doc: "least width"},
+    Field{group: GROUP_STYLE, name: "min_h", unit: UNIT_LENGTH, off: $offset_of(Style, min_h), count: 1, doc: "least height, a control's row height before it grows to fit its text"},
+    Field{group: GROUP_STYLE, name: "shadow_x", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_x), count: 1, doc: "shadow offset right"},
+    Field{group: GROUP_STYLE, name: "shadow_y", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_y), count: 1, doc: "shadow offset down"},
+    Field{group: GROUP_STYLE, name: "shadow_blur", unit: UNIT_LENGTH, off: $offset_of(Style, shadow_blur), count: 1, doc: "how far the shadow fades out, 0 for a hard edge"},
+    Field{group: GROUP_PAINT, name: "fill", unit: UNIT_COLOR, off: $offset_of(Paint, fill), count: 1, doc: "the face, at its top when it is a gradient"},
+    Field{group: GROUP_PAINT, name: "fill_to", unit: UNIT_COLOR, off: $offset_of(Paint, fill_to), count: 1, doc: "the face at its bottom: equal to fill for a flat face, else a vertical gradient"},
+    Field{group: GROUP_PAINT, name: "text", unit: UNIT_COLOR, off: $offset_of(Paint, text), count: 1, doc: "text drawn on the face"},
+    Field{group: GROUP_PAINT, name: "mark", unit: UNIT_COLOR, off: $offset_of(Paint, mark), count: 1, doc: "secondary ink: a glyph, a caret, a reading or a hint"},
+    Field{group: GROUP_PAINT, name: "border", unit: UNIT_COLOR, off: $offset_of(Paint, border), count: 1, doc: "the outline, transparent for none"},
+    Field{group: GROUP_PAINT, name: "border_w", unit: UNIT_LENGTH, off: $offset_of(Paint, border_w), count: 1, doc: "the outline's width"},
+    Field{group: GROUP_PAINT, name: "shadow", unit: UNIT_COLOR, off: $offset_of(Paint, shadow), count: 1, doc: "the shadow's color, transparent for none"}
+};
+
+# a name and what it means, for kinds and states
+# ---
+# name: the path segment
+# doc:  what it is
+pub rec Name {
+    name: str;
+    doc:  str;
+}
+
+# every built-in kind, in handle order: the names and meanings init registers
+val KIND_INFO: [51]Name = [51]Name{
+    Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
+    Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
+    Name{name: "panel", doc: "a panel's background, pad around its column"},
+    Name{name: "window", doc: "a window's body and its shadow, pad around its column, margin the resize grips outside its edges"},
+    Name{name: "window_title", doc: "a window's titlebar: text the title, mark the collapse glyph, hot under the cursor"},
+    Name{name: "dock", doc: "a docked panel: fill the body, border its inner edge, pad around its column"},
+    Name{name: "popup", doc: "a popup's body, such as a dropdown's options"},
+    Name{name: "button", doc: "a button, on when drawn chosen; margin.r between buttons in a row"},
+    Name{name: "checkbox", doc: "a checkbox's box: pad around the mark, inset.l between the box and the label"},
+    Name{name: "checkbox_mark", doc: "a checkbox's mark, drawn in its on state"},
+    Name{name: "toggle", doc: "a toggle's switch track and label, on while set: pad between the row and the track"},
+    Name{name: "toggle_knob", doc: "a toggle's knob, in the toggle's state: margin between the knob and the track"},
+    Name{name: "slider", doc: "a slider's track: text the label, mark the reading"},
+    Name{name: "slider_handle", doc: "a slider's handle: min_w its width"},
+    Name{name: "dropdown", doc: "a dropdown's header, on while open"},
+    Name{name: "field", doc: "a text field: mark the hint, focused while it holds the keyboard"},
+    Name{name: "field_caret", doc: "a text field's caret and its composition underline: fill, min_w the width"},
+    Name{name: "field_select", doc: "the highlight behind selected text: fill"},
+    Name{name: "section", doc: "a collapsible section heading: mark the caret"},
+    Name{name: "scrollbar", doc: "a scrollbar's track: min_w its width, margin.l between it and the content"},
+    Name{name: "scrollbar_thumb", doc: "a scrollbar's thumb: min_h its least length"},
+    Name{name: "list", doc: "a list's body"},
+    Name{name: "list_item", doc: "a list's row, on while selected"},
+    Name{name: "chart", doc: "a chart: border the grid, mark the axes, ticks, labels and hover guide, inset around labels, margin.r between bars"},
+    Name{name: "tab", doc: "a tab, on while chosen, and a tab bar's overflow buttons, disabled when they cannot act: margin.r between tabs"},
+    Name{name: "tooltip", doc: "a tooltip, and a chart's read-out: pad around its content, inset around a read-out's text, margin.t below the widget it describes"},
+    Name{name: "menu", doc: "a menu's body, pad around its rows, min_w its least width"},
+    Name{name: "menu_item", doc: "a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent"},
+    Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill or a border: pad around its content"},
+    Name{name: "modal", doc: "a modal dialog's body"},
+    Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"},
+    Name{name: "radio", doc: "a radio button's ring: pad around the dot, inset.l between the ring and the label"},
+    Name{name: "radio_mark", doc: "a radio button's dot, drawn in its on state"},
+    Name{name: "progress", doc: "a progress bar's track and its text"},
+    Name{name: "progress_bar", doc: "a progress bar's done part"},
+    Name{name: "separator", doc: "a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule"},
+    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret"},
+    Name{name: "drop_target", doc: "where a drag would drop: fill and border"},
+    Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"},
+    Name{name: "menu_bar", doc: "a menu bar's background"},
+    Name{name: "menu_title", doc: "a menu's header in a menu bar, on while its menu is open"},
+    Name{name: "option", doc: "a row of a dropdown's or a tab list's options, on while chosen"},
+    Name{name: "tab_bar", doc: "a tab bar's strip behind its tabs"},
+    Name{name: "tab_close", doc: "a tab's close box: fill under the cursor, border_w the cross's stroke"},
+    Name{name: "table_header", doc: "a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width"},
+    Name{name: "table_cell", doc: "a table's body cell: inset around its widgets, its row height from min_h and inset"},
+    Name{name: "table_rule", doc: "a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width"},
+    Name{name: "value", doc: "a value editor's drag cell: inset around its text and before its row's cells, min_w its least width"},
+    Name{name: "picker", doc: "a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label"},
+    Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"},
+    Name{name: "toast", doc: "a toast's card: pad around its text, margin between the stack and the surface's edges"}
+};
+
+# every state, indexed by the state constants
+pub val STATE_NAMES: [6]Name = [6]Name{
+    Name{name: "normal", doc: "at rest"},
+    Name{name: "hot", doc: "under the cursor"},
+    Name{name: "active", doc: "pressed or dragged"},
+    Name{name: "on", doc: "set: checked, chosen, selected or open"},
+    Name{name: "disabled", doc: "drawn but not taking input"},
+    Name{name: "focused", doc: "holding the keyboard"}
+};
+
+# a path segment standing for every kind or every state
+val WILD: str = "*";
+
+# a path's kind standing for every kind
+pub val ANY_KIND: u32 = 0xFFFFFFFF;
+
+# a path's state standing for every state
+pub val ANY_STATE: u8 = 0xFF;
+
+# a path's element standing for every element of an array field
+pub val ANY_ELEM: usize = 0xFFFFFFFFFFFFFFFF;
+
+# a parsed field path, naming one field or, through a wildcard, several
+# ---
+# field: row of FIELDS
+# kind:  the kind for a style or paint field, ANY_KIND for every one
+# state: the state for a paint field, ANY_STATE for every one
+# elem:  the element of an array field, ANY_ELEM for every one
+pub rec Path {
+    field: usize;
+    kind:  u32;
+    state: u8;
+    elem:  usize;
+}
+
+# one field's place in a theme
+# ---
+# off:   byte offset in the Theme record for a token or plot field, else in the kind's Style
+# unit:  UNIT_*
+# group: GROUP_*
+# kind:  the kind's handle, for a style or paint field
+pub rec Ref {
+    off:   usize;
+    unit:  u8;
+    group: u8;
+    kind:  u32;
+}
+
+# a field's value, the first one or four floats used by its unit: a color's
+# r, g, b, a, a quad's four lengths, or a length or factor alone
+# ---
+# v: the floats
+pub rec Value {
+    v: [4]f32;
+}
+
+# how many floats a unit holds
+# ---
+# unit: UNIT_*
+# ret:  4 for a color or a quad, else 1
+pub fun unit_floats(unit: u8) usize {
+    if (unit == UNIT_COLOR || unit == UNIT_QUAD) { ret 4; }
+    ret 1;
+}
+
+# a color as a field value
+pub fun of_color(c: draw.Color) Value {
+    var o: Value;
+    o.v[0] = c.r;
+    o.v[1] = c.g;
+    o.v[2] = c.b;
+    o.v[3] = c.a;
+    ret o;
+}
+
+# a length or factor as a field value
+pub fun of_length(x: f32) Value {
+    var o: Value;
+    o.v[0] = x;
+    ret o;
+}
+
+# corner radii as a field value
+pub fun of_radii(r: draw.Radii) Value {
+    var o: Value;
+    o.v[0] = r.tl;
+    o.v[1] = r.tr;
+    o.v[2] = r.br;
+    o.v[3] = r.bl;
+    ret o;
+}
+
+# edges as a field value
+pub fun of_edges(e: Edges) Value {
+    var o: Value;
+    o.v[0] = e.l;
+    o.v[1] = e.t;
+    o.v[2] = e.r;
+    o.v[3] = e.b;
+    ret o;
+}
+
+# a field value read as a color
+pub fun color_of(x: Value) draw.Color {
+    ret draw.rgba(x.v[0], x.v[1], x.v[2], x.v[3]);
+}
+
+# the row of FIELDS in a group with a name
+fun row_named(group: u8, name: str, n: usize) opt[usize] {
+    var i: usize = 0;
+    for (i < FIELD_COUNT) {
+        val f: Field = FIELDS[i];
+        if (f.group == group && str_len(f.name) == n && same(f.name, name, n)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# whether the first n bytes of a and b agree
+fun same(a: str, b: str, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a segment of n bytes spells s
+fun spells(seg: str, n: usize, s: str) bool {
+    ret str_len(s) == n && same(seg, s, n);
+}
+
+# the kind a segment names in a theme's registry, ANY_KIND for *, none for no kind
+fun kind_named(t: *Theme, seg: str, n: usize) opt[u32] {
+    if (spells(seg, n, WILD)) { ret opt[u32].some{ANY_KIND}; }
+    var k: u32 = 0;
+    for (k < t.len) {
+        if (spells(seg, n, t.names[k])) { ret opt[u32].some{k}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the kind a name names
+# ---
+# t:    the theme whose registry is searched
+# name: a kind's name, such as "button"
+# ret:  its handle, or none
+pub fun kind_of(t: *Theme, name: str) opt[u32] {
+    if (name == nil) { ret opt[u32].none{}; }
+    val k: opt[u32] = kind_named(t, name, str_len(name));
+    if (sel k.some && k.some == ANY_KIND) { ret opt[u32].none{}; }
+    ret k;
+}
+
+# how many kinds a theme has registered
+pub fun kind_count(t: *Theme) u32 {
+    ret t.len;
+}
+
+# a kind's name
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: its name
+pub fun kind_name(t: *Theme, k: u32) str {
+    ret t.names[k];
+}
+
+# a kind's meaning
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: what it styles
+pub fun kind_doc(t: *Theme, k: u32) str {
+    ret t.docs[k];
+}
+
+# the names of every kind, in handle order, kind_count of them, for a list
+# such as a dropdown's options
+pub fun kind_names(t: *Theme) *str {
+    ret t.names;
+}
+
+# a kind's style
+# ---
+# t:   the theme
+# k:   the kind's handle, below kind_count
+# ret: its style, valid until the registry grows
+pub fun style(t: *Theme, k: u32) *Style {
+    ret ?t.styles[k];
+}
+
+# the state a segment names, ANY_STATE for *, none for no state
+fun state_named(seg: str, n: usize) opt[u8] {
+    if (spells(seg, n, WILD)) { ret opt[u8].some{ANY_STATE}; }
+    var s: u8 = 0;
+    for (s < STATES) {
+        if (spells(seg, n, STATE_NAMES[s].name)) { ret opt[u8].some{s}; }
+        s = s + 1;
+    }
+    ret opt[u8].none{};
+}
+
+# a decimal element index, * for every element
+fun elem_named(seg: str, n: usize, count: usize) opt[usize] {
+    if (spells(seg, n, WILD)) { ret opt[usize].some{ANY_ELEM}; }
+    if (n == 0 || n > 4)      { ret opt[usize].none{}; }
+    var v: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = seg[i];
+        if (c < '0' || c > '9') { ret opt[usize].none{}; }
+        v = v * 10 + (c - '0')::usize;
+        i = i + 1;
+    }
+    if (v >= count) { ret opt[usize].none{}; }
+    ret opt[usize].some{v};
+}
+
+# the group a first segment names, or none for a kind
+fun group_named(seg: str, n: usize) opt[u8] {
+    if (spells(seg, n, "palette")) { ret opt[u8].some{GROUP_PALETTE}; }
+    if (spells(seg, n, "metrics")) { ret opt[u8].some{GROUP_METRICS}; }
+    if (spells(seg, n, "plot"))    { ret opt[u8].some{GROUP_PLOT}; }
+    ret opt[u8].none{};
+}
+
+# a path from up to three segments, each a pointer and a length, its kind
+# looked up in a theme's registry
+#
+# palette.<name>, metrics.<name> and plot.<name>[.<index>] name the tokens
+# and the chart fields, <kind>.<name> a style field and <kind>.<state>.<name>
+# a paint field, with * for every kind, state or element.
+# ---
+# t:    the theme whose kinds are named
+# segs: the segments' first bytes
+# lens: the segments' lengths
+# n:    how many segments
+# ret:  the path, or none when it names no field
+pub fun resolve(t: *Theme, segs: *str, lens: *usize, n: usize) opt[Path] {
+    var p: Path;
+    p.kind  = 0;
+    p.state = 0;
+    p.elem  = 0;
+    if (n < 2 || n > 3) { ret opt[Path].none{}; }
+    val g: opt[u8] = group_named(segs[0], lens[0]);
+    if (sel g.some) {
+        val r: opt[usize] = row_named(g.some, segs[1], lens[1]);
+        if (sel r.none) { ret opt[Path].none{}; }
+        p.field = r.some;
+        val count: usize = FIELDS[p.field].count;
+        if (n == 2) {
+            if (count > 1) { p.elem = ANY_ELEM; }
+            ret opt[Path].some{p};
+        }
+        if (count < 2) { ret opt[Path].none{}; }
+        val e: opt[usize] = elem_named(segs[2], lens[2], count);
+        if (sel e.none) { ret opt[Path].none{}; }
+        p.elem = e.some;
+        ret opt[Path].some{p};
+    }
+    val k: opt[u32] = kind_named(t, segs[0], lens[0]);
+    if (sel k.none) { ret opt[Path].none{}; }
+    p.kind = k.some;
+    if (n == 2) {
+        val r: opt[usize] = row_named(GROUP_STYLE, segs[1], lens[1]);
+        if (sel r.none) { ret opt[Path].none{}; }
+        p.field = r.some;
+        ret opt[Path].some{p};
+    }
+    val s: opt[u8] = state_named(segs[1], lens[1]);
+    if (sel s.none) { ret opt[Path].none{}; }
+    p.state = s.some;
+    val r: opt[usize] = row_named(GROUP_PAINT, segs[2], lens[2]);
+    if (sel r.none) { ret opt[Path].none{}; }
+    p.field = r.some;
+    ret opt[Path].some{p};
+}
+
+# a dotted path, such as "button.hot.fill" or "*.hot.border_w"
+# ---
+# t:   the theme whose kinds are named
+# s:   the path
+# ret: the path parsed, or none when it names no field
+pub fun path(t: *Theme, s: str) opt[Path] {
+    if (s == nil) { ret opt[Path].none{}; }
+    var segs: [3]str;
+    var lens: [3]usize;
+    var n:    usize = 0;
+    var at:   usize = 0;
+    var i:    usize = 0;
+    for {
+        val c: u8 = s[i];
+        if (c == '.' || c == 0) {
+            if (n == 3) { ret opt[Path].none{}; }
+            segs[n] = (s::usize + at)::str;
+            lens[n] = i - at;
+            n       = n + 1;
+            at      = i + 1;
+            if (c == 0) { brk; }
+        }
+        i = i + 1;
+    }
+    ret resolve(t, ?segs[0], ?lens[0], n);
+}
+
+# how many fields a path names
+# ---
+# t:   the theme
+# p:   the path
+# ret: 1, or the product of what its wildcards stand for
+pub fun span(t: *Theme, p: Path) usize {
+    val f: Field = FIELDS[p.field];
+    var n: usize = 1;
+    if (f.group == GROUP_STYLE || f.group == GROUP_PAINT) {
+        if (p.kind == ANY_KIND) { n = n * t.len::usize; }
+    }
+    if (f.group == GROUP_PAINT && p.state == ANY_STATE) { n = n * STATES::usize; }
+    if (f.count > 1 && p.elem == ANY_ELEM)              { n = n * f.count; }
+    ret n;
+}
+
+# the i-th field a path names, in kind, then state, then element order
+# ---
+# p:   the path
+# i:   which, below span(t, p)
+# ret: where that field is in a theme
+pub fun ref_at(p: Path, i: usize) Ref {
+    val f:    Field = FIELDS[p.field];
+    var r:    Ref   = Ref{off: 0, unit: f.unit, group: f.group, kind: 0};
+    var rest: usize = i;
+    var elem: usize = p.elem;
+    if (f.count > 1 && p.elem == ANY_ELEM) {
+        elem = rest % f.count;
+        rest = rest / f.count;
+    }
+    if (f.group == GROUP_PALETTE || f.group == GROUP_METRICS || f.group == GROUP_PLOT) {
+        r.off = f.off + elem * unit_floats(f.unit) * 4;
+        ret r;
+    }
+    var state: u8 = p.state;
+    if (f.group == GROUP_PAINT && p.state == ANY_STATE) {
+        state = (rest % STATES::usize)::u8;
+        rest  = rest / STATES::usize;
+    }
+    r.kind = p.kind;
+    if (p.kind == ANY_KIND) { r.kind = rest::u32; }
+    if (f.group == GROUP_STYLE) {
+        r.off = f.off;
+        ret r;
+    }
+    r.off = $offset_of(Style, states) + state::usize * $size_of(Paint) + f.off;
+    ret r;
+}
+
+# the path naming one field exactly
+# ---
+# field: row of FIELDS
+# kind:  the kind, for a style or paint field
+# state: the state, for a paint field
+# elem:  the element, for an array field
+# ret:   the path
+pub fun exact(field: usize, kind: u32, state: u8, elem: usize) Path {
+    ret Path{field: field, kind: kind, state: state, elem: elem};
+}
+
+# copy s into out from at, keeping room for the NUL
+fun put_seg(out: *u8, cap: usize, at: usize, s: str) usize {
+    var j: usize = at;
+    var i: usize = 0;
+    for (s[i] != 0 && j + 1 < cap) {
+        out[j] = s[i];
+        j      = j + 1;
+        i      = i + 1;
+    }
+    out[j] = 0;
+    ret j;
+}
+
+# a path's text, such as "button.hot.fill", NUL-terminated in out
+# ---
+# t:   the theme whose kinds are named
+# p:   the path
+# out: where to write it
+# cap: bytes at out, 64 holds every path
+# ret: bytes written, not counting the NUL
+pub fun path_text(t: *Theme, p: Path, out: *u8, cap: usize) usize {
+    if (cap == 0) { ret 0; }
+    val f: Field = FIELDS[p.field];
+    var j: usize = 0;
+    out[0] = 0;
+    if (f.group == GROUP_PALETTE) { j = put_seg(out, cap, j, "palette."); }
+    or (f.group == GROUP_METRICS) { j = put_seg(out, cap, j, "metrics."); }
+    or (f.group == GROUP_PLOT)    { j = put_seg(out, cap, j, "plot."); }
+    or {
+        if (p.kind == ANY_KIND) { j = put_seg(out, cap, j, WILD); }
+        or                      { j = put_seg(out, cap, j, t.names[p.kind]); }
+        j = put_seg(out, cap, j, ".");
+        if (f.group == GROUP_PAINT) {
+            if (p.state == ANY_STATE) { j = put_seg(out, cap, j, WILD); }
+            or                        { j = put_seg(out, cap, j, STATE_NAMES[p.state].name); }
+            j = put_seg(out, cap, j, ".");
+        }
+    }
+    j = put_seg(out, cap, j, f.name);
+    if (f.count > 1 && p.elem != ANY_ELEM) {
+        var digits: [8]u8;
+        var n:      usize = 0;
+        var v:      usize = p.elem;
+        for {
+            digits[n] = '0' + (v % 10)::u8;
+            n         = n + 1;
+            v         = v / 10;
+            if (v == 0) { brk; }
+        }
+        j = put_seg(out, cap, j, ".");
+        for (n > 0 && j + 1 < cap) {
+            n      = n - 1;
+            out[j] = digits[n];
+            j      = j + 1;
+        }
+        out[j] = 0;
+    }
+    ret j;
+}
+
+# the floats of a field in a theme
+fun at(t: *Theme, r: Ref) *f32 {
+    if (r.group == GROUP_STYLE || r.group == GROUP_PAINT) { ret ((?t.styles[r.kind])::usize + r.off)::*f32; }
+    ret (t::usize + r.off)::*f32;
+}
+
+# read one field of a theme
+# ---
+# t:   the theme
+# r:   the field, from ref_at
+# ret: its value, the floats past its unit zero
+pub fun get(t: *Theme, r: Ref) Value {
+    var o: Value;
+    val p: *f32  = at(t, r);
+    var i: usize = 0;
+    for (i < unit_floats(r.unit)) {
+        o.v[i] = p[i];
+        i      = i + 1;
+    }
+    ret o;
+}
+
+# write one field of a theme as it is, deriving nothing
+#
+# writing a token this way leaves the styles built from the old one; set
+# moves them.
+# ---
+# t: the theme
+# r: the field, from ref_at
+# v: its new value
+pub fun put(t: *Theme, r: Ref, v: Value) {
+    val p: *f32  = at(t, r);
+    var i: usize = 0;
+    for (i < unit_floats(r.unit)) {
+        p[i] = v.v[i];
+        i    = i + 1;
+    }
+}
+
+# whether a field is a token, read only by derive
+# ---
+# r:   the field
+# ret: true for a palette or metrics field
+pub fun is_token(r: Ref) bool {
+    ret r.group == GROUP_PALETTE || r.group == GROUP_METRICS;
+}
+
+# write one field of a theme, moving the styles with a token
+#
+# a style or plot field is written as it is. a token is written and the
+# styles rederived, so every style field that took its value from the old
+# token takes the new one and fields set by hand stay as they are.
+# ---
+# t: the theme
+# r: the field, from ref_at
+# v: its new value
+pub fun set(t: *Theme, r: Ref, v: Value) {
+    if (!is_token(r)) {
+        put(t, r, v);
+        ret;
+    }
+    val before: Theme = @t;
+    put(t, r, v);
+    rederive(t, ?before);
+}
+
+# write every field a path names
+# ---
+# t:   the theme
+# p:   the path
+# v:   the value, of the path's unit
+# ret: how many fields were written
+pub fun set_path(t: *Theme, p: Path, v: Value) usize {
+    val n:      usize = span(t, p);
+    val before: Theme = @t;
+    var i:      usize = 0;
+    for (i < n) {
+        put(t, ref_at(p, i), v);
+        i = i + 1;
+    }
+    if (n > 0 && is_token(ref_at(p, 0))) { rederive(t, ?before); }
+    ret n;
+}
+
+# a style's paint with one fill and the theme's text inks
+fun paint(t: *Theme, fill: draw.Color) Paint {
+    var p: Paint;
+    p.fill     = fill;
+    p.fill_to  = fill;
+    p.text     = t.text;
+    p.mark     = t.text_dim;
+    p.border   = clear();
+    p.border_w = 0.0::f32;
+    p.shadow   = clear();
+    ret p;
+}
+
+# transparent black
+fun clear() draw.Color {
+    ret draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
+}
+
+# fill every state of a style with one color, keeping its inks
+# ---
+# s: the style
+# c: the color, flat
+pub fun fill_all(s: *Style, c: draw.Color) {
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        s.states[i].fill    = c;
+        s.states[i].fill_to = c;
+        i                   = i + 1;
+    }
+}
+
+# fill one state of a style with one color
+fun fill_one(s: *Style, state: u8, c: draw.Color) {
+    s.states[state].fill    = c;
+    s.states[state].fill_to = c;
+}
+
+# a control's fills: at rest, hot, active and on, the rest as at rest
+# ---
+# s:      the style
+# normal: the fill at rest, and while disabled or focused
+# hot:    the fill under the cursor
+# active: the fill pressed
+# on:     the fill while set
+pub fun fills(s: *Style, normal: draw.Color, hot: draw.Color, active: draw.Color, on: draw.Color) {
+    fill_all(s, normal);
+    fill_one(s, HOT, hot);
+    fill_one(s, ACTIVE, active);
+    fill_one(s, ON, on);
+}
+
+# outline every state of a style
+# ---
+# s: the style
+# c: the outline's color
+# w: its width, unscaled
+pub fun outline_all(s: *Style, c: draw.Color, w: f32) {
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        s.states[i].border   = c;
+        s.states[i].border_w = w;
+        i                    = i + 1;
+    }
+}
+
+# the style every kind starts from: the theme's corner, pad, inset and gap,
+# its row height, transparent fills and its text inks, disabled text faint
+#
+# a kind's derive is handed this, built from the theme's tokens, to adjust.
+# ---
+# t:   the theme, its tokens read
+# ret: the style
+pub fun base(t: *Theme) Style {
+    var s: Style;
+    s.radius      = draw.radii(t.corner);
+    s.pad         = edges(t.pad);
+    s.inset       = edges(t.inset);
+    s.margin      = Edges{l: 0.0::f32, t: 0.0::f32, r: t.gap, b: t.gap};
+    s.min_w       = 0.0::f32;
+    s.min_h       = t.row;
+    s.shadow_x    = 0.0::f32;
+    s.shadow_y    = 0.0::f32;
+    s.shadow_blur = 0.0::f32;
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        s.states[i] = paint(t, clear());
+        i           = i + 1;
+    }
+    s.states[DISABLED].text = t.text_faint;
+    s.states[DISABLED].mark = t.text_faint;
+    ret s;
+}
+
+# a container whose padding sits below its content alone
+fun below(t: *Theme, s: *Style, fill: draw.Color) {
+    s.pad = Edges{l: 0.0::f32, t: 0.0::f32, r: 0.0::f32, b: t.pad};
+    fill_all(s, fill);
+}
+
+# square every corner of a style
+fun square(s: *Style) {
+    s.radius = draw.radii(0.0::f32);
+}
+
+# a list row's style, which a tree row shares
+fun row_style(t: *Theme, s: *Style) {
+    fills(s, clear(), t.control_hot, t.control_on, t.accent);
+    s.states[ON].text = t.accent_text;
+    s.states[ON].mark = t.accent_text;
+}
+
+# a button's style, which a tab starts from
+fun button_style(t: *Theme, s: *Style) {
+    fills(s, t.control, t.control_hot, t.control_on, t.accent);
+    s.states[ON].text = t.accent_text;
+}
+
+# the derive every built-in kind registers: its style from the tokens alone
+#
+# s arrives as base(t). a derive reads the theme's tokens and nothing of its
+# styles, so it builds the same style whenever the tokens are the same.
+fun builtin_style(t: *Theme, k: u32, s: *Style) {
+    if (k == PANEL) { below(t, s, t.panel); }
+    or (k == WINDOW) {
+        below(t, s, t.window);
+        s.margin = edges(t.pad);
+    }
+    or (k == POPUP) { below(t, s, t.window); }
+    or (k == MENU) {
+        below(t, s, t.window);
+        s.pad.t = t.pad;
+        s.min_w = t.row * 8.0::f32;
+    }
+    or (k == MODAL) {
+        fill_all(s, t.window);
+    }
+    or (k == TOOLTIP) {
+        fill_all(s, t.window);
+        outline_all(s, t.edge, t.edge_w);
+        s.margin.t = t.gap;
+    }
+    or (k == TOAST) {
+        fill_all(s, t.window);
+        outline_all(s, t.edge, t.edge_w);
+        s.margin = edges(t.pad * 2.0::f32);
+    }
+    or (k == OVERLAY)      { s.pad = edges(0.0::f32); }
+    or (k == WINDOW_TITLE) { fills(s, t.header, t.header_hot, t.header_hot, t.header); }
+    or (k == DOCK) {
+        square(s);
+        fill_all(s, t.dock);
+        outline_all(s, t.edge, t.edge_w);
+    }
+    or (k == BUTTON) { button_style(t, s); }
+    or (k == TAB) {
+        button_style(t, s);
+        s.radius   = draw.Radii{tl: t.corner, tr: t.corner, br: 0.0::f32, bl: 0.0::f32};
+        s.margin.r = t.edge_w;
+    }
+    or (k == TAB_BAR) {
+        square(s);
+        fill_all(s, t.track);
+    }
+    or (k == TAB_CLOSE) {
+        fills(s, clear(), t.control_hot, t.control_hot, clear());
+        outline_all(s, clear(), t.edge_w);
+    }
+    or (k == CHECKBOX || k == RADIO)                                { fills(s, t.control, t.control_hot, t.control_hot, t.control); }
+    or (k == CHECKBOX_MARK || k == RADIO_MARK || k == PROGRESS_BAR) { fill_all(s, t.accent); }
+    or (k == TOGGLE) {
+        s.pad = Edges{l: 0.0::f32, t: t.pad / 2.0::f32, r: 0.0::f32, b: t.pad / 2.0::f32};
+        fills(s, t.track, t.control_hot, t.control_hot, t.accent);
+    }
+    or (k == TOGGLE_KNOB) {
+        s.margin = edges(t.pad / 2.0::f32);
+        fills(s, t.handle, t.handle_on, t.handle_on, t.accent_text);
+    }
+    or (k == SLIDER || k == PROGRESS) { fill_all(s, t.track); }
+    or (k == SLIDER_HANDLE) {
+        s.min_w = t.handle_w;
+        fills(s, t.handle, t.handle, t.handle_on, t.handle);
+    }
+    or (k == DROPDOWN) { fills(s, t.control, t.control_hot, t.control_hot, t.control_on); }
+    or (k == OPTION) {
+        fills(s, t.track, t.control_hot, t.control_hot, t.accent);
+        s.states[ON].text = t.accent_text;
+    }
+    or (k == MENU_BAR) {
+        square(s);
+        fill_all(s, t.header);
+    }
+    or (k == MENU_TITLE) {
+        square(s);
+        s.inset = Edges{l: t.inset * 2.0::f32, t: t.inset, r: t.inset * 2.0::f32, b: t.inset};
+        fills(s, clear(), t.header_hot, t.header_hot, t.control_on);
+    }
+    or (k == MENU_ITEM) {
+        square(s);
+        fills(s, clear(), t.control_hot, t.control_hot, t.control_hot);
+    }
+    or (k == FIELD) {
+        fills(s, t.track, t.control_hot, t.control_hot, t.track);
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark = t.text_faint;
+            i                = i + 1;
+        }
+        s.states[FOCUSED].border   = t.accent;
+        s.states[FOCUSED].border_w = t.edge_w;
+    }
+    or (k == FIELD_CARET) {
+        s.min_w = t.caret_w;
+        fill_all(s, t.text);
+    }
+    or (k == FIELD_SELECT) { fill_all(s, t.select); }
+    or (k == SECTION) {
+        fills(s, t.header, t.header_hot, t.header_hot, t.header);
+        s.states[HOT].mark    = t.text;
+        s.states[ACTIVE].mark = t.text;
+    }
+    or (k == SCROLLBAR) {
+        s.min_w  = t.bar_w;
+        s.margin = Edges{l: t.pad, t: 0.0::f32, r: 0.0::f32, b: t.gap};
+        fill_all(s, t.track);
+    }
+    or (k == SCROLLBAR_THUMB) {
+        s.min_h = t.thumb_min;
+        fills(s, t.handle, t.handle, t.handle_on, t.handle);
+    }
+    or (k == LIST_ITEM || k == TREE_ITEM) { row_style(t, s); }
+    or (k == CHART)                       { outline_all(s, t.grid, t.edge_w); }
+    or (k == SEPARATOR)                   { outline_all(s, t.edge, t.edge_w); }
+    or (k == DROP_TARGET) {
+        square(s);
+        fill_all(s, t.select);
+        outline_all(s, t.accent, t.edge_w);
+    }
+    or (k == DRAG_PREVIEW) {
+        square(s);
+        fill_all(s, t.control);
+    }
+    or (k == TABLE_HEADER) {
+        square(s);
+        s.min_w = t.row;
+        fills(s, t.header, t.header_hot, t.header_hot, t.header);
+    }
+    or (k == TABLE_CELL) { square(s); }
+    or (k == TABLE_RULE) {
+        s.min_w = t.pad * 2.0::f32;
+        outline_all(s, t.edge, t.edge_w);
+        s.states[HOT].border    = t.accent;
+        s.states[ACTIVE].border = t.accent;
+    }
+    or (k == VALUE) {
+        s.min_w = 48.0::f32;
+        fills(s, t.control, t.control_hot, t.control_on, t.control);
+    }
+    or (k == PICKER) {
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark   = t.text;
+            s.states[i].border = t.track;
+            i                  = i + 1;
+        }
+    }
+    or (k == CHECKER) {
+        fill_all(s, t.text_dim);
+        var i: usize = 0;
+        for (i < STATES::usize) {
+            s.states[i].mark = t.control;
+            i                = i + 1;
+        }
+    }
+    or (k == SCRIM) {
+        square(s);
+        fill_all(s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
+    }
+}
+
+# the style a kind's derive builds from a theme's tokens
+fun built(t: *Theme, k: u32) Style {
+    var s: Style = base(t);
+    t.derives[k].f(t, k, ?s);
+    ret s;
+}
+
+# build every style of a theme from its tokens
+#
+# each registered kind's derive builds its style from base(t). the built-in
+# themes are exactly what derive builds plus a few touches, so a save writes
+# only the fields that differ from what derive builds.
+# ---
+# t: the theme, its styles overwritten
+pub fun derive(t: *Theme) {
+    var k: u32 = 0;
+    for (k < t.len) {
+        t.styles[k] = built(t, k);
+        k           = k + 1;
+    }
+}
+
+# move a theme's styles to its tokens, keeping style fields set by hand
+#
+# every style float that still holds what before's tokens derive takes what
+# t's tokens derive, and every other float, one set by hand, stays. call it
+# after changing tokens, with a copy of the theme record as it was before:
+# only its tokens are read.
+# ---
+# t:      the theme, its tokens already changed
+# before: the theme record as it was before the tokens changed
+pub fun rederive(t: *Theme, before: *Theme) {
+    val n: usize = $size_of(Style) / 4;
+    var k: u32   = 0;
+    for (k < t.len) {
+        var old: Style = built(before, k);
+        var neu: Style = built(t, k);
+        val now: *f32  = (?t.styles[k])::ptr::*f32;
+        val was: *f32  = (?old)::ptr::*f32;
+        val nxt: *f32  = (?neu)::ptr::*f32;
+        var i:   usize = 0;
+        for (i < n) {
+            if (now[i] == was[i]) { now[i] = nxt[i]; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# the tokens of blit's own look
+fun default_tokens(t: *Theme) {
     t.panel       = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.85::f32);
     t.window      = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 0.95::f32);
     t.dock        = draw.rgba(0.10::f32, 0.10::f32, 0.12::f32, 1.0::f32);
@@ -115,9 +1356,11 @@ pub fun default() Theme {
     t.handle      = draw.rgba(0.55::f32, 0.55::f32, 0.65::f32, 1.0::f32);
     t.handle_on   = draw.rgba(0.78::f32, 0.78::f32, 0.92::f32, 1.0::f32);
     t.select      = draw.rgba(0.55::f32, 0.85::f32, 0.55::f32, 0.35::f32);
+    t.grid        = draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
     t.row         = 16.0::f32;
     t.gap         = 4.0::f32;
     t.pad         = 4.0::f32;
+    t.inset       = 4.0::f32;
     t.handle_w    = 6.0::f32;
     t.bar_w       = 6.0::f32;
     t.thumb_min   = 12.0::f32;
@@ -132,9 +1375,1141 @@ pub fun default() Theme {
     t.series[5]   = draw.rgba(0.36::f32, 0.80::f32, 0.80::f32, 1.0::f32);
     t.series[6]   = draw.rgba(0.90::f32, 0.80::f32, 0.36::f32, 1.0::f32);
     t.series[7]   = draw.rgba(0.70::f32, 0.70::f32, 0.74::f32, 1.0::f32);
-    t.grid        = draw.rgba(0.18::f32, 0.18::f32, 0.22::f32, 1.0::f32);
     t.line_w      = 2.0::f32;
     t.tick        = 4.0::f32;
     t.area        = 0.25::f32;
-    ret t;
+}
+
+# blit's own look: dark surfaces, square corners and 4 pixel spacing
+# ---
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun default(t: *Theme) {
+    default_tokens(t);
+    derive(t);
+}
+
+# lift a kind off what lies beneath with a soft shadow below it
+fun elevate(t: *Theme, kind: u32, c: draw.Color, y: f32, blur: f32) {
+    val s: *Style = ?t.styles[kind];
+    s.shadow_y    = y;
+    s.shadow_blur = blur;
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        s.states[i].shadow = c;
+        i                  = i + 1;
+    }
+}
+
+# shade a kind's faces from their color at the top to darker by f at the bottom
+fun shade(t: *Theme, kind: u32, f: f32) {
+    var i: usize = 0;
+    for (i < STATES::usize) {
+        val c: draw.Color = t.styles[kind].states[i].fill;
+        t.styles[kind].states[i].fill_to = draw.rgba(c.r * f, c.g * f, c.b * f, c.a);
+        i                                = i + 1;
+    }
+}
+
+# outline a kind in every state
+fun outline(t: *Theme, kind: u32, c: draw.Color, w: f32) {
+    outline_all(?t.styles[kind], c, w);
+}
+
+# a rounded dark look with raised controls and floating surfaces lifted by
+# shadows
+# ---
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun dark(t: *Theme) {
+    default_tokens(t);
+    t.panel       = draw.hex(0x1B1D23, 0.92::f32);
+    t.window      = draw.hex(0x1F2229, 0.98::f32);
+    t.dock        = draw.hex(0x181A1F, 1.0::f32);
+    t.header      = draw.hex(0x2A2E37, 1.0::f32);
+    t.header_hot  = draw.hex(0x343945, 1.0::f32);
+    t.edge        = draw.hex(0x2C3039, 1.0::f32);
+    t.text        = draw.hex(0xE6E8EE, 1.0::f32);
+    t.text_dim    = draw.hex(0x9AA0AD, 1.0::f32);
+    t.text_faint  = draw.hex(0x646A77, 1.0::f32);
+    t.accent      = draw.hex(0x5B9DFF, 1.0::f32);
+    t.accent_text = draw.hex(0x0B1424, 1.0::f32);
+    t.control     = draw.hex(0x343944, 1.0::f32);
+    t.control_hot = draw.hex(0x414755, 1.0::f32);
+    t.control_on  = draw.hex(0x2A2E37, 1.0::f32);
+    t.track       = draw.hex(0x23262D, 1.0::f32);
+    t.handle      = draw.hex(0x8A93A6, 1.0::f32);
+    t.handle_on   = draw.hex(0xC4CBDA, 1.0::f32);
+    t.select      = draw.hex(0x5B9DFF, 0.35::f32);
+    t.grid        = draw.hex(0x2A2E37, 1.0::f32);
+    t.row         = 18.0::f32;
+    t.inset       = 5.0::f32;
+    t.corner      = 4.0::f32;
+    derive(t);
+    shade(t, BUTTON, 0.85::f32);
+    val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.35::f32);
+    elevate(t, WINDOW, sh, 2.0::f32, 8.0::f32);
+    elevate(t, POPUP, sh, 3.0::f32, 10.0::f32);
+    elevate(t, MENU, sh, 3.0::f32, 10.0::f32);
+    elevate(t, TOOLTIP, sh, 2.0::f32, 6.0::f32);
+    elevate(t, MODAL, sh, 4.0::f32, 16.0::f32);
+}
+
+# a rounded light look: pale surfaces, dark text, soft shadows
+# ---
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun light(t: *Theme) {
+    default_tokens(t);
+    t.panel       = draw.hex(0xF4F5F7, 0.95::f32);
+    t.window      = draw.hex(0xFFFFFF, 0.98::f32);
+    t.dock        = draw.hex(0xEEF0F3, 1.0::f32);
+    t.header      = draw.hex(0xE2E5EA, 1.0::f32);
+    t.header_hot  = draw.hex(0xD5D9E0, 1.0::f32);
+    t.edge        = draw.hex(0xC9CED6, 1.0::f32);
+    t.text        = draw.hex(0x1D2026, 1.0::f32);
+    t.text_dim    = draw.hex(0x5C6370, 1.0::f32);
+    t.text_faint  = draw.hex(0x9097A3, 1.0::f32);
+    t.accent      = draw.hex(0x2F6FEB, 1.0::f32);
+    t.accent_text = draw.hex(0xFFFFFF, 1.0::f32);
+    t.warn        = draw.hex(0xC2410C, 1.0::f32);
+    t.control     = draw.hex(0xE4E7EC, 1.0::f32);
+    t.control_hot = draw.hex(0xD6DAE1, 1.0::f32);
+    t.control_on  = draw.hex(0xC8CDD6, 1.0::f32);
+    t.track       = draw.hex(0xFFFFFF, 1.0::f32);
+    t.handle      = draw.hex(0x8C94A3, 1.0::f32);
+    t.handle_on   = draw.hex(0x5C6370, 1.0::f32);
+    t.select      = draw.hex(0x2F6FEB, 0.25::f32);
+    t.grid        = draw.hex(0xE2E5EA, 1.0::f32);
+    t.row         = 18.0::f32;
+    t.inset       = 5.0::f32;
+    t.corner      = 4.0::f32;
+    derive(t);
+    outline(t, FIELD, t.edge, 1.0::f32);
+    t.styles[FIELD].states[FOCUSED].border = t.accent;
+    val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.15::f32);
+    elevate(t, WINDOW, sh, 1.0::f32, 6.0::f32);
+    elevate(t, POPUP, sh, 2.0::f32, 8.0::f32);
+    elevate(t, MENU, sh, 2.0::f32, 8.0::f32);
+    elevate(t, TOOLTIP, sh, 1.0::f32, 4.0::f32);
+    elevate(t, MODAL, sh, 4.0::f32, 16.0::f32);
+}
+
+# a high-contrast look: black surfaces, white text and outlines, a yellow
+# accent and wide focus rings
+# ---
+# t: the theme, its tokens and styles replaced, its kinds kept
+pub fun contrast(t: *Theme) {
+    default_tokens(t);
+    val black: draw.Color = draw.hex(0x000000, 1.0::f32);
+    val white: draw.Color = draw.hex(0xFFFFFF, 1.0::f32);
+    val gray:  draw.Color = draw.hex(0x303030, 1.0::f32);
+    t.panel       = black;
+    t.window      = black;
+    t.dock        = black;
+    t.header      = gray;
+    t.header_hot  = draw.hex(0x505050, 1.0::f32);
+    t.edge        = white;
+    t.text        = white;
+    t.text_dim    = draw.hex(0xE0E0E0, 1.0::f32);
+    t.text_faint  = draw.hex(0xB0B0B0, 1.0::f32);
+    t.accent      = draw.hex(0xFFE000, 1.0::f32);
+    t.accent_text = black;
+    t.warn        = draw.hex(0xFF6060, 1.0::f32);
+    t.control     = black;
+    t.control_hot = gray;
+    t.control_on  = draw.hex(0x505050, 1.0::f32);
+    t.track       = black;
+    t.handle      = white;
+    t.handle_on   = draw.hex(0xFFE000, 1.0::f32);
+    t.select      = draw.hex(0xFFE000, 0.45::f32);
+    t.grid        = draw.hex(0x606060, 1.0::f32);
+    t.row         = 18.0::f32;
+    t.inset       = 5.0::f32;
+    t.edge_w      = 2.0::f32;
+    t.caret_w     = 2.0::f32;
+    derive(t);
+    outline(t, BUTTON, white, 1.0::f32);
+    outline(t, CHECKBOX, white, 1.0::f32);
+    outline(t, TOGGLE, white, 1.0::f32);
+    outline(t, SLIDER, white, 1.0::f32);
+    outline(t, DROPDOWN, white, 1.0::f32);
+    outline(t, FIELD, white, 1.0::f32);
+    outline(t, TAB, white, 1.0::f32);
+    outline(t, RADIO, white, 1.0::f32);
+    outline(t, PROGRESS, white, 1.0::f32);
+    outline(t, WINDOW_TITLE, white, 1.0::f32);
+    outline(t, POPUP, white, 1.0::f32);
+    outline(t, MENU, white, 1.0::f32);
+    outline(t, TOOLTIP, white, 1.0::f32);
+    outline(t, MODAL, white, 2.0::f32);
+    t.styles[FIELD].states[FOCUSED].border   = t.accent;
+    t.styles[FIELD].states[FOCUSED].border_w = 2.0::f32;
+    t.styles[BUTTON].states[HOT].border      = t.accent;
+}
+
+# how many built-in themes there are
+pub val BUILTINS: usize = 4;
+
+# the built-in themes' names, in the order set_builtin takes them
+pub val BUILTIN_NAMES: [4]str = [4]str{"default", "dark", "light", "contrast"};
+
+# give a theme a built-in look by its index in BUILTIN_NAMES, keeping its kinds
+#
+# a kind registered beyond the built-ins takes the look's tokens through its
+# derive.
+# ---
+# t: the theme
+# i: the index, below BUILTINS; past the last, the default look
+pub fun set_builtin(t: *Theme, i: usize) {
+    if (i == 1) { dark(t); }
+    or (i == 2) { light(t); }
+    or (i == 3) { contrast(t); }
+    or          { default(t); }
+}
+
+# give a theme a built-in look by name: default, dark, light or contrast
+# ---
+# t:    the theme
+# name: the name
+# ret:  true, or false for no built-in, leaving the theme alone
+pub fun builtin(t: *Theme, name: str) bool {
+    var i: usize = 0;
+    for (i < BUILTINS) {
+        if (name != nil && str_equals(name, BUILTIN_NAMES[i])) {
+            set_builtin(t, i);
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# kinds a registry allocates on its first growth
+val INIT_KINDS: u32 = 64;
+
+# set a theme up with the default look and every built-in kind registered
+# ---
+# t:   theme to initialize
+# a:   allocator backing its kind registry
+# ret: ok, or the allocator's refusal with nothing left allocated
+pub fun init(t: *Theme, a: *allo.Allocator) err[allo.Error] {
+    t.a       = a;
+    t.names   = nil;
+    t.docs    = nil;
+    t.derives = nil;
+    t.styles  = nil;
+    t.len     = 0;
+    t.cap     = 0;
+    default_tokens(t);
+    val g: err[allo.Error] = grow(t, BUILTIN_KINDS);
+    if (sel g.err) { ret g; }
+    var k: u32 = 0;
+    for (k < BUILTIN_KINDS) {
+        t.names[k]   = KIND_INFO[k].name;
+        t.docs[k]    = KIND_INFO[k].doc;
+        t.derives[k] = Hook{f: builtin_style};
+        k            = k + 1;
+    }
+    t.len = BUILTIN_KINDS;
+    derive(t);
+    ret err[allo.Error].ok{};
+}
+
+# release a theme's kind registry
+# ---
+# t:   theme to free
+# ret: ok, or the first refusal; the theme holds no kinds either way
+pub fun free(t: *Theme) err[allo.Error] {
+    var out: err[allo.Error] = err[allo.Error].ok{};
+    if (t.cap > 0) {
+        val n:  usize           = t.cap::usize;
+        val e0: err[allo.Error] = allo.deallocate[str](t.a, t.names, n);
+        val e1: err[allo.Error] = allo.deallocate[str](t.a, t.docs, n);
+        val e2: err[allo.Error] = allo.deallocate[Hook](t.a, t.derives, n);
+        val e3: err[allo.Error] = allo.deallocate[Style](t.a, t.styles, n);
+        if (sel e0.err) { out = e0; }
+        or (sel e1.err) { out = e1; }
+        or (sel e2.err) { out = e2; }
+        or (sel e3.err) { out = e3; }
+    }
+    t.names   = nil;
+    t.docs    = nil;
+    t.derives = nil;
+    t.styles  = nil;
+    t.len     = 0;
+    t.cap     = 0;
+    ret out;
+}
+
+# make room in a theme's registry for at least need kinds, moving every array
+# whole or none
+fun grow(t: *Theme, need: u32) err[allo.Error] {
+    if (need <= t.cap) { ret err[allo.Error].ok{}; }
+    var c: u32 = t.cap * 2;
+    if (c < INIT_KINDS) { c = INIT_KINDS; }
+    for (c < need) { c = c * 2; }
+    val n:  usize                 = c::usize;
+    val an: res[*str, allo.Error] = allo.allocate[str](t.a, n);
+    if (sel an.err) { ret err[allo.Error].err{an.err}; }
+    val ad: res[*str, allo.Error] = allo.allocate[str](t.a, n);
+    if (sel ad.err) {
+        val f0: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        ret err[allo.Error].err{ad.err};
+    }
+    val av: res[*Hook, allo.Error] = allo.allocate[Hook](t.a, n);
+    if (sel av.err) {
+        val f1: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        val f2: err[allo.Error] = allo.deallocate[str](t.a, ad.ok, n);
+        ret err[allo.Error].err{av.err};
+    }
+    val as: res[*Style, allo.Error] = allo.allocate[Style](t.a, n);
+    if (sel as.err) {
+        val f3: err[allo.Error] = allo.deallocate[str](t.a, an.ok, n);
+        val f4: err[allo.Error] = allo.deallocate[str](t.a, ad.ok, n);
+        val f5: err[allo.Error] = allo.deallocate[Hook](t.a, av.ok, n);
+        ret err[allo.Error].err{as.err};
+    }
+    val len: usize = t.len::usize;
+    if (len > 0) {
+        memory.raw_copy(an.ok::ptr, t.names::ptr, len * $size_of(str));
+        memory.raw_copy(ad.ok::ptr, t.docs::ptr, len * $size_of(str));
+        memory.raw_copy(av.ok::ptr, t.derives::ptr, len * $size_of(Hook));
+        memory.raw_copy(as.ok::ptr, t.styles::ptr, len * $size_of(Style));
+    }
+    val keep: u32             = t.len;
+    val old:  err[allo.Error] = free(t);
+    t.names   = an.ok;
+    t.docs    = ad.ok;
+    t.derives = av.ok;
+    t.styles  = as.ok;
+    t.len     = keep;
+    t.cap     = c;
+    ret err[allo.Error].ok{};
+}
+
+# register a widget kind by name, or find the one registered by that name
+#
+# the kind's style is derived from the theme's tokens now, and again by every
+# derive, rederive and built-in look. a name registered before keeps its
+# handle and takes the new derive and meaning. name and doc are borrowed and
+# must outlive the theme and every copy of it.
+# ---
+# t:      the theme
+# name:   the kind's name, its path segment, such as "dock_space"
+# doc:    what it styles, for the field table and the editor
+# derive: builds its style from the tokens
+# ret:    the kind's handle, or the allocator's refusal with nothing changed
+pub fun register_kind(t: *Theme, name: str, doc: str, derive: Derive) res[u32, allo.Error] {
+    val have: opt[u32] = kind_of(t, name);
+    if (sel have.some) {
+        t.docs[have.some]    = doc;
+        t.derives[have.some] = Hook{f: derive};
+        t.styles[have.some]  = built(t, have.some);
+        ret res[u32, allo.Error].ok{have.some};
+    }
+    val g: err[allo.Error] = grow(t, t.len + 1);
+    if (sel g.err) { ret res[u32, allo.Error].err{g.err}; }
+    val k: u32 = t.len;
+    t.names[k]   = name;
+    t.docs[k]    = doc;
+    t.derives[k] = Hook{f: derive};
+    t.len        = k + 1;
+    t.styles[k]  = built(t, k);
+    ret res[u32, allo.Error].ok{k};
+}
+
+# make one theme the same as another: tokens, kinds and styles
+# ---
+# dst: the theme written, set up by init or zeroed, its registry reused
+# src: the theme read
+# ret: ok, or the allocator's refusal with dst unchanged
+pub fun copy(dst: *Theme, src: *Theme) err[allo.Error] {
+    if (dst == src)   { ret err[allo.Error].ok{}; }
+    if (dst.a == nil) { dst.a = src.a; }
+    val g: err[allo.Error] = grow(dst, src.len);
+    if (sel g.err) { ret g; }
+    val a:       *allo.Allocator = dst.a;
+    val names:   *str            = dst.names;
+    val docs:    *str            = dst.docs;
+    val derives: *Hook           = dst.derives;
+    val styles:  *Style          = dst.styles;
+    val cap:     u32             = dst.cap;
+    @dst        = @src;
+    dst.a       = a;
+    dst.names   = names;
+    dst.docs    = docs;
+    dst.derives = derives;
+    dst.styles  = styles;
+    dst.cap     = cap;
+    val len: usize = src.len::usize;
+    if (len > 0) {
+        memory.raw_copy(names::ptr, src.names::ptr, len * $size_of(str));
+        memory.raw_copy(docs::ptr, src.docs::ptr, len * $size_of(str));
+        memory.raw_copy(derives::ptr, src.derives::ptr, len * $size_of(Hook));
+        memory.raw_copy(styles::ptr, src.styles::ptr, len * $size_of(Style));
+    }
+    ret err[allo.Error].ok{};
+}
+
+# why a theme document was refused, each at a byte offset into it
+# ---
+# toml:    the text is not TOML
+# unknown: a key names no field, kind or state
+# value:   a value does not fit its field
+# base:    base names no built-in theme
+pub tag LoadError: u8 {
+    toml:    toml.TomlError;
+    unknown: usize;
+    value:   usize;
+    base:    usize;
+}
+
+# a number as a float, or none
+fun number(v: *toml.Value) opt[f32] {
+    if (v.tag == toml.TYPE_FLOAT)   { ret opt[f32].some{v.data.float::f32}; }
+    if (v.tag == toml.TYPE_INTEGER) { ret opt[f32].some{v.data.integer::f32}; }
+    ret opt[f32].none{};
+}
+
+# a hex digit's value, or 16 for none
+fun hex_digit(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::u32 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::u32 + 10; }
+    ret 16;
+}
+
+# a color written as #rgb, #rrggbb or #rrggbbaa
+# ---
+# s:   the text
+# ret: the color, or none
+pub fun parse_hex(s: str) opt[draw.Color] {
+    if (s == nil || s[0] != '#') { ret opt[draw.Color].none{}; }
+    val n: usize = str_len(s) - 1;
+    if (n != 3 && n != 6 && n != 8) { ret opt[draw.Color].none{}; }
+    var ch: [4]f32;
+    ch[3] = 1.0::f32;
+    var i: usize = 0;
+    for (i < n) {
+        if (hex_digit(s[i + 1]) > 15) { ret opt[draw.Color].none{}; }
+        i = i + 1;
+    }
+    if (n == 3) {
+        var k: usize = 0;
+        for (k < 3) {
+            val d: u32 = hex_digit(s[k + 1]);
+            ch[k] = (d * 17)::f32 / 255.0::f32;
+            k     = k + 1;
+        }
+    }
+    or {
+        var k: usize = 0;
+        for (k < n / 2) {
+            val d: u32 = hex_digit(s[k * 2 + 1]) * 16 + hex_digit(s[k * 2 + 2]);
+            ch[k] = d::f32 / 255.0::f32;
+            k     = k + 1;
+        }
+    }
+    ret opt[draw.Color].some{draw.rgba(ch[0], ch[1], ch[2], ch[3])};
+}
+
+# a color: a hex string, or an array of three or four numbers in [0, 1]
+fun read_color(v: *toml.Value) opt[Value] {
+    if (v.tag == toml.TYPE_STRING) {
+        val c: opt[draw.Color] = parse_hex(v.data.string);
+        if (sel c.none) { ret opt[Value].none{}; }
+        ret opt[Value].some{of_color(c.some)};
+    }
+    if (v.tag != toml.TYPE_ARRAY) { ret opt[Value].none{}; }
+    val n: usize = toml.array_len(?v.data.array);
+    if (n != 3 && n != 4) { ret opt[Value].none{}; }
+    var o: Value;
+    o.v[3] = 1.0::f32;
+    var i: usize = 0;
+    for (i < n) {
+        val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+        if (sel e.none) { ret opt[Value].none{}; }
+        val f: opt[f32] = number(e.some);
+        if (sel f.none) { ret opt[Value].none{}; }
+        o.v[i] = f.some;
+        i      = i + 1;
+    }
+    ret opt[Value].some{o};
+}
+
+# a value of a unit: a color, a number, or a number or four numbers for a quad
+# ---
+# unit: UNIT_*
+# v:    the TOML value
+# ret:  the value, or none when it does not fit the unit
+pub fun read_value(unit: u8, v: *toml.Value) opt[Value] {
+    if (unit == UNIT_COLOR) { ret read_color(v); }
+    if (unit == UNIT_QUAD && v.tag == toml.TYPE_ARRAY) {
+        if (toml.array_len(?v.data.array) != 4) { ret opt[Value].none{}; }
+        var o: Value;
+        var i: usize = 0;
+        for (i < 4) {
+            val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+            if (sel e.none) { ret opt[Value].none{}; }
+            val f: opt[f32] = number(e.some);
+            if (sel f.none) { ret opt[Value].none{}; }
+            o.v[i] = f.some;
+            i      = i + 1;
+        }
+        ret opt[Value].some{o};
+    }
+    val f: opt[f32] = number(v);
+    if (sel f.none) { ret opt[Value].none{}; }
+    var o: Value;
+    o.v[0] = f.some;
+    if (unit == UNIT_QUAD) {
+        o.v[1] = f.some;
+        o.v[2] = f.some;
+        o.v[3] = f.some;
+    }
+    ret opt[Value].some{o};
+}
+
+# write a value to every field a path names, an array of colors to an array
+# field element by element
+fun apply(t: *Theme, p: Path, v: *toml.Value) err[LoadError] {
+    val f: Field = FIELDS[p.field];
+    if (f.count > 1 && p.elem == ANY_ELEM && v.tag == toml.TYPE_ARRAY && f.unit == UNIT_COLOR) {
+        val first:  opt[*toml.Value] = toml.array_get(?v.data.array, 0);
+        var colors: bool             = false;
+        if (sel first.some) { colors = first.some.tag != toml.TYPE_INTEGER && first.some.tag != toml.TYPE_FLOAT; }
+        if (colors) {
+            val n: usize = toml.array_len(?v.data.array);
+            if (n > f.count) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
+            var i: usize = 0;
+            for (i < n) {
+                val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+                if (sel e.none) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
+                val c: opt[Value] = read_color(e.some);
+                if (sel c.none) { ret err[LoadError].err{LoadError.value{e.some.span.at}}; }
+                put(t, ref_at(exact(p.field, 0, 0, i), 0), c.some);
+                i = i + 1;
+            }
+            ret err[LoadError].ok{};
+        }
+    }
+    val x: opt[Value] = read_value(f.unit, v);
+    if (sel x.none) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
+    val n: usize = span(t, p);
+    var i: usize = 0;
+    for (i < n) {
+        put(t, ref_at(p, i), x.some);
+        i = i + 1;
+    }
+    ret err[LoadError].ok{};
+}
+
+# the key of a table entry and its value
+fun entry(tb: *toml.Table, i: usize, key: *str, v: **toml.Value) bool {
+    val ko: opt[str]         = toml.table_key(tb, i);
+    val vo: opt[*toml.Value] = toml.table_value(tb, i);
+    if (sel ko.none) { ret false; }
+    if (sel vo.none) { ret false; }
+    @key = ko.some;
+    @v   = vo.some;
+    ret true;
+}
+
+# apply every field of one top-level table: tokens when tokens is true, the
+# rest otherwise
+fun read_table(t: *Theme, top: str, tb: *toml.Table, tokens: bool) err[LoadError] {
+    var segs: [3]str;
+    var lens: [3]usize;
+    segs[0] = top;
+    lens[0] = str_len(top);
+    val g:      opt[u8] = group_named(top, lens[0]);
+    val is_tok: bool    = sel g.some && (g.some == GROUP_PALETTE || g.some == GROUP_METRICS);
+    if (is_tok != tokens) { ret err[LoadError].ok{}; }
+    var i: usize = 0;
+    for (i < toml.table_len(tb)) {
+        var key: str;
+        var v:   *toml.Value;
+        if (!entry(tb, i, ?key, ?v)) { brk; }
+        segs[1] = key;
+        lens[1] = str_len(key);
+        if (v.tag == toml.TYPE_TABLE && sel g.none) {
+            var j: usize = 0;
+            for (j < toml.table_len(?v.data.table)) {
+                var k2: str;
+                var v2: *toml.Value;
+                if (!entry(?v.data.table, j, ?k2, ?v2)) { brk; }
+                segs[2] = k2;
+                lens[2] = str_len(k2);
+                val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 3);
+                if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v2.key.at}}; }
+                val e: err[LoadError] = apply(t, p.some, v2);
+                if (sel e.err) { ret e; }
+                j = j + 1;
+            }
+        }
+        or {
+            val p: opt[Path] = resolve(t, ?segs[0], ?lens[0], 2);
+            if (sel p.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
+            val e: err[LoadError] = apply(t, p.some, v);
+            if (sel e.err) { ret e; }
+        }
+        i = i + 1;
+    }
+    ret err[LoadError].ok{};
+}
+
+# the theme a parsed document describes, read into a theme keeping its kinds
+#
+# the document starts from the built-in named by its base key (default when
+# it has none). its palette and metrics tables set tokens and move the styles
+# with them (see rederive), then its plot table and kind tables set fields as
+# they are: [<kind>] for style fields and [<kind>.<state>] for paint fields,
+# with "*" for every kind or state, a kind named by its registered name. a
+# class table is left for the context (see style.load_theme). a key that
+# names nothing, an unregistered kind among them, is refused.
+# ---
+# t:    the theme, replaced only when the document is accepted
+# root: the parsed document
+# ret:  ok, or why the document was refused
+pub fun read(t: *Theme, root: *toml.Table) err[LoadError] {
+    var w: Theme;
+    w.a = t.a;
+    val c: err[allo.Error] = copy(?w, t);
+    if (sel c.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{c.err}}}; }
+    val e: err[LoadError] = read_into(?w, root);
+    if (sel e.ok) {
+        val keep: Theme = @t;
+        @t = w;
+        w  = keep;
+    }
+    val f: err[allo.Error] = free(?w);
+    ret e;
+}
+
+# read a document into a working theme
+fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
+    default(t);
+    val bo: opt[*toml.Value] = toml.get(root, "base");
+    if (sel bo.some) {
+        val bv: *toml.Value = bo.some;
+        if (bv.tag != toml.TYPE_STRING)  { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
+        if (!builtin(t, bv.data.string)) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
+    }
+    val before: Theme = @t;
+    var pass:   u8    = 0;
+    for (pass < 2) {
+        var i: usize = 0;
+        for (i < toml.table_len(root)) {
+            var key: str;
+            var v:   *toml.Value;
+            if (!entry(root, i, ?key, ?v)) { brk; }
+            i = i + 1;
+            if (str_equals(key, "base") || str_equals(key, "class")) { cnt; }
+            if (v.tag != toml.TYPE_TABLE)                            { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
+            val g:  opt[u8]  = group_named(key, str_len(key));
+            val ko: opt[u32] = kind_named(t, key, str_len(key));
+            if (sel g.none && sel ko.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
+            val e: err[LoadError] = read_table(t, key, ?v.data.table, pass == 0);
+            if (sel e.err) { ret e; }
+        }
+        if (pass == 0) { rederive(t, ?before); }
+        pass = pass + 1;
+    }
+    ret err[LoadError].ok{};
+}
+
+# read a TOML document into a theme (see read)
+# ---
+# t:    the theme, replaced only when the document is accepted
+# text: the document
+# ret:  ok, or why the document was refused
+pub fun load(t: *Theme, text: str) err[LoadError] {
+    val pr: res[toml.Table, toml.TomlError] = toml.parse(t.a, text);
+    if (sel pr.err) { ret err[LoadError].err{LoadError.toml{pr.err}}; }
+    var root: toml.Table      = pr.ok;
+    val e:    err[LoadError]  = read(t, ?root);
+    val d:    err[allo.Error] = toml.dnit(t.a, ?root);
+    if (sel e.err) { ret e; }
+    if (sel d.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{d.err}}}; }
+    ret err[LoadError].ok{};
+}
+
+# whether a channel is a whole number of 255ths, so hex holds it exactly
+fun on_grid(c: f32) bool {
+    if (c < 0.0::f32 || c > 1.0::f32) { ret false; }
+    val k: u32 = (c * 255.0::f32 + 0.5::f32)::u32;
+    ret k::f32 / 255.0::f32 == c;
+}
+
+# write a value of a unit: a color as #rrggbbaa when hex holds it exactly,
+# else as four floats, a quad as one float when its four agree
+# ---
+# w:    writer
+# unit: UNIT_*
+# x:    the value
+pub fun write_value(w: *tw.Writer, unit: u8, x: Value) {
+    if (unit == UNIT_COLOR) {
+        if (on_grid(x.v[0]) && on_grid(x.v[1]) && on_grid(x.v[2]) && on_grid(x.v[3])) {
+            val hex: str = "0123456789abcdef";
+            var buf: [10]u8;
+            buf[0] = '#';
+            var i: usize = 0;
+            for (i < 4) {
+                val k: u32 = (x.v[i] * 255.0::f32 + 0.5::f32)::u32;
+                buf[1 + i * 2] = hex[k >> 4];
+                buf[2 + i * 2] = hex[k & 15];
+                i              = i + 1;
+            }
+            buf[9] = 0;
+            tw.value_str(w, ?buf[0]);
+            ret;
+        }
+        tw.value_floats(w, ?x.v[0], 4);
+        ret;
+    }
+    if (unit == UNIT_QUAD && (x.v[0] != x.v[1] || x.v[0] != x.v[2] || x.v[0] != x.v[3])) {
+        tw.value_floats(w, ?x.v[0], 4);
+        ret;
+    }
+    tw.value_float(w, x.v[0]::f64);
+}
+
+# whether two values of a unit are the same floats
+fun same_value(unit: u8, a: Value, b: Value) bool {
+    var i: usize = 0;
+    for (i < unit_floats(unit)) {
+        if (a.v[i] != b.v[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# write one group of whole-theme fields as a table, every field
+fun save_group(w: *tw.Writer, t: *Theme, group: u8, name: str) {
+    var keys: [1]str;
+    keys[0] = name;
+    tw.put_table(w, ?keys[0], 1);
+    var i: usize = 0;
+    for (i < FIELD_COUNT) {
+        val f: Field = FIELDS[i];
+        if (f.group == group) {
+            tw.put_assign(w, f.name);
+            if (f.count > 1) {
+                tw.put_byte(w, '[');
+                var e: usize = 0;
+                for (e < f.count) {
+                    if (e > 0) { tw.put_text(w, ", "); }
+                    write_value(w, f.unit, get(t, ref_at(exact(i, 0, 0, e), 0)));
+                    e = e + 1;
+                }
+                tw.put_byte(w, ']');
+            }
+            or { write_value(w, f.unit, get(t, ref_at(exact(i, 0, 0, 0), 0))); }
+            tw.end_line(w);
+        }
+        i = i + 1;
+    }
+    tw.end_line(w);
+}
+
+# write the fields of one group of a kind (style fields, or one state's paint
+# fields) that differ from what its derive builds, under a table header when
+# any do
+fun save_diff(w: *tw.Writer, t: *Theme, d: *Style, kind: u32, state: u8, group: u8) {
+    var header: bool  = false;
+    var i:      usize = 0;
+    for (i < FIELD_COUNT) {
+        val f: Field = FIELDS[i];
+        if (f.group == group) {
+            val r:   Ref   = ref_at(exact(i, kind, state, 0), 0);
+            val now: Value = get(t, r);
+            var off: usize = r.off;
+            var was: Value;
+            var j:   usize = 0;
+            for (j < unit_floats(f.unit)) {
+                was.v[j] = ((d::usize + off)::*f32)[j];
+                j        = j + 1;
+            }
+            if (!same_value(f.unit, now, was)) {
+                if (!header) {
+                    var keys: [2]str;
+                    keys[0] = t.names[kind];
+                    keys[1] = STATE_NAMES[state].name;
+                    var n: usize = 1;
+                    if (group == GROUP_PAINT) { n = 2; }
+                    tw.put_table(w, ?keys[0], n);
+                    header = true;
+                }
+                tw.put_assign(w, f.name);
+                write_value(w, f.unit, now);
+                tw.end_line(w);
+            }
+        }
+        i = i + 1;
+    }
+    if (header) { tw.end_line(w); }
+}
+
+# write a theme as TOML into a writer
+#
+# the tokens and the plot fields are written in full, and each style field
+# only where it differs from what its kind's derive builds, so the document
+# is short and load reads back the same theme exactly.
+# ---
+# w: writer, past reset; the document is appended
+# t: the theme
+pub fun save(w: *tw.Writer, t: *Theme) {
+    save_group(w, t, GROUP_PALETTE, "palette");
+    save_group(w, t, GROUP_METRICS, "metrics");
+    save_group(w, t, GROUP_PLOT, "plot");
+    var k: u32 = 0;
+    for (k < t.len) {
+        var d: Style = built(t, k);
+        save_diff(w, t, ?d, k, 0, GROUP_STYLE);
+        var s: u8 = 0;
+        for (s < STATES) {
+            save_diff(w, t, ?d, k, s, GROUP_PAINT);
+            s = s + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# the unit's name in the field table
+fun unit_name(unit: u8) str {
+    if (unit == UNIT_COLOR)  { ret "color"; }
+    if (unit == UNIT_LENGTH) { ret "length"; }
+    if (unit == UNIT_QUAD)   { ret "4 lengths"; }
+    ret "factor";
+}
+
+# write the field table and the kind table as markdown, the tables the README
+# documents themes with
+# ---
+# w: writer, past reset; the tables are appended
+# t: the theme whose registered kinds are listed
+pub fun document(w: *tw.Writer, t: *Theme) {
+    tw.put_text(w, "| path | unit | meaning |\n|---|---|---|\n");
+    var i: usize = 0;
+    for (i < FIELD_COUNT) {
+        val f: Field = FIELDS[i];
+        tw.put_text(w, "| `");
+        if (f.group == GROUP_PALETTE) { tw.put_text(w, "palette."); }
+        or (f.group == GROUP_METRICS) { tw.put_text(w, "metrics."); }
+        or (f.group == GROUP_PLOT)    { tw.put_text(w, "plot."); }
+        or (f.group == GROUP_STYLE)   { tw.put_text(w, "<kind>."); }
+        or                            { tw.put_text(w, "<kind>.<state>."); }
+        tw.put_text(w, f.name);
+        tw.put_text(w, "` | ");
+        tw.put_text(w, unit_name(f.unit));
+        if (f.count > 1) { tw.put_text(w, " x 8"); }
+        tw.put_text(w, " | ");
+        tw.put_text(w, f.doc);
+        tw.put_text(w, " |\n");
+        i = i + 1;
+    }
+    tw.put_text(w, "\n| kind | what it styles |\n|---|---|\n");
+    var k: u32 = 0;
+    for (k < t.len) {
+        tw.put_text(w, "| `");
+        tw.put_text(w, t.names[k]);
+        tw.put_text(w, "` | ");
+        tw.put_text(w, t.docs[k]);
+        tw.put_text(w, " |\n");
+        k = k + 1;
+    }
+    tw.put_text(w, "\n| state | when |\n|---|---|\n");
+    var s: u8 = 0;
+    for (s < STATES) {
+        tw.put_text(w, "| `");
+        tw.put_text(w, STATE_NAMES[s].name);
+        tw.put_text(w, "` | ");
+        tw.put_text(w, STATE_NAMES[s].doc);
+        tw.put_text(w, " |\n");
+        s = s + 1;
+    }
+}
+
+# the README, whose field table document writes
+#[testing]
+#[embed("../README.md")]
+val README: [_]u8;
+
+# whether a whole-theme field's row in FIELDS has its name and offset
+#[testing]
+fun has_row(group: u8, name: str, off: usize) bool {
+    val r: opt[usize] = row_named(group, name, str_len(name));
+    if (sel r.none) { ret false; }
+    ret FIELDS[r.some].off == off;
+}
+
+# a theme over a page allocator, for a test
+#[testing]
+fun made(t: *Theme, a: *allo.Allocator) bool {
+    val m: err[allo.Error] = page.make(a);
+    if (sel m.err) { ret false; }
+    val e: err[allo.Error] = init(t, a);
+    ret sel e.ok;
+}
+
+# whether a path names a field in the default kinds
+#[testing]
+fun names(t: *Theme, s: str) bool {
+    val p: opt[Path] = path(t, s);
+    ret sel p.some;
+}
+
+# whether two themes have the same tokens, kinds and styles, byte for byte
+#[testing]
+fun same_theme(x: *Theme, y: *Theme) bool {
+    if (!memory.equal[u8](x::*u8, y::*u8, $offset_of(Theme, a))) { ret false; }
+    if (x.len != y.len)                                          { ret false; }
+    ret memory.equal[u8](x.styles::*u8, y.styles::*u8, x.len::usize * $size_of(Style));
+}
+
+# a kind registered by a test: a gold face, its border the accent
+#[testing]
+fun badge_style(t: *Theme, k: u32, s: *Style) {
+    fill_all(s, draw.hex(0xC8A000, 1.0::f32));
+    outline_all(s, t.accent, 1.0::f32);
+}
+
+test table__names_every_field_of_every_record {
+    var rows: usize = 0;
+    var bad:  u8    = 0;
+    $each f in $fields(Theme) {
+        if (f.offset < $offset_of(Theme, a)) {
+            var ok: bool = has_row(GROUP_PALETTE, f.name, f.offset) || has_row(GROUP_METRICS, f.name, f.offset);
+            ok = ok || has_row(GROUP_PLOT, f.name, f.offset);
+            if (!ok) { bad = 1; }
+            rows = rows + 1;
+        }
+    }
+    $each f in $fields(Style) {
+        if (!str_equals(f.name, "states")) {
+            if (!has_row(GROUP_STYLE, f.name, f.offset)) { bad = 2; }
+            rows = rows + 1;
+        }
+    }
+    $each f in $fields(Paint) {
+        if (!has_row(GROUP_PAINT, f.name, f.offset)) { bad = 3; }
+        rows = rows + 1;
+    }
+    if (bad != 0)            { ret bad::i32 + 1; }
+    if (rows != FIELD_COUNT) { ret 6; }
+    ret 0;
+}
+
+test registry__holds_the_builtins_and_grows_by_name {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a))                                  { ret 1; }
+    if (kind_count(?t) != BUILTIN_KINDS)                { ret 2; }
+    if (!str_equals(kind_name(?t, TOOLTIP), "tooltip")) { ret 3; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err)                                                    { ret 4; }
+    if (k.ok != BUILTIN_KINDS)                                        { ret 5; }
+    if (style(?t, k.ok).states[HOT].fill.g != 0xA0::f32 / 255.0::f32) { ret 6; }
+    val again: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel again.err)    { ret 7; }
+    if (again.ok != k.ok) { ret 7; }
+    # a hundred more grow the registry past its first allocation
+    var n:         usize = 0;
+    var names_buf: [100][8]u8;
+    for (n < 100) {
+        names_buf[n][0] = 'k';
+        names_buf[n][1] = '0' + (n / 10)::u8;
+        names_buf[n][2] = '0' + (n % 10)::u8;
+        names_buf[n][3] = 0;
+        val r: res[u32, allo.Error] = register_kind(?t, (?names_buf[n][0])::str, "more", badge_style);
+        if (sel r.err) { ret 8; }
+        n = n + 1;
+    }
+    if (kind_count(?t) != BUILTIN_KINDS + 101)          { ret 9; }
+    if (!str_equals(kind_name(?t, TOOLTIP), "tooltip")) { ret 10; }
+    val kk: opt[u32] = kind_of(?t, "badge");
+    if (sel kk.none)                                              { ret 11; }
+    if (style(?t, kk.some).states[NORMAL].border.r != t.accent.r) { ret 12; }
+
+    # a copy holds the same, in storage of its own
+    var c:  Theme;
+    val ce: err[allo.Error] = copy(?c, ?t);
+    if (sel ce.err)          { ret 13; }
+    if (!same_theme(?c, ?t)) { ret 14; }
+    style(?c, BUTTON).min_w = 99.0::f32;
+    if (style(?t, BUTTON).min_w == 99.0::f32) { ret 15; }
+    val f1: err[allo.Error] = free(?c);
+    val f2: err[allo.Error] = free(?t);
+    ret 0;
+}
+
+test path__resolves_wildcards_and_writes_back {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val p: opt[Path] = path(?t, "button.hot.fill");
+    if (sel p.none)            { ret 1; }
+    if (span(?t, p.some) != 1) { ret 2; }
+    val r: Ref = ref_at(p.some, 0);
+    if (r.kind != BUTTON || r.off != $offset_of(Style, states) + HOT::usize * $size_of(Paint)) { ret 3; }
+    val c: draw.Color = color_of(get(?t, r));
+    if (c.r != t.control_hot.r || c.a != t.control_hot.a) { ret 4; }
+
+    var buf: [64]u8;
+    path_text(?t, p.some, ?buf[0], 64);
+    if (!str_equals(?buf[0], "button.hot.fill")) { ret 5; }
+
+    val all: opt[Path] = path(?t, "*.*.border_w");
+    if (sel all.none)                                       { ret 6; }
+    if (span(?t, all.some) != t.len::usize * STATES::usize) { ret 6; }
+    val series: opt[Path] = path(?t, "plot.series");
+    if (sel series.none)                 { ret 7; }
+    if (span(?t, series.some) != SERIES) { ret 7; }
+    val one: opt[Path] = path(?t, "plot.series.3");
+    if (sel one.none)                                              { ret 8; }
+    if (ref_at(one.some, 0).off != $offset_of(Theme, series) + 48) { ret 8; }
+    path_text(?t, one.some, ?buf[0], 64);
+    if (!str_equals(?buf[0], "plot.series.3")) { ret 9; }
+    if (names(?t, "button.hot"))               { ret 10; }
+    if (names(?t, "button.warm.fill"))         { ret 11; }
+    if (names(?t, "palette.nope"))             { ret 12; }
+    if (names(?t, "plot.series.8"))            { ret 13; }
+    if (names(?t, "badge.radius"))             { ret 14; }
+
+    # a registered kind is addressable by its name, wildcards included
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err)                    { ret 15; }
+    if (!names(?t, "badge.hot.fill")) { ret 16; }
+    # a wildcard stands for every kind registered when it is applied
+    val n: usize = set_path(?t, all.some, of_length(2.0::f32));
+    if (n != t.len::usize * STATES::usize)                    { ret 17; }
+    if (style(?t, k.ok).states[FOCUSED].border_w != 2.0::f32) { ret 18; }
+    val f: err[allo.Error] = free(?t);
+    ret 0;
+}
+
+test rederive__moves_derived_fields_and_keeps_hand_set_ones {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    style(?t, LIST_ITEM).states[ON].fill = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val acc: opt[Path] = path(?t, "palette.accent");
+    if (sel acc.none) { ret 1; }
+    set(?t, ref_at(acc.some, 0), of_color(draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32)));
+    if (t.accent.b != 1.0::f32)                                     { ret 2; }
+    if (style(?t, BUTTON).states[ON].fill.b != 1.0::f32)            { ret 3; }
+    if (style(?t, CHECKBOX_MARK).states[NORMAL].fill.b != 1.0::f32) { ret 4; }
+    if (style(?t, LIST_ITEM).states[ON].fill.r != 1.0::f32)         { ret 5; }
+    if (style(?t, BUTTON).states[NORMAL].fill.r != t.control.r)     { ret 6; }
+
+    val gap: opt[Path] = path(?t, "metrics.gap");
+    if (sel gap.none) { ret 7; }
+    set(?t, ref_at(gap.some, 0), of_length(9.0::f32));
+    if (style(?t, BUTTON).margin.b != 9.0::f32) { ret 8; }
+    val f: err[allo.Error] = free(?t);
+    ret 0;
+}
+
+test toml__every_builtin_round_trips_exactly {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err) { ret 1; }
+    var w: tw.Writer;
+    tw.init(?w, ?a);
+    var i: usize = 0;
+    for (i < BUILTINS) {
+        set_builtin(?t, i);
+        style(?t, SLIDER).radius        = draw.Radii{tl: 1.0::f32, tr: 2.0::f32, br: 3.0::f32, bl: 4.0::f32};
+        style(?t, TAB).states[HOT].fill = draw.rgba(0.1::f32, 0.2::f32, 0.3::f32, 0.4::f32);
+        style(?t, k.ok).min_h           = 33.0::f32;
+        tw.reset(?w);
+        save(?w, ?t);
+        val text: res[str, allo.Error] = tw.text(?w);
+        if (sel text.err) { ret 2; }
+        var got: Theme;
+        got.a = ?a;
+        val ce: err[allo.Error] = copy(?got, ?t);
+        if (sel ce.err) { ret 3; }
+        default(?got);
+        val back: err[LoadError] = load(?got, text.ok);
+        if (sel back.err)          { ret 3; }
+        if (!same_theme(?got, ?t)) { ret 4 + i::i32; }
+        val fg: err[allo.Error] = free(?got);
+        i = i + 1;
+    }
+    val f:  err[allo.Error] = tw.free(?w);
+    val ft: err[allo.Error] = free(?t);
+    ret 0;
+}
+
+test load__reads_base_tokens_and_tables_and_refuses_unknown_keys {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    val doc: str            = "base = \"light\"\n[palette]\naccent = \"#ff0000\"\n[metrics]\ncorner = 6\n[plot]\nseries = [\"#00ff00\", [0.0, 0.0, 1.0]]\n[button]\ninset = [1, 2, 3, 4]\n[button.hot]\nfill = \"#123\"\n[\"*\".focused]\nborder_w = 3.0\n";
+    val r:   err[LoadError] = load(?t, doc);
+    if (sel r.err) { ret 2; }
+    var l: Theme;
+    if (!made(?l, ?a)) { ret 1; }
+    light(?l);
+    if (t.text.r != l.text.r)                                           { ret 3; }
+    if (t.accent.r != 1.0::f32 || t.accent.g != 0.0::f32)               { ret 4; }
+    if (style(?t, BUTTON).states[ON].fill.r != 1.0::f32)                { ret 5; }
+    if (style(?t, PANEL).radius.tl != 6.0::f32)                         { ret 6; }
+    if (t.series[0].g != 1.0::f32 || t.series[1].b != 1.0::f32)         { ret 7; }
+    if (t.series[2].r != l.series[2].r)                                 { ret 8; }
+    if (style(?t, BUTTON).inset.t != 2.0::f32)                          { ret 9; }
+    if (style(?t, BUTTON).states[HOT].fill.b != 0x33::f32 / 255.0::f32) { ret 10; }
+    if (style(?t, LABEL).states[FOCUSED].border_w != 3.0::f32)          { ret 11; }
+
+    # a refused document leaves the theme as it was
+    val bad: err[LoadError] = load(?t, "[button]\nfil = 1.0\n");
+    if (sel bad.ok)             { ret 12; }
+    if (!sel bad.err.unknown)   { ret 12; }
+    if (bad.err.unknown != 9)   { ret 12; }
+    if (t.accent.r != 1.0::f32) { ret 12; }
+    val worse: err[LoadError] = load(?t, "[button.hot]\nfill = 3\n");
+    if (!(sel worse.err && sel worse.err.value)) { ret 13; }
+    val base: err[LoadError] = load(?t, "base = \"pink\"\n");
+    if (!(sel base.err && sel base.err.base)) { ret 14; }
+    val syntax: err[LoadError] = load(?t, "[button\n");
+    if (!(sel syntax.err && sel syntax.err.toml)) { ret 15; }
+
+    # a kind is a table only once it is registered
+    val unknown: err[LoadError] = load(?t, "[badge.hot]\nfill = \"#00ff00\"\n");
+    if (sel unknown.ok)           { ret 16; }
+    if (!sel unknown.err.unknown) { ret 16; }
+    if (unknown.err.unknown != 1) { ret 16; }
+    val k: res[u32, allo.Error] = register_kind(?t, "badge", "a test badge", badge_style);
+    if (sel k.err) { ret 17; }
+    val known: err[LoadError] = load(?t, "[badge.hot]\nfill = \"#00ff00\"\n");
+    if (sel known.err)                                                   { ret 18; }
+    if (style(?t, k.ok).states[HOT].fill.g != 1.0::f32)                  { ret 19; }
+    if (style(?t, k.ok).states[NORMAL].fill.g != 0xA0::f32 / 255.0::f32) { ret 20; }
+    val f1: err[allo.Error] = free(?t);
+    val f2: err[allo.Error] = free(?l);
+    ret 0;
+}
+
+test document__is_the_readme_field_table {
+    var a: allo.Allocator;
+    var t: Theme;
+    if (!made(?t, ?a)) { ret 1; }
+    var w: tw.Writer;
+    tw.init(?w, ?a);
+    tw.reset(?w);
+    document(?w, ?t);
+    val text: res[str, allo.Error] = tw.text(?w);
+    if (sel text.err) { ret 2; }
+    val doc:   str   = text.ok;
+    val n:     usize = str_len(doc);
+    var found: bool  = false;
+    var i:     usize = 0;
+    for (!found && i + n <= $length_of(README)) {
+        if (same((?README[i])::str, doc, n)) { found = true; }
+        i = i + 1;
+    }
+    val f: err[allo.Error] = tw.free(?w);
+    if (!found) { ret 3; }
+    ret 0;
 }

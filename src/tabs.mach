@@ -52,6 +52,7 @@ use blit.interact;
 use blit.layout;
 use blit.state;
 use blit.store;
+use blit.theme;
 use blit.widget;
 
 # the payload type a dragged tab carries, a Carried
@@ -358,10 +359,11 @@ fun most(g: *Geom) f32 {
 
 # lay the bar out: its row, how far the tabs shrink, and whether they overflow
 fun measure(ctx: *context.Context, tabs: *Tab, n: usize) Geom {
-    var g: Geom;
-    g.pad = context.px(ctx, ctx.theme.pad);
+    var g:  Geom;
+    val ts: *theme.Style = context.look_of(ctx, theme.TAB);
+    g.pad = context.px(ctx, ts.inset.l);
     g.lh  = context.line_height(ctx);
-    g.rh  = widget.control_row_height(ctx) - widget.row_gap(ctx);
+    g.rh  = maxf(context.px(ctx, ts.min_h), g.lh + context.px(ctx, ts.inset.t + ts.inset.b));
     var nat: f32   = 0.0::f32;
     var lo:  f32   = 0.0::f32;
     var i:   usize = 0;
@@ -429,14 +431,17 @@ fun step(ctx: *context.Context, g: *Geom, s: *State, tabs: *Tab, n: usize, right
     ret to;
 }
 
+# the state an overflow button paints in: disabled when it cannot act
+fun button_state(h: interact.Hit, live: bool) u8 {
+    if (!live) { ret theme.DISABLED; }
+    ret theme.pick(h.hot, h.active, false, false);
+}
+
 # one overflow button, square at x0, drawing its mark through glyph
 fun button(ctx: *context.Context, id: u64, g: *Geom, x0: f32, live: bool) interact.Hit {
     val x1: f32          = x0 + g.rh;
     val h:  interact.Hit = interact.hit(ctx, id, x0, g.y0, x1, g.y1, input.BUTTON_LEFT);
-    var bg: draw.Color   = ctx.theme.control;
-    if (live && h.active) { bg = ctx.theme.control_on; }
-    or (live && h.hot)    { bg = ctx.theme.control_hot; }
-    context.fill(ctx, x0, g.y0, x1, g.y1, context.px(ctx, ctx.theme.corner), context.CORNERS_TOP, bg);
+    context.box(ctx, theme.TAB, button_state(h, live), x0, g.y0, x1, g.y1);
     ret h;
 }
 
@@ -447,23 +452,21 @@ fun overflow(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n:
 
     val canl: bool         = s.scroll > 0.0::f32;
     val hl:   interact.Hit = button(ctx, bid.child(id, "#left"), g, g.x1, canl);
-    var cl:   draw.Color   = ctx.theme.text_faint;
-    if (canl) { cl = ctx.theme.text; }
-    val lx: f32 = g.x1 + g.rh / 2.0::f32;
+    val cl:   draw.Color   = context.paint_of(ctx, theme.TAB, button_state(hl, canl)).text;
+    val lx:   f32          = g.x1 + g.rh / 2.0::f32;
     context.tri(ctx, lx - k, cy, lx + k / 2.0::f32, cy - k, lx + k / 2.0::f32, cy + k, cl);
     if (canl && hl.clicked) { s.scroll = step(ctx, g, s, tabs, n, false); }
 
     val canr: bool         = s.scroll < most(g);
     val hr:   interact.Hit = button(ctx, bid.child(id, "#right"), g, g.x1 + g.rh, canr);
-    var cr:   draw.Color   = ctx.theme.text_faint;
-    if (canr) { cr = ctx.theme.text; }
-    val rx: f32 = g.x1 + g.rh * 1.5::f32;
+    val cr:   draw.Color   = context.paint_of(ctx, theme.TAB, button_state(hr, canr)).text;
+    val rx:   f32          = g.x1 + g.rh * 1.5::f32;
     context.tri(ctx, rx + k, cy, rx - k / 2.0::f32, cy + k, rx - k / 2.0::f32, cy - k, cr);
     if (canr && hr.clicked) { s.scroll = step(ctx, g, s, tabs, n, true); }
 
     val hm: interact.Hit = button(ctx, bid.child(id, "#more"), g, g.x1 + g.rh * 2.0::f32, true);
     val mx: f32          = g.x1 + g.rh * 2.5::f32;
-    context.tri(ctx, mx - k, cy - k / 2.0::f32, mx + k, cy - k / 2.0::f32, mx, cy + k / 2.0::f32, ctx.theme.text);
+    context.tri(ctx, mx - k, cy - k / 2.0::f32, mx + k, cy - k / 2.0::f32, mx, cy + k / 2.0::f32, context.paint_of(ctx, theme.TAB, button_state(hm, true)).text);
     if (hm.clicked) {
         if (s.list != 0) { s.list = 0; }
         or               { s.list = 1; }
@@ -483,18 +486,13 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
     val pop: widget.Popup = widget.begin_popup(ctx, "#list", s.list, g.x1 + g.rh * 3.0::f32 - w, g.y1, w);
     i = 0;
     for (pop.open != 0 && i < n) {
-        val r:   context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), w, g.rh);
-        val h:   interact.Hit = interact.hit(ctx, bid.of_int(pid, tabs[i].key), r.x0, r.y0, r.x1, r.y1, input.BUTTON_LEFT);
-        var bg:  draw.Color   = ctx.theme.track;
-        var ink: draw.Color   = ctx.theme.text;
-        if (s.has != 0 && tabs[i].key == s.key) {
-            bg  = ctx.theme.accent;
-            ink = ctx.theme.accent_text;
-        }
-        or (h.hot) { bg = ctx.theme.control_hot; }
-        context.fill(ctx, r.x0, r.y0, r.x1, r.y1, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, bg);
+        val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), w, g.rh);
+        val h:  interact.Hit = interact.hit(ctx, bid.of_int(pid, tabs[i].key), r.x0, r.y0, r.x1, r.y1, input.BUTTON_LEFT);
+        val os: u8           = theme.pick(h.hot, h.active, s.has != 0 && tabs[i].key == s.key, false);
+        context.box(ctx, theme.OPTION, os, r.x0, r.y0, r.x1, r.y1);
         if (tabs[i].label != nil) {
-            context.text_at(ctx, tabs[i].label, r.x0 + g.pad, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, ink);
+            val oin: f32 = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
+            context.text_at(ctx, tabs[i].label, r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, context.paint_of(ctx, theme.OPTION, os).text);
         }
         if (h.clicked) {
             s.key    = tabs[i].key;
@@ -511,9 +509,10 @@ fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usi
 }
 
 # a tab's body and label in a rect, as drawn on the strip and in its preview
-fun body(ctx: *context.Context, g: *Geom, t: *Tab, x0: f32, y0: f32, x1: f32, y1: f32, bg: draw.Color, ink: draw.Color) {
-    context.fill(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.corner), context.CORNERS_TOP, bg);
+fun body(ctx: *context.Context, g: *Geom, t: *Tab, x0: f32, y0: f32, x1: f32, y1: f32, st: u8) {
+    context.box(ctx, theme.TAB, st, x0, y0, x1, y1);
     if (t.label == nil) { ret; }
+    val ink: draw.Color = context.paint_of(ctx, theme.TAB, st).text;
     context.push_clip(ctx, x0 + g.pad, y0, maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1);
     context.text_at(ctx, t.label, x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, ink);
     context.pop_clip(ctx);
@@ -526,9 +525,10 @@ fun close_box(ctx: *context.Context, g: *Geom, tid: u64, x1: f32, ink: draw.Colo
     val by0: f32          = (g.y0 + g.y1 - g.lh) / 2.0::f32;
     val by1: f32          = by0 + g.lh;
     val h:   interact.Hit = interact.hit(ctx, bid.child(tid, "#close"), bx0, by0, bx1, by1, input.BUTTON_LEFT);
-    if (h.hot) { context.fill(ctx, bx0, by0, bx1, by1, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, ctx.theme.control_hot); }
+    val cs:  u8           = theme.pick(h.hot, h.active, false, false);
+    context.box(ctx, theme.TAB_CLOSE, cs, bx0, by0, bx1, by1);
     val k:  f32 = g.lh / 4.0::f32;
-    val lw: f32 = maxf(context.px(ctx, ctx.theme.edge_w), g.lh / 10.0::f32);
+    val lw: f32 = maxf(context.px(ctx, context.paint_of(ctx, theme.TAB_CLOSE, cs).border_w), g.lh / 10.0::f32);
     context.line(ctx, bx0 + k, by0 + k, bx1 - k, by1 - k, lw, ink);
     context.line(ctx, bx0 + k, by1 - k, bx1 - k, by0 + k, lw, ink);
     ret h.clicked;
@@ -563,14 +563,14 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
     }
 
     context.push_clip(ctx, g.x0, g.y0, g.x1, g.y1);
-    context.quad(ctx, g.x0, g.y0, g.x1, g.y1, ctx.theme.track);
+    context.box(ctx, theme.TAB_BAR, theme.NORMAL, g.x0, g.y0, g.x1, g.y1);
     val strip: interact.Hit = interact.hit(ctx, bid.child(id, "#strip"), g.x0, g.y0, g.x1, g.y1, 0);
 
     # the tab under the pointer and the slot a drop there lands in
     var over: interact.Hit;
     var slot: usize = n;
     var mark: f32   = g.x0 + g.total - s.scroll;
-    val seps: f32   = context.px(ctx, ctx.theme.edge_w);
+    val seps: f32   = context.px(ctx, context.look_of(ctx, theme.TAB).margin.r);
     var x:    f32   = g.x0 - s.scroll;
     var i:    usize = 0;
     for (i < n) {
@@ -587,15 +587,9 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
             s.index  = i;
             s.follow = 1;
         }
-        var bg:  draw.Color = ctx.theme.control;
-        var ink: draw.Color = ctx.theme.text;
-        if (s.has != 0 && s.key == t.key) {
-            bg  = ctx.theme.accent;
-            ink = ctx.theme.accent_text;
-        }
-        or (h.active) { bg = ctx.theme.control_on; }
-        or (h.hot)    { bg = ctx.theme.control_hot; }
-        body(ctx, ?g, t, x0, g.y0, x1 - seps, g.y1, bg, ink);
+        val tst: u8         = theme.pick(h.hot, h.active, s.has != 0 && s.key == t.key, false);
+        val ink: draw.Color = context.paint_of(ctx, theme.TAB, tst).text;
+        body(ctx, ?g, t, x0, g.y0, x1 - seps, g.y1, tst);
         var shut: bool = h.clicked && h.button == input.BUTTON_MIDDLE;
         if (t.closable && close_box(ctx, ?g, tid, x1 - seps, ink)) { shut = true; }
         if (t.closable && shut) {
@@ -611,7 +605,7 @@ pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
         }
         if (d.on) {
             val pv: dnd.Preview = dnd.begin_preview(ctx);
-            body(ctx, ?g, t, pv.x0, pv.y0, pv.x1, pv.y1, ctx.theme.control_hot, ctx.theme.text);
+            body(ctx, ?g, t, pv.x0, pv.y0, pv.x1, pv.y1, theme.HOT);
             dnd.end_preview(ctx, pv);
         }
 

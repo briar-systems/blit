@@ -61,6 +61,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use blit.theme;
 use blit.widget;
 
 # the kinds of value an editor edits
@@ -735,7 +736,7 @@ fun pull(ctx: *context.Context, sp: *Spec, p: ptr, d: *Drag, dx: f32) bool {
 
 # a value's text drawn in a cell, centred when it fits
 fun cell_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
-    val pad: f32 = context.px(ctx, ctx.theme.pad);
+    val pad: f32 = context.px(ctx, context.look_of(ctx, theme.VALUE).inset.l);
     val tw:  f32 = context.text_width(ctx, s);
     var tx:  f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
     if (tx < x0 + pad) { tx = x0 + pad; }
@@ -768,33 +769,35 @@ fun drag_cell(ctx: *context.Context, key: str, sp: *Spec, p: ptr, x0: f32, y0: f
     if (h.double)                            { start(ctx, key, format(sp.kind, load(sp.kind, p), ?text[0]), number_char); }
     or (h.held && pull(ctx, sp, p, d, h.dx)) { changed = true; }
 
-    var bg: draw.Color = ctx.theme.control;
-    if (h.hot)    { bg = ctx.theme.control_hot; }
-    if (h.active) { bg = ctx.theme.control_on; }
-    context.fill(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, bg);
-    cell_text(ctx, format(sp.kind, load(sp.kind, p), ?text[0]), x0, y0, x1, y1, ctx.theme.text);
+    val st: u8 = theme.pick(h.hot, h.active, false, false);
+    context.box(ctx, theme.VALUE, st, x0, y0, x1, y1);
+    cell_text(ctx, format(sp.kind, load(sp.kind, p), ?text[0]), x0, y0, x1, y1, context.paint_of(ctx, theme.VALUE, st).text);
     ret changed;
 }
 
-# height of a control row, without the gap below it
-fun row_h(ctx: *context.Context) f32 {
-    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
 }
 
-# the least width a value's cell is laid out at, unscaled
-val CELL_MIN: f32 = 48.0;
+# height of a value row: the value style's least height, grown to fit a line
+# of text with its inset
+fun row_h(ctx: *context.Context) f32 {
+    val s: *theme.Style = context.look_of(ctx, theme.VALUE);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
+}
 
 # place an editor's row and draw its label, returning the rect its cells share
 fun row(ctx: *context.Context, label: str, cells: usize, extra: f32) context.Area {
-    val pad: f32   = context.px(ctx, ctx.theme.pad);
+    val pad: f32   = context.px(ctx, context.look_of(ctx, theme.VALUE).inset.l);
     val n:   usize = bid.shown(label);
     var lw:  f32   = 0.0::f32;
     if (n > 0) { lw = context.text_width_n(ctx, label, n) + pad; }
-    val nw: f32          = lw + cells::f32 * context.px(ctx, CELL_MIN) + extra;
+    val nw: f32          = lw + cells::f32 * context.px(ctx, context.look_of(ctx, theme.VALUE).min_w) + extra;
     val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nw, row_h(ctx));
     if (n > 0) {
         val ty: f32 = r.y0 + (r.y1 - r.y0 - context.line_height(ctx)) / 2.0::f32;
-        context.text_span(ctx, label, n, r.x0, ty, ctx.theme.text);
+        context.text_span(ctx, label, n, r.x0, ty, context.paint_of(ctx, theme.LABEL, theme.NORMAL).text);
     }
     ret context.Area{x0: r.x0 + lw, y0: r.y0, x1: r.x1, y1: r.y1};
 }

@@ -29,7 +29,7 @@ blit.context.end(?ctx);
 
 `use blit;` binds the surface; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`. A submodule can also be
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -120,29 +120,63 @@ blit.widget.rich(?ctx, ?sp[0], 4);
 
 ## Theme & scale
 
-Every color and length a widget draws with comes from a theme, a plain record
-(`blit.theme.Theme`) of colors and unscaled pixel lengths: surfaces (`panel`,
-`window`, `dock`, `header`, `header_hot`), `edge`, three text tiers `text`,
-`text_dim` and `text_faint` (hints and placeholders),
-`accent` and `accent_text` (text on an accent fill), `warn`, control states (`control`, `control_hot`, `control_on`,
-`track`, `handle`, `handle_on`), the text selection highlight `select`, and the
-metrics `row`, `gap`, `pad`, `handle_w`, `bar_w`, `thumb_min`, `corner`,
-`edge_w` and `caret_w`, and for charts a `series` palette of
-`blit.theme.SERIES` colors, `grid`, `line_w`, `tick` and `area`. No widget
-holds a color or a size of its own.
+Every color and length a widget draws with comes from a theme
+(`blit.theme.Theme`) in two layers. The **tokens** are what a look is designed
+in: a palette (`panel`, `window`, `text`, `text_dim`, `text_faint`, `accent`,
+`control`, `track`, `handle` and the rest) and metrics (`row`, `gap`, container
+padding `pad`, control inset `inset`, `corner`, `edge_w`, ...). The **styles**
+are one `blit.theme.Style` per registered widget kind (`blit.theme.BUTTON`,
+`SLIDER`, `WINDOW_TITLE`, `MENU_ITEM`, ...): its corner radii, padding, inset, margins,
+least sizes and shadow, and a `Paint` per state (`NORMAL`, `HOT`, `ACTIVE`,
+`ON`, `DISABLED`, `FOCUSED`) with its fill, gradient end, text, secondary mark,
+border and shadow colors. Widgets draw from the styles alone, and no widget
+holds a color or a size of its own. Charts read the `plot` fields (`series`,
+`line_w`, `tick`, `area`) as they are.
+
+`blit.theme.derive(?t)` builds every style from the tokens, so after changing
+tokens in code, derive. `theme.set` changes one field, and for a token it
+moves every style field that took its value from the old token while keeping
+the ones set by hand (`rederive`).
 
 ```mach
-var look: blit.theme.Theme = blit.theme.default();
+val look: *blit.theme.Theme = blit.context.theme_of(?ctx);
+blit.theme.dark(look);
 look.accent = blit.draw.rgba(0.37::f32, 0.83::f32, 0.63::f32, 1.0::f32);
 look.corner = 3.0::f32;
-blit.context.set_theme(?ctx, look);
+blit.theme.derive(look);
+blit.theme.style(look, blit.theme.BUTTON).states[blit.theme.HOT].fill_to = blit.draw.hex(0x2A2E37, 1.0::f32);
 blit.context.set_scale(?ctx, 2.0::f32);
 ```
 
-- **Zero configuration.** A context draws with `blit.theme.default()` until
-  `set_theme` swaps in another, and `theme_of` hands back the live one to
-  adjust in place. `warn` is there for consumers drawing their own content in
-  the same palette. No widget uses it.
+- **Zero configuration.** A context sets its theme up with the default look,
+  and `theme_of` hands back the live one to adjust in place. A theme of your
+  own is set up with `blit.theme.init(?t, ?a)`, released with `free`, and
+  copied into a context with `blit.context.set_theme(?ctx, ?t)`. `warn` is
+  there for consumers drawing their own content in the same palette. No
+  widget uses it.
+- **Built-in themes.** `default(t)` is blit's own look (dark, square, 4 pixel
+  spacing), `dark(t)` a rounded dark look with shaded buttons and shadows
+  under floating surfaces, `light(t)` a light one and `contrast(t)` a
+  high-contrast one with outlined controls and wide focus rings. Each gives a
+  theme its look in place, keeping its kinds, and `builtin(t, name)` and
+  `BUILTIN_NAMES` reach them by name.
+- **Kinds are a registry.** `blit.theme.register_kind(t, name, doc, derive)`
+  adds a widget kind and returns its handle: `derive(t, kind, ?style)` builds
+  its style from the tokens, starting from `blit.theme.base(t)`, and runs
+  again whenever the styles are derived. The built-in kinds are registered
+  the same way when a theme is set up, in the order of their constants. A
+  registered kind is addressable by its name everywhere a built-in one is:
+  paths, wildcards, TOML tables, classes and the editor. A module adds kinds
+  of its own this way, as `blit.dock` does (`dock_space`, `dock_splitter`,
+  `dock_zone`, `dock_preview`, see `dock.register_kinds`).
+- **The box painter.** `blit.context.box(?ctx, kind, state, x0, y0, x1, y1)`
+  paints a kind in a state with the shapes of Shapes & paths: its shadow (a
+  rounded rect faded over `shadow_blur`), a flat face, or a vertical gradient
+  when `fill_to` differs from `fill`, and its outline. `box_part` rounds only
+  some corners and outlines some sides, and `box_shadow` and `box_face` paint
+  the two halves apart. A custom widget paints through it and looks like the
+  built-ins. `blit.theme.pick(hot, active, on, focused)` is the state they
+  paint in: on, then focused, then active, then hot.
 - **One scale.** `set_scale` multiplies every theme length and the size text is
   laid out and rasterised at (see glyph sources), so 2.0 doubles the whole
   interface, layout and hit rects included, for a HiDPI display or a user's
@@ -151,12 +185,224 @@ blit.context.set_scale(?ctx, 2.0::f32);
   `blit.widget.row_gap(?ctx)`, `text_row_height`, `control_row_height` and
   `control_height` (a control row without its gap) report the spacing at the
   current theme and scale.
-- **Rows fit their text.** A control row is `row` tall, or a line of text plus
-  `pad` above and below if that is taller, so a larger glyph source never
-  overflows its rows.
-- **Rounded corners.** `corner` rounds controls and containers through
-  `blit.context.fill`, a feathered rounded rect (see Shapes & paths). The
-  default is square, one quad per rect.
+- **Rows fit their text.** A control row is its style's `min_h` tall, or a
+  line of text plus its `inset` above and below if that is taller, so a
+  larger glyph source never overflows its rows.
+
+### Overrides and classes
+
+Every field has a path: `palette.accent`, `metrics.gap`, `plot.series.3`,
+`button.radius` for a style field and `button.hot.fill` for a paint field,
+with `*` for every kind or state. `blit.style` pushes a value onto every field
+a path names until the matching pop, so a scope of widgets draws differently
+and nothing else does:
+
+```mach
+blit.style.push_color(?ctx, "button.*.fill", blit.draw.hex(0xB03030, 1.0::f32));
+blit.style.push_length(?ctx, "*.*.border_w", 0.0::f32);
+blit.widget.button(?ctx, "delete");
+blit.style.pop(?ctx);
+blit.style.pop(?ctx);
+```
+
+`push_color`, `push_length`, `push_radii`, `push_edges` and the untyped `push`
+refuse a path naming no field of their unit, and still open an empty push so
+every push pairs with its pop. A frame left with pushes open is restored at
+the next `begin`.
+
+A class is a named list of such settings, applied to a widget call with
+`push_class` and `pop`:
+
+```mach
+val danger: opt[u32] = blit.style.add_class(?ctx, "danger");
+blit.style.set(?ctx, danger.some, "button.*.fill", blit.theme.of_color(red));
+blit.style.set(?ctx, danger.some, "button.hot.fill", blit.theme.of_color(bright_red));
+# per frame:
+blit.style.push_class(?ctx, danger.some);
+blit.widget.button(?ctx, "delete");
+blit.style.pop(?ctx);
+```
+
+### Themes as TOML
+
+Themes are TOML, read with `std.data.toml` and written with `blit.writer`.
+`blit.style.load_theme(?ctx, text)` replaces the context's theme with one a
+document describes, and reads its classes, so a running interface reloads its
+look whenever the host reads the file again. `save_theme(?ctx)` writes the
+theme and the classes back out. `blit.theme.load(t, text)` and `save` read and
+write a theme alone. A document styles a registered kind by name, and a kind
+not registered when it is read is refused like any unknown key, so a host
+registers its kinds before loading.
+
+```toml
+base = "dark"            # a built-in to start from, default when absent
+
+[palette]                # tokens: every style built from one follows it
+accent = "#5b9dff"
+
+[metrics]
+corner = 6
+
+[plot]
+series = ["#5b9dff", "#f0a040"]
+
+[button]                 # a kind's style fields
+inset = [8, 4, 8, 4]     # one length for every side, or left, top, right, bottom
+
+[button.hot]             # a kind's paint fields in a state
+fill = "#3a4050"
+fill_to = "#2a2e37"
+
+["*".focused]            # every kind
+border_w = 2.0
+
+[class.danger]           # a class: paths and their values
+"button.*.fill" = "#b03030"
+```
+
+Colors are `#rgb`, `#rrggbb` or `#rrggbbaa`, or an array of three or four
+numbers in [0, 1]. A key naming no field, kind or state, a value that does not
+fit its field and a `base` naming no built-in are refused with their byte
+offset in the document (`blit.theme.LoadError`), and a refused theme changes
+nothing. A save writes the tokens and `plot` in full and a style field only
+where it differs from what the tokens derive, colors in hex when hex holds
+them exactly, so the file stays short and reads back to the same theme
+exactly.
+
+### Theme editor
+
+`blit.editor.theme_editor(?ctx, key, h)` edits the context's live theme with
+blit's own widgets: built-in themes by button, a group (the palette, the
+metrics, the chart fields or a widget kind) and a state by dropdown, and the
+group's fields in a scrolling list `h` pixels tall, each with its meaning from
+the field table and a slider per float. It returns `blit.editor.EDITED` on a
+frame an edit changed the theme and `SAVE` when its save button was pressed,
+and the host writes `blit.style.save_theme(?ctx)` wherever it keeps themes.
+
+### Theme fields
+
+The field table (`blit.theme.FIELDS`) is the one source of the paths, units
+and meanings below: TOML, overrides, classes and the editor read it, and a
+test holds this README's copy to it (`blit.theme.document` writes it). The
+kind table lists the built-in kinds; a registered kind carries its own
+meaning, which `document` lists for the theme it is given and the editor
+shows.
+
+| path | unit | meaning |
+|---|---|---|
+| `palette.panel` | color | panel background |
+| `palette.window` | color | window, popup, menu, tooltip and modal background |
+| `palette.dock` | color | docked container background |
+| `palette.header` | color | window titlebar and section heading |
+| `palette.header_hot` | color | a titlebar or heading under the cursor |
+| `palette.edge` | color | a dock's inner edge and a separator's rule |
+| `palette.text` | color | text |
+| `palette.text_dim` | color | secondary text and glyphs: notes, readings, carets, axis labels |
+| `palette.text_faint` | color | the faintest text: hints, placeholders and disabled text |
+| `palette.accent` | color | a mark that is on (a checked box, a chosen button, a selected row) and a focused field's outline |
+| `palette.accent_text` | color | text and marks drawn on an accent fill |
+| `palette.warn` | color | warnings, for consumers drawing their own content; no widget uses it |
+| `palette.control` | color | a control's face at rest |
+| `palette.control_hot` | color | a control under the cursor |
+| `palette.control_on` | color | a control pressed, a dropdown open or a menu's header open |
+| `palette.track` | color | a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face |
+| `palette.handle` | color | a slider handle, toggle knob or scrollbar thumb at rest |
+| `palette.handle_on` | color | a handle, knob or thumb being dragged or hovered |
+| `palette.select` | color | the highlight behind selected text |
+| `palette.grid` | color | chart grid lines |
+| `metrics.row` | length | least height of a control row, which grows to fit a line of text and its inset |
+| `metrics.gap` | length | space between layout rows, cells and buttons in a row |
+| `metrics.pad` | length | container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content |
+| `metrics.inset` | length | control inset: between a control's edge and its text, and between a box and its label |
+| `metrics.handle_w` | length | slider handle width |
+| `metrics.bar_w` | length | scrollbar width |
+| `metrics.thumb_min` | length | shortest scrollbar thumb |
+| `metrics.corner` | length | corner radius of controls and containers, 0 for square |
+| `metrics.edge_w` | length | width of an edge line: a dock's inner side, a chart's rules and a focused field's outline |
+| `metrics.caret_w` | length | width of a text field's caret |
+| `plot.series` | color x 8 | chart series colors, series k drawing in series[k % 8] |
+| `plot.line_w` | length | width of a chart line |
+| `plot.tick` | length | length of a chart axis tick |
+| `plot.area` | factor | alpha factor of the area filled under a chart line, in [0, 1] |
+| `<kind>.radius` | 4 lengths | corner radii: top-left, top-right, bottom-right, bottom-left |
+| `<kind>.pad` | 4 lengths | container padding between its edges and its content: left, top, right, bottom |
+| `<kind>.inset` | 4 lengths | control inset between its edges and its text: left, top, right, bottom |
+| `<kind>.margin` | 4 lengths | space around the widget: left, top, right (between cells), bottom (between rows) |
+| `<kind>.min_w` | length | least width |
+| `<kind>.min_h` | length | least height, a control's row height before it grows to fit its text |
+| `<kind>.shadow_x` | length | shadow offset right |
+| `<kind>.shadow_y` | length | shadow offset down |
+| `<kind>.shadow_blur` | length | how far the shadow fades out, 0 for a hard edge |
+| `<kind>.<state>.fill` | color | the face, at its top when it is a gradient |
+| `<kind>.<state>.fill_to` | color | the face at its bottom: equal to fill for a flat face, else a vertical gradient |
+| `<kind>.<state>.text` | color | text drawn on the face |
+| `<kind>.<state>.mark` | color | secondary ink: a glyph, a caret, a reading or a hint |
+| `<kind>.<state>.border` | color | the outline, transparent for none |
+| `<kind>.<state>.border_w` | length | the outline's width |
+| `<kind>.<state>.shadow` | color | the shadow's color, transparent for none |
+
+| kind | what it styles |
+|---|---|
+| `label` | a line of text, and a wrapped note in mark |
+| `layout` | layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row |
+| `panel` | a panel's background, pad around its column |
+| `window` | a window's body and its shadow, pad around its column, margin the resize grips outside its edges |
+| `window_title` | a window's titlebar: text the title, mark the collapse glyph, hot under the cursor |
+| `dock` | a docked panel: fill the body, border its inner edge, pad around its column |
+| `popup` | a popup's body, such as a dropdown's options |
+| `button` | a button, on when drawn chosen; margin.r between buttons in a row |
+| `checkbox` | a checkbox's box: pad around the mark, inset.l between the box and the label |
+| `checkbox_mark` | a checkbox's mark, drawn in its on state |
+| `toggle` | a toggle's switch track and label, on while set: pad between the row and the track |
+| `toggle_knob` | a toggle's knob, in the toggle's state: margin between the knob and the track |
+| `slider` | a slider's track: text the label, mark the reading |
+| `slider_handle` | a slider's handle: min_w its width |
+| `dropdown` | a dropdown's header, on while open |
+| `field` | a text field: mark the hint, focused while it holds the keyboard |
+| `field_caret` | a text field's caret and its composition underline: fill, min_w the width |
+| `field_select` | the highlight behind selected text: fill |
+| `section` | a collapsible section heading: mark the caret |
+| `scrollbar` | a scrollbar's track: min_w its width, margin.l between it and the content |
+| `scrollbar_thumb` | a scrollbar's thumb: min_h its least length |
+| `list` | a list's body |
+| `list_item` | a list's row, on while selected |
+| `chart` | a chart: border the grid, mark the axes, ticks, labels and hover guide, inset around labels, margin.r between bars |
+| `tab` | a tab, on while chosen, and a tab bar's overflow buttons, disabled when they cannot act: margin.r between tabs |
+| `tooltip` | a tooltip, and a chart's read-out: pad around its content, inset around a read-out's text, margin.t below the widget it describes |
+| `menu` | a menu's body, pad around its rows, min_w its least width |
+| `menu_item` | a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent |
+| `overlay` | an overlay, chrome-free unless its style gives it a fill or a border: pad around its content |
+| `modal` | a modal dialog's body |
+| `scrim` | the scrim over everything behind a modal dialog |
+| `radio` | a radio button's ring: pad around the dot, inset.l between the ring and the label |
+| `radio_mark` | a radio button's dot, drawn in its on state |
+| `progress` | a progress bar's track and its text |
+| `progress_bar` | a progress bar's done part |
+| `separator` | a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule |
+| `tree_item` | a tree's row, on while selected: mark the caret |
+| `drop_target` | where a drag would drop: fill and border |
+| `drag_preview` | what a drag carries, drawn at the cursor |
+| `menu_bar` | a menu bar's background |
+| `menu_title` | a menu's header in a menu bar, on while its menu is open |
+| `option` | a row of a dropdown's or a tab list's options, on while chosen |
+| `tab_bar` | a tab bar's strip behind its tabs |
+| `tab_close` | a tab's close box: fill under the cursor, border_w the cross's stroke |
+| `table_header` | a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width |
+| `table_cell` | a table's body cell: inset around its widgets, its row height from min_h and inset |
+| `table_rule` | a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width |
+| `value` | a value editor's drag cell: inset around its text and before its row's cells, min_w its least width |
+| `picker` | a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label |
+| `checker` | the checkerboard alpha shows through: fill and mark its two cells |
+| `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
+
+| state | when |
+|---|---|
+| `normal` | at rest |
+| `hot` | under the cursor |
+| `active` | pressed or dragged |
+| `on` | set: checked, chosen, selected or open |
+| `disabled` | drawn but not taking input |
+| `focused` | holding the keyboard |
 
 ## Docking
 
@@ -218,9 +464,13 @@ blit.widget.end_window(?ctx, w);
   as `[dock.<id>]`, `[docknode.<id>]` and `[docked.<id>]` tables, loaded
   pinned, so a loaded layout waits for its space however late it is drawn.
   `empty` tells a space with no layout yet, to build a default one only then.
-- **Look.** The chrome draws from the theme: the `dock` background, `handle`
-  and `handle_on` splitters, `control` and `accent` zones, and the `select`
-  tint for the preview.
+- **Look.** The chrome draws in four kinds `blit.dock.register_kinds(t)`
+  registers on a theme, which a dock does on the context's theme the first
+  time it draws: `dock_space` (the background), `dock_splitter` (a splitter
+  while hot or dragged, `min_w` its thickness), `dock_zone` (a drop zone,
+  hot under the drag) and `dock_preview` (where a window would land). A side
+  panel's edge and padding are the built-in `dock` style's. A host loading a
+  theme file that styles them registers them first.
 
 ### Side panels
 
@@ -514,8 +764,8 @@ if (t.dropped) { move_layer(@(t.data::*u64), here); }
   it), `missed` (released over no target) or `cancelled` (Escape) is set, so a
   dragged tab can become a window when no tab bar took it.
 - **Target.** `target` reports a drag of its type over it when its hit is
-  hot, the topmost claimant under the pointer, and draws the theme's accept
-  highlight (the `select` tint under an `accent` outline) over the rect.
+  hot, the topmost claimant under the pointer, and draws the accept
+  highlight (the `drop_target` style) over the rect.
   `Drop.dropped` is the frame the button comes up over it, with the payload
   in `data` and `n` and the starting widget in `source`. A target accepting
   several types calls `target` once per type with the same hit. A target with
@@ -595,8 +845,9 @@ works inside surfaces, docks and windows alike.
   as `button_at(?ctx, label, x0, y0, x1, y1, on)`. `begin_columns(?ctx, n)`,
   `next_column` and `end_columns` lay whole widgets side by side and resume
   below the tallest column.
-- **Style.** The gaps between items and the padding containers keep come from
-  the theme (`gap`, `pad`) at the context's scale.
+- **Style.** The gaps between items come from the `layout` style's margins
+  (`margin.b` down a column, `margin.r` across a row), and the padding a
+  container keeps from its own style's `pad`, at the context's scale.
 
 This is a breaking change from the loose layout fields: `Context.ox`, `oy`,
 `cx`, `cy` and `pw` are gone (read `avail` instead), as are the saved-layout
@@ -727,7 +978,7 @@ layout cursor across the column like `blit.widget`'s:
   it animates while drawn and an interface without one still reports `none`
   from `next_frame`. Either takes text to centre over the bar, nil for none.
 - **Separators.** `separator(?ctx)` is a rule across the column in the
-  theme's `edge` color, `edge_w` thick, and `separator_label(?ctx, label)` runs
+  `separator` style's `border` color, `border_w` thick, and `separator_label(?ctx, label)` runs
   the rule on from a dim label.
 - **Combo.** `combo(?ctx, label, ?selected, ?options[0], count)` is a select
   whose popup holds a filter field that takes the keyboard when it opens.
@@ -989,6 +1240,8 @@ if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
   claims every button, so nothing beneath it is hovered, pressed or scrolled,
   while the widgets inside the modal work as usual. Popups, dropdowns and menus
   opened inside a modal stack above it.
+  The scrim paints in the `scrim` style, the body and its shadow in `modal`
+  and the titlebar in `window_title`.
 - **Placement.** A `Modal` declares a title, a width (0 to fit its widgets),
   a greatest width and `MODAL_*` flags. It opens centred, or with its top left
   at `x`, `y` under `MODAL_ANCHORED`, and stays on the screen. Its size is
@@ -1047,7 +1300,7 @@ o.keep = 1;
   measured spends its first frame hidden, only measuring, and asks for the
   next at once, as a fitted stack does.
 - **No chrome, no claim.** A bare overlay draws no title, frame or
-  background, and claims nothing itself: input stops only where its widgets
+  background unless its style gives it one, and claims nothing itself: input stops only where its widgets
   claim, so the world under its empty space and its text stays interactive.
 - **Order.** Overlays paint and take input in the overlays band, above docks
   and windows and beneath popups, menus and modals. `order` places one among
@@ -1106,9 +1359,10 @@ blit.tooltip.end(?ctx, tip);
   pointer. Its content is for reading: a widget in it that claims would take
   the hover from the widget it describes.
 
-Toasts and tooltips draw their cards with the window surface, the edge line,
-the text colour, the padding and the corner radius of the theme, read through
-`blit.overlay.chrome(?ctx, kind)`.
+Overlays, toasts and tooltips draw in the `overlay`, `toast` and `tooltip`
+styles, which `blit.overlay.chrome(?ctx, kind)` reads at rest and
+`blit.overlay.paint` draws. A bare overlay's style has no fill or outline, so
+it stays chrome-free until a theme gives it one.
 
 ## Charts
 

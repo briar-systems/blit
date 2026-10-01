@@ -64,6 +64,7 @@ use blit.interact;
 use blit.layout;
 use blit.menu;
 use blit.state;
+use blit.theme;
 use blit.widget;
 
 # no sort
@@ -296,13 +297,20 @@ fun clampd(v: f64, lo: f64, hi: f64) f64 {
     ret v;
 }
 
-fun pad(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.pad);
+# a kind's left inset, at the context's scale
+fun pad(ctx: *context.Context, kind: u32) f32 {
+    ret context.px(ctx, context.look_of(ctx, kind).inset.l);
 }
 
-# height of a control row, without the gap below it
-fun row_h(ctx: *context.Context) f32 {
-    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+# a kind's row: its least height, grown to fit a line of text with its inset
+fun row_of(ctx: *context.Context, kind: u32) f32 {
+    val s: *theme.Style = context.look_of(ctx, kind);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
+}
+
+# a table rule's paint in a state
+fun rule_of(ctx: *context.Context, state: u8) *theme.Paint {
+    ret context.paint_of(ctx, theme.TABLE_RULE, state);
 }
 
 # the scope a cell's widgets are keyed in: the column's label under the row's
@@ -324,7 +332,7 @@ fun column_state(ctx: *context.Context, c: *Column, i: usize) *ColumnState {
         cs.pos   = i::u32;
         cs.width = c.width;
         if (cs.width <= 0.0::f32) {
-            val label: f32 = context.text_width_n(ctx, c.label, bid.shown(c.label)) + context.line_height(ctx) + pad(ctx) * 3.0::f32;
+            val label: f32 = context.text_width_n(ctx, c.label, bid.shown(c.label)) + context.line_height(ctx) + pad(ctx, theme.TABLE_HEADER) * 3.0::f32;
             cs.width = label / context.scale_of(ctx);
         }
         if ((c.flags & HIDDEN) != 0) { cs.hidden = 1; }
@@ -339,7 +347,7 @@ fun column_state(ctx: *context.Context, c: *Column, i: usize) *ColumnState {
 # a column's least width in unscaled pixels
 fun least(ctx: *context.Context, c: *Column) f32 {
     if (c.min > 0.0::f32) { ret c.min; }
-    ret ctx.theme.row;
+    ret context.look_of(ctx, theme.TABLE_HEADER).min_w;
 }
 
 # mark every column's layout and the table's as the user's, pinning them
@@ -503,8 +511,8 @@ pub fun begin(ctx: *context.Context, key: str, cols: *Column, n: usize, o: Optio
     }
 
     t.rh = o.row_h;
-    if (t.rh <= 0.0::f32) { t.rh = row_h(ctx); }
-    if (o.header)         { t.hh = row_h(ctx); }
+    if (t.rh <= 0.0::f32) { t.rh = row_of(ctx, theme.TABLE_CELL); }
+    if (o.header)         { t.hh = row_of(ctx, theme.TABLE_HEADER); }
     t.fr = o.freeze_rows;
     if (t.fr > o.rows) { t.fr = o.rows; }
 
@@ -515,7 +523,7 @@ pub fun begin(ctx: *context.Context, key: str, cols: *Column, n: usize, o: Optio
     t.y1 = a.y1;
 
     # scrollbars where the content outgrows the view, each narrowing the other's room
-    val bar: f32 = context.px(ctx, ctx.theme.bar_w);
+    val bar: f32 = context.px(ctx, context.look_of(ctx, theme.SCROLLBAR).min_w);
     val top: f32 = t.y0 + t.hh + t.fr::f32 * t.rh;
     t.ch = (o.rows - t.fr)::f64 * t.rh::f64;
     var need_v: bool = t.ch > (t.y1 - top)::f64;
@@ -601,22 +609,23 @@ fun carried(ctx: *context.Context, t: *Table) opt[Carry] {
 
 # a header cell's face and label, with the sort arrow when it is sorted by
 fun head_face(ctx: *context.Context, t: *Table, c: *Column, ci: usize, x0: f32, y0: f32, x1: f32, y1: f32, hot: bool) {
-    var bg: draw.Color = ctx.theme.header;
-    if (hot) { bg = ctx.theme.header_hot; }
-    context.quad(ctx, x0, y0, x1, y1, bg);
+    val st: u8           = theme.pick(hot, false, false, false);
+    val hp: *theme.Paint = context.paint_of(ctx, theme.TABLE_HEADER, st);
+    val p:  f32          = pad(ctx, theme.TABLE_HEADER);
+    context.box(ctx, theme.TABLE_HEADER, st, x0, y0, x1, y1);
     val lh: f32 = context.line_height(ctx);
     val ty: f32 = y0 + (y1 - y0 - lh) / 2.0::f32;
-    context.text_span(ctx, c.label, bid.shown(c.label), x0 + pad(ctx), ty, ctx.theme.text);
+    context.text_span(ctx, c.label, bid.shown(c.label), x0 + p, ty, hp.text);
     if (t.sort != ci) { ret; }
     # a triangle half a line wide at the right, up for ascending
     val s:  f32 = lh / 2.0::f32;
-    val ax: f32 = x1 - pad(ctx) * 3.0::f32 - s;
+    val ax: f32 = x1 - p * 3.0::f32 - s;
     val ay: f32 = y0 + (y1 - y0 - s / 2.0::f32) / 2.0::f32;
     if (t.dir == SORT_ASC) {
-        context.tri(ctx, ax, ay + s / 2.0::f32, ax + s, ay + s / 2.0::f32, ax + s / 2.0::f32, ay, ctx.theme.text_dim);
+        context.tri(ctx, ax, ay + s / 2.0::f32, ax + s, ay + s / 2.0::f32, ax + s / 2.0::f32, ay, hp.mark);
     }
     or {
-        context.tri(ctx, ax, ay, ax + s, ay, ax + s / 2.0::f32, ay + s / 2.0::f32, ctx.theme.text_dim);
+        context.tri(ctx, ax, ay, ax + s, ay, ax + s / 2.0::f32, ay + s / 2.0::f32, hp.mark);
     }
 }
 
@@ -671,27 +680,28 @@ fun head(ctx: *context.Context, t: *Table, st: *TableState, c: *Column, ci: usiz
         }
     }
 
-    var rule: draw.Color = ctx.theme.edge;
+    var rs: u8 = theme.NORMAL;
     if ((c.flags & NO_RESIZE) == 0) {
-        val g:  f32          = pad(ctx);
-        val hg: interact.Hit = interact.hit(ctx, bid.child(c.id, "#grip"), x1 - g * 2.0::f32, y0, x1, y1, input.BUTTON_LEFT);
+        val g:  f32          = context.px(ctx, context.look_of(ctx, theme.TABLE_RULE).min_w);
+        val hg: interact.Hit = interact.hit(ctx, bid.child(c.id, "#grip"), x1 - g, y0, x1, y1, input.BUTTON_LEFT);
         if (hg.pressed) {
             val cs: *ColumnState = column_state(ctx, c, ci);
             cs.grab = maxf(cs.width, least(ctx, c));
         }
         if (hg.hot || hg.active) {
             context.set_cursor(ctx, input.CURSOR_RESIZE_EW);
-            rule = ctx.theme.accent;
+            rs = theme.pick(hg.hot, hg.active, false, false);
         }
     }
-    val ew: f32 = context.px(ctx, ctx.theme.edge_w);
-    context.quad(ctx, x1 - ew, y0, x1, y1, rule);
+    val rp: *theme.Paint = rule_of(ctx, rs);
+    val ew: f32          = context.px(ctx, rp.border_w);
+    context.quad(ctx, x1 - ew, y0, x1, y1, rp.border);
     context.pop_clip(ctx);
 }
 
 # the header row across the table
 fun header(ctx: *context.Context, t: *Table, st: *TableState) {
-    context.quad(ctx, t.x0, t.y0, t.x1, t.y0 + t.hh, ctx.theme.header);
+    context.box(ctx, theme.TABLE_HEADER, theme.NORMAL, t.x0, t.y0, t.x1, t.y0 + t.hh);
     var i: usize = 0;
     for (i < t.n) {
         val ci: usize   = t.cols[i].order;
@@ -775,7 +785,7 @@ pub fun cell(ctx: *context.Context, t: *Table, c: usize) bool {
 
     context.push_id(ctx, context.id_of(ctx, col.label));
     context.push_clip(ctx, maxf(x0, rx0), maxf(t.ry0, ry0), minf(x1, rx1), minf(y1, ry1));
-    val p: f32          = pad(ctx);
+    val p: f32          = pad(ctx, theme.TABLE_CELL);
     var f: layout.Frame = layout.column(x0 + p, t.ry0, maxf(col.w - p * 2.0::f32, 0.0::f32), t.rh, widget.row_gap(ctx));
     f.axis  = layout.Axis.horizontal{};
     f.align = layout.Align.center{};
@@ -813,7 +823,7 @@ fun chooser(ctx: *context.Context, t: *Table, st: *TableState) {
 fun thumb(ctx: *context.Context, track: f32, view: f64, content: f64, at: f64, most: f64, t0: *f32, tl: *f32) {
     var l: f32 = track;
     if (content > 0.0::f64) { l = (track::f64 * view / content)::f32; }
-    l   = clampf(l, context.px(ctx, ctx.theme.thumb_min), track);
+    l   = clampf(l, context.px(ctx, context.look_of(ctx, theme.SCROLLBAR_THUMB).min_h), track);
     @tl = l;
     @t0 = 0.0::f32;
     if (most > 0.0::f64) { @t0 = ((track - l)::f64 * at / most)::f32; }
@@ -821,15 +831,14 @@ fun thumb(ctx: *context.Context, track: f32, view: f64, content: f64, at: f64, m
 
 # the scrollbars, dragged by their thumbs
 fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
-    val top:    f32 = t.y0 + t.hh + t.fr::f32 * t.rh;
-    val vh:     f32 = maxf(t.vy1 - top, 0.0::f32);
-    val my:     f64 = most_y(t, vh);
-    val mx:     f32 = most_x(t);
-    var dx:     f32;
-    var dy:     f32;
-    var t0:     f32;
-    var tl:     f32;
-    val corner: f32 = context.px(ctx, ctx.theme.corner);
+    val top: f32 = t.y0 + t.hh + t.fr::f32 * t.rh;
+    val vh:  f32 = maxf(t.vy1 - top, 0.0::f32);
+    val my:  f64 = most_y(t, vh);
+    val mx:  f32 = most_x(t);
+    var dx:  f32;
+    var dy:  f32;
+    var t0:  f32;
+    var tl:  f32;
 
     if (t.vx1 < t.x1) {
         val id:    u64 = bid.child(t.id, "#vthumb");
@@ -841,10 +850,8 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
         }
         val h: interact.Hit = interact.hit(ctx, id, t.vx1, top + t0, t.x1, top + t0 + tl, input.BUTTON_LEFT);
         if (h.pressed) { st.gy = st.sy; }
-        var tc: draw.Color = ctx.theme.handle;
-        if (h.active) { tc = ctx.theme.handle_on; }
-        context.fill(ctx, t.vx1, top, t.x1, t.vy1, corner, context.CORNERS_ALL, ctx.theme.track);
-        context.fill(ctx, t.vx1, top + t0, t.x1, top + t0 + tl, corner, context.CORNERS_ALL, tc);
+        context.box(ctx, theme.SCROLLBAR, theme.NORMAL, t.vx1, top, t.x1, t.vy1);
+        context.box(ctx, theme.SCROLLBAR_THUMB, theme.pick(h.hot, h.active, false, false), t.vx1, top + t0, t.x1, top + t0 + tl);
     }
     if (t.vy1 < t.y1) {
         val id:    u64 = bid.child(t.id, "#hthumb");
@@ -857,10 +864,8 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
         }
         val h: interact.Hit = interact.hit(ctx, id, x0 + t0, t.vy1, x0 + t0 + tl, t.y1, input.BUTTON_LEFT);
         if (h.pressed) { st.gx = st.sx; }
-        var tc: draw.Color = ctx.theme.handle;
-        if (h.active) { tc = ctx.theme.handle_on; }
-        context.fill(ctx, x0, t.vy1, t.vx1, t.y1, corner, context.CORNERS_ALL, ctx.theme.track);
-        context.fill(ctx, x0 + t0, t.vy1, x0 + t0 + tl, t.y1, corner, context.CORNERS_ALL, tc);
+        context.box(ctx, theme.SCROLLBAR, theme.NORMAL, x0, t.vy1, t.vx1, t.y1);
+        context.box(ctx, theme.SCROLLBAR_THUMB, theme.pick(h.hot, h.active, false, false), x0 + t0, t.vy1, x0 + t0 + tl, t.y1);
     }
 }
 
@@ -877,9 +882,10 @@ pub fun end(ctx: *context.Context, t: *Table) {
     val st: *TableState = state.get[TableState](ctx, t.id);
 
     # a rule down each shown column's right edge, in its strip
-    val by0: f32   = t.y0 + t.hh;
-    val ew:  f32   = context.px(ctx, ctx.theme.edge_w);
-    var i:   usize = 0;
+    val by0: f32          = t.y0 + t.hh;
+    val rp:  *theme.Paint = rule_of(ctx, theme.NORMAL);
+    val ew:  f32          = context.px(ctx, rp.border_w);
+    var i:   usize        = 0;
     for (i < t.n) {
         val c: *Column = ?t.cols[i];
         if (c.shown) {
@@ -889,7 +895,7 @@ pub fun end(ctx: *context.Context, t: *Table) {
             val x1: f32 = left(t, c) + c.w;
             if (x1 > rx0 && x1 - ew < rx1) {
                 context.push_clip(ctx, rx0, by0, rx1, t.vy1);
-                context.quad(ctx, x1 - ew, by0, x1, t.vy1, ctx.theme.edge);
+                context.quad(ctx, x1 - ew, by0, x1, t.vy1, rp.border);
                 context.pop_clip(ctx);
             }
         }
@@ -897,7 +903,7 @@ pub fun end(ctx: *context.Context, t: *Table) {
     }
     if (t.fr > 0) {
         val fy: f32 = by0 + t.fr::f32 * t.rh;
-        context.quad(ctx, t.x0, fy - ew, t.vx1, fy, ctx.theme.edge);
+        context.quad(ctx, t.x0, fy - ew, t.vx1, fy, rp.border);
     }
 
     chooser(ctx, t, st);

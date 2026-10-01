@@ -30,9 +30,9 @@ fun main(argc: i64, argv: **u8) i64 {
     # a target that encodes sRGB gets linear colors
     blit.context.set_srgb(?ctx, 1);
     # a rounder look at 150%: every theme metric and all text scale with it
-    var look: blit.theme.Theme = blit.theme.default();
+    val look: *blit.theme.Theme = blit.context.theme_of(?ctx);
     look.corner = 3.0::f32;
-    blit.context.set_theme(?ctx, look);
+    blit.theme.derive(look);
     blit.context.set_scale(?ctx, 1.5::f32);
 
     var checked: u8    = 1;

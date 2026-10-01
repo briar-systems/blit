@@ -54,6 +54,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use blit.theme;
 use blit.widget;
 
 # modal flags a declaration combines with |
@@ -162,53 +163,21 @@ rec Stack {
     key:   u64;
 }
 
-# the colors a modal draws with
-# ---
-# scrim:      the scrim over everything beneath it
-# body:       its body
-# header:     its titlebar
-# header_hot: its titlebar under the cursor
-# title:      its title
-# close:      its close button's mark
-# close_hot:  its close button's mark under the cursor
-rec Look {
-    scrim:      draw.Color;
-    body:       draw.Color;
-    header:     draw.Color;
-    header_hot: draw.Color;
-    title:      draw.Color;
-    close:      draw.Color;
-    close_hot:  draw.Color;
+# the modal style's padding around its body column, at the context's scale
+fun pads(ctx: *context.Context) theme.Edges {
+    ret context.px_edges(ctx, context.look_of(ctx, theme.MODAL).pad);
 }
 
-# the one place a modal reads its colors from the theme
-fun look(ctx: *context.Context) Look {
-    ret Look{
-        scrim:      draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32),
-        body:       ctx.theme.window,
-        header:     ctx.theme.header,
-        header_hot: ctx.theme.header_hot,
-        title:      ctx.theme.text,
-        close:      ctx.theme.text_dim,
-        close_hot:  ctx.theme.text
-    };
-}
-
-fun pad(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.pad);
-}
-
+# the layout style's space between items down a column, at the context's scale
 fun gap(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.gap);
+    ret context.px(ctx, context.look_of(ctx, theme.LAYOUT).margin.b);
 }
 
-fun corner(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.corner);
-}
-
-# a titlebar's height: the theme's row, grown to fit a line of text
+# a titlebar's height: the window title style's least height, grown to fit a
+# line of text with its inset
 fun row_h(ctx: *context.Context) f32 {
-    ret maxf(context.px(ctx, ctx.theme.row), context.line_height(ctx) + pad(ctx) * 2.0::f32);
+    val s: *theme.Style = context.look_of(ctx, theme.WINDOW_TITLE);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
 }
 
 fun maxf(a: f32, b: f32) f32 {
@@ -363,25 +332,25 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
     context.push_id(ctx, r.id);
     st.key = hit.key(context.layer_of(ctx), ctx.ordinal);
 
-    val lk:    Look         = look(ctx);
     val every: u8           = input.BUTTON_LEFT | input.BUTTON_RIGHT | input.BUTTON_MIDDLE | input.BUTTON_X1 | input.BUTTON_X2;
     val sh:    interact.Hit = interact.hit(ctx, bid.child(r.id, "#scrim"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, every);
     if (sh.pressed && (m.flags & MODAL_SCRIM_CLOSES) != 0) {
         dismiss(ctx, ?r, CLOSE_SCRIM);
         ret r;
     }
-    context.quad(ctx, 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, lk.scrim);
+    context.box(ctx, theme.SCRIM, theme.NORMAL, 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
 
-    val p:  f32 = pad(ctx);
-    var th: f32 = row_h(ctx);
+    val pd: theme.Edges = pads(ctx);
+    val ti: theme.Edges = context.px_edges(ctx, context.look_of(ctx, theme.WINDOW_TITLE).inset);
+    var th: f32         = row_h(ctx);
     if ((m.flags & MODAL_NO_TITLE) != 0) { th = 0.0::f32; }
     r.th = th;
     val closer:  bool = th > 0.0::f32 && (m.flags & MODAL_NO_CLOSE) == 0;
     var close_w: f32  = 0.0::f32;
     if (closer) { close_w = th; }
-    r.min_w = p * 2.0::f32;
-    if (th > 0.0::f32) { r.min_w = p * 2.0::f32 + context.text_width_n(ctx, m.title, bid.shown(m.title)) + close_w; }
-    r.max_w = maxf(ctx.sw - p * 2.0::f32, r.min_w);
+    r.min_w = pd.l + pd.r;
+    if (th > 0.0::f32) { r.min_w = maxf(r.min_w, ti.l + ti.r + context.text_width_n(ctx, m.title, bid.shown(m.title)) + close_w); }
+    r.max_w = maxf(ctx.sw - pd.l - pd.r, r.min_w);
     if (m.max_w > 0.0::f32) { r.max_w = clampf(m.max_w, r.min_w, r.max_w); }
     r.auto = m.w <= 0.0::f32;
 
@@ -410,6 +379,10 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
     r.y0 = y0;
 
     r.claim = context.reserve_claim(ctx, r.id);
+    # the modal's shadow and body draw beneath its titlebar, which draws
+    # beneath its widgets
+    r.ch = context.split(ctx, 3);
+    context.set_channel(ctx, r.ch, 1);
 
     if (th > 0.0::f32) {
         val x1: f32 = x0 + w;
@@ -423,22 +396,21 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
                 ret r;
             }
         }
-        var bg: draw.Color = lk.header;
-        if (hx.hot) { bg = lk.header_hot; }
-        context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_TOP, bg);
+        val ts: u8           = theme.pick(hx.hot, hx.active, false, false);
+        val tp: *theme.Paint = context.paint_of(ctx, theme.WINDOW_TITLE, ts);
+        context.box_face(ctx, theme.WINDOW_TITLE, ts, x0, y0, x1, y1, context.CORNERS_TOP, context.SIDES_ALL);
         val ty: f32 = y0 + (th - context.line_height(ctx)) / 2.0::f32;
-        context.text_span(ctx, m.title, bid.shown(m.title), x0 + p, ty, lk.title);
+        context.text_span(ctx, m.title, bid.shown(m.title), x0 + ti.l, ty, tp.text);
         if (closer) {
-            var xc: draw.Color = lk.close;
-            if (hx.hot) { xc = lk.close_hot; }
+            var xc: draw.Color = tp.mark;
+            if (hx.hot) { xc = tp.text; }
             val gw: f32 = context.text_width(ctx, "x");
             context.glyph(ctx, 'x', x1 - th + (th - gw) / 2.0::f32, ty, xc);
         }
     }
 
-    r.ch = context.split(ctx, 2);
-    context.set_channel(ctx, r.ch, 1);
-    context.push_layout(ctx, layout.column(x0 + p, y0 + th + p, w - p * 2.0::f32, 0.0::f32, gap(ctx)));
+    context.set_channel(ctx, r.ch, 2);
+    context.push_layout(ctx, layout.column(x0 + pd.l, y0 + th + pd.t, maxf(w - pd.l - pd.r, 0.0::f32), 0.0::f32, gap(ctx)));
     ret r;
 }
 
@@ -451,19 +423,20 @@ pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
 pub fun end_modal(ctx: *context.Context, r: ModalArea) {
     if (r.shown == 0) { ret; }
     val st: *ModalState   = r.st;
-    val p:  f32           = pad(ctx);
+    val pd: theme.Edges   = pads(ctx);
     val f:  *layout.Frame = context.top_layout(ctx);
     val nw: f32           = f.need_w;
     val nh: f32           = f.need_h;
     context.pop_layout(ctx);
 
-    val h:  f32 = r.th + nh + p * 2.0::f32;
+    val h:  f32 = r.th + nh + pd.t + pd.b;
     val x1: f32 = r.x0 + r.w;
     val y1: f32 = r.y0 + h;
     context.set_channel(ctx, r.ch, 0);
     var ends: u8 = context.CORNERS_BOTTOM;
     if (r.th == 0.0::f32) { ends = context.CORNERS_ALL; }
-    context.fill(ctx, r.x0, r.y0 + r.th, x1, y1, corner(ctx), ends, look(ctx).body);
+    context.box_shadow(ctx, theme.MODAL, theme.NORMAL, r.x0, r.y0, x1, y1, context.CORNERS_ALL);
+    context.box_face(ctx, theme.MODAL, theme.NORMAL, r.x0, r.y0 + r.th, x1, y1, ends, context.SIDES_ALL);
     context.merge(ctx, r.ch);
     context.fill_claim(ctx, r.claim, r.x0, r.y0, x1, y1);
 
@@ -479,7 +452,7 @@ pub fun end_modal(ctx: *context.Context, r: ModalArea) {
     }
     st.h = h;
     st.w = r.w;
-    if (r.auto) { st.w = clampf(nw + p * 2.0::f32, r.min_w, r.max_w); }
+    if (r.auto) { st.w = clampf(nw + pd.l + pd.r, r.min_w, r.max_w); }
     val s: *Stack = stack(ctx);
     if (st.key > s.key) {
         s.cur = r.id;

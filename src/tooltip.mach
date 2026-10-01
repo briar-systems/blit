@@ -29,6 +29,7 @@ use blit.input;
 use blit.layout;
 use blit.overlay;
 use blit.state;
+use blit.theme;
 use blit.widget;
 use allo: std.allocator;
 use std.allocator.page;
@@ -127,7 +128,7 @@ pub fun begin(ctx: *context.Context, id: u64, t: Tip) Shown {
     or {
         val local: context.Area = context.Area{x0: a.x0 - ctx.lx, y0: a.y0 - ctx.ly, x1: a.x1 - ctx.lx, y1: a.y1 - ctx.ly};
         o    = overlay.on_rect(local, overlay.BOTTOM_LEFT, overlay.TOP_LEFT);
-        o.dy = context.px(ctx, ctx.theme.gap);
+        o.dy = context.px(ctx, context.look_of(ctx, theme.TOOLTIP).margin.t);
     }
     o.keep  = 1;
     o.band  = band.TOOLTIPS;
