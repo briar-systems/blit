@@ -348,6 +348,7 @@ pub rec TextLine {
 # clip_on:      1 if the frame copied text into clip, else 0
 # paste_wanted: 1 if a widget asked for the clipboard's text this frame, else 0
 # timed:        1 once a frame has carried the host's clock, else 0
+# clocked:      1 once time has advanced between frames, so the host supplies a clock
 # delta:        seconds since the previous frame, 0 on the first
 # wake:         the earliest time a widget asked for a frame by this frame
 # wake_on:      1 if a widget asked for a frame this frame, else 0
@@ -449,6 +450,7 @@ pub rec Context {
     clip_on:      u8;
     paste_wanted: u8;
     timed:        u8;
+    clocked:      u8;
     delta:        f64;
     wake:         f64;
     wake_on:      u8;
@@ -583,6 +585,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_on      = 0;
     ctx.paste_wanted = 0;
     ctx.timed        = 0;
+    ctx.clocked      = 0;
     ctx.delta        = 0.0::f64;
     ctx.wake         = 0.0::f64;
     ctx.wake_on      = 0;
@@ -732,7 +735,7 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.in           = in;
     ctx.in.prev_down = prev;
     ctx.delta        = 0.0::f64;
-    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
+    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; ctx.clocked = 1; }
     ctx.timed = 1;
 
     ctx.sw  = sw;
@@ -1032,7 +1035,7 @@ pub fun preedit_caret(ctx: *Context) usize {
 
 # record each button pressed this frame as its last press, extending the run
 # of clicks when it lands on the claimant the one before did, soon and near
-# enough
+# enough. without a host clock no press is soon, so every one is single
 fun take_presses(ctx: *Context) {
     val near: f32   = px(ctx, ctx.dbl_dist);
     var b:    usize = 0;
@@ -1042,7 +1045,7 @@ fun take_presses(ctx: *Context) {
             val dx:  f32    = ctx.in.mx - p.x;
             val dy:  f32    = ctx.in.my - p.y;
             var run: u32    = 1;
-            if (p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
+            if (ctx.clocked != 0 && p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
                 run = p.clicks + 1;
             }
             @p = Press{time: ctx.in.time, x: ctx.in.mx, y: ctx.in.my, id: ctx.hover, clicks: run};
