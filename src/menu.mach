@@ -2,7 +2,10 @@
 # context menus that open on a right press
 #
 # a bar is the next item of the current layout frame, one row high across it,
-# so placed first it runs along a window's or surface's top. each begin_menu
+# so placed first it runs along a window's or surface's top. a main bar
+# (begin_main_bar) instead takes its row off the top of the screen's free
+# area, as a docked container does, so a dock space placed from
+# context.free_area after it starts below it. each begin_menu
 # in it is a header that opens its menu on a press, and while one is open,
 # moving onto another header opens that one instead. begin_menu inside an
 # open menu is a row that opens a submenu beside it when hovered. a context
@@ -58,6 +61,7 @@ use allo: std.allocator;
 use std.allocator.page;
 
 use blit.context;
+use blit.dock;
 use blit.draw;
 use blit.driver;
 use blit.field;
@@ -70,7 +74,7 @@ use blit.state;
 use blit.theme;
 use blit.widget;
 
-# a menu bar along the top of a layout column
+# a menu bar along the top of a layout column or of the free area
 pub val KIND_BAR: u8 = 0;
 # a menu dropped from a bar header or opened beside a submenu row
 pub val KIND_DROP: u8 = 1;
@@ -505,11 +509,30 @@ fun open_popup(ctx: *context.Context, m: *Menu, x: f32, y: f32, flip_x: f32, nes
 # key: the bar's key in the current id scope
 # ret: the handle its menus open from
 pub fun begin_bar(ctx: *context.Context, key: str) Menu {
-    val id: u64          = context.id_of(ctx, key);
-    val st: *MenuState   = state.get[MenuState](ctx, id);
-    var m:  Menu         = menu_of(ctx, id, KIND_BAR, st, nil);
-    val rh: f32          = row_of(ctx, theme.MENU_TITLE);
-    val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fixed(rh), 0.0::f32, rh);
+    val rh: f32 = row_of(ctx, theme.MENU_TITLE);
+    ret bar_in(ctx, key, widget.place(ctx, layout.fill(1.0::f32), layout.fixed(rh), 0.0::f32, rh));
+}
+
+# start a main menu bar: one control row taken off the top of the free area
+#
+# it takes its row as a docked container does (see context.carve), so
+# context.free_area read after it starts below the bar, and a dock space or
+# side panel placed from it lies beneath. it is begin_bar in every other way:
+# its headers are begin_menu calls between it and end_bar. call it at the
+# root, outside surfaces and bands, before what is placed from the free area.
+# ---
+# ctx: context
+# key: the bar's key in the current id scope
+# ret: the handle its menus open from
+pub fun begin_main_bar(ctx: *context.Context, key: str) Menu {
+    ret bar_in(ctx, key, context.carve(ctx, context.Side.top{}, row_of(ctx, theme.MENU_TITLE)));
+}
+
+# start a bar over r, in local pixels
+fun bar_in(ctx: *context.Context, key: str, r: context.Area) Menu {
+    val id: u64        = context.id_of(ctx, key);
+    val st: *MenuState = state.get[MenuState](ctx, id);
+    var m:  Menu       = menu_of(ctx, id, KIND_BAR, st, nil);
     m.open  = 1;
     m.x     = r.x0;
     m.x0    = r.x0;
@@ -531,7 +554,7 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
 # its claim
 # ---
 # ctx: context
-# m:   the value begin_bar returned
+# m:   the value begin_bar or begin_main_bar returned
 pub fun end_bar(ctx: *context.Context, m: *Menu) {
     interact.end_group(ctx, m.grp);
     context.pop_id(ctx);
@@ -1271,6 +1294,80 @@ test menu__an_open_menu_owns_the_keyboard {
     if (!driver.focused(?d, name))                       { ret 6; }
     driver.key(?d, input.KEY_LEFT, 0);
     if (pr.f.caret != 1) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# a main bar, and a dock space placed from the free area after it
+# ---
+# w:     a window docked over the whole space
+# bar:   the bar's row, as begin_main_bar took it
+# free:  the free area after the bar
+# built: the window was docked
+#[testing]
+rec Main {
+    w:     widget.Window;
+    bar:   context.Area;
+    free:  context.Area;
+    built: bool;
+}
+
+#[testing]
+fun main_ui(ctx: *context.Context, user: ptr) {
+    val mp:  *Main = user::*Main;
+    var bar: Menu  = begin_main_bar(ctx, "main");
+    mp.bar = context.Area{x0: bar.x0, y0: bar.y0, x1: bar.x1, y1: bar.y1};
+    var file: Menu = begin_menu(ctx, ?bar, "File");
+    item(ctx, ?file, of("New"));
+    end_menu(ctx, ?file);
+    end_bar(ctx, ?bar);
+
+    mp.free = context.free_area(ctx);
+    val sid: u64 = context.id_of(ctx, "space");
+    if (!mp.built) {
+        dock.add(ctx, dock.root(ctx, sid), context.id_of(ctx, "P"));
+        mp.built = true;
+    }
+    dock.space(ctx, "space", mp.free);
+    val w: widget.WindowArea = widget.begin_window(ctx, mp.w);
+    if (w.body != 0) { widget.button(ctx, "b"); }
+    widget.end_window(ctx, w);
+}
+
+test menu__main_bar_takes_its_row_from_the_free_area {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var mp: Main;
+    mp.w = widget.window("P", 40.0::f32, 40.0::f32, 120.0::f32, 100.0::f32);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 300.0::f32, main_ui, (?mp)::ptr);
+    if (sel ie.err) { ret 1; }
+    driver.steps(?d, 2);
+
+    # the bar runs across the top, and the free area starts below it
+    if (mp.bar.y0 != 0.0::f32 || mp.bar.x0 != 0.0::f32 || mp.bar.x1 != 400.0::f32) { ret 2; }
+    if (mp.bar.y1 <= mp.bar.y0 || mp.free.y0 != mp.bar.y1)                         { ret 3; }
+    if (mp.free.y1 != 300.0::f32)                                                  { ret 4; }
+
+    # the window docked in the space lies wholly beneath the bar
+    val file: u64               = driver.find(?d, "main/File");
+    val fr:   opt[context.Area] = driver.rect(?d, file);
+    val br:   opt[context.Area] = driver.rect(?d, driver.find(?d, "P/b"));
+    if (sel fr.none)                                                                                       { ret 5; }
+    if (sel br.none)                                                                                       { ret 6; }
+    if (fr.some.y1 > mp.bar.y1 || br.some.y0 < mp.free.y0)                                                 { ret 7; }
+    if (driver.at(?d, (fr.some.x0 + fr.some.x1) / 2.0::f32, (fr.some.y0 + fr.some.y1) / 2.0::f32) != file) { ret 8; }
+
+    # a press on its header opens its menu over the space
+    driver.click(?d, file);
+    driver.step(?d);
+    val new: u64               = driver.find(?d, "main/File/New");
+    val nr:  opt[context.Area] = driver.rect(?d, new);
+    if (sel nr.none)                                                                                      { ret 9; }
+    if (driver.at(?d, (nr.some.x0 + nr.some.x1) / 2.0::f32, (nr.some.y0 + nr.some.y1) / 2.0::f32) != new) { ret 10; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }

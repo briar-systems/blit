@@ -4261,8 +4261,8 @@ pub fun carve(ctx: *Context, side: Side, size: f32) Area {
 
 # the part of the screen docked containers have not taken so far this frame
 #
-# read it after the docks to place what the docks surround, such as a world
-# view. floating windows and popups are not counted.
+# read it after the docks and a main menu bar (see menu.begin_main_bar) to
+# place what they surround, such as a dock space or a world view. floating windows and popups are not counted.
 # ---
 # ctx: context
 # ret: the free area, in screen pixels
