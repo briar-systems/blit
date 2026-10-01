@@ -5,9 +5,9 @@
 # layout is the context's stack of frames (see blit.layout). every container
 # pushes the frame its content is laid out in and pops it at its end, and
 # begin_stack opens a horizontal or vertical stack as an item of the current
-# frame, and begin_flow a flow, whose items wrap onto rows. a widget asks the top frame for its rect with its own size rules and
-# the size its content needs, which size_next and a stack's item rules
-# override. same_line puts an item beside the last one. the helpers place rows
+# frame, and begin_flow a flow, whose items wrap onto rows. a widget asks the
+# top frame for its rect with its own size rules and the size its content
+# needs, which size_next and a stack's or a flow's item rules override. same_line puts an item beside the last one. the helpers place rows
 # by hand: space and advance move the pen, cell_x0 and cell_x1 split the
 # column into equal cells for widgets that take a rect (button_at), and
 # begin_columns lays whole widgets side by side. the gaps and padding come
