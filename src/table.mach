@@ -58,6 +58,7 @@ use std.memory;
 
 use blit.context;
 use blit.dnd;
+use blit.dock;
 use blit.draw;
 use drv: blit.driver;
 use bid: blit.id;
@@ -581,6 +582,22 @@ fun most_x(t: *Table) f32 {
     ret maxf(t.tw - (t.vx1 - t.x0), 0.0::f32);
 }
 
+# whether rows at offset sy, scrolling at most my, can move by a vertical
+# wheel turned wheel pixels, positive towards the top
+fun can_wheel_y(sy: f64, my: f64, wheel: f32) bool {
+    if (wheel > 0.0::f32) { ret sy > 0.0::f64; }
+    if (wheel < 0.0::f32) { ret sy < my; }
+    ret false;
+}
+
+# whether columns at offset sx, scrolling at most mx, can move by a
+# horizontal wheel turned wheel pixels, positive towards the right
+fun can_wheel_x(sx: f32, mx: f32, wheel: f32) bool {
+    if (wheel > 0.0::f32) { ret sx < mx; }
+    if (wheel < 0.0::f32) { ret sx > 0.0::f32; }
+    ret false;
+}
+
 # the x range a column is drawn in: the frozen strip, or the scrolled one
 fun strip(t: *Table, c: *Column, x0: *f32, x1: *f32) {
     if (c.frozen) {
@@ -880,8 +897,11 @@ fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
 # draw the scrollbars
 #
 # the wheel goes to the table when the widget under the cursor is in it and
-# no scroll region inside took it first, and scrolls from the next frame. a
-# table in a disabled scope (see context.begin_disabled) takes no wheel.
+# no scroll region inside took it first, and scrolls from the next frame. each
+# axis is taken apart: the table takes the vertical wheel only when it can
+# move vertically the way it turns, and the horizontal only when it can move
+# sideways that way, leaving the rest for the region around it. a table in a
+# disabled scope (see context.begin_disabled) takes no wheel.
 # ---
 # ctx: context
 # t:   the table begin opened
@@ -916,14 +936,21 @@ pub fun end(ctx: *context.Context, t: *Table) {
 
     chooser(ctx, t, st);
 
-    if (ctx.wheel_taken == 0 && !context.disabled(ctx) && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
-        st.sy           = st.sy - ctx.in.wheel::f64;
-        st.sx           = st.sx + ctx.in.wheel_x;
+    val top: f32 = by0 + t.fr::f32 * t.rh;
+    val my:  f64 = most_y(t, maxf(t.vy1 - top, 0.0::f32));
+    val mx:  f32 = most_x(t);
+    st.sy = clampd(st.sy, 0.0::f64, my);
+    st.sx = clampf(st.sx, 0.0::f32, mx);
+    # each axis the table can move the way its wheel turns
+    val wheel: bool = !context.disabled(ctx) && ctx.hover_seen > t.seen;
+    if (wheel && ctx.wheel_taken == 0 && can_wheel_y(st.sy, my, ctx.in.wheel)) {
+        st.sy           = clampd(st.sy - ctx.in.wheel::f64, 0.0::f64, my);
         ctx.wheel_taken = 1;
     }
-    val top: f32 = by0 + t.fr::f32 * t.rh;
-    st.sy = clampd(st.sy, 0.0::f64, most_y(t, maxf(t.vy1 - top, 0.0::f32)));
-    st.sx = clampf(st.sx, 0.0::f32, most_x(t));
+    if (wheel && ctx.hwheel_taken == 0 && can_wheel_x(st.sx, mx, ctx.in.wheel_x)) {
+        st.sx            = clampf(st.sx + ctx.in.wheel_x, 0.0::f32, mx);
+        ctx.hwheel_taken = 1;
+    }
     bars(ctx, t, st);
     context.pop_id(ctx);
 }
@@ -1060,6 +1087,93 @@ fun span_x(d: *drv.Driver, id: u64, x0: *f32, x1: *f32) {
         @x0 = r.some.x0;
         @x1 = r.some.x1;
     }
+}
+
+# the probe table inside a left dock that scrolls over the space below it
+#[testing]
+rec InDock {
+    side: dock.Dock;
+    p:    Probe;
+}
+
+#[testing]
+fun docked_ui(ctx: *context.Context, user: ptr) {
+    val w:  *InDock       = user::*InDock;
+    val dk: dock.DockArea = dock.begin_dock(ctx, "side", ?w.side);
+    probe_ui(ctx, (?w.p)::ptr);
+    widget.space(ctx, 1000.0::f32);
+    dock.end_dock(ctx, ?w.side, dk);
+}
+
+# turn the wheels over the third row in view, run that frame and the next,
+# and report whether the table took the horizontal wheel
+#[testing]
+fun wheel_in(d: *drv.Driver, w: *InDock, dx: f32, dy: f32) bool {
+    drv.scroll(d, mark_id(?w.p, (w.p.t.first + 2)::u64), dx, dy);
+    val took: bool = d.ctx.hwheel_taken != 0;
+    drv.step(d);
+    ret took;
+}
+
+test table__passes_each_wheel_to_the_dock_at_either_end {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var w: InDock;
+    w.side.side = context.Side.left{};
+    w.side.size = 120.0::f32;
+    w.p.rows    = 20;
+    w.p.freeze  = 1;
+    w.p.cols[0] = Column{label: "A", width: 80.0::f32};
+    w.p.cols[1] = Column{label: "B", width: 80.0::f32};
+    w.p.cols[2] = Column{label: "C", width: 80.0::f32};
+    var d:  drv.Driver;
+    val ie: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, docked_ui, (?w)::ptr);
+    if (sel ie.err) { ret 1; }
+    drv.steps(?d, 2);
+    val st: *TableState = state.get[TableState](?d.ctx, w.p.t.id);
+
+    # the table takes the vertical wheel while it can move, up to its end
+    wheel_in(?d, ?w, 0.0::f32, -30.0::f32);
+    if (st.sy != 30.0::f64 || w.side.scroll.offset != 0.0::f32) { ret 2; }
+    wheel_in(?d, ?w, 0.0::f32, -1000.0::f32);
+    val end: f64 = st.sy;
+    if (end <= 30.0::f64 || w.side.scroll.offset != 0.0::f32) { ret 3; }
+    # at its end the vertical wheel passes to the dock, while the table
+    # still takes the horizontal one
+    if (!wheel_in(?d, ?w, 30.0::f32, -30.0::f32))                                { ret 4; }
+    if (st.sy != end || st.sx != 30.0::f32 || w.side.scroll.offset != 30.0::f32) { ret 5; }
+
+    # turned back, the table takes it again, up to its start
+    wheel_in(?d, ?w, 0.0::f32, 1000.0::f32);
+    if (st.sy != 0.0::f64 || w.side.scroll.offset != 30.0::f32) { ret 6; }
+    # at its start the vertical wheel passes to the dock
+    wheel_in(?d, ?w, 0.0::f32, 30.0::f32);
+    if (st.sy != 0.0::f64 || w.side.scroll.offset != 0.0::f32) { ret 7; }
+
+    # sideways to its end, where the horizontal wheel passes on while the
+    # table takes the vertical one
+    wheel_in(?d, ?w, 1000.0::f32, 0.0::f32);
+    val right: f32 = st.sx;
+    if (right <= 30.0::f32)                      { ret 8; }
+    if (wheel_in(?d, ?w, 30.0::f32, -30.0::f32)) { ret 9; }
+    if (st.sx != right || st.sy != 30.0::f64)    { ret 10; }
+    # and back to its start, where the horizontal wheel passes on too
+    wheel_in(?d, ?w, -1000.0::f32, 0.0::f32);
+    if (st.sx != 0.0::f32)                        { ret 11; }
+    if (wheel_in(?d, ?w, -30.0::f32, -30.0::f32)) { ret 12; }
+    if (st.sx != 0.0::f32 || st.sy != 60.0::f64)  { ret 13; }
+    if (w.side.scroll.offset != 0.0::f32)         { ret 14; }
+
+    # a table with nothing to scroll down passes the vertical wheel
+    w.p.rows = 2;
+    drv.steps(?d, 2);
+    if (!drv.scroll(?d, mark_id(?w.p, 0), 0.0::f32, -30.0::f32)) { ret 15; }
+    if (st.sy != 0.0::f64 || w.side.scroll.offset != 30.0::f32)  { ret 16; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
 }
 
 test table__a_million_rows_cost_only_those_in_view {

@@ -210,6 +210,13 @@ blit.style.pop(?ctx);
 blit.style.pop(?ctx);
 ```
 
+A paint's `fill_to` follows its `fill`: every write of a fill through a path
+(a push, a class, `theme.set` and `set_path`, a TOML document) writes `fill_to`
+too, so a fill alone gives a flat face. Writing `fill_to` as well, in the same
+push, class or document in any order, or in a later push, gives the gradient,
+and a pop restores both. A save writes `fill_to` after `fill` whenever the two
+differ, so the gradient reads back.
+
 `push_color`, `push_length`, `push_radii`, `push_edges` and the untyped `push`
 refuse a path naming no field of their unit, and still open an empty push so
 every push pairs with its pop. A frame left with pushes open is restored at
@@ -319,7 +326,7 @@ shows.
 | `metrics.gap` | length | space between layout rows, cells and buttons in a row |
 | `metrics.pad` | length | container padding: below a panel's, window's, popup's or menu's content, around a dock's column, and between a scrollbar and its content |
 | `metrics.inset` | length | control inset: between a control's edge and its text, and between a box and its label |
-| `metrics.handle_w` | length | slider handle width |
+| `metrics.handle_w` | length | slider handle width, 0 for none |
 | `metrics.bar_w` | length | scrollbar width |
 | `metrics.thumb_min` | length | shortest scrollbar thumb |
 | `metrics.corner` | length | corner radius of controls and containers, 0 for square |
@@ -348,7 +355,7 @@ shows.
 | `<kind>.shadow_blur` | length | how far the shadow fades out, 0 for a hard edge |
 | `<kind>.overflow` | factor | how a label too wide for its box fits: 0 clips it at the box, 1 cuts it with an ellipsis at its end |
 | `<kind>.<state>.fill` | color | the face, at its top when it is a gradient |
-| `<kind>.<state>.fill_to` | color | the face at its bottom: equal to fill for a flat face, else a vertical gradient |
+| `<kind>.<state>.fill_to` | color | the face at its bottom, a vertical gradient from fill: written with every write of fill, so a fill alone is flat |
 | `<kind>.<state>.text` | color | text drawn on the face |
 | `<kind>.<state>.mark` | color | secondary ink: a glyph, a caret, a reading or a hint |
 | `<kind>.<state>.border` | color | the outline, transparent for none |
@@ -370,7 +377,7 @@ shows.
 | `toggle` | a toggle's switch track and label, on while set: pad between the row and the track |
 | `toggle_knob` | a toggle's knob, in the toggle's state: margin between the knob and the track |
 | `slider` | a slider's track: text the label, mark the reading |
-| `slider_handle` | a slider's handle: min_w its width |
+| `slider_handle` | a slider's handle: min_w its width, 0 for none |
 | `dropdown` | a dropdown's header, on while open |
 | `field` | a text field: mark the hint, focused while it holds the keyboard |
 | `field_caret` | a text field's caret and its composition underline: fill, min_w the width |
@@ -393,7 +400,7 @@ shows.
 | `progress` | a progress bar's track and its text |
 | `progress_bar` | a progress bar's done part |
 | `separator` | a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule |
-| `tree_item` | a tree's row, on while selected: mark the caret |
+| `tree_item` | a tree's row, on while selected: mark the caret, min_w its size, 0 to follow the caption's ascent |
 | `drop_target` | where a drag would drop: fill and border |
 | `drag_preview` | what a drag carries, drawn at the cursor |
 | `menu_bar` | a menu bar's background |
@@ -409,6 +416,7 @@ shows.
 | `checker` | the checkerboard alpha shows through: fill and mark its two cells |
 | `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
 | `focus_ring` | the ring around the control the keyboard reached: border and border_w its stroke, radius its corners |
+| `slider_fill` | a slider's fill from the track's start to the value, transparent unless a theme gives it a fill |
 
 | state | when |
 |---|---|
@@ -489,8 +497,9 @@ blit.widget.end_window(?ctx, w);
 - **The tree.** A split node divides its rect between two children along an
   axis by a ratio, and a leaf is a tab stack of windows. `root`, `split` (a
   new empty leaf on one side of a node, taking a share of it), `add` (dock a
-  window as a leaf's last tab), `remove` (float it again) and `node_of` build
-  and read it in code. A window is its title's id. The tree lives in the
+  window as a leaf's last tab), `insert` (dock it at an index in the leaf's
+  tab stack), `select` (bring a docked window to its leaf's front), `remove`
+  (float it again) and `node_of` build and read it in code. A window is its title's id. The tree lives in the
   state store, one small entry per space, node and docked window, so a layout
   of any size fits, and everything in it is pinned.
 - **Drawing.** `space(?ctx, key, area)` lays the tree out over the rect, in
@@ -991,7 +1000,9 @@ instead of `ox` and `pw`.
   `checkbox` a box beside its label.
 - **Sliders.** `slider(?ctx, label, reading, ?v, lo, hi)` shows the caller's
   formatted `reading` of the value beside its label, and `slider_f` is the
-  same without one.
+  same without one. A theme fills the track up to the value through
+  `slider_fill`, clear in the built-in themes, and a `slider_handle.min_w` of
+  0 leaves the handle out for a fill alone.
 - **Text.** `text` is one line, and `note(?ctx, s)` is dim text wrapped at
   spaces to the column's width.
 - **Lists.** `blit.list.show(?ctx, key, ?l, rows, h)` is a scrolling list `h`

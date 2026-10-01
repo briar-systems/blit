@@ -494,6 +494,106 @@ pub fun add(ctx: *context.Context, leaf: u64, window: u64) {
     place(ctx, leaf, window, LAST);
 }
 
+# gathers the windows docked in one leaf, leaving one out
+# ---
+# leaf:  the leaf
+# skip:  the window left out
+# items: where they go, nil while counting
+# n:     windows counted or gathered
+rec Stack {
+    leaf:  u64;
+    skip:  u64;
+    items: **widget.Docked;
+    n:     usize;
+}
+
+fun stack_one(dk: *widget.Docked, user: ptr) {
+    val s: *Stack = user::*Stack;
+    if (dk.node != s.leaf || dk.id == s.skip) { ret; }
+    if (s.items != nil)                       { s.items[s.n] = dk; }
+    s.n = s.n + 1;
+}
+
+# whether docked window a's tab comes before b's: by rank, then by id
+fun ahead(a: *widget.Docked, b: *widget.Docked) bool {
+    if (a.rank != b.rank) { ret a.rank < b.rank; }
+    ret a.id < b.id;
+}
+
+# dock a window into a leaf at a place in its tab stack, selected
+#
+# as add, but the tab goes at index at among the leaf's other tabs rather
+# than last: 0 puts it first, and an index past the last tab puts it last. a
+# window already in the leaf moves to that index. choose the leaf's front tab
+# afterwards with select.
+# ---
+# ctx:    context
+# leaf:   the leaf, from root or split
+# window: the window's id
+# at:     its tab's index in the leaf
+pub fun insert(ctx: *context.Context, leaf: u64, window: u64, at: usize) {
+    val n: *Node = node(ctx, leaf);
+    if (n == nil || n.a != 0 || window == 0) { ret; }
+    var s: Stack = Stack{leaf: leaf, skip: window, items: nil, n: 0};
+    state.each[widget.Docked](ctx, stack_one, (?s)::ptr);
+    var to: usize = at;
+    if (to > s.n) { to = s.n; }
+    val bar:    u64        = bar_of(leaf);
+    val placed: opt[usize] = tabs.index(ctx, bar, window);
+    var shown:  usize      = 0;
+    if (s.n > 0) {
+        s.items = context.frame_alloc[*widget.Docked](ctx, s.n);
+        if (s.items == nil) { ret; }
+        s.n = 0;
+        state.each[widget.Docked](ctx, stack_one, (?s)::ptr);
+        var i: usize = 1;
+        for (i < s.n) {
+            val it: *widget.Docked = s.items[i];
+            var j:  usize          = i;
+            for (j > 0 && ahead(it, s.items[j - 1])) {
+                s.items[j] = s.items[j - 1];
+                j          = j - 1;
+            }
+            s.items[j] = it;
+            i          = i + 1;
+        }
+        # number the other tabs in order, leaving index to for the window
+        i = 0;
+        for (i < s.n) {
+            var r:  f64        = i::f64;
+            val ix: opt[usize] = tabs.index(ctx, bar, s.items[i].id);
+            if (i >= to)     { r = r + 1.0::f64; }
+            or (sel ix.some) { shown = shown + 1; }
+            if (s.items[i].rank != r) {
+                s.items[i].rank = r;
+                context.redraw(ctx);
+            }
+            i = i + 1;
+        }
+    }
+    # a tab its bar has placed keeps the bar's order, so it moves there too:
+    # past the placed tabs now before it. one not placed yet takes its place
+    # from the rank
+    if (sel placed.some) { tabs.move(ctx, bar, window, shown); }
+    place(ctx, leaf, window, to::f64);
+}
+
+# bring a docked window to the front of its leaf, its tab selected and its
+# body shown
+#
+# a window that floats is left as it is.
+# ---
+# ctx:    context
+# window: the window's id
+pub fun select(ctx: *context.Context, window: u64) {
+    val dk: *widget.Docked = state.find[widget.Docked](ctx, window);
+    if (dk == nil) { ret; }
+    val n: *Node = node(ctx, dk.node);
+    if (n == nil || n.front == window) { ret; }
+    n.front = window;
+    context.redraw(ctx);
+}
+
 # dock a window into a leaf at a rank
 fun place(ctx: *context.Context, leaf: u64, window: u64, rank: f64) {
     val n: *Node = node(ctx, leaf);
@@ -1431,12 +1531,14 @@ fun docked_load(dk: *widget.Docked, t: *toml.Table) {
 # wins:  the windows, "A", "B" and "C"
 # sid:   the space's id
 # build: true to build the default layout while the space is empty
+# stack: true to build it as one tab stack, by position, instead
 # hide:  true to draw nothing
 #[testing]
 rec App {
     wins:  [3]widget.Window;
     sid:   u64;
     build: bool;
+    stack: bool;
     hide:  bool;
 }
 
@@ -1445,6 +1547,13 @@ fun app_ui(ctx: *context.Context, user: ptr) {
     val ap:  *App = user::*App;
     val sid: u64  = context.id_of(ctx, "main");
     if (ap.hide) { ret; }
+    if (ap.stack && empty(ctx, sid)) {
+        val r: u64 = root(ctx, sid);
+        insert(ctx, r, context.id_of(ctx, "A"), 0);
+        insert(ctx, r, context.id_of(ctx, "B"), 0);
+        insert(ctx, r, context.id_of(ctx, "C"), 1);
+        select(ctx, context.id_of(ctx, "B"));
+    }
     if (ap.build && empty(ctx, sid)) {
         val r: u64 = root(ctx, sid);
         val l: u64 = split(ctx, r, context.Side.left{}, 0.3::f32);
@@ -1572,6 +1681,56 @@ test space__builds_splits_tabs_and_resizes {
     ret 0;
 }
 
+# the left edge of a window's tab in a leaf's bar, -1 when it was not drawn
+#[testing]
+fun tab_x(d: *driver.Driver, leaf: u64, window: u64) f32 {
+    val r: opt[context.Area] = driver.rect(d, tabs.tab_id(bar_of(leaf), window));
+    if (sel r.none) { ret -1.0::f32; }
+    ret r.some.x0;
+}
+
+test space__places_tabs_by_position_and_selects_the_front {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    ap.stack = true;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val a: u64 = win(?d, "A");
+    val b: u64 = win(?d, "B");
+    val c: u64 = win(?d, "C");
+    val r: u64 = node_of(?d.ctx, a);
+
+    # B went first, C between it and A, and B was chosen to show
+    if (r == 0 || node_of(?d.ctx, b) != r || node_of(?d.ctx, c) != r) { ret 2; }
+    val bx: f32 = tab_x(?d, r, b);
+    val cx: f32 = tab_x(?d, r, c);
+    val ax: f32 = tab_x(?d, r, a);
+    if (bx < 0.0::f32 || cx <= bx || ax <= cx)                           { ret 3; }
+    if (left_of(?d, "B/b") < 0.0::f32 || left_of(?d, "C/b") >= 0.0::f32) { ret 4; }
+
+    # a window in the stack moves to a position, in front
+    insert(?d.ctx, r, a, 0);
+    driver.steps(?d, 2);
+    if (tab_x(?d, r, a) != bx || tab_x(?d, r, b) <= bx) { ret 5; }
+    if (tab_x(?d, r, c) <= tab_x(?d, r, b))             { ret 6; }
+    if (left_of(?d, "A/b") < 0.0::f32)                  { ret 7; }
+
+    # select changes the front without moving a tab, and leaves a floating
+    # window floating
+    select(?d.ctx, c);
+    select(?d.ctx, context.id_of(?d.ctx, "none"));
+    driver.steps(?d, 2);
+    if (left_of(?d, "C/b") < 0.0::f32 || left_of(?d, "A/b") >= 0.0::f32) { ret 8; }
+    if (tab_x(?d, r, a) != bx)                                           { ret 9; }
+    if (node_of(?d.ctx, context.id_of(?d.ctx, "none")) != 0)             { ret 10; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test space__keyboard_crosses_docked_tabs_in_focus_order {
     var al:   allo.Allocator;
     val made: err[allo.Error] = page.make(?al);
@@ -1677,6 +1836,44 @@ test space__docks_by_drag_and_tears_off {
     if (!driver.drag_onto(?d, tabs.tab_id(bar_of(node_of(?d.ctx, b)), b), tabs.tab_id(bar_of(lc), c))) { ret 20; }
     driver.steps(?d, 2);
     if (node_of(?d.ctx, b) != lc) { ret 21; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test space__docked_body_pads_as_floating {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var ap: App;
+    var d:  driver.Driver;
+    if (!app(?d, ?al, ?ap)) { ret 1; }
+    val t:   *theme.Theme    = context.theme_of(?d.ctx);
+    val pad: opt[theme.Path] = theme.path(t, "window.pad");
+    if (sel pad.none) { ret 2; }
+    theme.set_path(t, pad.some, theme.of_edges(theme.Edges{l: 7.0::f32, t: 5.0::f32, r: 9.0::f32, b: 11.0::f32}));
+    # no titlebar, so a floating body starts where its window does
+    ap.wins[0].flags = widget.WINDOW_NO_TITLE;
+    driver.steps(?d, 2);
+
+    # floating, A's button sits the window's padding inside its body
+    val st: *widget.WindowState = widget.window_state(?d.ctx, "A");
+    val fl: opt[context.Area]   = driver.rect(?d, driver.find(?d, "A/b"));
+    if (sel fl.none) { ret 3; }
+    val fx: f32 = fl.some.x0 - st.x;
+    val fy: f32 = fl.some.y0 - st.y;
+    if (fx != 7.0::f32 || fy != 5.0::f32) { ret 4; }
+
+    # docked, the same content sits the same padding inside its rect
+    ap.build = true;
+    driver.steps(?d, 2);
+    val a:  u64               = win(?d, "A");
+    val dk: *widget.Docked    = state.find[widget.Docked](?d.ctx, a);
+    val dr: opt[context.Area] = driver.rect(?d, driver.find(?d, "A/b"));
+    if (dk == nil || node_of(?d.ctx, a) == 0)                 { ret 5; }
+    if (sel dr.none)                                          { ret 6; }
+    if (dr.some.x0 - dk.x0 != fx || dr.some.y0 - dk.y0 != fy) { ret 7; }
 
     val freed: err[allo.Error] = driver.free(?d);
     if (sel freed.err) { ret 1; }
