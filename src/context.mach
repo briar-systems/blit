@@ -138,18 +138,23 @@ rec Origin {
 # a run of indexed triangles: bind the texture, set the scissor, draw the indices
 pub val RUN_TRIANGLES: u32 = 0;
 
+# a consumer span: set the scissor and call the app's own drawing for id with
+# data in the rect, then resume blit's runs
+pub val RUN_CUSTOM: u32 = 1;
+
 # one span of the composed index list, drawn with one texture and one scissor
 # on one layer
 #
 # every index lies in exactly one run. for kind RUN_TRIANGLES a renderer binds
 # atlas page `page` when tex is draw.ATLAS, else the consumer texture tex with
 # the sampling filter it names, sets the scissor to the clip rect, and draws
-# count indices from start as triangles. the record is plain numbers, so a
-# foreign renderer reads it field for field. kind is RUN_TRIANGLES today. it
-# leaves room for runs of other kinds, which a renderer that does not know
-# them skips.
+# count indices from start as triangles. a RUN_CUSTOM run holds no indices
+# (count 0): the renderer sets the scissor and calls back into the app with id,
+# data and the rect at that point in paint order (see custom). the record is
+# plain numbers, so a foreign renderer reads it field for field, and skips a
+# run of a kind it does not know.
 # ---
-# kind:    what the run asks of the renderer, RUN_TRIANGLES
+# kind:    what the run asks of the renderer, RUN_TRIANGLES or RUN_CUSTOM
 # tex:     consumer texture handle, draw.ATLAS (0) for the font atlas
 # page:    the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
 # layer:   layer the run was drawn on
@@ -159,7 +164,13 @@ pub val RUN_TRIANGLES: u32 = 0;
 # clip_x1: scissor right in screen pixels
 # clip_y1: scissor bottom in screen pixels
 # start:   first index of the run
-# count:   indices in the run, three per triangle
+# count:   indices in the run, three per triangle, 0 for RUN_CUSTOM
+# id:      RUN_CUSTOM: the app's callback id, else 0
+# data:    RUN_CUSTOM: the app's value passed back to the callback, else 0
+# x0:      RUN_CUSTOM: rect left in screen pixels, else 0
+# y0:      RUN_CUSTOM: rect top in screen pixels, y down, else 0
+# x1:      RUN_CUSTOM: rect right in screen pixels, else 0
+# y1:      RUN_CUSTOM: rect bottom in screen pixels, else 0
 pub rec Run {
     kind:    u32;
     tex:     u64;
@@ -172,6 +183,12 @@ pub rec Run {
     clip_y1: f32;
     start:   usize;
     count:   usize;
+    id:      u64;
+    data:    u64;
+    x0:      f32;
+    y0:      f32;
+    x1:      f32;
+    y1:      f32;
 }
 
 # the channels a container splits its runs into, from split, for set_channel
@@ -1206,7 +1223,8 @@ fun state(ctx: *Context) Run {
     var r: Run = Run{
         kind:    RUN_TRIANGLES, tex: ctx.tex, page: 0, layer: ctx.layer, filter: ctx.filter,
         clip_x0: ctx.clip_x0, clip_y0: ctx.clip_y0, clip_x1: ctx.clip_x1, clip_y1: ctx.clip_y1,
-        start:   0, count: 0
+        start:   0, count: 0, id: 0, data: 0,
+        x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
     };
     if (ctx.tex == draw.ATLAS) {
         r.page   = ctx.page;
@@ -1216,8 +1234,11 @@ fun state(ctx: *Context) Run {
 }
 
 # whether two runs draw the same way: kind, texture, layer and scissor
+#
+# a consumer span is a call of its own and never draws the same way as another
+# run.
 fun same_state(a: Run, b: Run) bool {
-    ret a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
+    ret a.kind == RUN_TRIANGLES && a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
         && a.layer == b.layer && a.clip_x0 == b.clip_x0 && a.clip_y0 == b.clip_y0
         && a.clip_x1 == b.clip_x1 && a.clip_y1 == b.clip_y1;
 }
@@ -1268,7 +1289,8 @@ pub fun run_at(ctx: *Context, index: usize) Run {
         ret Run{
             kind:    RUN_TRIANGLES, tex: draw.ATLAS, page: 0, layer: 0, filter: draw.FILTER_NEAREST,
             clip_x0: 0.0::f32, clip_y0: 0.0::f32, clip_x1: 0.0::f32, clip_y1: 0.0::f32,
-            start:   0, count: 0
+            start:   0, count: 0, id: 0, data: 0,
+            x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
         };
     }
     ret ctx.runs[index];
@@ -1291,6 +1313,49 @@ fun flush_run(ctx: *Context) {
     ctx.chans[ctx.run_len] = ctx.chan;
     ctx.run_len            = ctx.run_len + 1;
     ctx.run_start          = len;
+}
+
+# place a consumer span: the app draws into a rect itself at this point in
+# paint order
+#
+# the span is a run of kind RUN_CUSTOM with no indices, carrying id, data, the
+# rect in screen space and the current clip as its scissor. it lands on the
+# current layer and channel and sorts like any run, so geometry drawn after it
+# or on a higher layer paints over it. a rect wholly outside the clip is
+# dropped. if the run list cannot grow, oom is set and the span is dropped.
+# ---
+# ctx:  context
+# x0:   rect left in local pixels
+# y0:   rect top in local pixels
+# x1:   rect right in local pixels
+# y1:   rect bottom in local pixels
+# id:   the app's callback id, passed through untouched
+# data: the app's value for the callback, passed through untouched
+pub fun custom(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, id: u64, data: u64) {
+    val sx0: f32 = minf(x0, x1) + ctx.lx;
+    val sy0: f32 = minf(y0, y1) + ctx.ly;
+    val sx1: f32 = maxf(x0, x1) + ctx.lx;
+    val sy1: f32 = maxf(y0, y1) + ctx.ly;
+    if (culled(ctx, sx0, sy0, sx1, sy1)) { ret; }
+    flush_run(ctx);
+    ctx.runs  = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
+    ctx.chans = room[u32](ctx, ctx.chans, ?ctx.chans_cap, ctx.run_len + 1, RUN_DEPTH);
+    if (ctx.run_len >= ctx.runs_cap || ctx.run_len >= ctx.chans_cap) { ret; }
+    var run: Run = state(ctx);
+    run.kind               = RUN_CUSTOM;
+    run.tex                = draw.ATLAS;
+    run.page               = 0;
+    run.filter             = draw.FILTER_NEAREST;
+    run.start              = draw.index_count(?ctx.dl);
+    run.id                 = id;
+    run.data               = data;
+    run.x0                 = sx0;
+    run.y0                 = sy0;
+    run.x1                 = sx1;
+    run.y1                 = sy1;
+    ctx.runs[ctx.run_len]  = run;
+    ctx.chans[ctx.run_len] = ctx.chan;
+    ctx.run_len            = ctx.run_len + 1;
 }
 
 # split the runs drawn from here on into n channels, starting in channel 0
@@ -2555,6 +2620,46 @@ test clip__runs_carry_their_scissor {
     if (cut.clip_x1 != 4.0::f32 || cut.clip_y1 != 100.0::f32)          { ret 8; }
     val full: Run = run_at(?ctx, 1);
     if (full.start != 6 || full.clip_x1 != 100.0::f32) { ret 9; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test custom__span_sorts_with_its_rect_and_scissor {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    # a popup drawn before the span still paints over it
+    push_layer(?ctx);
+    quad(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, white);
+    pop_layer(?ctx);
+    val surf: Surface = begin_surface(?ctx, 10.0::f32, 10.0::f32, 40.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    custom(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 100.0::f32, 7, 9);
+    # a span wholly outside the clip is dropped
+    custom(?ctx, 60.0::f32, 60.0::f32, 70.0::f32, 70.0::f32, 8, 0);
+    end_surface(?ctx, surf);
+    # the same state as the first quad, kept apart by the span between them
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    end(?ctx);
+
+    if (run_count(?ctx) != 4 || index_count(?ctx) != 18) { ret 2; }
+    val span: Run = run_at(?ctx, 1);
+    if (span.kind != RUN_CUSTOM || span.id != 7 || span.data != 9)           { ret 3; }
+    if (span.start != 6 || span.count != 0 || span.layer != 0)               { ret 4; }
+    if (span.x0 != 10.0::f32 || span.y0 != 10.0::f32)                        { ret 5; }
+    if (span.x1 != 110.0::f32 || span.y1 != 110.0::f32)                      { ret 6; }
+    if (span.clip_x0 != 10.0::f32 || span.clip_x1 != 50.0::f32)              { ret 7; }
+    if (run_at(?ctx, 0).kind != RUN_TRIANGLES || run_at(?ctx, 0).count != 6) { ret 8; }
+    if (run_at(?ctx, 2).start != 6 || run_at(?ctx, 2).count != 6)            { ret 9; }
+    if (run_at(?ctx, 3).layer != 1 || run_at(?ctx, 3).start != 12)           { ret 10; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
