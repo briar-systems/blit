@@ -295,8 +295,8 @@ shows.
 
 | path | unit | meaning |
 |---|---|---|
-| `palette.panel` | color | panel background |
-| `palette.window` | color | window, popup, menu, tooltip and modal background |
+| `palette.panel` | color | panel background, opaque in the built-in themes |
+| `palette.window` | color | window, popup, menu, tooltip, toast and modal background, opaque in the built-in themes |
 | `palette.dock` | color | docked container background |
 | `palette.header` | color | window titlebar and section heading |
 | `palette.header_hot` | color | a titlebar or heading under the cursor |
@@ -313,7 +313,7 @@ shows.
 | `palette.track` | color | a slider, toggle, scrollbar, progress or tab bar track, an option row at rest and a text field's face |
 | `palette.handle` | color | a slider handle, toggle knob or scrollbar thumb at rest |
 | `palette.handle_on` | color | a handle, knob or thumb being dragged or hovered |
-| `palette.select` | color | the highlight behind selected text |
+| `palette.select` | color | the highlight behind selected text, translucent in the built-in themes |
 | `palette.grid` | color | chart grid lines |
 | `metrics.row` | length | least height of a control row, which grows to fit a line of text and its inset |
 | `metrics.gap` | length | space between layout rows, cells and buttons in a row |
@@ -386,7 +386,7 @@ shows.
 | `menu_item` | a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent |
 | `overlay` | an overlay, chrome-free unless its style gives it a fill or a border: pad around its content |
 | `modal` | a modal dialog's body |
-| `scrim` | the scrim over everything behind a modal dialog |
+| `scrim` | the scrim over everything behind a modal dialog, translucent in the built-in themes |
 | `radio` | a radio button's ring: pad around the dot, inset.l between the ring and the label |
 | `radio_mark` | a radio button's dot, drawn in its on state |
 | `progress` | a progress bar's track and its text |
