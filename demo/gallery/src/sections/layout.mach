@@ -1,13 +1,16 @@
-# layout: stacks with sizing rules, same-line rows, columns and controls
-# placed by hand
+# layout: stacks with sizing rules, flows, same-line rows, columns and
+# controls placed by hand
 #
 # layout is a stack of frames. a stack lays its items along an axis, each
 # side sized fixed, fit to its content, filling a share of what is left or a
-# fraction of it. same_line puts the next item beside the last, columns lay
-# whole widgets side by side, and place hands back a rect for anything drawn
+# fraction of it. a flow lays its items left to right and wraps them onto
+# rows. same_line puts the next item beside the last, columns lay whole
+# widgets side by side, and place hands back a rect for anything drawn
 # outside blit's widgets.
 
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
 
 use blit;
 
@@ -60,6 +63,38 @@ pub fun show(ctx: *blit.context.Context, user: ptr) {
     blit.widget.size_next(ctx, blit.layout.limit(blit.layout.frac(0.5::f32), blit.context.px(ctx, 120.0::f32), 0.0::f32), blit.layout.auto());
     blit.widget.button(ctx, "half, at least 120");
 
+    # a flow: tags wrap onto rows as the width runs out
+    blit.controls.separator_label(ctx, "A flow");
+    var tags: blit.layout.Flow = blit.widget.flow(ctx);
+    tags.item_w = blit.layout.fit();
+    blit.widget.begin_flow(ctx, "tags", tags);
+    val names: [9]str = [9]str{"layout", "stacks", "flows", "rows", "gaps", "alignment", "wrapping", "sizing", "truncation"};
+    var k:     usize  = 0;
+    for (k < 9) {
+        blit.widget.button(ctx, names[k]);
+        k = k + 1;
+    }
+    blit.widget.end_flow(ctx);
+
+    # label and value pairs, centered in their rows, each cut to the row
+    # when it is wider than one
+    var pairs: blit.layout.Flow = blit.widget.flow(ctx);
+    pairs.align = blit.layout.Align.center{};
+    blit.widget.begin_flow(ctx, "pairs", pairs);
+    val t:    *blit.theme.Theme = blit.context.theme_of(ctx);
+    val sp:   f32               = blit.context.px(ctx, 6.0::f32);
+    val lh:   f32               = blit.context.line_height(ctx);
+    val keys: [4]str            = [4]str{"generation", "population", "rule", "note"};
+    val vals: [4]str            = [4]str{"1,024", "53,211", "B3/S23", "a value long enough to be cut when the row is narrow"};
+    var p:    usize             = 0;
+    for (p < 4) {
+        val w: f32               = blit.context.text_width(ctx, keys[p]) + sp + blit.context.text_width(ctx, vals[p]);
+        val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fit(), blit.layout.fit(), w, lh);
+        blit.text.fit_pair(ctx, blit.theme.LABEL, keys[p], str_len(keys[p]), t.text_faint, vals[p], t.text, sp, r.y0, r);
+        p = p + 1;
+    }
+    blit.widget.end_flow(ctx);
+
     blit.controls.separator_label(ctx, "Same line");
     blit.widget.text(ctx, "label");
     blit.widget.same_line(ctx);
@@ -76,7 +111,6 @@ pub fun show(ctx: *blit.context.Context, user: ptr) {
 
     # a control drawn by hand takes its place in the layout like a widget
     blit.controls.separator_label(ctx, "Placed by hand");
-    val t: *blit.theme.Theme = blit.context.theme_of(ctx);
     val h: f32               = blit.context.px(ctx, 24.0::f32);
     val r: blit.context.Area = blit.widget.place(ctx, blit.layout.fill(1.0::f32), blit.layout.fixed(h), 0.0::f32, h);
     val w: f32               = (r.x1 - r.x0) / 8.0::f32;

@@ -5,9 +5,9 @@
 # layout is the context's stack of frames (see blit.layout). every container
 # pushes the frame its content is laid out in and pops it at its end, and
 # begin_stack opens a horizontal or vertical stack as an item of the current
-# frame. a widget asks the top frame for its rect with its own size rules and
-# the size its content needs, which size_next and a stack's item rules
-# override. same_line puts an item beside the last one. the helpers place rows
+# frame, and begin_flow a flow, whose items wrap onto rows. a widget asks the
+# top frame for its rect with its own size rules and the size its content
+# needs, which size_next and a stack's or a flow's item rules override. same_line puts an item beside the last one. the helpers place rows
 # by hand: space and advance move the pen, cell_x0 and cell_x1 split the
 # column into equal cells for widgets that take a rect (button_at), and
 # begin_columns lays whole widgets side by side. the gaps and padding come
@@ -232,7 +232,9 @@ fun top(ctx: *context.Context) *layout.Frame {
     if (context.layout_depth(ctx) == 0) {
         context.push_layout(ctx, layout.column(0.0::f32, 0.0::f32, ctx.sw, ctx.sh, gap(ctx)));
     }
-    ret context.top_layout(ctx);
+    val f: *layout.Frame = context.top_layout(ctx);
+    if (f.flow != 0 && f.synced != f.row + 1) { sync_rows(ctx, f); }
+    ret f;
 }
 
 # the default width of a widget that spans the space it is given
@@ -370,6 +372,12 @@ fun guessing(f: *layout.Frame, s: layout.Stack, it: layout.Item) bool {
         over = it.fit_h;
     }
     if (main == 0 || over != 0) { ret true; }
+    ret by_size(f, it);
+}
+
+# whether f aligns an item opening at it by a size the item has not measured:
+# centered or end-aligned across f's axis while fitted to its content there
+fun by_size(f: *layout.Frame, it: layout.Item) bool {
     var cross: u8 = it.fit_w;
     if (layout.across(f)) { cross = it.fit_h; }
     ret cross != 0 && f.inline == 0 && ((sel f.align.center) || (sel f.align.end));
@@ -413,13 +421,19 @@ pub fun begin_stack(ctx: *context.Context, key: str, s: layout.Stack) {
     c.item_h      = s.item_h;
     c.prev_fixed  = m.fixed;
     c.prev_weight = m.weight;
-    c.id          = id;
-    c.slot        = it;
-    c.rule_w      = rw;
-    c.rule_h      = rh;
-    if (m.seen == 0 && guessing(f, s, it)) { c.hidden = 1; }
-    context.push_layout(ctx, c);
-    if (c.hidden != 0) {
+    enter(ctx, ?c, id, it, rw, rh, m.seen == 0 && guessing(f, s, it));
+}
+
+# push a stack's or a flow's frame c, opened as item it of the current frame
+# under the rules rw and rh, laying it out only to measure when hide is set
+fun enter(ctx: *context.Context, c: *layout.Frame, id: u64, it: layout.Item, rw: layout.Size, rh: layout.Size, hide: bool) {
+    c.id     = id;
+    c.slot   = it;
+    c.rule_w = rw;
+    c.rule_h = rh;
+    if (hide) { c.hidden = 1; }
+    context.push_layout(ctx, @c);
+    if (hide) {
         context.push_measure(ctx);
         context.wake_at(ctx, ctx.in.time);
     }
@@ -432,6 +446,12 @@ pub fun begin_stack(ctx: *context.Context, key: str, s: layout.Stack) {
 # ---
 # ctx: context
 pub fun end_stack(ctx: *context.Context) {
+    leave(ctx);
+}
+
+# pop a stack's or a flow's frame, keep what it measured and place it in its
+# parent
+fun leave(ctx: *context.Context) {
     val c: layout.Frame = @context.top_layout(ctx);
     context.pop_layout(ctx);
     if (c.hidden != 0) { context.pop_measure(ctx); }
@@ -450,6 +470,108 @@ pub fun end_stack(ctx: *context.Context) {
     if (it.fit_w != 0) { it.w = it.nat_w; }
     if (it.fit_h != 0) { it.h = it.nat_h; }
     layout.commit(top(ctx), it);
+}
+
+# a flow's options, at the layout style's gaps: margin.r between items in a
+# row and margin.b between rows, start-aligned, filling its parent's width
+# and fitting its content's height
+# ---
+# ctx: context
+# ret: options to adjust and pass to begin_flow
+pub fun flow(ctx: *context.Context) layout.Flow {
+    ret layout.flow(across(ctx), gap(ctx));
+}
+
+# the natural height a flow's row measured, kept for the next frame
+# ---
+# h: the tallest natural height of the row's items
+rec Row {
+    h: f32;
+}
+
+# the id a flow keeps row n's measure under
+fun row_id(f: *layout.Frame, n: usize) u64 {
+    ret bid.child_int(f.id, n::u64);
+}
+
+# the height row n of a flow measured last frame, 0 when it has none
+fun row_len(ctx: *context.Context, f: *layout.Frame, n: usize) f32 {
+    val r: *Row = state.find[Row](ctx, row_id(f, n));
+    if (r == nil) { ret 0.0::f32; }
+    ret r.h;
+}
+
+# keep the height of a flow's row n for the next frame
+fun keep_row(ctx: *context.Context, f: *layout.Frame, n: usize, h: f32) {
+    state.get[Row](ctx, row_id(f, n)).h = h;
+}
+
+# bring a flow's row measures up to its current row: keep the row a wrap
+# closed, and read the height the row after this one measured last frame
+fun sync_rows(ctx: *context.Context, f: *layout.Frame) {
+    if (f.id != 0) {
+        if (f.row > 0) { keep_row(ctx, f, f.row - 1, f.done_h); }
+        f.next_len = row_len(ctx, f, f.row + 1);
+    }
+    f.synced = f.row + 1;
+}
+
+# open a flow as the next item of the current frame
+#
+# the flow's items go left to right, s.gap apart, and an item that would pass
+# the flow's right edge starts a new row, s.row_gap below the last (see
+# blit.layout). a row is as tall as its tallest item, and its items sit across
+# that height as s.align says, read from what the row measured last frame,
+# kept in the state store under the flow's id. an item wider than a whole row
+# takes the row alone at the row's width, and a widget cuts its label to it as
+# its kind's overflow says, as a control placed by hand does with
+# blit.text.fit_box or fit_pair. the flow is sized in its parent as a stack
+# is (see begin_stack). a width fitted to the content is its items in one
+# row, so a flow sized by layout.limit(layout.fit(), 0, max) wraps at max and
+# is as narrow as its items when they fit in less. a flow that is not
+# start-aligned, or that its parent aligns by its size, lays out its first
+# frame only to measure, as a stack does. flows and stacks nest in each other.
+# pair it with end_flow.
+# ---
+# ctx: context
+# key: the flow's key in the current id scope
+# s:   its options (see flow)
+pub fun begin_flow(ctx: *context.Context, key: str, s: layout.Flow) {
+    val id: u64           = context.id_of(ctx, key);
+    val m:  *Measure      = state.get[Measure](ctx, id);
+    val f:  *layout.Frame = top(ctx);
+    val rw: layout.Size   = layout.pick(f.next_w, s.w, layout.pick(f.item_w, wide(), wide()));
+    val rh: layout.Size   = layout.pick(f.next_h, s.h, layout.pick(f.item_h, layout.fit(), layout.fit()));
+    val it: layout.Item   = layout.resolve(f, rw, rh, m.w, m.h);
+    f.next_w = layout.auto();
+    f.next_h = layout.auto();
+
+    # a width fitted to the content wraps at its largest size, if it has one
+    var w: f32 = it.w;
+    if (it.fit_w != 0) { w = rw.max; }
+    var c: layout.Frame = layout.rows(it.x, it.y, w, s.gap, s.row_gap);
+    c.h = it.h;
+    if (it.fit_h == 0) { c.open = c.open & layout.OPEN_W; }
+    c.align   = s.align;
+    c.item_w  = s.item_w;
+    c.item_h  = s.item_h;
+    c.id      = id;
+    c.row_len = row_len(ctx, ?c, 0);
+    val hide: bool = m.seen == 0 && (!(sel s.align.start) || by_size(f, it));
+    enter(ctx, ?c, id, it, rw, rh, hide);
+}
+
+# close the flow begin_flow opened and place it in its parent
+#
+# a side fitted to the content takes the size measured this frame: a height
+# its rows stacked, a width its items in one row up to the width's largest
+# size.
+# ---
+# ctx: context
+pub fun end_flow(ctx: *context.Context) {
+    val f: *layout.Frame = top(ctx);
+    if (f.id != 0 && f.items > 0) { keep_row(ctx, f, f.row, f.line_h); }
+    leave(ctx);
 }
 
 # move the pen past an item len pixels long along the current frame's axis,

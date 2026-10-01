@@ -923,7 +923,7 @@ works inside surfaces, docks and windows alike.
 - **A stack of frames.** Layout is a stack of frames on the context
   (`blit.layout.Frame`): a content box, a pen, the axis items advance along,
   the gap between them and how they align across it. Every container (panel,
-  window, popup, dock, scroll region, columns, stack) pushes its frame at its
+  window, popup, dock, scroll region, columns, stack, flow) pushes its frame at its
   begin and pops it at its end, so a panel opened inside a window leaves the
   window's layout where it was. Outside any container, widgets lay out down a
   column over the screen.
@@ -943,6 +943,27 @@ works inside surfaces, docks and windows alike.
   blit.widget.size_next(?ctx, blit.layout.fill(1.0::f32), blit.layout.auto());
   blit.widget.text_field(?ctx, "find", ?find, "find");
   blit.widget.end_stack(?ctx);
+  ```
+- **Flows.** `begin_flow(?ctx, key, s)`/`end_flow` open a flow as the next
+  item of the current frame: its items go left to right, and one that would
+  pass the right edge starts the next row. A row is as tall as its tallest
+  item, and its items sit in that height as `align` says, read from what the
+  row measured last frame. An item wider than a whole row takes the row alone
+  at its width and cuts its label to it, as a control placed by hand does
+  with `blit.text.fit_box` or `fit_pair`. `blit.widget.flow(?ctx)` gives the
+  options at the layout style's gaps (`margin.r` between items, `margin.b`
+  between rows): adjust `gap`, `row_gap`, `align`, the flow's own `w` and `h`
+  and `item_w`/`item_h`, as for a stack. A flow is sized in its parent as a
+  stack is, and its width fitted to its content is its items in one row, so
+  `limit(fit(), 0, max)` wraps at `max`. Flows and stacks nest in each other,
+  and in windows, docked bodies and overlays.
+  ```mach
+  blit.widget.size_next(?ctx, blit.layout.limit(blit.layout.fit(), 0.0::f32, max_w), blit.layout.auto());
+  blit.widget.begin_flow(?ctx, "readout", blit.widget.flow(?ctx));
+  # one item per label and value pair, cut to the row when wider than it
+  val r: blit.context.Area = blit.widget.place(?ctx, blit.layout.fit(), blit.layout.fit(), pair_w, line_h);
+  blit.text.fit_pair(?ctx, blit.theme.LABEL, "gen", 3, faint, gen, ink, pair_gap, r.y0, r);
+  blit.widget.end_flow(?ctx);
   ```
 - **Sizing.** Each side of an item is `blit.layout.fixed(px)`, `fit()` (what its
   content needs), `fill(weight)` (a share of the space the other items leave)
