@@ -1,8 +1,9 @@
 # menus: a menu bar, menus that drop from it, submenus that open on hover and
 # context menus that open on a right press
 #
-# a bar runs along the top of the current layout column. each begin_menu in
-# it is a header that opens its menu on a press, and while one is open,
+# a bar is the next item of the current layout frame, one row high across it,
+# so placed first it runs along a window's or surface's top. each begin_menu
+# in it is a header that opens its menu on a press, and while one is open,
 # moving onto another header opens that one instead. begin_menu inside an
 # open menu is a row that opens a submenu beside it when hovered. a context
 # menu opens where the right button went down over its region, or wherever
@@ -53,6 +54,7 @@ use blit.field;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
+use blit.layout;
 use blit.state;
 use blit.widget;
 
@@ -167,6 +169,8 @@ pub rec MenuState {
 # hnext:  a bar's header after the open one
 # hopen:  true once a bar placed its open header
 # x:      a bar's next header left
+# x0:     a bar's left
+# x1:     a bar's right
 # y0:     a bar's top
 # y1:     a bar's bottom
 # ch:     a bar's channels: its background beneath its headers
@@ -197,6 +201,8 @@ pub rec Menu {
     hnext:  u64;
     hopen:  bool;
     x:      f32;
+    x0:     f32;
+    x1:     f32;
     y0:     f32;
     y1:     f32;
     ch:     context.Channels;
@@ -393,7 +399,9 @@ fun open_popup(ctx: *context.Context, m: *Menu, x: f32, y: f32, flip_x: f32, nes
     if (nested) { m.pop = widget.begin_popup_nested(ctx, m.id, 1, sx - ctx.lx, sy - ctx.ly, w); }
     or          { m.pop = widget.begin_popup_id(ctx, m.id, 1, sx - ctx.lx, sy - ctx.ly, w); }
     m.open = 1;
-    ctx.cy = ctx.cy + pad(ctx);
+    # rows sit edge to edge, below the menu's top padding
+    context.top_layout(ctx).gap = 0.0::f32;
+    widget.space(ctx, pad(ctx));
 
     m.moved = ctx.in.mx != st.mx || ctx.in.my != st.my;
     st.mx   = ctx.in.mx;
@@ -401,22 +409,26 @@ fun open_popup(ctx: *context.Context, m: *Menu, x: f32, y: f32, flip_x: f32, nes
     if (st.child == 0) { m.keys = nav_keys(ctx); }
 }
 
-# start a menu bar along the top of the current layout column
+# start a menu bar as the next item of the current layout frame
 #
-# it is one control row high and the column's width, and its headers are
+# it is one control row high and fills the frame's width, and its headers are
 # begin_menu calls between it and end_bar.
 # ---
 # ctx: context
 # key: the bar's key in the current id scope
 # ret: the handle its menus open from
 pub fun begin_bar(ctx: *context.Context, key: str) Menu {
-    val id: u64        = context.id_of(ctx, key);
-    val st: *MenuState = state.get[MenuState](ctx, id);
-    var m:  Menu       = menu_of(ctx, id, KIND_BAR, st, nil);
+    val id: u64          = context.id_of(ctx, key);
+    val st: *MenuState   = state.get[MenuState](ctx, id);
+    var m:  Menu         = menu_of(ctx, id, KIND_BAR, st, nil);
+    val rh: f32          = row_h(ctx);
+    val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fixed(rh), 0.0::f32, rh);
     m.open  = 1;
-    m.x     = ctx.cx;
-    m.y0    = ctx.cy;
-    m.y1    = ctx.cy + row_h(ctx);
+    m.x     = r.x0;
+    m.x0    = r.x0;
+    m.x1    = r.x1;
+    m.y0    = r.y0;
+    m.y1    = r.y1;
     m.claim = context.reserve_claim(ctx, 0);
     m.moved = ctx.in.mx != st.mx || ctx.in.my != st.my;
     st.mx   = ctx.in.mx;
@@ -427,8 +439,8 @@ pub fun begin_bar(ctx: *context.Context, key: str) Menu {
     ret m;
 }
 
-# finish a menu bar: paint its background beneath its headers, give it its
-# claim and move the layout cursor below it
+# finish a menu bar: paint its background beneath its headers and give it
+# its claim
 # ---
 # ctx: context
 # m:   the value begin_bar returned
@@ -447,13 +459,10 @@ pub fun end_bar(ctx: *context.Context, m: *Menu) {
         state.get[MenuState](ctx, to).first = 1;
     }
 
-    val x0: f32 = ctx.ox;
-    val x1: f32 = ctx.ox + ctx.pw;
     context.set_channel(ctx, m.ch, 0);
-    context.quad(ctx, x0, m.y0, x1, m.y1, ctx.theme.header);
+    context.quad(ctx, m.x0, m.y0, m.x1, m.y1, ctx.theme.header);
     context.merge(ctx, m.ch);
-    context.fill_claim(ctx, m.claim, x0, m.y0, x1, m.y1);
-    widget.advance(ctx, m.y1 - m.y0);
+    context.fill_claim(ctx, m.claim, m.x0, m.y0, m.x1, m.y1);
 }
 
 # a header in a bar, or a row opening a submenu in an open menu, and the menu
@@ -529,15 +538,16 @@ fun header(ctx: *context.Context, bar: *Menu, m: *Menu, label: str) {
 # a row in an open menu that opens a submenu beside it on hover, a click,
 # enter or right
 fun submenu_row(ctx: *context.Context, parent: *Menu, m: *Menu, label: str) {
-    val ps:   *MenuState = parent.st;
-    val i:    u32        = row_index(parent, true);
-    val p:    f32        = pad(ctx);
-    val rh:   f32        = row_h(ctx);
-    val x0:   f32        = ctx.cx;
-    val y0:   f32        = ctx.cy;
-    val x1:   f32        = ctx.cx + ctx.pw;
-    val y1:   f32        = y0 + rh;
-    val here: bool       = ps.cursor == i + 1;
+    val ps:   *MenuState   = parent.st;
+    val i:    u32          = row_index(parent, true);
+    val p:    f32          = pad(ctx);
+    val rh:   f32          = row_h(ctx);
+    val r:    context.Area = row(ctx, rh);
+    val x0:   f32          = r.x0;
+    val y0:   f32          = r.y0;
+    val x1:   f32          = r.x1;
+    val y1:   f32          = r.y1;
+    val here: bool         = ps.cursor == i + 1;
 
     val h: interact.Hit = interact.hit(ctx, m.id, x0, y0, x1, y1, input.BUTTON_LEFT);
     if (h.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
@@ -562,7 +572,6 @@ fun submenu_row(ctx: *context.Context, parent: *Menu, m: *Menu, label: str) {
     val ay: f32 = y0 + (rh - k) / 2.0::f32;
     context.tri(ctx, ax, ay, ax + k / 2.0::f32, ay + k / 2.0::f32, ax, ay + k, ctx.theme.text_dim);
     parent.need = maxf(parent.need, lx - x0 + context.text_width_n(ctx, label, bid.shown(label)) + p * 4.0::f32 + k);
-    ctx.cy      = y1;
 
     if (!open) {
         m.st.child  = 0;
@@ -572,6 +581,11 @@ fun submenu_row(ctx: *context.Context, parent: *Menu, m: *Menu, label: str) {
     open_popup(ctx, m, x1, y0 - p, x0, true);
     # the key that opened it was this frame's, and its parent's
     if (parent.took) { m.keys = 0; }
+}
+
+# place a row h tall across an open menu
+fun row(ctx: *context.Context, h: f32) context.Area {
+    ret widget.place(ctx, layout.fill(1.0::f32), layout.fixed(h), 0.0::f32, h);
 }
 
 # count a row of an open menu, tracking the enabled ones around its highlight
@@ -634,7 +648,8 @@ pub fun end_menu(ctx: *context.Context, m: *Menu) {
 
     var icons: u8 = 0;
     if (m.icons) { icons = 1; }
-    val h: f32 = ctx.cy + pad(ctx) - ctx.oy;
+    val f: *layout.Frame = context.top_layout(ctx);
+    val h: f32           = f.y + pad(ctx) - f.y0;
     if (m.need != st.w || h != st.h || icons != st.icons) { context.wake_at(ctx, ctx.in.time); }
     st.w     = m.need;
     st.h     = h;
@@ -650,11 +665,10 @@ pub fun end_menu(ctx: *context.Context, m: *Menu) {
 # m:   the menu
 pub fun separator(ctx: *context.Context, m: *Menu) {
     if (m.open == 0 || m.kind == KIND_BAR) { ret; }
-    val p: f32 = pad(ctx);
-    val w: f32 = context.px(ctx, ctx.theme.edge_w);
-    val y: f32 = ctx.cy + p;
-    context.quad(ctx, ctx.cx + p, y, ctx.cx + ctx.pw - p, y + w, ctx.theme.edge);
-    ctx.cy = y + w + p;
+    val p: f32          = pad(ctx);
+    val w: f32          = context.px(ctx, ctx.theme.edge_w);
+    val r: context.Area = row(ctx, p * 2.0::f32 + w);
+    context.quad(ctx, r.x0 + p, r.y0 + p, r.x1 - p, r.y0 + p + w, ctx.theme.edge);
 }
 
 # an entry of a menu: drawn while the menu is open, fired by a click, by enter
@@ -672,15 +686,16 @@ pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
     if (!it.disabled && !context.typing(ctx) && struck(ctx, it.shortcut)) { fired = true; }
 
     if (m.open != 0 && m.kind != KIND_BAR) {
-        val i:       u32 = row_index(m, !it.disabled);
-        val id:      u64 = context.id_of(ctx, it.label);
-        val p:       f32 = pad(ctx);
-        val rh:      f32 = row_h(ctx);
-        val x0:      f32 = ctx.cx;
-        val y0:      f32 = ctx.cy;
-        val x1:      f32 = ctx.cx + ctx.pw;
-        val y1:      f32 = y0 + rh;
-        var buttons: u8  = input.BUTTON_LEFT;
+        val i:       u32          = row_index(m, !it.disabled);
+        val id:      u64          = context.id_of(ctx, it.label);
+        val p:       f32          = pad(ctx);
+        val rh:      f32          = row_h(ctx);
+        val r:       context.Area = row(ctx, rh);
+        val x0:      f32          = r.x0;
+        val y0:      f32          = r.y0;
+        val x1:      f32          = r.x1;
+        val y1:      f32          = r.y1;
+        var buttons: u8           = input.BUTTON_LEFT;
         if (it.disabled) { buttons = 0; }
 
         val h: interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, buttons);
@@ -728,7 +743,6 @@ pub fun item(ctx: *context.Context, m: *Menu, it: Item) bool {
             need = need + lh * 2.0::f32 + sw;
         }
         m.need = maxf(m.need, need + lh / 2.0::f32);
-        ctx.cy = y1;
     }
 
     if (fired && it.check != nil) {

@@ -89,6 +89,15 @@ pub val MOD_CTRL:  u8 = 2;
 pub val MOD_ALT:   u8 = 4;
 pub val MOD_SUPER: u8 = 8;
 
+# the modifier that makes arrows, backspace and delete act on words: option
+# (alt) on darwin, ctrl elsewhere
+$if ($mach.build.os == $mach.os.darwin) {
+    pub val MOD_WORD: u8 = MOD_ALT;
+}
+$or {
+    pub val MOD_WORD: u8 = MOD_CTRL;
+}
+
 # pointer shapes the context asks the host for (see context.cursor)
 pub val CURSOR_ARROW:       u8 = 0;
 pub val CURSOR_TEXT:        u8 = 1;
