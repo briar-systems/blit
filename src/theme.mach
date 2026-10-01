@@ -52,7 +52,7 @@ use std.memory;
 pub val SERIES: usize = 8;
 
 # how many widget kinds a theme styles
-pub val KINDS: u32 = 50;
+pub val KINDS: u32 = 51;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -107,7 +107,7 @@ pub val LIST_ITEM: u32 = 22;
 pub val CHART: u32 = 23;
 # a tab, on while chosen, and a tab bar's overflow buttons: margin.r between tabs
 pub val TAB: u32 = 24;
-# a tooltip, and a chart's read-out
+# a tooltip, and a chart's read-out: pad around its content, margin.t below the widget it describes
 pub val TOOLTIP: u32 = 25;
 # a menu's body: pad around its rows, min_w its least width
 pub val MENU: u32 = 26;
@@ -157,6 +157,8 @@ pub val VALUE: u32 = 47;
 pub val PICKER: u32 = 48;
 # the checkerboard alpha shows through: fill and mark its two cells
 pub val CHECKER: u32 = 49;
+# a toast's card: pad around its text, margin between the stack and the surface's edges
+pub val TOAST: u32 = 50;
 
 # at rest
 pub val NORMAL: u8 = 0;
@@ -294,7 +296,7 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
-    styles:      [50]Style;
+    styles:      [51]Style;
 }
 
 # a field holding a color, four floats
@@ -402,7 +404,7 @@ pub rec Name {
 }
 
 # every widget kind, indexed by the kind constants
-pub val KIND_NAMES: [50]Name = [50]Name{
+pub val KIND_NAMES: [51]Name = [51]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -428,10 +430,10 @@ pub val KIND_NAMES: [50]Name = [50]Name{
     Name{name: "list_item", doc: "a list's row, on while selected"},
     Name{name: "chart", doc: "a chart: border the grid, mark the axes, ticks, labels and hover guide, inset around labels, margin.r between bars"},
     Name{name: "tab", doc: "a tab, on while chosen, and a tab bar's overflow buttons, disabled when they cannot act: margin.r between tabs"},
-    Name{name: "tooltip", doc: "a tooltip, and a chart's read-out"},
+    Name{name: "tooltip", doc: "a tooltip, and a chart's read-out: pad around its content, inset around a read-out's text, margin.t below the widget it describes"},
     Name{name: "menu", doc: "a menu's body, pad around its rows, min_w its least width"},
     Name{name: "menu_item", doc: "a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent"},
-    Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill"},
+    Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill or a border: pad around its content"},
     Name{name: "modal", doc: "a modal dialog's body"},
     Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"},
     Name{name: "radio", doc: "a radio button's ring: pad around the dot, inset.l between the ring and the label"},
@@ -452,7 +454,8 @@ pub val KIND_NAMES: [50]Name = [50]Name{
     Name{name: "table_rule", doc: "a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width"},
     Name{name: "value", doc: "a value editor's drag cell: inset around its text and before its row's cells, min_w its least width"},
     Name{name: "picker", doc: "a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label"},
-    Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"}
+    Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"},
+    Name{name: "toast", doc: "a toast's card: pad around its text, margin between the stack and the surface's edges"}
 };
 
 # every state, indexed by the state constants
@@ -1018,6 +1021,12 @@ pub fun derive(t: *Theme) {
     t.styles[MODAL]         = below(t, t.window);
     t.styles[MODAL].pad     = edges(t.pad);
     fill_all(?t.styles[TOOLTIP], t.window);
+    outline(t, TOOLTIP, t.edge, t.edge_w);
+    t.styles[TOOLTIP].margin.t = t.gap;
+    fill_all(?t.styles[TOAST], t.window);
+    outline(t, TOAST, t.edge, t.edge_w);
+    t.styles[TOAST].margin = edges(t.pad * 2.0::f32);
+    t.styles[OVERLAY].pad  = edges(0.0::f32);
 
     fills(?t.styles[WINDOW_TITLE], t.header, t.header_hot, t.header_hot, t.header);
 

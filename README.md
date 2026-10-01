@@ -351,10 +351,10 @@ test holds this README's copy to it (`blit.theme.document` writes it).
 | `list_item` | a list's row, on while selected |
 | `chart` | a chart: border the grid, mark the axes, ticks, labels and hover guide, inset around labels, margin.r between bars |
 | `tab` | a tab, on while chosen, and a tab bar's overflow buttons, disabled when they cannot act: margin.r between tabs |
-| `tooltip` | a tooltip, and a chart's read-out |
+| `tooltip` | a tooltip, and a chart's read-out: pad around its content, inset around a read-out's text, margin.t below the widget it describes |
 | `menu` | a menu's body, pad around its rows, min_w its least width |
 | `menu_item` | a row of a menu, on while its submenu is open: mark its shortcut and arrow, inset.l its indent |
-| `overlay` | an overlay, chrome-free unless its style gives it a fill |
+| `overlay` | an overlay, chrome-free unless its style gives it a fill or a border: pad around its content |
 | `modal` | a modal dialog's body |
 | `scrim` | the scrim over everything behind a modal dialog |
 | `radio` | a radio button's ring: pad around the dot, inset.l between the ring and the label |
@@ -376,6 +376,7 @@ test holds this README's copy to it (`blit.theme.document` writes it).
 | `value` | a value editor's drag cell: inset around its text and before its row's cells, min_w its least width |
 | `picker` | a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label |
 | `checker` | the checkerboard alpha shows through: fill and mark its two cells |
+| `toast` | a toast's card: pad around its text, margin between the stack and the surface's edges |
 
 | state | when |
 |---|---|
@@ -1193,7 +1194,7 @@ o.keep = 1;
   measured spends its first frame hidden, only measuring, and asks for the
   next at once, as a fitted stack does.
 - **No chrome, no claim.** A bare overlay draws no title, frame or
-  background, and claims nothing itself: input stops only where its widgets
+  background unless its style gives it one, and claims nothing itself: input stops only where its widgets
   claim, so the world under its empty space and its text stays interactive.
 - **Order.** Overlays paint and take input in the overlays band, above docks
   and windows and beneath popups, menus and modals. `order` places one among
@@ -1252,9 +1253,10 @@ blit.tooltip.end(?ctx, tip);
   pointer. Its content is for reading: a widget in it that claims would take
   the hover from the widget it describes.
 
-Toasts and tooltips draw their cards with the window surface, the edge line,
-the text colour, the padding and the corner radius of the theme, read through
-`blit.overlay.chrome(?ctx, kind)`.
+Overlays, toasts and tooltips draw in the `overlay`, `toast` and `tooltip`
+styles, which `blit.overlay.chrome(?ctx, kind)` reads at rest and
+`blit.overlay.paint` draws. A bare overlay's style has no fill or outline, so
+it stays chrome-free until a theme gives it one.
 
 ## Charts
 

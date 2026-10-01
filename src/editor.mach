@@ -169,7 +169,7 @@ pub fun theme_editor(ctx: *context.Context, key: str, h: f32) u8 {
         out = out | EDITED;
     }
 
-    var groups: [53]str;
+    var groups: [54]str;
     groups[0] = "palette";
     groups[1] = "metrics";
     groups[2] = "plot";
@@ -233,7 +233,7 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
 }
 
 test editor__group_list_holds_every_group_and_kind {
-    if (GROUPS + th.KINDS::usize != 53) { ret 1; }
+    if (GROUPS + th.KINDS::usize != 54) { ret 1; }
     ret 0;
 }
 
