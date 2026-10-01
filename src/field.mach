@@ -1,15 +1,27 @@
-# the edit model of a one-line text field, as plain data
+# the edit model of a text field or a text area, as plain data
 #
 # a Field is utf-8 text in a buffer the consumer owns, with a caret, a
 # selection and a view offset, edited by typed codepoints, pasted text and
 # editing keys. it knows nothing of the context, the font or the clipboard:
-# blit.widget.text_field draws one, routes the keyboard to it while it holds
-# the focus, and does the clipboard hand-off. every offset is a byte offset on
-# a character boundary.
+# blit.widget.text_field and blit.textarea.text_area draw one, route the
+# keyboard to it while it holds the focus, and do the clipboard hand-off.
+# every offset is a byte offset on a character boundary.
 #
-# a field takes a codepoint only when it is printable, its filter accepts it,
-# and it fits both the buffer and the field's maximum length in characters.
+# a field takes a codepoint only when it is printable (a newline too in a
+# LINES field), its filter accepts it, and it fits both the buffer and the
+# field's maximum length in characters.
+#
+# flags shape a field: LINES makes it multi-line, READ_ONLY refuses every
+# edit while still moving, selecting and copying, MASKED hides its text (a
+# password) and treats it as one word, and COUNT asks the widget to show its
+# length against its maximum.
+#
+# undo and redo walk a History of edits kept in a second consumer-owned buffer
+# (see keep_history). typing and single-character deletions coalesce into
+# word-sized steps, and any other edit, a caret movement or an undo ends the
+# step. when the history is full its oldest steps are dropped.
 
+use std.memory;
 use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -31,7 +43,84 @@ pub val EDITED:  u8 = 1;
 pub val ENTERED: u8 = 2;
 pub val ESCAPED: u8 = 4;
 
-# an editable line of utf-8 text in a consumer-owned buffer
+# flag bits of a field, combined with | in Field.flags
+# ---
+# LINES:     multi-line: enter types a newline, home and end act on the line
+# READ_ONLY: every edit is refused, moving, selecting and copying still work
+# MASKED:    the text is drawn hidden, is never copied, and is one word
+# COUNT:     the widget shows the length in characters, against max when set
+pub val LINES:     u8 = 1;
+pub val READ_ONLY: u8 = 2;
+pub val MASKED:    u8 = 4;
+pub val COUNT:     u8 = 8;
+
+# kinds of edit, which decide what coalesces into one undo step
+val KIND_OTHER: usize = 0;
+val KIND_TYPE:  usize = 1;
+val KIND_BACK:  usize = 2;
+val KIND_DEL:   usize = 3;
+
+# one undo step's header, followed in the history by its bytes
+# ---
+# at:    byte offset of the edit
+# old_n: bytes the edit removed, stored first
+# new_n: bytes the edit put in their place, stored after
+# c0:    caret before
+# a0:    anchor before
+# c1:    caret after
+# a1:    anchor after
+# kind:  a KIND_* constant
+rec Head {
+    at:    usize;
+    old_n: usize;
+    new_n: usize;
+    c0:    usize;
+    a0:    usize;
+    c1:    usize;
+    a1:    usize;
+    kind:  usize;
+}
+
+# the undo history of a field, in a consumer-owned buffer
+#
+# the buffer holds steps oldest first, each a Head, the removed bytes, the
+# inserted bytes, padding to 8 and the step's size in 8 bytes, so steps walk
+# back from the top as well as forward from the bottom.
+# ---
+# buf:    the steps, nil for no history
+# cap:    bytes buf holds
+# used:   bytes of the steps undo can reach
+# end:    bytes of the steps, redo reaches those past used
+# sealed: 1 when the next edit starts a new step
+# open:   1 while an edit is being recorded
+# merge:  the KIND_* the open edit coalesces into the top step as, else 0
+# at:     the open edit's offset
+# old_n:  bytes the open edit removes
+# len0:   the text's length before the open edit
+# c0:     caret before the open edit
+# a0:     anchor before the open edit
+# kind:   the open edit's KIND_*
+# tmp:    the character a coalescing deletion removes
+# tmp_n:  bytes in tmp
+pub rec History {
+    buf:    *u8;
+    cap:    usize;
+    used:   usize;
+    end:    usize;
+    sealed: u8;
+    open:   u8;
+    merge:  usize;
+    at:     usize;
+    old_n:  usize;
+    len0:   usize;
+    c0:     usize;
+    a0:     usize;
+    kind:   usize;
+    tmp:    [4]u8;
+    tmp_n:  usize;
+}
+
+# an editable run of utf-8 text in a consumer-owned buffer
 # ---
 # buf:    the text, NUL-terminated
 # cap:    bytes buf holds, the terminator included
@@ -42,6 +131,9 @@ pub val ESCAPED: u8 = 4;
 # anchor: the selection's other end, equal to caret when nothing is selected
 # first:  byte offset of the first character shown, kept by the widget so the caret stays in view
 # accept: whether a typed codepoint belongs in the field, nil for any printable one
+# flags:  LINES, READ_ONLY, MASKED and COUNT bits, 0 from init
+# rev:    bumped by every change to the text, so a view can tell its layout is stale
+# hist:   the undo history, empty until keep_history
 pub rec Field {
     buf:    *u8;
     cap:    usize;
@@ -52,6 +144,9 @@ pub rec Field {
     anchor: usize;
     first:  usize;
     accept: fun(u32) bool;
+    flags:  u8;
+    rev:    u64;
+    hist:   History;
 }
 
 # make an empty field over a buffer
@@ -71,7 +166,28 @@ pub fun init(f: *Field, buf: *u8, cap: usize, max: usize, accept: fun(u32) bool)
     f.anchor = 0;
     f.first  = 0;
     f.accept = accept;
+    f.flags  = 0;
+    f.rev    = 0;
+    var none: History;
+    f.hist = none;
     if (cap > 0) { buf[0] = 0; }
+}
+
+# keep undo history in a buffer, dropping any history kept so far
+#
+# each step costs about 80 bytes plus the text it changed, and the oldest
+# steps are dropped to make room. a step larger than the whole buffer clears
+# the history.
+# ---
+# f:   the field
+# buf: storage for the history, nil for none
+# cap: bytes buf holds
+pub fun keep_history(f: *Field, buf: *u8, cap: usize) {
+    var none: History;
+    f.hist     = none;
+    f.hist.buf = buf;
+    f.hist.cap = cap;
+    if (buf == nil) { f.hist.cap = 0; }
 }
 
 # the field's text
@@ -82,18 +198,33 @@ pub fun text(f: *Field) str {
     ret f.buf;
 }
 
+# whether a field has a flag set
+# ---
+# f:    the field
+# flag: a flag bit
+# ret:  true when set
+pub fun has(f: *Field, flag: u8) bool {
+    ret (f.flags & flag) != 0;
+}
+
 # replace the text with the codepoints of s the field takes, caret at the end
+#
+# a read-only field takes it too, and the undo history is cleared.
 # ---
 # f: the field
 # s: utf-8 text
 pub fun set(f: *Field, s: str) {
-    f.len    = 0;
     f.chars  = 0;
     f.caret  = 0;
     f.anchor = 0;
     f.first  = 0;
+    if (f.len > 0) { f.rev = f.rev + 1; }
+    f.len = 0;
     if (f.cap > 0) { f.buf[0] = 0; }
-    paste(f, s);
+    val typed: bool = type_all(f, s);
+    f.hist.used   = 0;
+    f.hist.end    = 0;
+    f.hist.sealed = 0;
 }
 
 # whether some text is selected
@@ -146,50 +277,189 @@ pub fun after(f: *Field, i: usize) usize {
     ret j;
 }
 
-# characters in the bytes [lo, hi)
-fun count(f: *Field, lo: usize, hi: usize) usize {
-    var n: usize = 0;
-    var i: usize = lo;
-    for (i < hi) {
-        if (!utf8.is_continuation(f.buf[i])) { n = n + 1; }
+# classes of character words are runs of
+val CLASS_SPACE: u8 = 0;
+val CLASS_BREAK: u8 = 1;
+val CLASS_WORD:  u8 = 2;
+val CLASS_PUNCT: u8 = 3;
+
+# the class of the character starting with byte b: any non-ascii character
+# is a word character
+fun class_of(b: u8) u8 {
+    if (b == '\n')                                        { ret CLASS_BREAK; }
+    if (b == ' ' || b == '\t' || b == '\r')               { ret CLASS_SPACE; }
+    if (b >= 0x80 || b == '_')                            { ret CLASS_WORD; }
+    if (b >= '0' && b <= '9')                             { ret CLASS_WORD; }
+    if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')) { ret CLASS_WORD; }
+    ret CLASS_PUNCT;
+}
+
+# whether the character starting with byte b separates words
+fun blank(b: u8) bool {
+    val c: u8 = class_of(b);
+    ret c == CLASS_SPACE || c == CLASS_BREAK;
+}
+
+# the start of the word before i: past any blanks, then the run of one class
+#
+# a MASKED field is one word, so this is its start.
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the boundary a word movement left lands on
+pub fun word_left(f: *Field, i: usize) usize {
+    if (has(f, MASKED)) { ret 0; }
+    var j: usize = i;
+    for (j > 0 && blank(f.buf[before(f, j)])) { j = before(f, j); }
+    if (j == 0) { ret 0; }
+    val c: u8 = class_of(f.buf[before(f, j)]);
+    for (j > 0 && class_of(f.buf[before(f, j)]) == c) { j = before(f, j); }
+    ret j;
+}
+
+# the end of the word after i: past any blanks, then the run of one class
+#
+# a MASKED field is one word, so this is its end.
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the boundary a word movement right lands on
+pub fun word_right(f: *Field, i: usize) usize {
+    if (has(f, MASKED)) { ret f.len; }
+    var j: usize = i;
+    for (j < f.len && blank(f.buf[j])) { j = after(f, j); }
+    if (j >= f.len) { ret f.len; }
+    val c: u8 = class_of(f.buf[j]);
+    for (j < f.len && class_of(f.buf[j]) == c) { j = after(f, j); }
+    ret j;
+}
+
+# select the run of one class of character at i, as a double click does
+#
+# the character at i decides the class, or the one before it at the end of
+# the text or of a line. a MASKED field selects all of it.
+# ---
+# f: the field
+# i: a byte offset on a boundary
+pub fun select_word(f: *Field, i: usize) {
+    if (has(f, MASKED)) {
+        place(f, f.len, 0);
+        ret;
+    }
+    var at: usize = i;
+    if (at > f.len)                                   { at = f.len; }
+    if (at > 0 && (at == f.len || f.buf[at] == '\n')) { at = before(f, at); }
+    if (at >= f.len || f.buf[at] == '\n') {
+        place(f, i, i);
+        ret;
+    }
+    val c:  u8    = class_of(f.buf[at]);
+    var lo: usize = at;
+    for (lo > 0 && class_of(f.buf[before(f, lo)]) == c) { lo = before(f, lo); }
+    var hi: usize = after(f, at);
+    for (hi < f.len && class_of(f.buf[hi]) == c) { hi = after(f, hi); }
+    place(f, hi, lo);
+}
+
+# the start of the line holding i, 0 in a one-line field
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the offset just past the newline before i, or 0
+pub fun line_start(f: *Field, i: usize) usize {
+    var j: usize = i;
+    for (j > 0 && f.buf[j - 1] != '\n') { j = j - 1; }
+    ret j;
+}
+
+# the end of the line holding i, len in a one-line field
+# ---
+# f:   the field
+# i:   a byte offset on a boundary
+# ret: the offset of the newline after i, or len
+pub fun line_end(f: *Field, i: usize) usize {
+    var j: usize = i;
+    for (j < f.len && f.buf[j] != '\n') { j = j + 1; }
+    ret j;
+}
+
+# select the line holding i without its newline, as a triple click does
+# ---
+# f: the field
+# i: a byte offset on a boundary
+pub fun select_line(f: *Field, i: usize) {
+    place(f, line_end(f, i), line_start(f, i));
+}
+
+# put the caret and the anchor somewhere, ending the undo step
+#
+# widgets place the caret this way for clicks and drags. both are clamped to
+# the text.
+# ---
+# f:      the field
+# caret:  byte offset on a boundary
+# anchor: byte offset on a boundary, caret for no selection
+pub fun place(f: *Field, caret: usize, anchor: usize) {
+    var c: usize = caret;
+    var a: usize = anchor;
+    if (c > f.len) { c = f.len; }
+    if (a > f.len) { a = f.len; }
+    f.caret       = c;
+    f.anchor      = a;
+    f.hist.sealed = 1;
+}
+
+# characters in the bytes [lo, lo + n) of p
+fun count_bytes(p: *u8, n: usize) usize {
+    var c: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (!utf8.is_continuation(p[i])) { c = c + 1; }
         i = i + 1;
     }
-    ret n;
+    ret c;
+}
+
+# characters in the bytes [lo, hi)
+fun count(f: *Field, lo: usize, hi: usize) usize {
+    if (hi <= lo) { ret 0; }
+    ret count_bytes(?f.buf[lo], hi - lo);
 }
 
 # remove the bytes [lo, hi), leaving caret and anchor at lo
 fun remove(f: *Field, lo: usize, hi: usize) {
+    if (hi <= lo) { ret; }
     f.chars = f.chars - count(f, lo, hi);
-    var i: usize = hi;
-    for (i <= f.len) {
-        f.buf[lo + i - hi] = f.buf[i];
-        i                  = i + 1;
-    }
+    memory.raw_move((?f.buf[lo])::ptr, (?f.buf[hi])::ptr, f.len - hi + 1);
     f.len    = f.len - (hi - lo);
     f.caret  = lo;
     f.anchor = lo;
+    f.rev    = f.rev + 1;
     if (f.first > lo) { f.first = lo; }
 }
 
-# remove the selected text
-# ---
-# f:   the field
-# ret: true if anything was selected and removed
-pub fun erase(f: *Field) bool {
-    if (!selected(f)) { ret false; }
-    remove(f, sel_lo(f), sel_hi(f));
-    ret true;
+# replace the bytes [at, at + gone) with n bytes of src, which fit
+fun splice(f: *Field, at: usize, gone: usize, src: *u8, n: usize) {
+    f.chars = f.chars - count(f, at, at + gone);
+    memory.raw_move((?f.buf[at + n])::ptr, (?f.buf[at + gone])::ptr, f.len - at - gone + 1);
+    if (n > 0) { memory.raw_copy((?f.buf[at])::ptr, src::ptr, n); }
+    f.len   = f.len - gone + n;
+    f.chars = f.chars + count(f, at, at + n);
+    f.rev   = f.rev + 1;
+    if (f.first > at) { f.first = at; }
 }
 
-# whether a codepoint is text rather than a control
-fun printable(cp: u32) bool {
+# whether a codepoint is text rather than a control, a newline being text in
+# a LINES field
+fun printable(f: *Field, cp: u32) bool {
+    if (cp == '\n') { ret has(f, LINES); }
     ret cp >= 0x20 && (cp < 0x7F || cp >= 0xA0);
 }
 
 # whether the field takes a codepoint once freed_chars characters of
 # freed_bytes bytes are removed, and how many bytes it encodes to
 fun fits(f: *Field, cp: u32, freed_chars: usize, freed_bytes: usize, n: *usize) bool {
-    if (!printable(cp))                                            { ret false; }
+    if (!printable(f, cp))                                         { ret false; }
     if (f.accept != nil && !f.accept(cp))                          { ret false; }
     if (cp > utf8.MAX_CODEPOINT || (cp >= 0xD800 && cp <= 0xDFFF)) { ret false; }
     if (f.max != 0 && f.chars - freed_chars >= f.max)              { ret false; }
@@ -203,51 +473,21 @@ fun put(f: *Field, cp: u32) bool {
     if (!fits(f, cp, 0, 0, ?n)) { ret false; }
     var b:     [4]u8;
     val wrote: usize = utf8.encode(cp, ?b[0], 4);
-
-    val at: usize = f.caret;
-    var i:  usize = f.len + 1;
-    for (i > at) {
-        i            = i - 1;
-        f.buf[i + n] = f.buf[i];
-    }
-    var k: usize = 0;
-    for (k < n) {
-        f.buf[at + k] = b[k];
-        k             = k + 1;
-    }
+    val at:    usize = f.caret;
+    memory.raw_move((?f.buf[at + n])::ptr, (?f.buf[at])::ptr, f.len - at + 1);
+    memory.raw_copy((?f.buf[at])::ptr, (?b[0])::ptr, n);
     f.len    = f.len + n;
     f.chars  = f.chars + 1;
     f.caret  = at + n;
     f.anchor = f.caret;
+    f.rev    = f.rev + 1;
     ret true;
 }
 
-# type a codepoint at the caret, replacing any selection
-#
-# a codepoint the field refuses leaves the selection in place.
-# ---
-# f:   the field
-# cp:  a unicode scalar value
-# ret: true if the text changed
-pub fun insert(f: *Field, cp: u32) bool {
-    val lo: usize = sel_lo(f);
-    val hi: usize = sel_hi(f);
-    var n:  usize = 0;
-    if (!fits(f, cp, count(f, lo, hi), hi - lo, ?n)) { ret false; }
-    val erased: bool = erase(f);
-    ret put(f, cp);
-}
-
-# type the codepoints of utf-8 text at the caret, replacing any selection
-#
-# codepoints the field refuses are skipped, and typing stops once it is full.
-# ---
-# f:   the field
-# s:   utf-8 text, nil for none
-# ret: true if the text changed
-pub fun paste(f: *Field, s: str) bool {
+# type the codepoints of s the field takes at the caret, which has no selection
+fun type_all(f: *Field, s: str) bool {
     if (s == nil) { ret false; }
-    var changed: bool  = erase(f);
+    var changed: bool  = false;
     val n:       usize = str_len(s);
     var i:       usize = 0;
     for (i < n) {
@@ -258,55 +498,371 @@ pub fun paste(f: *Field, s: str) bool {
     ret changed;
 }
 
+# 8-byte alignment of a step's bytes
+fun round8(n: usize) usize {
+    ret (n + 7) & ~(7::usize);
+}
+
+# bytes a step takes in the history
+fun step_size(old_n: usize, new_n: usize) usize {
+    ret round8($size_of(Head) + old_n + new_n) + 8;
+}
+
+# the step header at byte offset at
+fun head_at(h: *History, at: usize) Head {
+    var hd: Head;
+    memory.raw_copy((?hd)::ptr, (?h.buf[at])::ptr, $size_of(Head));
+    ret hd;
+}
+
+# write a step header at byte offset at
+fun put_head(h: *History, at: usize, hd: Head) {
+    var v: Head = hd;
+    memory.raw_copy((?h.buf[at])::ptr, (?v)::ptr, $size_of(Head));
+}
+
+# write a step's size at the end of a step of that size starting at at
+fun put_size(h: *History, at: usize, size: usize) {
+    var v: usize = size;
+    memory.raw_copy((?h.buf[at + size - 8])::ptr, (?v)::ptr, 8);
+}
+
+# the size of the step ending at byte offset at
+fun size_before(h: *History, at: usize) usize {
+    var v: usize = 0;
+    memory.raw_copy((?v)::ptr, (?h.buf[at - 8])::ptr, 8);
+    ret v;
+}
+
+# drop the oldest step, moving everything up to keep bytes down after it
+fun evict(h: *History, keep: usize) {
+    val hd:   Head  = head_at(h, 0);
+    val size: usize = step_size(hd.old_n, hd.new_n);
+    memory.raw_move(h.buf::ptr, (?h.buf[size])::ptr, keep - size);
+    h.used = h.used - size;
+    h.end  = h.used;
+}
+
+# forget every step
+fun clear(h: *History) {
+    h.used = 0;
+    h.end  = 0;
+    h.open = 0;
+}
+
+# whether an edit of kind removing [lo, hi) coalesces into the top step
+fun coalesces(f: *Field, kind: usize, lo: usize, hi: usize, cp: u32) bool {
+    val h: *History = ?f.hist;
+    if (kind == KIND_OTHER || h.sealed != 0 || h.used == 0 || h.end != h.used) { ret false; }
+    val start: usize = h.used - size_before(h, h.used);
+    val top:   Head  = head_at(h, start);
+    if (top.kind != kind || top.c1 != f.caret || top.a1 != f.anchor) { ret false; }
+    val data: usize = start + $size_of(Head);
+    if (kind == KIND_TYPE) {
+        if (lo != hi || top.at + top.new_n != lo || top.new_n == 0) { ret false; }
+        # a word starts a new step
+        val word: bool = cp >= 0x80 || !blank(cp::u8);
+        ret !(blank(h.buf[data + top.old_n + top.new_n - 1]) && word);
+    }
+    if (hi - lo > 4 || top.new_n != 0 || top.old_n == 0) { ret false; }
+    if (kind == KIND_BACK) {
+        if (hi != top.at) { ret false; }
+        ret !(!blank(f.buf[lo]) && blank(h.buf[data]));
+    }
+    if (lo != top.at) { ret false; }
+    ret !(!blank(f.buf[lo]) && blank(h.buf[data + top.old_n - 1]));
+}
+
+# start recording an edit of kind that removes [lo, hi), typing cp for KIND_TYPE
+fun record(f: *Field, kind: usize, lo: usize, hi: usize, cp: u32) {
+    val h: *History = ?f.hist;
+    h.open = 0;
+    if (h.cap == 0) { ret; }
+    h.kind  = kind;
+    h.at    = lo;
+    h.old_n = hi - lo;
+    h.len0  = f.len;
+    h.c0    = f.caret;
+    h.a0    = f.anchor;
+    h.merge = KIND_OTHER;
+    if (coalesces(f, kind, lo, hi, cp)) {
+        h.merge = kind;
+        h.tmp_n = hi - lo;
+        if (h.tmp_n > 0) { memory.raw_copy((?h.tmp[0])::ptr, (?f.buf[lo])::ptr, h.tmp_n); }
+        h.open = 1;
+        ret;
+    }
+    h.end = h.used;
+    val pend: usize = $size_of(Head) + h.old_n;
+    for (h.used > 0 && h.used + pend > h.cap) { evict(h, h.used); }
+    if (h.used + pend > h.cap) {
+        clear(h);
+        ret;
+    }
+    if (h.old_n > 0) { memory.raw_copy((?h.buf[h.used + $size_of(Head)])::ptr, (?f.buf[lo])::ptr, h.old_n); }
+    h.open = 1;
+}
+
+# grow the top step to size bytes, dropping older steps for room
+fun grow_top(h: *History, start: *usize, size: usize) bool {
+    for (@start > 0 && @start + size > h.cap) {
+        val keep: usize = h.used;
+        evict(h, keep);
+        @start = h.used - size_before(h, h.used);
+    }
+    if (@start + size > h.cap) {
+        clear(h);
+        ret false;
+    }
+    ret true;
+}
+
+# finish recording the open edit, now that the field holds its result
+fun commit(f: *Field) {
+    val h: *History = ?f.hist;
+    if (h.open == 0) { ret; }
+    h.open   = 0;
+    h.sealed = 0;
+    val hsz: usize = $size_of(Head);
+    if (h.merge != KIND_OTHER) {
+        var start: usize = h.used - size_before(h, h.used);
+        var top:   Head  = head_at(h, start);
+        var add:   usize = h.tmp_n;
+        if (h.merge == KIND_TYPE) { add = f.caret - (top.at + top.new_n); }
+        var size: usize = step_size(top.old_n + h.tmp_n, top.new_n);
+        if (h.merge == KIND_TYPE)       { size = step_size(top.old_n, top.new_n + add); }
+        if (!grow_top(h, ?start, size)) { ret; }
+        val data: usize = start + hsz;
+        if (h.merge == KIND_TYPE) {
+            memory.raw_copy((?h.buf[data + top.old_n + top.new_n])::ptr, (?f.buf[top.at + top.new_n])::ptr, add);
+            top.new_n = top.new_n + add;
+        }
+        or (h.merge == KIND_BACK) {
+            memory.raw_move((?h.buf[data + add])::ptr, (?h.buf[data])::ptr, top.old_n);
+            memory.raw_copy((?h.buf[data])::ptr, (?h.tmp[0])::ptr, add);
+            top.old_n = top.old_n + add;
+            top.at    = h.at;
+        }
+        or {
+            memory.raw_copy((?h.buf[data + top.old_n])::ptr, (?h.tmp[0])::ptr, add);
+            top.old_n = top.old_n + add;
+        }
+        top.c1 = f.caret;
+        top.a1 = f.anchor;
+        put_head(h, start, top);
+        put_size(h, start, size);
+        h.used = start + size;
+        h.end  = h.used;
+        ret;
+    }
+    val new_n: usize = f.len + h.old_n - h.len0;
+    val size:  usize = step_size(h.old_n, new_n);
+    for (h.used > 0 && h.used + size > h.cap) { evict(h, h.used + hsz + h.old_n); }
+    if (h.used + size > h.cap) {
+        clear(h);
+        ret;
+    }
+    if (new_n > 0) { memory.raw_copy((?h.buf[h.used + hsz + h.old_n])::ptr, (?f.buf[h.at])::ptr, new_n); }
+    var hd: Head;
+    hd.at    = h.at;
+    hd.old_n = h.old_n;
+    hd.new_n = new_n;
+    hd.c0    = h.c0;
+    hd.a0    = h.a0;
+    hd.c1    = f.caret;
+    hd.a1    = f.anchor;
+    hd.kind  = h.kind;
+    put_head(h, h.used, hd);
+    put_size(h, h.used, size);
+    h.used = h.used + size;
+    h.end  = h.used;
+}
+
+# remove [lo, hi) as one recorded edit of kind
+fun cut_range(f: *Field, kind: usize, lo: usize, hi: usize) bool {
+    if (hi <= lo) { ret false; }
+    record(f, kind, lo, hi, 0);
+    remove(f, lo, hi);
+    commit(f);
+    ret true;
+}
+
+# remove the selected text
+# ---
+# f:   the field
+# ret: true if anything was selected and removed, never in a READ_ONLY field
+pub fun erase(f: *Field) bool {
+    if (has(f, READ_ONLY) || !selected(f)) { ret false; }
+    ret cut_range(f, KIND_OTHER, sel_lo(f), sel_hi(f));
+}
+
+# type a codepoint at the caret, replacing any selection
+#
+# a codepoint the field refuses leaves the selection in place, and a
+# READ_ONLY field refuses every one.
+# ---
+# f:   the field
+# cp:  a unicode scalar value
+# ret: true if the text changed
+pub fun insert(f: *Field, cp: u32) bool {
+    if (has(f, READ_ONLY)) { ret false; }
+    val lo: usize = sel_lo(f);
+    val hi: usize = sel_hi(f);
+    var n:  usize = 0;
+    if (!fits(f, cp, count(f, lo, hi), hi - lo, ?n)) { ret false; }
+    record(f, KIND_TYPE, lo, hi, cp);
+    remove(f, lo, hi);
+    val typed: bool = put(f, cp);
+    commit(f);
+    ret true;
+}
+
+# type the codepoints of utf-8 text at the caret, replacing any selection,
+# as one undo step
+#
+# codepoints the field refuses are skipped, typing stops once it is full, and
+# a READ_ONLY field takes none.
+# ---
+# f:   the field
+# s:   utf-8 text, nil for none
+# ret: true if the text changed
+pub fun paste(f: *Field, s: str) bool {
+    if (s == nil || has(f, READ_ONLY)) { ret false; }
+    val lo: usize = sel_lo(f);
+    val hi: usize = sel_hi(f);
+    record(f, KIND_OTHER, lo, hi, 0);
+    remove(f, lo, hi);
+    val typed: bool = type_all(f, s);
+    if (!typed && lo == hi) {
+        f.hist.open = 0;
+        ret false;
+    }
+    commit(f);
+    ret true;
+}
+
+# take back the last undo step, restoring its text, caret and selection
+# ---
+# f:   the field
+# ret: true if there was a step to take back, never in a READ_ONLY field
+pub fun undo(f: *Field) bool {
+    val h: *History = ?f.hist;
+    if (has(f, READ_ONLY) || h.used == 0) { ret false; }
+    val start: usize = h.used - size_before(h, h.used);
+    val hd:    Head  = head_at(h, start);
+    splice(f, hd.at, hd.new_n, ?h.buf[start + $size_of(Head)], hd.old_n);
+    f.caret  = hd.c0;
+    f.anchor = hd.a0;
+    h.used   = start;
+    h.sealed = 1;
+    ret true;
+}
+
+# make the last undone step again
+# ---
+# f:   the field
+# ret: true if there was a step to redo, never in a READ_ONLY field
+pub fun redo(f: *Field) bool {
+    val h: *History = ?f.hist;
+    if (has(f, READ_ONLY) || h.used >= h.end) { ret false; }
+    val hd: Head = head_at(h, h.used);
+    splice(f, hd.at, hd.old_n, ?h.buf[h.used + $size_of(Head) + hd.old_n], hd.new_n);
+    f.caret  = hd.c1;
+    f.anchor = hd.a1;
+    h.used   = h.used + step_size(hd.old_n, hd.new_n);
+    h.sealed = 1;
+    ret true;
+}
+
 # move the caret to i, extending the selection when shift is held
 fun move_to(f: *Field, i: usize, shift: bool) {
-    f.caret = i;
+    f.caret       = i;
+    f.hist.sealed = 1;
     if (!shift) { f.anchor = i; }
+}
+
+# move the caret to i like an arrow key, extending the selection with shift
+#
+# for movement a widget works out from its layout, such as a text area's up
+# and down. it ends the undo step.
+# ---
+# f:     the field
+# i:     byte offset on a boundary
+# shift: true to keep the anchor where it is
+pub fun move(f: *Field, i: usize, shift: bool) {
+    var at: usize = i;
+    if (at > f.len) { at = f.len; }
+    move_to(f, at, shift);
 }
 
 # apply an editing key
 #
-# backspace and delete remove the selection or one character. left and right
-# move by a character and home and end to either end, extending the selection
-# with shift; without shift, left and right collapse a selection to its side.
-# a shortcut A (see input.shortcut) selects all, and enter and escape report
-# that the edit ended. other keys do nothing.
+# backspace and delete remove the selection or one character, or with
+# input.MOD_WORD up to the start or end of a word. left and right move by a
+# character, or by a word with input.MOD_WORD, and home and end to either end
+# of the text, or of the line in a LINES field unless MOD_WORD is held, all
+# extending the selection with shift; without shift, plain left and right
+# collapse a selection to its side. a shortcut A (see input.shortcut) selects
+# all, shortcut Z undoes and shortcut shift Z or Y redoes. enter types a
+# newline in a LINES field and otherwise reports that the edit ended, as
+# escape always does. other keys do nothing.
 # ---
 # f:   the field
 # k:   the key press
 # ret: the outcome bits it came to
 pub fun key(f: *Field, k: input.Key) u8 {
     val shift: bool = (k.mods & input.MOD_SHIFT) != 0;
+    val word:  bool = (k.mods & input.MOD_WORD) != 0;
+    val cmd:   bool = input.shortcut(k.mods);
     val c:     u32  = k.code;
-    if (c == input.KEY_ENTER)  { ret ENTERED; }
+    if (c == input.KEY_ENTER) {
+        if (!has(f, LINES))  { ret ENTERED; }
+        if (insert(f, '\n')) { ret EDITED; }
+        ret 0;
+    }
     if (c == input.KEY_ESCAPE) { ret ESCAPED; }
-    if (c == 'A' && input.shortcut(k.mods)) {
-        f.anchor = 0;
-        f.caret  = f.len;
+    if (cmd && c == 'A') {
+        place(f, f.len, 0);
+        ret 0;
+    }
+    if (cmd && (c == 'Z' || c == 'Y')) {
+        var done: bool = false;
+        if (c == 'Y' || shift) { done = redo(f); }
+        or                     { done = undo(f); }
+        if (done)              { ret EDITED; }
         ret 0;
     }
     if (c == input.KEY_BACKSPACE || c == input.KEY_DELETE) {
-        if (erase(f)) { ret EDITED; }
-        if (c == input.KEY_BACKSPACE && f.caret > 0) {
-            remove(f, before(f, f.caret), f.caret);
-            ret EDITED;
+        if (has(f, READ_ONLY)) { ret 0; }
+        if (erase(f))          { ret EDITED; }
+        val at: usize = f.caret;
+        if (c == input.KEY_BACKSPACE) {
+            if (word && cut_range(f, KIND_OTHER, word_left(f, at), at)) { ret EDITED; }
+            if (!word && cut_range(f, KIND_BACK, before(f, at), at))    { ret EDITED; }
+            ret 0;
         }
-        if (c == input.KEY_DELETE && f.caret < f.len) {
-            remove(f, f.caret, after(f, f.caret));
-            ret EDITED;
-        }
+        if (word && cut_range(f, KIND_OTHER, at, word_right(f, at))) { ret EDITED; }
+        if (!word && cut_range(f, KIND_DEL, at, after(f, at)))       { ret EDITED; }
         ret 0;
     }
     if (c == input.KEY_LEFT) {
-        if (selected(f) && !shift) { move_to(f, sel_lo(f), false); }
+        if (word)                  { move_to(f, word_left(f, f.caret), shift); }
+        or (selected(f) && !shift) { move_to(f, sel_lo(f), false); }
         or                         { move_to(f, before(f, f.caret), shift); }
     }
     or (c == input.KEY_RIGHT) {
-        if (selected(f) && !shift) { move_to(f, sel_hi(f), false); }
+        if (word)                  { move_to(f, word_right(f, f.caret), shift); }
+        or (selected(f) && !shift) { move_to(f, sel_hi(f), false); }
         or                         { move_to(f, after(f, f.caret), shift); }
     }
-    or (c == input.KEY_HOME) { move_to(f, 0, shift); }
-    or (c == input.KEY_END)  { move_to(f, f.len, shift); }
+    or (c == input.KEY_HOME) {
+        if (has(f, LINES) && !word) { move_to(f, line_start(f, f.caret), shift); }
+        or                          { move_to(f, 0, shift); }
+    }
+    or (c == input.KEY_END) {
+        if (has(f, LINES) && !word) { move_to(f, line_end(f, f.caret), shift); }
+        or                          { move_to(f, f.len, shift); }
+    }
     ret 0;
 }
 
@@ -389,5 +945,212 @@ test field__limits_filters_and_pastes {
     if (insert(?d, 'a') || insert(?d, 0x08) || !insert(?d, '7')) { ret 5; }
     paste(?d, "1a2\n3");
     if (!str_equals(text(?d), "7123")) { ret 6; }
+    ret 0;
+}
+
+test field__moves_and_deletes_by_word {
+    var buf: [64]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 64, 0, nil);
+    val w: u8 = input.MOD_WORD;
+    set(?f, "one  two.three caf\xC3\xA9");
+
+    # left stops at word starts, past blanks, punctuation being its own word
+    key(?f, press(input.KEY_LEFT, w));
+    if (f.caret != 15) { ret 1; }
+    key(?f, press(input.KEY_LEFT, w));
+    if (f.caret != 9) { ret 2; }
+    key(?f, press(input.KEY_LEFT, w));
+    if (f.caret != 8) { ret 3; }
+    key(?f, press(input.KEY_LEFT, w));
+    key(?f, press(input.KEY_LEFT, w));
+    if (f.caret != 0) { ret 4; }
+
+    # right stops at word ends, and shift extends
+    key(?f, press(input.KEY_RIGHT, w));
+    if (f.caret != 3) { ret 5; }
+    key(?f, press(input.KEY_RIGHT, w | input.MOD_SHIFT));
+    if (sel_lo(?f) != 3 || sel_hi(?f) != 8) { ret 6; }
+
+    # backspace and delete take a word
+    key(?f, press(input.KEY_END, 0));
+    if (key(?f, press(input.KEY_BACKSPACE, w)) != EDITED || !str_equals(text(?f), "one  two.three ")) { ret 7; }
+    key(?f, press(input.KEY_HOME, 0));
+    if (key(?f, press(input.KEY_DELETE, w)) != EDITED || !str_equals(text(?f), "  two.three ")) { ret 8; }
+    if (key(?f, press(input.KEY_DELETE, w)) != EDITED || !str_equals(text(?f), ".three "))      { ret 9; }
+
+    # a masked field is one word
+    f.flags = MASKED;
+    set(?f, "pass word");
+    key(?f, press(input.KEY_LEFT, w));
+    if (f.caret != 0) { ret 10; }
+    key(?f, press(input.KEY_DELETE, w));
+    if (f.len != 0) { ret 11; }
+    ret 0;
+}
+
+test field__selects_words_and_lines {
+    var buf: [64]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 64, 0, nil);
+    f.flags = LINES;
+    set(?f, "alpha beta\ngamma, delta");
+
+    select_word(?f, 7);
+    if (sel_lo(?f) != 6 || sel_hi(?f) != 10) { ret 1; }
+    # the end of a line takes the word before it
+    select_word(?f, 10);
+    if (sel_lo(?f) != 6 || sel_hi(?f) != 10) { ret 2; }
+    select_word(?f, 16);
+    if (sel_lo(?f) != 16 || sel_hi(?f) != 17) { ret 3; }
+    select_word(?f, 5);
+    if (sel_lo(?f) != 5 || sel_hi(?f) != 6) { ret 4; }
+
+    select_line(?f, 13);
+    if (sel_lo(?f) != 11 || sel_hi(?f) != 23) { ret 5; }
+    select_line(?f, 0);
+    if (sel_lo(?f) != 0 || sel_hi(?f) != 10) { ret 6; }
+
+    f.flags = MASKED;
+    select_word(?f, 3);
+    if (sel_lo(?f) != 0 || sel_hi(?f) != f.len) { ret 7; }
+    ret 0;
+}
+
+test field__lines_take_newlines_and_move_per_line {
+    var buf: [32]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 32, 0, nil);
+    insert(?f, 'a');
+    if (insert(?f, '\n') || key(?f, press(input.KEY_ENTER, 0)) != ENTERED) { ret 1; }
+
+    f.flags = LINES;
+    if (key(?f, press(input.KEY_ENTER, 0)) != EDITED) { ret 2; }
+    paste(?f, "bc\r\nd");
+    if (!str_equals(text(?f), "a\nbc\nd")) { ret 3; }
+    key(?f, press(input.KEY_LEFT, 0));
+    key(?f, press(input.KEY_LEFT, 0));
+    key(?f, press(input.KEY_HOME, 0));
+    if (f.caret != 2) { ret 4; }
+    key(?f, press(input.KEY_END, input.MOD_SHIFT));
+    if (sel_lo(?f) != 2 || sel_hi(?f) != 4) { ret 5; }
+    key(?f, press(input.KEY_END, input.MOD_WORD));
+    if (f.caret != f.len) { ret 6; }
+    ret 0;
+}
+
+test field__read_only_moves_but_never_edits {
+    var buf: [32]u8;
+    var h:   [256]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 32, 0, nil);
+    keep_history(?f, ?h[0], 256);
+    set(?f, "fixed");
+    insert(?f, '!');
+    f.flags = READ_ONLY;
+    if (insert(?f, 'x') || paste(?f, "y") || erase(?f) || undo(?f)) { ret 1; }
+    key(?f, press('A', input.MOD_CTRL));
+    if (key(?f, press(input.KEY_BACKSPACE, 0)) != 0 || key(?f, press(input.KEY_DELETE, input.MOD_WORD)) != 0) { ret 2; }
+    if (sel_hi(?f) != 6)                                                                                      { ret 3; }
+    key(?f, press(input.KEY_LEFT, input.MOD_WORD));
+    if (f.caret != 5 || !str_equals(text(?f), "fixed!")) { ret 4; }
+    # set still works, as the consumer's own write
+    set(?f, "new");
+    if (!str_equals(text(?f), "new")) { ret 5; }
+    ret 0;
+}
+
+test field__undo_coalesces_typing_into_words {
+    var buf: [64]u8;
+    var h:   [512]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 64, 0, nil);
+    keep_history(?f, ?h[0], 512);
+    val z: input.Key = press('Z', input.MOD_CTRL);
+
+    paste(?f, "hello world");
+    if (undo(?f) == false || f.len != 0)                                    { ret 1; }
+    if (!redo(?f) || !str_equals(text(?f), "hello world") || f.caret != 11) { ret 2; }
+    set(?f, "");
+
+    # typing undoes a word at a time, the blank going with the word before it
+    var s: str   = "one two";
+    var i: usize = 0;
+    for (s[i] != 0) {
+        insert(?f, s[i]::u32);
+        i = i + 1;
+    }
+    if (key(?f, z) != EDITED || !str_equals(text(?f), "one "))                                            { ret 3; }
+    if (key(?f, z) != EDITED || f.len != 0)                                                               { ret 4; }
+    if (key(?f, z) != 0)                                                                                  { ret 5; }
+    if (key(?f, press('Z', input.MOD_CTRL | input.MOD_SHIFT)) != EDITED || !str_equals(text(?f), "one ")) { ret 6; }
+    if (key(?f, press('Y', input.MOD_CTRL)) != EDITED || !str_equals(text(?f), "one two"))                { ret 7; }
+
+    # a caret movement ends a step
+    key(?f, press(input.KEY_LEFT, 0));
+    key(?f, press(input.KEY_RIGHT, 0));
+    insert(?f, 's');
+    insert(?f, 'x');
+    key(?f, z);
+    if (!str_equals(text(?f), "one two")) { ret 8; }
+
+    # backspaces coalesce the same way, restoring the caret
+    key(?f, press(input.KEY_BACKSPACE, 0));
+    key(?f, press(input.KEY_BACKSPACE, 0));
+    key(?f, press(input.KEY_BACKSPACE, 0));
+    key(?f, press(input.KEY_BACKSPACE, 0));
+    key(?f, press(input.KEY_BACKSPACE, 0));
+    if (!str_equals(text(?f), "on")) { ret 9; }
+    key(?f, z);
+    if (!str_equals(text(?f), "one") || f.caret != 3) { ret 10; }
+    key(?f, z);
+    if (!str_equals(text(?f), "one two") || f.caret != 7) { ret 11; }
+
+    # forward deletes too
+    key(?f, press(input.KEY_HOME, 0));
+    key(?f, press(input.KEY_DELETE, 0));
+    key(?f, press(input.KEY_DELETE, 0));
+    key(?f, z);
+    if (!str_equals(text(?f), "one two") || f.caret != 0) { ret 12; }
+
+    # typing over a selection undoes to the selection
+    key(?f, press(input.KEY_END, input.MOD_SHIFT));
+    insert(?f, 'q');
+    insert(?f, 'r');
+    key(?f, z);
+    if (!str_equals(text(?f), "one two") || sel_lo(?f) != 0 || sel_hi(?f) != 7) { ret 13; }
+
+    # an edit after an undo drops what redo could reach
+    insert(?f, 'k');
+    if (redo(?f)) { ret 14; }
+    ret 0;
+}
+
+test field__history_drops_its_oldest_steps_when_full {
+    var buf: [64]u8;
+    var h:   [256]u8;
+    var f:   Field;
+    init(?f, ?buf[0], 64, 0, nil);
+    # each one-character step takes 80 bytes, so three fit
+    keep_history(?f, ?h[0], 256);
+    paste(?f, "a");
+    paste(?f, "b");
+    paste(?f, "c");
+    paste(?f, "d");
+    var n: usize = 0;
+    for (undo(?f)) { n = n + 1; }
+    if (n != 3 || !str_equals(text(?f), "a")) { ret 1; }
+
+    # a step larger than the history clears it, and editing goes on
+    keep_history(?f, ?h[0], 128);
+    paste(?f, "b");
+    paste(?f, "0123456789012345678901234567890123456789012345678901234567890");
+    if (undo(?f) || f.len != 63) { ret 2; }
+
+    # no history, no undo
+    var g: Field;
+    init(?g, ?buf[0], 64, 0, nil);
+    insert(?g, 'x');
+    if (undo(?g) || key(?g, press('Z', input.MOD_CTRL)) != 0) { ret 3; }
     ret 0;
 }

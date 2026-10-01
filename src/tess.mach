@@ -1,0 +1,1381 @@
+# tessellation: filled and stroked shapes as antialiased triangles in a draw list
+#
+# shapes are built as contours of points in screen pixels in a Scratch, then
+# filled or stroked into a draw list. every edge is antialiased by feathered
+# geometry: a strip FEATHER pixels wide whose inner vertices carry the color
+# and outer vertices carry none, so coverage falls off across the edge with no
+# texture or shader beyond the plain draw contract.
+#
+# - a convex fill is a fan over the contour inset by half the feather, ringed
+#   by the feather strip
+# - a stroke is a ribbon of cross-sections, one per point, two or more where a
+#   bevel or round join splits the outer side, with feathered butt ends on an
+#   open contour
+# - a general fill takes the nonzero rule over every contour: the contours,
+#   inset by half the feather, are cut into trapezoids between the heights
+#   where edges start, end or cross, and each contour is ringed by the
+#   feather strip. a hole is a contour wound against its outline
+#
+# curves and arcs are flattened to stay within TOLERANCE of the true shape in
+# screen pixels, so their segment count follows their size on screen and so
+# the interface scale.
+#
+# a shape is written whole or not at all: its room is reserved before any of
+# it is put, and a scratch buffer that cannot grow refuses the shape.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use blit.draw;
+use blit.path;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.sort;
+use vec: std.collections.vector;
+use std.math.float.acos_f32;
+use std.math.float.cos_f32;
+use std.math.float.sin_f32;
+use std.math.float.sqrt_f32;
+
+# the farthest a flattened curve or arc strays from the true one, in pixels
+pub val TOLERANCE: f32 = 0.25;
+
+# the width of the antialiasing feather across every edge, in pixels
+pub val FEATHER: f32 = 1.0;
+
+# the longest a miter join reaches, in half stroke widths, before it bevels
+pub val MITER_LIMIT: f32 = 4.0;
+
+# the most segments one curve or arc is cut into
+val SEGMENTS_MAX: usize = 1024;
+
+val PI:      f32 = 3.141592653589793::f32;
+val HALF_PI: f32 = 1.5707963267948966::f32;
+
+# how a shape's vertices are colored: a solid color, or a linear gradient
+#
+# colors are premultiplied. a vertex at (x, y) takes c0 + (c1 - c0) * t where
+# t = (x - ox) * gx + (y - oy) * gy clamped to [0, 1], so a solid brush has a
+# zero gradient. every vertex samples (u, v).
+# ---
+# c0: color at t = 0, premultiplied
+# c1: color at t = 1, premultiplied
+# ox: gradient start x in screen pixels
+# oy: gradient start y in screen pixels
+# gx: gradient axis x over its length squared
+# gy: gradient axis y over its length squared
+# u:  texture u every vertex samples
+# v:  texture v every vertex samples
+pub rec Brush {
+    c0: draw.Color;
+    c1: draw.Color;
+    ox: f32;
+    oy: f32;
+    gx: f32;
+    gy: f32;
+    u:  f32;
+    v:  f32;
+}
+
+# a brush of one premultiplied color sampling (u, v)
+# ---
+# c:   premultiplied color
+# u:   texture u
+# v:   texture v
+# ret: the brush
+pub fun solid(c: draw.Color, u: f32, v: f32) Brush {
+    ret Brush{c0: c, c1: c, ox: 0.0::f32, oy: 0.0::f32, gx: 0.0::f32, gy: 0.0::f32, u: u, v: v};
+}
+
+# a brush running from c0 at (x0, y0) to c1 at (x1, y1) in screen pixels
+#
+# coincident ends give c1 everywhere.
+# ---
+# x0:  start x
+# y0:  start y
+# c0:  premultiplied color at the start
+# x1:  end x
+# y1:  end y
+# c1:  premultiplied color at the end
+# u:   texture u
+# v:   texture v
+# ret: the brush
+pub fun linear(x0: f32, y0: f32, c0: draw.Color, x1: f32, y1: f32, c1: draw.Color, u: f32, v: f32) Brush {
+    val dx: f32 = x1 - x0;
+    val dy: f32 = y1 - y0;
+    val l2: f32 = dx * dx + dy * dy;
+    if (l2 <= 0.0::f32) { ret solid(c1, u, v); }
+    ret Brush{c0: c0, c1: c1, ox: x0, oy: y0, gx: dx / l2, gy: dy / l2, u: u, v: v};
+}
+
+# the brush's color at (x, y), scaled by coverage k
+fun shade(b: *Brush, x: f32, y: f32, k: f32) draw.Color {
+    var t: f32 = (x - b.ox) * b.gx + (y - b.oy) * b.gy;
+    if (t < 0.0::f32) { t = 0.0::f32; }
+    if (t > 1.0::f32) { t = 1.0::f32; }
+    ret draw.rgba(
+        (b.c0.r + (b.c1.r - b.c0.r) * t) * k, (b.c0.g + (b.c1.g - b.c0.g) * t) * k,
+        (b.c0.b + (b.c1.b - b.c0.b) * t) * k, (b.c0.a + (b.c1.a - b.c0.a) * t) * k);
+}
+
+# put a vertex at (x, y) in the brush's color scaled by k
+fun dot(dl: *draw.DrawList, b: *Brush, x: f32, y: f32, k: f32) u32 {
+    ret draw.put(dl, draw.vert(x, y, b.u, b.v, shade(b, x, y, k)));
+}
+
+# an axis-aligned quad sampling (u0, v0)-(u1, v1), colored by the brush at its
+# corners and not feathered, for glyphs, images and pixel-aligned rects
+# ---
+# dl:  draw list
+# x0:  left x
+# y0:  top y
+# x1:  right x
+# y1:  bottom y
+# u0:  left u
+# v0:  top v
+# u1:  right u
+# v1:  bottom v
+# b:   brush, whose own uv is ignored
+# ret: ok, or the allocator's refusal with nothing written
+pub fun rect(dl: *draw.DrawList, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, b: *Brush) err[allo.Error] {
+    val room: err[allo.Error] = draw.reserve(dl, 4, 6);
+    if (sel room.err) { ret room; }
+    val tl: u32 = draw.put(dl, draw.vert(x0, y0, u0, v0, shade(b, x0, y0, 1.0::f32)));
+    val tr: u32 = draw.put(dl, draw.vert(x1, y0, u1, v0, shade(b, x1, y0, 1.0::f32)));
+    val br: u32 = draw.put(dl, draw.vert(x1, y1, u1, v1, shade(b, x1, y1, 1.0::f32)));
+    val bl: u32 = draw.put(dl, draw.vert(x0, y1, u0, v1, shade(b, x0, y1, 1.0::f32)));
+    draw.quad_tris(dl, tl, tr, br, bl);
+    ret err[allo.Error].ok{};
+}
+
+# one cross-section of a stroke ribbon: its centre and the unit-scaled
+# vectors to its left and right edges
+# ---
+# x:    centre x
+# y:    centre y
+# lx:   left vector x
+# ly:   left vector y
+# rx:   right vector x
+# ry:   right vector y
+# fade: 1 when the whole section is transparent, at a feathered end
+rec Section {
+    x:    f32;
+    y:    f32;
+    lx:   f32;
+    ly:   f32;
+    rx:   f32;
+    ry:   f32;
+    fade: u8;
+}
+
+# an edge of a filled contour, top to bottom, with the winding it adds and
+# the order it was made in
+rec Edge {
+    x0: f32;
+    y0: f32;
+    x1: f32;
+    y1: f32;
+    w:  i32;
+    id: usize;
+}
+
+# an active edge where it crosses a band: at its top, bottom and middle
+# ---
+# xa: x at the band's top
+# xb: x at the band's bottom
+# xm: x at the band's middle
+# w:  winding the edge adds
+# e:  the edge's index in the sorted edges
+# id: the order the edge was made in, which breaks ties
+rec Cross {
+    xa: f32;
+    xb: f32;
+    xm: f32;
+    w:  i32;
+    e:  usize;
+    id: usize;
+}
+
+# a filled trapezoid between two band heights
+rec Trap {
+    ya:  f32;
+    yb:  f32;
+    xla: f32;
+    xlb: f32;
+    xra: f32;
+    xrb: f32;
+}
+
+# the buffers shapes are built and tessellated in, reused across shapes
+# ---
+# pts:   contour points in screen pixels
+# marks: where each contour starts in pts
+# shut:  1 for each closed contour, parallel to marks
+# line:  one contour's points, closing duplicate dropped
+# sects: a stroke's cross-sections
+# ring:  each fill point inset by half the feather
+# aux:   each fill point outset by half the feather
+# edges: a fill's edges, sorted by their tops while it sweeps
+# ys:    the heights of a fill's points
+# act:   the edges the sweep's current band crosses, in order across it
+# cuts:  the heights inside the current band where its edges cross
+# traps: a fill's trapezoids
+# bad:   1 once a buffer could not grow since begin, else 0
+pub rec Scratch {
+    pts:   vec.Vector[draw.Point];
+    marks: vec.Vector[usize];
+    shut:  vec.Vector[u8];
+    line:  vec.Vector[draw.Point];
+    sects: vec.Vector[Section];
+    ring:  vec.Vector[draw.Point];
+    aux:   vec.Vector[draw.Point];
+    edges: vec.Vector[Edge];
+    ys:    vec.Vector[f32];
+    act:   vec.Vector[Cross];
+    cuts:  vec.Vector[f32];
+    traps: vec.Vector[Trap];
+    bad:   u8;
+}
+
+# empty scratch buffers growing from a, owning nothing yet
+# ---
+# a:   allocator
+# ret: the scratch
+pub fun init(a: *allo.Allocator) Scratch {
+    ret Scratch{
+        pts:  vec.init[draw.Point](a), marks: vec.init[usize](a), shut: vec.init[u8](a),
+        line: vec.init[draw.Point](a), sects: vec.init[Section](a), ring: vec.init[draw.Point](a),
+        aux:  vec.init[draw.Point](a), edges: vec.init[Edge](a), ys: vec.init[f32](a),
+        act:  vec.init[Cross](a), cuts: vec.init[f32](a), traps: vec.init[Trap](a), bad: 0
+    };
+}
+
+# release every scratch buffer
+# ---
+# sc:  scratch
+# ret: ok, or the first refusal
+pub fun free(sc: *Scratch) err[allo.Error] {
+    val e0: err[allo.Error] = vec.dnit[draw.Point](?sc.pts);
+    if (sel e0.err) { ret e0; }
+    val e1: err[allo.Error] = vec.dnit[usize](?sc.marks);
+    if (sel e1.err) { ret e1; }
+    val e2: err[allo.Error] = vec.dnit[u8](?sc.shut);
+    if (sel e2.err) { ret e2; }
+    val e3: err[allo.Error] = vec.dnit[draw.Point](?sc.line);
+    if (sel e3.err) { ret e3; }
+    val e4: err[allo.Error] = vec.dnit[Section](?sc.sects);
+    if (sel e4.err) { ret e4; }
+    val e5: err[allo.Error] = vec.dnit[draw.Point](?sc.ring);
+    if (sel e5.err) { ret e5; }
+    val e6: err[allo.Error] = vec.dnit[draw.Point](?sc.aux);
+    if (sel e6.err) { ret e6; }
+    val e7: err[allo.Error] = vec.dnit[Edge](?sc.edges);
+    if (sel e7.err) { ret e7; }
+    val e8: err[allo.Error] = vec.dnit[f32](?sc.ys);
+    if (sel e8.err) { ret e8; }
+    val e9: err[allo.Error] = vec.dnit[Cross](?sc.act);
+    if (sel e9.err) { ret e9; }
+    val e10: err[allo.Error] = vec.dnit[f32](?sc.cuts);
+    if (sel e10.err) { ret e10; }
+    ret vec.dnit[Trap](?sc.traps);
+}
+
+# drop every contour to start building a new shape
+# ---
+# sc: scratch
+pub fun begin(sc: *Scratch) {
+    vec.clear[draw.Point](?sc.pts);
+    vec.clear[usize](?sc.marks);
+    vec.clear[u8](?sc.shut);
+    sc.bad = 0;
+}
+
+# start a contour, open or closed
+# ---
+# sc:     scratch
+# closed: 1 when the contour's last point joins back to its first
+pub fun contour(sc: *Scratch, closed: u8) {
+    val rm: res[usize, allo.Error] = vec.push[usize](?sc.marks, sc.pts.len);
+    if (sel rm.err) {
+        sc.bad = 1;
+        ret;
+    }
+    val rs: res[usize, allo.Error] = vec.push[u8](?sc.shut, closed);
+    if (sel rs.err) {
+        sc.marks.len = sc.marks.len - 1;
+        sc.bad       = 1;
+    }
+}
+
+# mark the current contour closed
+# ---
+# sc: scratch
+pub fun shut(sc: *Scratch) {
+    if (sc.shut.len > 0) { sc.shut.data[sc.shut.len - 1] = 1; }
+}
+
+# append a point to the current contour, starting one when there is none,
+# and skipping a point on top of the one before it
+# ---
+# sc: scratch
+# x:  x in screen pixels
+# y:  y in screen pixels
+pub fun point(sc: *Scratch, x: f32, y: f32) {
+    if (sc.marks.len == 0) { contour(sc, 0); }
+    if (sc.marks.len == 0) { ret; }
+    val first: usize = sc.marks.data[sc.marks.len - 1];
+    if (sc.pts.len > first) {
+        val last: draw.Point = sc.pts.data[sc.pts.len - 1];
+        if (near(last.x, x) && near(last.y, y)) { ret; }
+    }
+    val r: res[usize, allo.Error] = vec.push[draw.Point](?sc.pts, draw.Point{x: x, y: y});
+    if (sel r.err) { sc.bad = 1; }
+}
+
+# whether two coordinates are the same point for tessellation
+fun near(a: f32, b: f32) bool {
+    val d: f32 = a - b;
+    ret d < 0.0001::f32 && d > -0.0001::f32;
+}
+
+# segments an arc of radius r sweeping the angle needs to stay within
+# TOLERANCE of the true arc
+# ---
+# r:     radius in screen pixels
+# sweep: angle in radians, either sign
+# ret:   segment count, at least 1
+pub fun segments(r: f32, sweep: f32) usize {
+    var a: f32 = sweep;
+    if (a < 0.0::f32)                    { a = 0.0::f32 - a; }
+    if (r <= TOLERANCE || a <= 0.0::f32) { ret 1; }
+    # each segment's chord strays from the arc by r (1 - cos(step / 2))
+    val step: f32 = 2.0::f32 * acos_f32(1.0::f32 - TOLERANCE / r);
+    if (step <= 0.0::f32) { ret SEGMENTS_MAX; }
+    var n: usize = (a / step)::usize;
+    if (n::f32 * step < a) { n = n + 1; }
+    if (n < 1)             { n = 1; }
+    if (n > SEGMENTS_MAX)  { n = SEGMENTS_MAX; }
+    ret n;
+}
+
+# append the points of an arc of radius r around (cx, cy) from angle a0 to a1
+#
+# angles are in radians from +x, increasing clockwise on screen since y runs
+# down. both ends are appended.
+# ---
+# sc: scratch
+# cx: centre x in screen pixels
+# cy: centre y in screen pixels
+# r:  radius in pixels
+# a0: start angle
+# a1: end angle
+pub fun arc(sc: *Scratch, cx: f32, cy: f32, r: f32, a0: f32, a1: f32) {
+    val n: usize = segments(r, a1 - a0);
+    var k: usize = 0;
+    for (k <= n) {
+        val a: f32 = a0 + (a1 - a0) * k::f32 / n::f32;
+        point(sc, cx + r * cos_f32(a), cy + r * sin_f32(a));
+        k = k + 1;
+    }
+}
+
+# the unit vector at quarter turn q, exact
+fun quarter_x(q: usize) f32 {
+    if (q % 4 == 0) { ret 1.0::f32; }
+    if (q % 4 == 2) { ret -1.0::f32; }
+    ret 0.0::f32;
+}
+
+fun quarter_y(q: usize) f32 {
+    if (q % 4 == 1) { ret 1.0::f32; }
+    if (q % 4 == 3) { ret -1.0::f32; }
+    ret 0.0::f32;
+}
+
+# append a quarter arc of radius r around (cx, cy) from quarter turn q to q+1,
+# clockwise on screen, with its ends exact
+#
+# quarter 0 starts at +x, 1 at +y (down), 2 at -x and 3 at -y. a radius of
+# zero appends the centre alone.
+# ---
+# sc: scratch
+# cx: centre x
+# cy: centre y
+# r:  radius
+# q:  starting quarter turn, 0 to 3
+pub fun quarter(sc: *Scratch, cx: f32, cy: f32, r: f32, q: usize) {
+    if (r <= 0.0::f32) {
+        point(sc, cx, cy);
+        ret;
+    }
+    val ux: f32   = quarter_x(q);
+    val uy: f32   = quarter_y(q);
+    val px: f32   = quarter_x(q + 1);
+    val py: f32   = quarter_y(q + 1);
+    val n:  usize = segments(r, HALF_PI);
+    point(sc, cx + r * ux, cy + r * uy);
+    var k: usize = 1;
+    for (k < n) {
+        val a: f32 = HALF_PI * k::f32 / n::f32;
+        val c: f32 = cos_f32(a);
+        val s: f32 = sin_f32(a);
+        point(sc, cx + r * (ux * c + px * s), cy + r * (uy * c + py * s));
+        k = k + 1;
+    }
+    point(sc, cx + r * px, cy + r * py);
+}
+
+# segments a curve needs whose second differences reach m pixels, for a
+# degree whose Wang factor is f
+fun curve_segments(m: f32, f: f32) usize {
+    if (m <= 0.0::f32) { ret 1; }
+    val x: f32   = sqrt_f32(f * m / TOLERANCE);
+    var n: usize = x::usize;
+    if (n::f32 < x)       { n = n + 1; }
+    if (n < 1)            { n = 1; }
+    if (n > SEGMENTS_MAX) { n = SEGMENTS_MAX; }
+    ret n;
+}
+
+# the length of (x, y)
+fun len2(x: f32, y: f32) f32 {
+    ret sqrt_f32(x * x + y * y);
+}
+
+# where flattening stands between commands
+# ---
+# cx:   current point x, in path units
+# cy:   current point y, in path units
+# sx:   x the open contour started at
+# sy:   y the open contour started at
+# live: 1 while a contour is open
+rec Pen {
+    cx:   f32;
+    cy:   f32;
+    sx:   f32;
+    sy:   f32;
+    live: u8;
+}
+
+# append a path's contours, each point at (ox + x * s, oy + y * s)
+#
+# a contour ends at the next move or at close. a command after close and
+# before a move starts a new contour where the closed one began.
+# ---
+# sc: scratch
+# p:  path
+# ox: x offset in screen pixels
+# oy: y offset in screen pixels
+# s:  scale from path units to pixels
+pub fun flatten(sc: *Scratch, p: *path.Path, ox: f32, oy: f32, s: f32) {
+    var pen: Pen;
+    var i:   usize = 0;
+    for (i < path.len(p)) {
+        step(sc, ?pen, path.at(p, i), ox, oy, s);
+        i = i + 1;
+    }
+}
+
+# append the contours of path data (see blit.path), as flatten does a path's
+#
+# the stream is read up to its end or the first malformed command.
+# ---
+# sc:   scratch
+# data: the stream
+# n:    floats in the stream
+# ox:   x offset in screen pixels
+# oy:   y offset in screen pixels
+# s:    scale from path units to pixels
+pub fun flatten_data(sc: *Scratch, data: *f32, n: usize, ox: f32, oy: f32, s: f32) {
+    var pen: Pen;
+    var i:   usize = 0;
+    for (i < n) {
+        var o:    path.Op;
+        val took: usize = path.decode(data, n, i, ?o);
+        if (took == 0) { ret; }
+        step(sc, ?pen, o, ox, oy, s);
+        i = i + took;
+    }
+}
+
+# append one path command
+fun step(sc: *Scratch, pen: *Pen, o: path.Op, ox: f32, oy: f32, s: f32) {
+    if (o.verb == path.MOVE) {
+        contour(sc, 0);
+        point(sc, ox + o.x * s, oy + o.y * s);
+        pen.cx   = o.x;
+        pen.cy   = o.y;
+        pen.sx   = o.x;
+        pen.sy   = o.y;
+        pen.live = 1;
+        ret;
+    }
+    if (o.verb == path.CLOSE) {
+        if (pen.live != 0) { shut(sc); }
+        pen.cx   = pen.sx;
+        pen.cy   = pen.sy;
+        pen.live = 0;
+        ret;
+    }
+    val cx: f32 = pen.cx;
+    val cy: f32 = pen.cy;
+    if (pen.live == 0) {
+        contour(sc, 0);
+        point(sc, ox + cx * s, oy + cy * s);
+        pen.sx   = cx;
+        pen.sy   = cy;
+        pen.live = 1;
+    }
+    if (o.verb == path.QUAD) {
+        val mx: f32   = (cx - 2.0::f32 * o.cx0 + o.x) * s;
+        val my: f32   = (cy - 2.0::f32 * o.cy0 + o.y) * s;
+        val n:  usize = curve_segments(len2(mx, my), 0.25::f32);
+        var k:  usize = 1;
+        for (k <= n) {
+            val t: f32 = k::f32 / n::f32;
+            val u: f32 = 1.0::f32 - t;
+            val x: f32 = u * u * cx + 2.0::f32 * u * t * o.cx0 + t * t * o.x;
+            val y: f32 = u * u * cy + 2.0::f32 * u * t * o.cy0 + t * t * o.y;
+            point(sc, ox + x * s, oy + y * s);
+            k = k + 1;
+        }
+    }
+    or (o.verb == path.CUBIC) {
+        val ax: f32 = (cx - 2.0::f32 * o.cx0 + o.cx1) * s;
+        val ay: f32 = (cy - 2.0::f32 * o.cy0 + o.cy1) * s;
+        val bx: f32 = (o.cx0 - 2.0::f32 * o.cx1 + o.x) * s;
+        val by: f32 = (o.cy0 - 2.0::f32 * o.cy1 + o.y) * s;
+        var m:  f32 = len2(ax, ay);
+        if (len2(bx, by) > m) { m = len2(bx, by); }
+        val n: usize = curve_segments(m, 0.75::f32);
+        var k: usize = 1;
+        for (k <= n) {
+            val t: f32 = k::f32 / n::f32;
+            val u: f32 = 1.0::f32 - t;
+            val x: f32 = u * u * u * cx + 3.0::f32 * u * u * t * o.cx0 + 3.0::f32 * u * t * t * o.cx1 + t * t * t * o.x;
+            val y: f32 = u * u * u * cy + 3.0::f32 * u * u * t * o.cy0 + 3.0::f32 * u * t * t * o.cy1 + t * t * t * o.y;
+            point(sc, ox + x * s, oy + y * s);
+            k = k + 1;
+        }
+    }
+    or {
+        point(sc, ox + o.x * s, oy + o.y * s);
+    }
+    pen.cx = o.x;
+    pen.cy = o.y;
+}
+
+# the bounding box of every point built since begin, false when there is none
+# ---
+# sc:  scratch
+# x0:  receives the left edge
+# y0:  receives the top edge
+# x1:  receives the right edge
+# y1:  receives the bottom edge
+# ret: true if any point was built
+pub fun bounds(sc: *Scratch, x0: *f32, y0: *f32, x1: *f32, y1: *f32) bool {
+    if (sc.pts.len == 0) { ret false; }
+    var i: usize = 0;
+    @x0 = sc.pts.data[0].x;
+    @y0 = sc.pts.data[0].y;
+    @x1 = @x0;
+    @y1 = @y0;
+    for (i < sc.pts.len) {
+        val p: draw.Point = sc.pts.data[i];
+        if (p.x < @x0) { @x0 = p.x; }
+        if (p.y < @y0) { @y0 = p.y; }
+        if (p.x > @x1) { @x1 = p.x; }
+        if (p.y > @y1) { @y1 = p.y; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# contour c's first point and point count, without a closing point that
+# repeats the first
+fun span(sc: *Scratch, c: usize, n: *usize) usize {
+    val first: usize = sc.marks.data[c];
+    var last:  usize = sc.pts.len;
+    if (c + 1 < sc.marks.len) { last = sc.marks.data[c + 1]; }
+    var m: usize = last - first;
+    if (m >= 2) {
+        val a: draw.Point = sc.pts.data[first];
+        val b: draw.Point = sc.pts.data[last - 1];
+        if (near(a.x, b.x) && near(a.y, b.y)) { m = m - 1; }
+    }
+    @n = m;
+    ret first;
+}
+
+# the signed area of contour c, times two
+fun area(sc: *Scratch, c: usize) f32 {
+    var m:     usize = 0;
+    val first: usize = span(sc, c, ?m);
+    var s:     f32   = 0.0::f32;
+    var i:     usize = 0;
+    for (i < m) {
+        val a: draw.Point = sc.pts.data[first + i];
+        val b: draw.Point = sc.pts.data[first + (i + 1) % m];
+        s = s + a.x * b.y - b.x * a.y;
+        i = i + 1;
+    }
+    ret s;
+}
+
+# the outward unit normal of the edge a to b, for a contour whose signed area
+# has sign o
+fun normal(a: draw.Point, b: draw.Point, o: f32) draw.Point {
+    var dx: f32 = b.x - a.x;
+    var dy: f32 = b.y - a.y;
+    val l:  f32 = len2(dx, dy);
+    if (l > 0.0::f32) {
+        dx = dx / l;
+        dy = dy / l;
+    }
+    if (o > 0.0::f32) { ret draw.Point{x: dy, y: 0.0::f32 - dx}; }
+    ret draw.Point{x: 0.0::f32 - dy, y: dx};
+}
+
+# the vertex normal between two unit edge normals, lengthened to keep the
+# feather a constant width along both edges
+fun miter(n0: draw.Point, n1: draw.Point) draw.Point {
+    var mx: f32 = (n0.x + n1.x) * 0.5::f32;
+    var my: f32 = (n0.y + n1.y) * 0.5::f32;
+    val d2: f32 = mx * mx + my * my;
+    if (d2 > 0.000001::f32) {
+        var inv: f32 = 1.0::f32 / d2;
+        if (inv > 100.0::f32) { inv = 100.0::f32; }
+        mx = mx * inv;
+        my = my * inv;
+    }
+    ret draw.Point{x: mx, y: my};
+}
+
+# fill the first contour, which must be convex, with a feathered edge
+# ---
+# dl:  draw list
+# sc:  scratch holding the contour
+# b:   brush
+# ret: ok, or the allocator's refusal with nothing written
+pub fun fill_convex(dl: *draw.DrawList, sc: *Scratch, b: *Brush) err[allo.Error] {
+    if (sc.bad != 0)       { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    if (sc.marks.len == 0) { ret err[allo.Error].ok{}; }
+    var n:     usize = 0;
+    val first: usize = span(sc, 0, ?n);
+    if (n < 3) { ret err[allo.Error].ok{}; }
+    val o: f32 = area(sc, 0);
+    if (o < 0.000001::f32 && o > -0.000001::f32) { ret err[allo.Error].ok{}; }
+
+    val room: err[allo.Error] = draw.reserve(dl, n * 2, (n - 2) * 3 + n * 6);
+    if (sel room.err) { ret room; }
+    val h:    f32         = FEATHER * 0.5::f32;
+    val p:    *draw.Point = ?sc.pts.data[first];
+    val base: u32         = draw.count(dl)::u32;
+    var i:    usize       = 0;
+    for (i < n) {
+        val prev: draw.Point = p[(i + n - 1) % n];
+        val next: draw.Point = p[(i + 1) % n];
+        val m:    draw.Point = miter(normal(prev, p[i], o), normal(p[i], next, o));
+        val vi:   u32        = dot(dl, b, p[i].x - m.x * h, p[i].y - m.y * h, 1.0::f32);
+        val vo:   u32        = dot(dl, b, p[i].x + m.x * h, p[i].y + m.y * h, 0.0::f32);
+        i = i + 1;
+    }
+    i = 2;
+    for (i < n) {
+        draw.tri(dl, base, base + ((i - 1) * 2)::u32, base + (i * 2)::u32);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        val j: usize = (i + 1) % n;
+        draw.quad_tris(dl, base + (i * 2)::u32, base + (j * 2)::u32, base + (j * 2 + 1)::u32, base + (i * 2 + 1)::u32);
+        i = i + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# append a cross-section to the ribbon being built
+fun section(sc: *Scratch, x: f32, y: f32, lx: f32, ly: f32, rx: f32, ry: f32, fade: u8) {
+    val r: res[usize, allo.Error] = vec.push[Section](?sc.sects, Section{x: x, y: y, lx: lx, ly: ly, rx: rx, ry: ry, fade: fade});
+    if (sel r.err) { sc.bad = 1; }
+}
+
+# the left unit normal of the unit direction d, (-d.y, d.x)
+fun left(d: draw.Point) draw.Point {
+    ret draw.Point{x: 0.0::f32 - d.y, y: d.x};
+}
+
+# the unit direction from a to b
+fun dir(a: draw.Point, b: draw.Point) draw.Point {
+    val dx: f32 = b.x - a.x;
+    val dy: f32 = b.y - a.y;
+    val l:  f32 = len2(dx, dy);
+    if (l <= 0.0::f32) { ret draw.Point{x: 1.0::f32, y: 0.0::f32}; }
+    ret draw.Point{x: dx / l, y: dy / l};
+}
+
+# v turned by angle a, clockwise on screen for positive a
+fun turn(v: draw.Point, a: f32) draw.Point {
+    val c: f32 = cos_f32(a);
+    val s: f32 = sin_f32(a);
+    ret draw.Point{x: v.x * c - v.y * s, y: v.x * s + v.y * c};
+}
+
+# the cross-sections where segments of directions da and dc meet at p
+fun joint(sc: *Scratch, p: draw.Point, da: draw.Point, dc: draw.Point, join: u8, outer: f32) {
+    val na: draw.Point = left(da);
+    val nc: draw.Point = left(dc);
+    val sx: f32        = na.x + nc.x;
+    val sy: f32        = na.y + nc.y;
+    val l2: f32        = sx * sx + sy * sy;
+    val tn: f32        = da.x * dc.y - da.y * dc.x;
+    if (l2 < 0.00000001::f32) {
+        # a full reversal: square off both sides
+        section(sc, p.x, p.y, na.x, na.y, 0.0::f32 - na.x, 0.0::f32 - na.y, 0);
+        section(sc, p.x, p.y, nc.x, nc.y, 0.0::f32 - nc.x, 0.0::f32 - nc.y, 0);
+        ret;
+    }
+    var mx:   f32  = sx * 2.0::f32 / l2;
+    var my:   f32  = sy * 2.0::f32 / l2;
+    val mlen: f32  = 2.0::f32 / sqrt_f32(l2);
+    val flat: bool = tn < 0.0001::f32 && tn > -0.0001::f32 && da.x * dc.x + da.y * dc.y > 0.0::f32;
+    if (flat || (join == draw.JOIN_MITER && mlen <= MITER_LIMIT)) {
+        section(sc, p.x, p.y, mx, my, 0.0::f32 - mx, 0.0::f32 - my, 0);
+        ret;
+    }
+    # the inner side shares the miter point, held to the limit, and the outer
+    # side is cut straight or follows an arc between the two segment normals
+    if (mlen > MITER_LIMIT) {
+        mx = mx * MITER_LIMIT / mlen;
+        my = my * MITER_LIMIT / mlen;
+    }
+    var cosa: f32 = na.x * nc.x + na.y * nc.y;
+    if (cosa > 1.0::f32)  { cosa = 1.0::f32; }
+    if (cosa < -1.0::f32) { cosa = -1.0::f32; }
+    val ang:   f32   = acos_f32(cosa);
+    var steps: usize = 1;
+    if (join == draw.JOIN_ROUND) { steps = segments(outer, ang); }
+    var sgn: f32 = 1.0::f32;
+    if (tn < 0.0::f32) { sgn = -1.0::f32; }
+    var k: usize = 0;
+    for (k <= steps) {
+        val a: f32 = sgn * ang * k::f32 / steps::f32;
+        if (tn > 0.0::f32) {
+            # turning toward the left: the right side is outer
+            var r: draw.Point = turn(draw.Point{x: 0.0::f32 - na.x, y: 0.0::f32 - na.y}, a);
+            if (k == steps) { r = draw.Point{x: 0.0::f32 - nc.x, y: 0.0::f32 - nc.y}; }
+            section(sc, p.x, p.y, mx, my, r.x, r.y, 0);
+        }
+        or {
+            var l: draw.Point = turn(na, a);
+            if (k == steps) { l = nc; }
+            section(sc, p.x, p.y, l.x, l.y, 0.0::f32 - mx, 0.0::f32 - my, 0);
+        }
+        k = k + 1;
+    }
+}
+
+# stroke every contour w pixels wide, centred on its points
+#
+# open contours end square at their points, feathered. a stroke narrower than
+# a pixel is drawn a pixel wide with its coverage scaled by its width.
+# ---
+# dl:   draw list
+# sc:   scratch holding the contours
+# w:    stroke width in pixels
+# join: draw.JOIN_MITER, JOIN_BEVEL or JOIN_ROUND
+# b:    brush
+# ret:  ok, or the allocator's refusal with the contours before it written
+pub fun stroke(dl: *draw.DrawList, sc: *Scratch, w: f32, join: u8, b: *Brush) err[allo.Error] {
+    if (sc.bad != 0)   { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    if (w <= 0.0::f32) { ret err[allo.Error].ok{}; }
+    var c: usize = 0;
+    for (c < sc.marks.len) {
+        val e: err[allo.Error] = stroke_contour(dl, sc, c, w, join, b);
+        if (sel e.err) { ret e; }
+        c = c + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# stroke contour c
+fun stroke_contour(dl: *draw.DrawList, sc: *Scratch, c: usize, w: f32, join: u8, b: *Brush) err[allo.Error] {
+    var m:      usize = 0;
+    val first:  usize = span(sc, c, ?m);
+    var closed: bool  = sc.shut.data[c] != 0;
+    if (m < 2) { ret err[allo.Error].ok{}; }
+    if (m < 3) { closed = false; }
+    val p: *draw.Point = ?sc.pts.data[first];
+
+    val h:  f32 = FEATHER * 0.5::f32;
+    var cw: f32 = w * 0.5::f32 - h;
+    if (cw < 0.0::f32) { cw = 0.0::f32; }
+    val ow: f32 = cw + FEATHER;
+    var k:  f32 = w;
+    if (k > 1.0::f32) { k = 1.0::f32; }
+
+    vec.clear[Section](?sc.sects);
+    if (closed) {
+        var i: usize = 0;
+        for (i < m) {
+            val prev: draw.Point = p[(i + m - 1) % m];
+            val next: draw.Point = p[(i + 1) % m];
+            joint(sc, p[i], dir(prev, p[i]), dir(p[i], next), join, ow);
+            i = i + 1;
+        }
+    }
+    or {
+        val d0: draw.Point = dir(p[0], p[1]);
+        val n0: draw.Point = left(d0);
+        var e0: f32        = len2(p[1].x - p[0].x, p[1].y - p[0].y) * 0.5::f32;
+        if (e0 > h) { e0 = h; }
+        section(sc, p[0].x - d0.x * h, p[0].y - d0.y * h, n0.x, n0.y, 0.0::f32 - n0.x, 0.0::f32 - n0.y, 1);
+        section(sc, p[0].x + d0.x * e0, p[0].y + d0.y * e0, n0.x, n0.y, 0.0::f32 - n0.x, 0.0::f32 - n0.y, 0);
+        var i: usize = 1;
+        for (i + 1 < m) {
+            joint(sc, p[i], dir(p[i - 1], p[i]), dir(p[i], p[i + 1]), join, ow);
+            i = i + 1;
+        }
+        val dl1: draw.Point = dir(p[m - 2], p[m - 1]);
+        val nl:  draw.Point = left(dl1);
+        var e1:  f32        = len2(p[m - 1].x - p[m - 2].x, p[m - 1].y - p[m - 2].y) * 0.5::f32;
+        if (e1 > h) { e1 = h; }
+        section(sc, p[m - 1].x - dl1.x * e1, p[m - 1].y - dl1.y * e1, nl.x, nl.y, 0.0::f32 - nl.x, 0.0::f32 - nl.y, 0);
+        section(sc, p[m - 1].x + dl1.x * h, p[m - 1].y + dl1.y * h, nl.x, nl.y, 0.0::f32 - nl.x, 0.0::f32 - nl.y, 1);
+    }
+    if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+
+    val n:     usize = sc.sects.len;
+    var pairs: usize = n - 1;
+    if (closed) { pairs = n; }
+    val room: err[allo.Error] = draw.reserve(dl, n * 4, pairs * 18);
+    if (sel room.err) { ret room; }
+    val base: u32   = draw.count(dl)::u32;
+    var i:    usize = 0;
+    for (i < n) {
+        val s:  Section = sc.sects.data[i];
+        var kc: f32     = k;
+        if (s.fade != 0) { kc = 0.0::f32; }
+        val v0: u32 = dot(dl, b, s.x + s.lx * ow, s.y + s.ly * ow, 0.0::f32);
+        val v1: u32 = dot(dl, b, s.x + s.lx * cw, s.y + s.ly * cw, kc);
+        val v2: u32 = dot(dl, b, s.x + s.rx * cw, s.y + s.ry * cw, kc);
+        val v3: u32 = dot(dl, b, s.x + s.rx * ow, s.y + s.ry * ow, 0.0::f32);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < pairs) {
+        val a: u32 = base + (i * 4)::u32;
+        val z: u32 = base + (((i + 1) % n) * 4)::u32;
+        draw.quad_tris(dl, a, z, z + 1, a + 1);
+        draw.quad_tris(dl, a + 1, z + 1, z + 2, a + 2);
+        draw.quad_tris(dl, a + 2, z + 2, z + 3, a + 3);
+        i = i + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# record a scratch push that failed
+fun pushed(r: res[usize, allo.Error], sc: *Scratch) {
+    if (sel r.err) { sc.bad = 1; }
+}
+
+# fill every contour by the nonzero rule, with feathered edges
+#
+# the contours are inset by half the feather, cut into trapezoids between the
+# heights where their edges start, end or cross, and ringed by the feather.
+# a sweep down the edges, sorted once, keeps only those crossing the current
+# band, so e edges cost e log e plus the edges each band holds and the
+# crossings, where comparing every pair would cost e squared.
+# ---
+# dl:  draw list
+# sc:  scratch holding the contours
+# b:   brush
+# ret: ok, or the allocator's refusal with nothing written
+pub fun fill(dl: *draw.DrawList, sc: *Scratch, b: *Brush) err[allo.Error] {
+    if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    var o: f32   = 0.0::f32;
+    var c: usize = 0;
+    for (c < sc.marks.len) {
+        o = o + area(sc, c);
+        c = c + 1;
+    }
+    # lobes wound against each other can cancel: any orientation then serves
+    if (o == 0.0::f32) { o = 1.0::f32; }
+
+    # inset and outset rings, parallel to pts; a contour too small to fill
+    # keeps its points but adds no edges
+    val h: f32 = FEATHER * 0.5::f32;
+    vec.clear[draw.Point](?sc.ring);
+    vec.clear[draw.Point](?sc.aux);
+    vec.clear[Edge](?sc.edges);
+    vec.clear[f32](?sc.ys);
+    pushed(vec.reserve[draw.Point](?sc.ring, sc.pts.len), sc);
+    pushed(vec.reserve[draw.Point](?sc.aux, sc.pts.len), sc);
+    if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    sc.ring.len = sc.pts.len;
+    sc.aux.len  = sc.pts.len;
+    var ringed: usize = 0;
+    c = 0;
+    for (c < sc.marks.len) {
+        var m:     usize = 0;
+        val first: usize = span(sc, c, ?m);
+        if (m < 3) {
+            c = c + 1;
+            cnt;
+        }
+        val p: *draw.Point = ?sc.pts.data[first];
+        var i: usize       = 0;
+        for (i < m) {
+            val mv: draw.Point = miter(normal(p[(i + m - 1) % m], p[i], o), normal(p[i], p[(i + 1) % m], o));
+            sc.ring.data[first + i] = draw.Point{x: p[i].x - mv.x * h, y: p[i].y - mv.y * h};
+            sc.aux.data[first + i]  = draw.Point{x: p[i].x + mv.x * h, y: p[i].y + mv.y * h};
+            i                       = i + 1;
+        }
+        i = 0;
+        for (i < m) {
+            val a: draw.Point = sc.ring.data[first + i];
+            val z: draw.Point = sc.ring.data[first + (i + 1) % m];
+            pushed(vec.push[f32](?sc.ys, a.y), sc);
+            val id: usize = sc.edges.len;
+            if (a.y < z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: a.x, y0: a.y, x1: z.x, y1: z.y, w: 1, id: id}), sc); }
+            or (a.y > z.y) { pushed(vec.push[Edge](?sc.edges, Edge{x0: z.x, y0: z.y, x1: a.x, y1: a.y, w: -1, id: id}), sc); }
+            i = i + 1;
+        }
+        ringed = ringed + m;
+        c      = c + 1;
+    }
+    if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    trapezoids(sc);
+    if (sc.bad != 0) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+
+    val nt:   usize           = sc.traps.len;
+    val room: err[allo.Error] = draw.reserve(dl, nt * 4 + ringed * 2, nt * 6 + ringed * 6);
+    if (sel room.err) { ret room; }
+    var i: usize = 0;
+    for (i < nt) {
+        val t:  Trap = sc.traps.data[i];
+        val q0: u32  = dot(dl, b, t.xla, t.ya, 1.0::f32);
+        val q1: u32  = dot(dl, b, t.xra, t.ya, 1.0::f32);
+        val q2: u32  = dot(dl, b, t.xrb, t.yb, 1.0::f32);
+        val q3: u32  = dot(dl, b, t.xlb, t.yb, 1.0::f32);
+        draw.quad_tris(dl, q0, q1, q2, q3);
+        i = i + 1;
+    }
+    c = 0;
+    for (c < sc.marks.len) {
+        var m:     usize = 0;
+        val first: usize = span(sc, c, ?m);
+        c = c + 1;
+        if (m < 3) { cnt; }
+        val base: u32   = draw.count(dl)::u32;
+        var j:    usize = 0;
+        for (j < m) {
+            val vi: u32 = dot(dl, b, sc.ring.data[first + j].x, sc.ring.data[first + j].y, 1.0::f32);
+            val vo: u32 = dot(dl, b, sc.aux.data[first + j].x, sc.aux.data[first + j].y, 0.0::f32);
+            j = j + 1;
+        }
+        j = 0;
+        for (j < m) {
+            val z: usize = (j + 1) % m;
+            draw.quad_tris(dl, base + (j * 2)::u32, base + (z * 2)::u32, base + (z * 2 + 1)::u32, base + (j * 2 + 1)::u32);
+            j = j + 1;
+        }
+    }
+    ret err[allo.Error].ok{};
+}
+
+# x of an edge at height y
+fun edge_x(e: Edge, y: f32) f32 {
+    ret e.x0 + (e.x1 - e.x0) * (y - e.y0) / (e.y1 - e.y0);
+}
+
+# order edges by their tops, then by the order they were made
+fun by_top(a: *Edge, b: *Edge) i64 {
+    if (a.y0 < b.y0) { ret -1; }
+    if (a.y0 > b.y0) { ret 1; }
+    if (a.id < b.id) { ret -1; }
+    if (a.id > b.id) { ret 1; }
+    ret 0;
+}
+
+# where edges a and z cross, a made first; false when they run parallel
+fun meet(a: Edge, z: Edge, y: *f32) bool {
+    val sa: f32 = (a.x1 - a.x0) / (a.y1 - a.y0);
+    val sz: f32 = (z.x1 - z.x0) / (z.y1 - z.y0);
+    val ds: f32 = sa - sz;
+    if (ds <= 0.000001::f32 && ds >= -0.000001::f32) { ret false; }
+    @y = (z.x0 - a.x0 + a.y0 * sa - z.y0 * sz) / ds;
+    ret true;
+}
+
+# whether p goes after q across a band's top: by x there, then by x at its
+# bottom, then by the order made
+fun after_top(p: *Cross, q: *Cross) bool {
+    if (p.xa != q.xa) { ret p.xa > q.xa; }
+    if (p.xb != q.xb) { ret p.xb > q.xb; }
+    ret p.id > q.id;
+}
+
+# whether p goes after q across a band's middle, then by the order made
+fun after_mid(p: *Cross, q: *Cross) bool {
+    if (p.xm != q.xm) { ret p.xm > q.xm; }
+    ret p.id > q.id;
+}
+
+# insertion sort the active edges across a band's top or middle, nearly in
+# order from the band before
+fun settle(act: *Cross, n: usize, mid: bool) {
+    var k: usize = 1;
+    for (k < n) {
+        var x: Cross = act[k];
+        var m: usize = k;
+        for (m > 0 && ((mid && after_mid(?act[m - 1], ?x)) || (!mid && after_top(?act[m - 1], ?x)))) {
+            act[m] = act[m - 1];
+            m      = m - 1;
+        }
+        act[m] = x;
+        k      = k + 1;
+    }
+}
+
+# reorder the active edges, in order across the band's top, by x at its
+# bottom, adding to cuts the height of each crossing strictly inside the band
+#
+# a pair that crosses inside the band changes order across it, and insertion
+# sort swaps each such pair exactly once, so the cost is the crossings.
+fun cross(sc: *Scratch, act: *Cross, n: usize, ya: f32, yb: f32) {
+    val es: *Edge = sc.edges.data;
+    var k:  usize = 1;
+    for (k < n) {
+        var x: Cross = act[k];
+        var m: usize = k;
+        for (m > 0 && act[m - 1].xb > x.xb) {
+            var lo: Edge = es[act[m - 1].e];
+            var hi: Edge = es[x.e];
+            if (hi.id < lo.id) {
+                lo = es[x.e];
+                hi = es[act[m - 1].e];
+            }
+            var y: f32 = 0.0::f32;
+            if (meet(lo, hi, ?y) && y > ya && y < yb) { pushed(vec.push[f32](?sc.cuts, y), sc); }
+            act[m] = act[m - 1];
+            m      = m - 1;
+        }
+        act[m] = x;
+        k      = k + 1;
+    }
+}
+
+# put the trapezoids the nonzero rule fills between heights ya and yb, across
+# which the active edges keep their order
+fun band(sc: *Scratch, act: *Cross, n: usize, ya: f32, yb: f32) {
+    if (yb - ya < 0.00001::f32) { ret; }
+    val es: *Edge = sc.edges.data;
+    val ym: f32   = (ya + yb) * 0.5::f32;
+    var i:  usize = 0;
+    for (i < n) {
+        val e: Edge = es[act[i].e];
+        act[i].xa = edge_x(e, ya);
+        act[i].xb = edge_x(e, yb);
+        act[i].xm = edge_x(e, ym);
+        i         = i + 1;
+    }
+    settle(act, n, true);
+    var wind: i32   = 0;
+    var from: usize = 0;
+    var k:    usize = 0;
+    for (k < n) {
+        val prev: i32 = wind;
+        wind = wind + act[k].w;
+        if (prev == 0 && wind != 0) { from = k; }
+        or (prev != 0 && wind == 0) {
+            val t: Trap = Trap{ya: ya, yb: yb, xla: act[from].xa, xlb: act[from].xb, xra: act[k].xa, xrb: act[k].xb};
+            pushed(vec.push[Trap](?sc.traps, t), sc);
+        }
+        k = k + 1;
+    }
+}
+
+# cut the filled region into trapezoids by a sweep down the edges
+#
+# the edges are sorted by their tops once, and the sweep keeps those crossing
+# the band between two consecutive point heights: an edge enters at the first
+# band below its top and leaves at the first below its bottom. a band is cut
+# again where its edges cross, so each piece holds its edges in one order.
+fun trapezoids(sc: *Scratch) {
+    vec.clear[Trap](?sc.traps);
+    vec.clear[Cross](?sc.act);
+    sort.sort[f32](sc.ys.data, sc.ys.len);
+    sort.sort_by[Edge](sc.edges.data, sc.edges.len, by_top);
+    val es:   *Edge = sc.edges.data;
+    var next: usize = 0;
+    var b:    usize = 1;
+    for (b < sc.ys.len) {
+        val ya: f32 = sc.ys.data[b - 1];
+        val yb: f32 = sc.ys.data[b];
+        b = b + 1;
+        if (yb - ya < 0.00001::f32) { cnt; }
+        # every edge's ends are point heights, so the middle decides which
+        # edges cross the band
+        val ym:   f32   = (ya + yb) * 0.5::f32;
+        var keep: usize = 0;
+        var i:    usize = 0;
+        for (i < sc.act.len) {
+            val x: Cross = sc.act.data[i];
+            if (es[x.e].y1 > ym) {
+                sc.act.data[keep] = x;
+                keep              = keep + 1;
+            }
+            i = i + 1;
+        }
+        sc.act.len = keep;
+        for (next < sc.edges.len && es[next].y0 < ym) {
+            if (es[next].y1 > ym) {
+                val x: Cross = Cross{xa: 0.0::f32, xb: 0.0::f32, xm: 0.0::f32, w: es[next].w, e: next, id: es[next].id};
+                pushed(vec.push[Cross](?sc.act, x), sc);
+            }
+            next = next + 1;
+        }
+        if (sc.bad != 0) { ret; }
+
+        val act: *Cross = sc.act.data;
+        val n:   usize  = sc.act.len;
+        i = 0;
+        for (i < n) {
+            act[i].xa = edge_x(es[act[i].e], ya);
+            act[i].xb = edge_x(es[act[i].e], yb);
+            i         = i + 1;
+        }
+        settle(act, n, false);
+        vec.clear[f32](?sc.cuts);
+        cross(sc, act, n, ya, yb);
+        if (sc.bad != 0) { ret; }
+        sort.sort[f32](sc.cuts.data, sc.cuts.len);
+        var top: f32 = ya;
+        i = 0;
+        for (i < sc.cuts.len) {
+            band(sc, act, n, top, sc.cuts.data[i]);
+            top = sc.cuts.data[i];
+            i   = i + 1;
+        }
+        band(sc, act, n, top, yb);
+        if (sc.bad != 0) { ret; }
+    }
+}
+
+# a draw list and scratch on the page allocator, for the tests below
+#[testing]
+fun fixture(a: *allo.Allocator, dl: *draw.DrawList, sc: *Scratch) bool {
+    val made: err[allo.Error] = page.make(a);
+    if (sel made.err) { ret false; }
+    val ie: err[allo.Error] = draw.init(dl, a);
+    if (sel ie.err) { ret false; }
+    @sc = init(a);
+    ret true;
+}
+
+# the summed area of every triangle the draw list holds, weighted by alpha
+#[testing]
+pub fun coverage(dl: *draw.DrawList) f32 {
+    val p:  *draw.Vert = draw.data(dl);
+    val ix: *u32       = draw.indices(dl);
+    var s:  f32        = 0.0::f32;
+    var i:  usize      = 0;
+    for (i + 2 < draw.index_count(dl)) {
+        val a:  draw.Vert = p[ix[i]];
+        val b:  draw.Vert = p[ix[i + 1]];
+        val c:  draw.Vert = p[ix[i + 2]];
+        var ar: f32       = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) * 0.5::f32;
+        if (ar < 0.0::f32) { ar = 0.0::f32 - ar; }
+        s = s + ar * (a.a + b.a + c.a) / 3.0::f32;
+        i = i + 3;
+    }
+    ret s;
+}
+
+#[testing]
+fun close_to(a: f32, b: f32, tol: f32) bool {
+    val d: f32 = a - b;
+    ret d < tol && d > 0.0::f32 - tol;
+}
+
+test fill_convex__feathers_and_keeps_area {
+    var a:  allo.Allocator;
+    var dl: draw.DrawList;
+    var sc: Scratch;
+    if (!fixture(?a, ?dl, ?sc)) { ret 1; }
+
+    var b: Brush = solid(draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32), 0.0::f32, 0.0::f32);
+    # a 10 x 10 square, either winding
+    begin(?sc);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 10.0::f32);
+    point(?sc, 0.0::f32, 10.0::f32);
+    val e: err[allo.Error] = fill_convex(?dl, ?sc, ?b);
+    if (sel e.err) { ret 2; }
+    # an inner ring and an outer ring, a fan and a feather quad per edge
+    if (draw.count(?dl) != 8 || draw.index_count(?dl) != 6 + 24) { ret 3; }
+    val p: *draw.Vert = draw.data(?dl);
+    if (p[0].x != 0.5::f32 || p[0].y != 0.5::f32 || p[0].a != 1.0::f32)   { ret 4; }
+    if (p[1].x != -0.5::f32 || p[1].y != -0.5::f32 || p[1].a != 0.0::f32) { ret 5; }
+    # coverage across the feather sums to the true area
+    if (!close_to(coverage(?dl), 100.0::f32, 0.5::f32)) { ret 6; }
+
+    draw.reset(?dl);
+    begin(?sc);
+    point(?sc, 0.0::f32, 10.0::f32);
+    point(?sc, 10.0::f32, 10.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    point(?sc, 0.0::f32, 0.0::f32);
+    val e2: err[allo.Error] = fill_convex(?dl, ?sc, ?b);
+    if (draw.data(?dl)[0].x != 0.5::f32 || draw.data(?dl)[0].y != 9.5::f32) { ret 7; }
+
+    val f0: err[allo.Error] = free(?sc);
+    val f1: err[allo.Error] = draw.free(?dl);
+    ret 0;
+}
+
+test segments__follow_radius_in_pixels {
+    # a larger radius on screen needs more segments for the same tolerance
+    val one: usize = segments(10.0::f32, 2.0::f32 * PI);
+    val two: usize = segments(20.0::f32, 2.0::f32 * PI);
+    if (one < 8 || two <= one)       { ret 1; }
+    if (segments(0.1::f32, PI) != 1) { ret 2; }
+    ret 0;
+}
+
+test stroke__joins_and_feathered_ends {
+    var a:  allo.Allocator;
+    var dl: draw.DrawList;
+    var sc: Scratch;
+    if (!fixture(?a, ?dl, ?sc)) { ret 1; }
+
+    var b: Brush = solid(draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32), 0.0::f32, 0.0::f32);
+    # a straight 3px line 10 long: two faded ends and two solid sections
+    begin(?sc);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    val e: err[allo.Error] = stroke(?dl, ?sc, 3.0::f32, draw.JOIN_MITER, ?b);
+    if (sel e.err)                                            { ret 2; }
+    if (draw.count(?dl) != 16 || draw.index_count(?dl) != 54) { ret 3; }
+    if (!close_to(coverage(?dl), 30.0::f32, 0.5::f32))        { ret 4; }
+
+    # a right angle mitered is one section at the corner, beveled is two
+    draw.reset(?dl);
+    begin(?sc);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 10.0::f32);
+    val em: err[allo.Error] = stroke(?dl, ?sc, 2.0::f32, draw.JOIN_MITER, ?b);
+    if (draw.count(?dl) != 20) { ret 5; }
+    draw.reset(?dl);
+    val eb: err[allo.Error] = stroke(?dl, ?sc, 2.0::f32, draw.JOIN_BEVEL, ?b);
+    if (draw.count(?dl) != 24) { ret 6; }
+    # a round join fans the outer side
+    draw.reset(?dl);
+    val er: err[allo.Error] = stroke(?dl, ?sc, 8.0::f32, draw.JOIN_ROUND, ?b);
+    if (draw.count(?dl) <= 24) { ret 7; }
+
+    # a hairline keeps a pixel's width and scales its coverage
+    draw.reset(?dl);
+    begin(?sc);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    val eh: err[allo.Error] = stroke(?dl, ?sc, 0.5::f32, draw.JOIN_MITER, ?b);
+    if (!close_to(coverage(?dl), 5.0::f32, 0.5::f32)) { ret 8; }
+
+    val f0: err[allo.Error] = free(?sc);
+    val f1: err[allo.Error] = draw.free(?dl);
+    ret 0;
+}
+
+test fill__nonzero_with_a_hole_and_overlaps {
+    var a:  allo.Allocator;
+    var dl: draw.DrawList;
+    var sc: Scratch;
+    if (!fixture(?a, ?dl, ?sc)) { ret 1; }
+
+    var b: Brush = solid(draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32), 0.0::f32, 0.0::f32);
+    # a 20 x 20 square with a 10 x 10 hole wound against it
+    begin(?sc);
+    contour(?sc, 1);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 20.0::f32, 0.0::f32);
+    point(?sc, 20.0::f32, 20.0::f32);
+    point(?sc, 0.0::f32, 20.0::f32);
+    contour(?sc, 1);
+    point(?sc, 5.0::f32, 5.0::f32);
+    point(?sc, 5.0::f32, 15.0::f32);
+    point(?sc, 15.0::f32, 15.0::f32);
+    point(?sc, 15.0::f32, 5.0::f32);
+    val e: err[allo.Error] = fill(?dl, ?sc, ?b);
+    if (sel e.err)                                      { ret 2; }
+    if (!close_to(coverage(?dl), 300.0::f32, 1.0::f32)) { ret 3; }
+
+    # two overlapping squares wound alike cover their union once
+    draw.reset(?dl);
+    begin(?sc);
+    contour(?sc, 1);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 10.0::f32);
+    point(?sc, 0.0::f32, 10.0::f32);
+    contour(?sc, 1);
+    point(?sc, 5.0::f32, 5.0::f32);
+    point(?sc, 15.0::f32, 5.0::f32);
+    point(?sc, 15.0::f32, 15.0::f32);
+    point(?sc, 5.0::f32, 15.0::f32);
+    val e2: err[allo.Error] = fill(?dl, ?sc, ?b);
+    # the interior is exact; the feathers along the hidden edges add a little
+    val cov: f32 = coverage(?dl);
+    if (cov < 175.0::f32 || cov > 190.0::f32) { ret 4; }
+
+    # a bow tie crosses itself and fills both lobes
+    draw.reset(?dl);
+    begin(?sc);
+    point(?sc, 0.0::f32, 0.0::f32);
+    point(?sc, 10.0::f32, 10.0::f32);
+    point(?sc, 10.0::f32, 0.0::f32);
+    point(?sc, 0.0::f32, 10.0::f32);
+    val e3: err[allo.Error] = fill(?dl, ?sc, ?b);
+    if (draw.index_count(?dl) == 0) { ret 5; }
+
+    val f0: err[allo.Error] = free(?sc);
+    val f1: err[allo.Error] = draw.free(?dl);
+    ret 0;
+}
+
+test flatten__curves_follow_tolerance_and_scale {
+    var a:  allo.Allocator;
+    var dl: draw.DrawList;
+    var sc: Scratch;
+    if (!fixture(?a, ?dl, ?sc)) { ret 1; }
+
+    var p: path.Path = path.init(?a);
+    path.move(?p, 0.0::f32, 0.0::f32);
+    path.quad(?p, 10.0::f32, 20.0::f32, 20.0::f32, 0.0::f32);
+    path.close(?p);
+    path.line(?p, 5.0::f32, 5.0::f32);
+    begin(?sc);
+    flatten(?sc, ?p, 100.0::f32, 50.0::f32, 1.0::f32);
+    val small: usize = sc.marks.data[1];
+    # the curve ends exactly, offset into place, and the closed contour is shut
+    if (sc.pts.data[small - 1].x != 120.0::f32 || sc.pts.data[small - 1].y != 50.0::f32) { ret 2; }
+    if (sc.marks.len != 2 || sc.shut.data[0] != 1 || sc.shut.data[1] != 0)               { ret 3; }
+    # a line after close starts where the closed contour began
+    if (sc.pts.data[small].x != 100.0::f32) { ret 4; }
+
+    begin(?sc);
+    flatten(?sc, ?p, 0.0::f32, 0.0::f32, 4.0::f32);
+    if (sc.marks.data[1] <= small) { ret 5; }
+
+    val f2: err[allo.Error] = path.free(?p);
+    val f0: err[allo.Error] = free(?sc);
+    val f1: err[allo.Error] = draw.free(?dl);
+    ret 0;
+}

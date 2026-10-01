@@ -1,0 +1,1269 @@
+# tables: columns that resize, reorder, sort and hide, frozen leading columns
+# and rows under a frozen header, and rows clipped to the view so a table of
+# any length costs only the rows it shows
+#
+# the caller describes the columns in an array of Column records it owns and
+# runs the rows itself, in the immediate mode of every widget:
+#
+#     var t: Table = begin(ctx, "files", ?cols[0], 3, options(count, 300.0));
+#     for (next_row(ctx, ?t)) {
+#         if (cell(ctx, ?t, 0)) { widget.text(ctx, names[t.row]); }
+#         if (cell(ctx, ?t, 1)) { ... any widget ... }
+#     }
+#     end(ctx, ?t);
+#
+# next_row yields only the rows in view, the frozen rows first, so the walk is
+# as long as the view is tall whatever the row count. rows are one height,
+# which is what lets the view find its first row by arithmetic.
+#
+# a row is an id scope keyed by its row key (Options.key, the row index by
+# default) under the table's id, and a cell an id scope keyed by its column's
+# label under its row, so a widget in a cell keeps its id, and its state,
+# however many rows are clipped before it. a cell is a horizontal stack across
+# the cell's width, its widgets centred down the row, clipped to the cell.
+#
+# each column's layout is a ColumnState the state store keeps under the
+# column's id, its label under the table's id: width, place in the display
+# order and whether it is hidden. the sort and the scroll are a TableState
+# under the table's id. a user's change to the layout pins the entries, so it
+# outlives frames the table is not drawn in, and register makes both kinds
+# persist through state.save and state.load.
+#
+# in the header, a header cell's right edge is a grip that resizes its column,
+# a click sorts by the column (ascending, then descending), a drag drops the
+# column onto another's place (blit.dnd) and a right click opens a context
+# menu (blit.menu) that shows and hides columns. the header and the first
+# freeze_cols visible columns stay where they are while the rest scrolls under
+# the wheel and the scrollbars. frozen and scrolled parts are clipped to disjoint rects, so
+# neither paints or claims over the other whatever order they are drawn in.
+#
+# the table never sorts: it reports the column and direction asked for, and
+# the caller orders its rows, mapping t.row to its data.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+use std.data.toml;
+use std.memory;
+
+use blit.context;
+use blit.dnd;
+use blit.draw;
+use drv: blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.menu;
+use blit.state;
+use blit.theme;
+use blit.widget;
+
+# no sort
+pub val SORT_NONE: u8 = 0;
+
+# sorted from the least value up
+pub val SORT_ASC: u8 = 1;
+
+# sorted from the greatest value down
+pub val SORT_DESC: u8 = 2;
+
+# the column keeps its width
+pub val NO_RESIZE: u32 = 1;
+
+# the column keeps its place in the order
+pub val NO_REORDER: u32 = 2;
+
+# the column cannot be hidden
+pub val NO_HIDE: u32 = 4;
+
+# a click on the column's header does not sort
+pub val NO_SORT: u32 = 8;
+
+# the column starts hidden
+pub val HIDDEN: u32 = 16;
+
+# the drag and drop type tag a column's header drags under
+pub val DRAG_KIND: str = "blit.table.column";
+
+# the key of the header's context menu, under the table's id
+pub val MENU_KEY: str = "#columns";
+
+# one column as the caller describes it, and where the table put it
+#
+# label, width, min and flags are the caller's. the rest begin fills each
+# frame.
+# ---
+# label:  header text, and the column's key (see blit.id)
+# width:  starting width in unscaled pixels, 0 to fit the header
+# min:    least width in unscaled pixels, 0 for the theme's row height
+# flags:  NO_RESIZE, NO_REORDER, NO_HIDE, NO_SORT and HIDDEN bits
+# id:     the column's id, its label under the table's id
+# shown:  true when the column is not hidden
+# frozen: true when it is one of the leading columns that do not scroll
+# pos:    its place in the display order, hidden columns included
+# x:      its left edge in pixels from the table's left, before scrolling
+# w:      its width in pixels
+# order:  the index of the column shown at place n, n being this record's
+#         own index in the array
+pub rec Column {
+    label:  str;
+    width:  f32;
+    min:    f32;
+    flags:  u32;
+    id:     u64;
+    shown:  bool;
+    frozen: bool;
+    pos:    usize;
+    x:      f32;
+    w:      f32;
+    order:  usize;
+}
+
+# how a table is laid out
+# ---
+# rows:        number of rows
+# h:           table height in pixels, header and scrollbars included
+# row_h:       row height in pixels, 0 for a control row
+# header:      true to draw the header row
+# freeze_cols: leading visible columns that do not scroll sideways
+# freeze_rows: leading rows that do not scroll, beneath the header
+# user:        handed to key untouched
+# key:         the key of the row at an index, its id scope; nil keys a row
+#              by its index. a caller that sorts keys rows by their data so
+#              a row's widgets keep their state when the order changes
+pub rec Options {
+    rows:        usize;
+    h:           f32;
+    row_h:       f32;
+    header:      bool;
+    freeze_cols: usize;
+    freeze_rows: usize;
+    user:        ptr;
+    key:         fun(ptr, usize) u64;
+}
+
+# a table's frame: what begin laid out and where next_row and cell are
+# ---
+# id:      the table's id
+# cols:    the caller's columns
+# n:       number of columns
+# o:       the options it was opened with
+# row:     the row next_row yielded
+# sort:    index of the column sorted by, n for none
+# dir:     SORT_ASC or SORT_DESC while sort names a column
+# sorted:  true on the frame the sort changed, when the caller orders its rows again
+# first:   first scrolled row in view
+# last:    row past the last in view
+# x0:      table left in local pixels
+# y0:      table top
+# x1:      table right
+# y1:      table bottom
+# vx1:     right of the cells, left of the vertical scrollbar
+# vy1:     bottom of the cells, above the horizontal scrollbar
+# hh:      header height, 0 without one
+# rh:      row height
+# fw:      width of the frozen columns
+# fr:      frozen rows
+# tw:      width of every shown column together
+# sx:      pixels scrolled sideways
+# frac:    pixels of the first scrolled row scrolled out above
+# ch:      height of the scrolled rows together
+# next:    the row next_row yields next
+# ry0:     the current row's top
+# in_row:  true while a row's id scope is open
+# in_cell: true while a cell's scope, clip and frame are open
+# seen:    the context's hover_seen when the table opened
+pub rec Table {
+    id:      u64;
+    cols:    *Column;
+    n:       usize;
+    o:       Options;
+    row:     usize;
+    sort:    usize;
+    dir:     u8;
+    sorted:  bool;
+    first:   usize;
+    last:    usize;
+    x0:      f32;
+    y0:      f32;
+    x1:      f32;
+    y1:      f32;
+    vx1:     f32;
+    vy1:     f32;
+    hh:      f32;
+    rh:      f32;
+    fw:      f32;
+    fr:      usize;
+    tw:      f32;
+    sx:      f32;
+    frac:    f32;
+    ch:      f64;
+    next:    usize;
+    ry0:     f32;
+    in_row:  bool;
+    in_cell: bool;
+    seen:    u64;
+}
+
+# a column's layout, kept under the column's id
+# ---
+# set:    1 once given its starting layout or loaded
+# custom: 1 once the user changed the table's layout, or it was loaded
+# kept:   1 once pinned for custom
+# hidden: 1 while hidden
+# pos:    its place in the display order
+# width:  width in unscaled pixels
+# grab:   width when its grip was pressed
+pub rec ColumnState {
+    set:    u8;
+    custom: u8;
+    kept:   u8;
+    hidden: u8;
+    pos:    u32;
+    width:  f32;
+    grab:   f32;
+}
+
+# a table's sort, scroll and header state, kept under the table's id
+# ---
+# sort:   id of the column sorted by, 0 for none
+# dir:    SORT_ASC or SORT_DESC while sort names a column
+# custom: 1 once the user changed the sort, or it was loaded
+# kept:   1 once pinned for custom
+# moved:  1 once a header dragged since the last press on one
+# sx:     pixels scrolled sideways
+# sy:     pixels scrolled down past the frozen rows
+# gx:     sx when the horizontal thumb was pressed
+# gy:     sy when the vertical thumb was pressed
+pub rec TableState {
+    sort:   u64;
+    dir:    u8;
+    custom: u8;
+    kept:   u8;
+    moved:  u8;
+    sx:     f32;
+    sy:     f64;
+    gx:     f32;
+    gy:     f64;
+}
+
+# what a header drag carries: the column and the table it belongs to
+rec Carry {
+    table: u64;
+    col:   u64;
+}
+
+# a table's options: rows rows in a table h pixels tall, with a header
+# ---
+# rows: number of rows
+# h:    table height in pixels
+# ret:  options to adjust and pass to begin
+pub fun options(rows: usize, h: f32) Options {
+    var o: Options;
+    o.rows   = rows;
+    o.h      = h;
+    o.header = true;
+    ret o;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+fun clampd(v: f64, lo: f64, hi: f64) f64 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# a kind's left inset, at the context's scale
+fun pad(ctx: *context.Context, kind: u32) f32 {
+    ret context.px(ctx, context.look_of(ctx, kind).inset.l);
+}
+
+# a kind's row: its least height, grown to fit a line of text with its inset
+fun row_of(ctx: *context.Context, kind: u32) f32 {
+    val s: *theme.Style = context.look_of(ctx, kind);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
+}
+
+# a table rule's paint in a state
+fun rule_of(ctx: *context.Context, state: u8) *theme.Paint {
+    ret context.paint_of(ctx, theme.TABLE_RULE, state);
+}
+
+# the scope a cell's widgets are keyed in: the column's label under the row's
+# key under the table's id
+# ---
+# t:   the table
+# key: the row's key, its index unless Options.key says otherwise
+# c:   the column's index
+# ret: the cell's seed, the parent of its widgets' ids
+pub fun cell_id(t: *Table, key: u64, c: usize) u64 {
+    ret bid.of_label(bid.of_int(t.id, key), t.cols[c].label);
+}
+
+# a column's state, given its starting layout the first time
+fun column_state(ctx: *context.Context, c: *Column, i: usize) *ColumnState {
+    val cs: *ColumnState = state.get[ColumnState](ctx, c.id);
+    if (cs.set == 0) {
+        cs.set   = 1;
+        cs.pos   = i::u32;
+        cs.width = c.width;
+        if (cs.width <= 0.0::f32) {
+            val label: f32 = context.text_width_n(ctx, c.label, bid.shown(c.label)) + context.line_height(ctx) + pad(ctx, theme.TABLE_HEADER) * 3.0::f32;
+            cs.width = label / context.scale_of(ctx);
+        }
+        if ((c.flags & HIDDEN) != 0) { cs.hidden = 1; }
+    }
+    if (cs.custom != 0 && cs.kept == 0) {
+        cs.kept = 1;
+        state.pin[ColumnState](ctx, c.id, 1);
+    }
+    ret cs;
+}
+
+# a column's least width in unscaled pixels
+fun least(ctx: *context.Context, c: *Column) f32 {
+    if (c.min > 0.0::f32) { ret c.min; }
+    ret context.look_of(ctx, theme.TABLE_HEADER).min_w;
+}
+
+# mark every column's layout and the table's as the user's, pinning them
+fun customise(ctx: *context.Context, t: *Table, st: *TableState) {
+    st.custom = 1;
+    if (st.kept == 0) {
+        st.kept = 1;
+        state.pin[TableState](ctx, t.id, 1);
+    }
+    var i: usize = 0;
+    for (i < t.n) {
+        val cs: *ColumnState = column_state(ctx, ?t.cols[i], i);
+        cs.custom = 1;
+        if (cs.kept == 0) {
+            cs.kept = 1;
+            state.pin[ColumnState](ctx, t.cols[i].id, 1);
+        }
+        i = i + 1;
+    }
+}
+
+# put the column with id from at the place of the column with id to, moving
+# the columns between toward the place it left
+fun move_column(ctx: *context.Context, t: *Table, from: u64, to: u64) {
+    var pf: u32   = 0;
+    var pt: u32   = 0;
+    var hf: bool  = false;
+    var ht: bool  = false;
+    var i:  usize = 0;
+    for (i < t.n) {
+        val c: *Column = ?t.cols[i];
+        if (c.id == from) {
+            pf = column_state(ctx, c, i).pos;
+            hf = true;
+        }
+        if (c.id == to) {
+            pt = column_state(ctx, c, i).pos;
+            ht = true;
+        }
+        i = i + 1;
+    }
+    if (!hf || !ht || pf == pt) { ret; }
+    i = 0;
+    for (i < t.n) {
+        val cs: *ColumnState = column_state(ctx, ?t.cols[i], i);
+        if (cs.pos == pf)                           { cs.pos = pt; }
+        or (pf < pt && cs.pos > pf && cs.pos <= pt) { cs.pos = cs.pos - 1; }
+        or (pt < pf && cs.pos >= pt && cs.pos < pf) { cs.pos = cs.pos + 1; }
+        i = i + 1;
+    }
+}
+
+# order the columns by their place, ties by index, and number the places
+# again from 0 so they stay a permutation as columns come and go
+fun order_columns(ctx: *context.Context, t: *Table) {
+    val cols: *Column = t.cols;
+    var i:    usize   = 0;
+    for (i < t.n) {
+        cols[i].order = i;
+        i             = i + 1;
+    }
+    # insertion sort: the order is kept from frame to frame, so it is sorted
+    # already but for a column that just moved
+    i = 1;
+    for (i < t.n) {
+        val c: usize = cols[i].order;
+        var j: usize = i;
+        for (j > 0) {
+            val p: usize = cols[j - 1].order;
+            if (cols[p].pos < cols[c].pos || (cols[p].pos == cols[c].pos && p < c)) { brk; }
+            cols[j].order = p;
+            j             = j - 1;
+        }
+        cols[j].order = c;
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < t.n) {
+        val c: usize = cols[i].order;
+        cols[c].pos                        = i;
+        column_state(ctx, ?cols[c], c).pos = i::u32;
+        i                                  = i + 1;
+    }
+}
+
+# open a table as the next item of the layout, spanning the column, and draw
+# its header
+#
+# each column's id, place, offset and width are written into its record. the
+# header's sort, resize, reorder and hide act from this frame's input, a
+# resize showing at once and the rest from the next frame. pair it with end,
+# placing the rows between with next_row and cell.
+# ---
+# ctx:  context
+# key:  the table's key in the current id scope
+# cols: the columns, n records the caller owns (pass ?cols[0])
+# n:    number of columns
+# o:    the table's options (see options)
+# ret:  the table's frame, for next_row, cell and end
+pub fun begin(ctx: *context.Context, key: str, cols: *Column, n: usize, o: Options) Table {
+    var t: Table;
+    t.id   = context.id_of(ctx, key);
+    t.cols = cols;
+    t.n    = n;
+    t.o    = o;
+    val st: *TableState = state.get[TableState](ctx, t.id);
+    if (st.custom != 0 && st.kept == 0) {
+        st.kept = 1;
+        state.pin[TableState](ctx, t.id, 1);
+    }
+    val scale: f32 = context.scale_of(ctx);
+
+    var i: usize = 0;
+    for (i < n) {
+        cols[i].id = bid.of_label(t.id, cols[i].label);
+        i          = i + 1;
+    }
+    # widths follow a dragged grip at once, before anything is placed
+    i = 0;
+    for (i < n) {
+        val c:  *Column      = ?cols[i];
+        val cs: *ColumnState = column_state(ctx, c, i);
+        var dx: f32;
+        var dy: f32;
+        if ((c.flags & NO_RESIZE) == 0 && interact.drag(ctx, bid.child(c.id, "#grip"), ?dx, ?dy)) {
+            cs.width = maxf(cs.grab + dx / scale, least(ctx, c));
+            customise(ctx, ?t, st);
+        }
+        c.pos   = cs.pos::usize;
+        c.shown = cs.hidden == 0;
+        c.w     = context.px(ctx, maxf(cs.width, least(ctx, c)));
+        i       = i + 1;
+    }
+    order_columns(ctx, ?t);
+
+    var vis: usize = 0;
+    i = 0;
+    for (i < n) {
+        val c: *Column = ?cols[cols[i].order];
+        c.x      = t.tw;
+        c.frozen = false;
+        if (c.shown) {
+            t.tw = t.tw + c.w;
+            vis  = vis + 1;
+            if (vis <= o.freeze_cols) {
+                c.frozen = true;
+                t.fw     = t.tw;
+            }
+        }
+        i = i + 1;
+    }
+
+    t.sort = n;
+    i      = 0;
+    for (i < n && st.sort != 0) {
+        if (cols[i].id == st.sort) {
+            t.sort = i;
+            t.dir  = st.dir;
+        }
+        i = i + 1;
+    }
+
+    t.rh = o.row_h;
+    if (t.rh <= 0.0::f32) { t.rh = row_of(ctx, theme.TABLE_CELL); }
+    if (o.header)         { t.hh = row_of(ctx, theme.TABLE_HEADER); }
+    t.fr = o.freeze_rows;
+    if (t.fr > o.rows) { t.fr = o.rows; }
+
+    val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), t.tw, maxf(o.h, 0.0::f32));
+    t.x0 = a.x0;
+    t.y0 = a.y0;
+    t.x1 = a.x1;
+    t.y1 = a.y1;
+
+    # scrollbars where the content outgrows the view, each narrowing the other's room
+    val bar: f32 = context.px(ctx, context.look_of(ctx, theme.SCROLLBAR).min_w);
+    val top: f32 = t.y0 + t.hh + t.fr::f32 * t.rh;
+    t.ch = (o.rows - t.fr)::f64 * t.rh::f64;
+    var need_v: bool = t.ch > (t.y1 - top)::f64;
+    var room:   f32  = t.x1 - t.x0;
+    if (need_v) { room = room - bar; }
+    val need_h: bool = t.tw > room;
+    if (need_h && !need_v) { need_v = t.ch > (t.y1 - bar - top)::f64; }
+    t.vx1 = t.x1;
+    t.vy1 = t.y1;
+    if (need_v) { t.vx1 = t.x1 - bar; }
+    if (need_h) { t.vy1 = t.y1 - bar; }
+
+    val vh: f32 = maxf(t.vy1 - top, 0.0::f32);
+    st.sy = clampd(st.sy, 0.0::f64, most_y(?t, vh));
+    st.sx = clampf(st.sx, 0.0::f32, most_x(?t));
+    t.sx  = st.sx;
+
+    # the rows in view, found by arithmetic
+    t.first = t.fr;
+    t.last  = t.fr;
+    if (t.rh > 0.0::f32) {
+        val skipped: f64 = st.sy / t.rh::f64;
+        var k:       u64 = skipped::u64;
+        t.first = t.fr + k::usize;
+        t.frac  = (st.sy - k::f64 * t.rh::f64)::f32;
+        val span: f32   = (vh + t.frac) / t.rh;
+        var m:    usize = span::usize;
+        if (m::f32 < span) { m = m + 1; }
+        t.last = t.first + m;
+        if (t.first > o.rows) { t.first = o.rows; }
+        if (t.last > o.rows)  { t.last = o.rows; }
+    }
+    t.next = 0;
+
+    t.seen = ctx.hover_seen;
+    val claim: usize = context.reserve_claim(ctx, t.id);
+    context.fill_claim(ctx, claim, t.x0, t.y0, t.x1, t.y1);
+    context.push_id(ctx, t.id);
+    if (o.header) { header(ctx, ?t, st); }
+    ret t;
+}
+
+# the farthest the scrolled rows can scroll in a view vh tall
+fun most_y(t: *Table, vh: f32) f64 {
+    val m: f64 = t.ch - vh::f64;
+    if (m < 0.0::f64) { ret 0.0::f64; }
+    ret m;
+}
+
+# the farthest the columns can scroll sideways
+fun most_x(t: *Table) f32 {
+    ret maxf(t.tw - (t.vx1 - t.x0), 0.0::f32);
+}
+
+# the x range a column is drawn in: the frozen strip, or the scrolled one
+fun strip(t: *Table, c: *Column, x0: *f32, x1: *f32) {
+    if (c.frozen) {
+        @x0 = t.x0;
+        @x1 = t.x0 + t.fw;
+        ret;
+    }
+    @x0 = t.x0 + t.fw;
+    @x1 = t.vx1;
+}
+
+# a column's left edge in local pixels, after scrolling
+fun left(t: *Table, c: *Column) f32 {
+    if (c.frozen) { ret t.x0 + c.x; }
+    ret t.x0 + c.x - t.sx;
+}
+
+# the payload a header drag of this table carries, none for any other drag
+fun carried(ctx: *context.Context, t: *Table) opt[Carry] {
+    val p: opt[dnd.Payload] = dnd.carried(ctx, DRAG_KIND);
+    if (sel p.none) { ret opt[Carry].none{}; }
+    val got: dnd.Payload = p.some;
+    if (got.n != $size_of(Carry)) { ret opt[Carry].none{}; }
+    var c: Carry;
+    memory.raw_copy((?c)::ptr, got.data::ptr, $size_of(Carry));
+    if (c.table != t.id) { ret opt[Carry].none{}; }
+    ret opt[Carry].some{c};
+}
+
+# a header cell's face and label, with the sort arrow when it is sorted by
+fun head_face(ctx: *context.Context, t: *Table, c: *Column, ci: usize, x0: f32, y0: f32, x1: f32, y1: f32, hot: bool) {
+    val st: u8           = theme.pick(hot, false, false, false);
+    val hp: *theme.Paint = context.paint_of(ctx, theme.TABLE_HEADER, st);
+    val p:  f32          = pad(ctx, theme.TABLE_HEADER);
+    context.box(ctx, theme.TABLE_HEADER, st, x0, y0, x1, y1);
+    val lh: f32 = context.line_height(ctx);
+    val ty: f32 = y0 + (y1 - y0 - lh) / 2.0::f32;
+    context.text_span(ctx, c.label, bid.shown(c.label), x0 + p, ty, hp.text);
+    if (t.sort != ci) { ret; }
+    # a triangle half a line wide at the right, up for ascending
+    val s:  f32 = lh / 2.0::f32;
+    val ax: f32 = x1 - p * 3.0::f32 - s;
+    val ay: f32 = y0 + (y1 - y0 - s / 2.0::f32) / 2.0::f32;
+    if (t.dir == SORT_ASC) {
+        context.tri(ctx, ax, ay + s / 2.0::f32, ax + s, ay + s / 2.0::f32, ax + s / 2.0::f32, ay, hp.mark);
+    }
+    or {
+        context.tri(ctx, ax, ay, ax + s, ay, ax + s / 2.0::f32, ay + s / 2.0::f32, hp.mark);
+    }
+}
+
+# one header cell: sort on a click, menu on a right click, reorder by drag
+# and drop, resize by its grip
+fun head(ctx: *context.Context, t: *Table, st: *TableState, c: *Column, ci: usize) {
+    var rx0: f32;
+    var rx1: f32;
+    strip(t, c, ?rx0, ?rx1);
+    val x0: f32 = left(t, c);
+    val x1: f32 = x0 + c.w;
+    if (x1 <= rx0 || x0 >= rx1) { ret; }
+    val y0: f32 = t.y0;
+    val y1: f32 = t.y0 + t.hh;
+    context.push_clip(ctx, rx0, y0, rx1, y1);
+
+    val h: interact.Hit = interact.hit(ctx, c.id, x0, y0, x1, y1, input.BUTTON_LEFT | input.BUTTON_RIGHT);
+    if (h.pressed) { st.moved = 0; }
+    if ((c.flags & NO_REORDER) == 0 && h.button != input.BUTTON_RIGHT) {
+        var carry: Carry    = Carry{table: t.id, col: c.id};
+        val d:     dnd.Drag = dnd.source(ctx, h, DRAG_KIND, (?carry)::ptr, $size_of(Carry), x0, y0, x1, y1);
+        if (d.on) {
+            st.moved = 1;
+            val p: dnd.Preview = dnd.begin_preview(ctx);
+            if (p.on) { head_face(ctx, t, c, ci, p.x0, p.y0, p.x1, p.y1, true); }
+            dnd.end_preview(ctx, p);
+        }
+    }
+    if (h.clicked && h.button == input.BUTTON_RIGHT) { menu.open_context(ctx, MENU_KEY); }
+    or (h.clicked && st.moved == 0 && (c.flags & NO_SORT) == 0) {
+        if (st.sort == c.id && st.dir == SORT_ASC) { st.dir = SORT_DESC; }
+        or {
+            st.sort = c.id;
+            st.dir  = SORT_ASC;
+        }
+        t.sort   = ci;
+        t.dir    = st.dir;
+        t.sorted = true;
+        customise(ctx, t, st);
+    }
+    head_face(ctx, t, c, ci, x0, y0, x1, y1, h.hot || h.active);
+
+    val cr: opt[Carry] = carried(ctx, t);
+    if (sel cr.some) {
+        val from: u64 = cr.some.col;
+        if (from != c.id && (c.flags & NO_REORDER) == 0) {
+            val dp: dnd.Drop = dnd.target(ctx, h, DRAG_KIND, x0, y0, x1, y1);
+            if (dp.dropped) {
+                move_column(ctx, t, from, c.id);
+                customise(ctx, t, st);
+            }
+        }
+    }
+
+    var rs: u8 = theme.NORMAL;
+    if ((c.flags & NO_RESIZE) == 0) {
+        val g:  f32          = context.px(ctx, context.look_of(ctx, theme.TABLE_RULE).min_w);
+        val hg: interact.Hit = interact.hit(ctx, bid.child(c.id, "#grip"), x1 - g, y0, x1, y1, input.BUTTON_LEFT);
+        if (hg.pressed) {
+            val cs: *ColumnState = column_state(ctx, c, ci);
+            cs.grab = maxf(cs.width, least(ctx, c));
+        }
+        if (hg.hot || hg.active) {
+            context.set_cursor(ctx, input.CURSOR_RESIZE_EW);
+            rs = theme.pick(hg.hot, hg.active, false, false);
+        }
+    }
+    val rp: *theme.Paint = rule_of(ctx, rs);
+    val ew: f32          = context.px(ctx, rp.border_w);
+    context.quad(ctx, x1 - ew, y0, x1, y1, rp.border);
+    context.pop_clip(ctx);
+}
+
+# the header row across the table
+fun header(ctx: *context.Context, t: *Table, st: *TableState) {
+    context.box(ctx, theme.TABLE_HEADER, theme.NORMAL, t.x0, t.y0, t.x1, t.y0 + t.hh);
+    var i: usize = 0;
+    for (i < t.n) {
+        val ci: usize   = t.cols[i].order;
+        val c:  *Column = ?t.cols[ci];
+        if (c.shown) { head(ctx, t, st, c, ci); }
+        i = i + 1;
+    }
+}
+
+# close the open cell's frame, clip and scope
+fun close_cell(ctx: *context.Context, t: *Table) {
+    if (!t.in_cell) { ret; }
+    context.pop_layout(ctx);
+    context.pop_clip(ctx);
+    context.pop_id(ctx);
+    t.in_cell = false;
+}
+
+# close the open row's scope, and its cell's
+fun close_row(ctx: *context.Context, t: *Table) {
+    close_cell(ctx, t);
+    if (!t.in_row) { ret; }
+    context.pop_id(ctx);
+    t.in_row = false;
+}
+
+# move to the next row in view: the frozen rows, then the scrolled rows the
+# view shows
+#
+# the row is t.row, an id scope keyed by its key until the next call.
+# ---
+# ctx: context
+# t:   the table begin opened
+# ret: true while there is a row, false once they are done
+pub fun next_row(ctx: *context.Context, t: *Table) bool {
+    close_row(ctx, t);
+    var r: usize = t.next;
+    if (r >= t.fr && r < t.first) { r = t.first; }
+    if (r >= t.fr && r >= t.last) { ret false; }
+    t.row  = r;
+    t.next = r + 1;
+    if (r < t.fr) { t.ry0 = t.y0 + t.hh + r::f32 * t.rh; }
+    or            { t.ry0 = t.y0 + t.hh + t.fr::f32 * t.rh + (r - t.first)::f32 * t.rh - t.frac; }
+    var key: u64 = r::u64;
+    if (t.o.key != nil) { key = t.o.key(t.o.user, r); }
+    context.push_id_int(ctx, key);
+    t.in_row = true;
+    ret true;
+}
+
+# open the current row's cell in column c, for the widgets that fill it
+#
+# the cell is a horizontal stack across the column's width, padded at its
+# sides, its widgets centred down the row and clipped to the cell, and an id
+# scope keyed by the column's label. it stays open until the next cell,
+# next_row or end.
+# ---
+# ctx: context
+# t:   the table
+# c:   the column's index in the caller's array
+# ret: true when the cell shows, false for a hidden column or one scrolled
+#      out of view, whose widgets the caller skips
+pub fun cell(ctx: *context.Context, t: *Table, c: usize) bool {
+    close_cell(ctx, t);
+    if (!t.in_row || c >= t.n) { ret false; }
+    val col: *Column = ?t.cols[c];
+    if (!col.shown) { ret false; }
+    var rx0: f32;
+    var rx1: f32;
+    strip(t, col, ?rx0, ?rx1);
+    var ry0: f32 = t.y0 + t.hh;
+    var ry1: f32 = ry0 + t.fr::f32 * t.rh;
+    if (t.row >= t.fr) {
+        ry0 = ry1;
+        ry1 = t.vy1;
+    }
+    val x0: f32 = left(t, col);
+    val x1: f32 = x0 + col.w;
+    val y1: f32 = t.ry0 + t.rh;
+    if (x1 <= rx0 || x0 >= rx1 || y1 <= ry0 || t.ry0 >= ry1) { ret false; }
+
+    context.push_id(ctx, context.id_of(ctx, col.label));
+    context.push_clip(ctx, maxf(x0, rx0), maxf(t.ry0, ry0), minf(x1, rx1), minf(y1, ry1));
+    val p: f32          = pad(ctx, theme.TABLE_CELL);
+    var f: layout.Frame = layout.column(x0 + p, t.ry0, maxf(col.w - p * 2.0::f32, 0.0::f32), t.rh, widget.row_gap(ctx));
+    f.axis  = layout.Axis.horizontal{};
+    f.align = layout.Align.center{};
+    f.open  = 0;
+    context.push_layout(ctx, f);
+    t.in_cell = true;
+    ret true;
+}
+
+# the context menu a right click on the header opens, a checked item per
+# column that can be hidden
+fun chooser(ctx: *context.Context, t: *Table, st: *TableState) {
+    var m: menu.Menu = menu.begin_context(ctx, MENU_KEY, 0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
+    var i: usize     = 0;
+    for (i < t.n) {
+        val ci: usize   = t.cols[i].order;
+        val c:  *Column = ?t.cols[ci];
+        if ((c.flags & NO_HIDE) == 0) {
+            var on: u8 = 0;
+            if (c.shown) { on = 1; }
+            var it: menu.Item = menu.of(c.label);
+            it.check = ?on;
+            if (menu.item(ctx, ?m, it)) {
+                column_state(ctx, c, ci).hidden = 1 - on;
+                customise(ctx, t, st);
+            }
+        }
+        i = i + 1;
+    }
+    menu.end_menu(ctx, ?m);
+}
+
+# a scrollbar's thumb over a track from a to b along one axis: where the
+# thumb starts and how long it is, for a view len long over content long
+fun thumb(ctx: *context.Context, track: f32, view: f64, content: f64, at: f64, most: f64, t0: *f32, tl: *f32) {
+    var l: f32 = track;
+    if (content > 0.0::f64) { l = (track::f64 * view / content)::f32; }
+    l   = clampf(l, context.px(ctx, context.look_of(ctx, theme.SCROLLBAR_THUMB).min_h), track);
+    @tl = l;
+    @t0 = 0.0::f32;
+    if (most > 0.0::f64) { @t0 = ((track - l)::f64 * at / most)::f32; }
+}
+
+# the scrollbars, dragged by their thumbs
+fun bars(ctx: *context.Context, t: *Table, st: *TableState) {
+    val top: f32 = t.y0 + t.hh + t.fr::f32 * t.rh;
+    val vh:  f32 = maxf(t.vy1 - top, 0.0::f32);
+    val my:  f64 = most_y(t, vh);
+    val mx:  f32 = most_x(t);
+    var dx:  f32;
+    var dy:  f32;
+    var t0:  f32;
+    var tl:  f32;
+
+    if (t.vx1 < t.x1) {
+        val id:    u64 = bid.child(t.id, "#vthumb");
+        val track: f32 = t.vy1 - top;
+        thumb(ctx, track, vh::f64, t.ch, st.sy, my, ?t0, ?tl);
+        if (interact.drag(ctx, id, ?dx, ?dy) && track > tl) {
+            st.sy = clampd(st.gy + dy::f64 * my / (track - tl)::f64, 0.0::f64, my);
+            thumb(ctx, track, vh::f64, t.ch, st.sy, my, ?t0, ?tl);
+        }
+        val h: interact.Hit = interact.hit(ctx, id, t.vx1, top + t0, t.x1, top + t0 + tl, input.BUTTON_LEFT);
+        if (h.pressed) { st.gy = st.sy; }
+        context.box(ctx, theme.SCROLLBAR, theme.NORMAL, t.vx1, top, t.x1, t.vy1);
+        context.box(ctx, theme.SCROLLBAR_THUMB, theme.pick(h.hot, h.active, false, false), t.vx1, top + t0, t.x1, top + t0 + tl);
+    }
+    if (t.vy1 < t.y1) {
+        val id:    u64 = bid.child(t.id, "#hthumb");
+        val x0:    f32 = t.x0 + t.fw;
+        val track: f32 = t.vx1 - x0;
+        thumb(ctx, track, track::f64, (t.tw - t.fw)::f64, st.sx::f64, mx::f64, ?t0, ?tl);
+        if (interact.drag(ctx, id, ?dx, ?dy) && track > tl) {
+            st.sx = clampf(st.gx + dx * mx / (track - tl), 0.0::f32, mx);
+            thumb(ctx, track, track::f64, (t.tw - t.fw)::f64, st.sx::f64, mx::f64, ?t0, ?tl);
+        }
+        val h: interact.Hit = interact.hit(ctx, id, x0 + t0, t.vy1, x0 + t0 + tl, t.y1, input.BUTTON_LEFT);
+        if (h.pressed) { st.gx = st.sx; }
+        context.box(ctx, theme.SCROLLBAR, theme.NORMAL, x0, t.vy1, t.vx1, t.y1);
+        context.box(ctx, theme.SCROLLBAR_THUMB, theme.pick(h.hot, h.active, false, false), x0 + t0, t.vy1, x0 + t0 + tl, t.y1);
+    }
+}
+
+# close a table: rule its columns, run the column menu, take the wheel and
+# draw the scrollbars
+#
+# the wheel goes to the table when the widget under the cursor is in it and
+# no scroll region inside took it first, and scrolls from the next frame.
+# ---
+# ctx: context
+# t:   the table begin opened
+pub fun end(ctx: *context.Context, t: *Table) {
+    close_row(ctx, t);
+    val st: *TableState = state.get[TableState](ctx, t.id);
+
+    # a rule down each shown column's right edge, in its strip
+    val by0: f32          = t.y0 + t.hh;
+    val rp:  *theme.Paint = rule_of(ctx, theme.NORMAL);
+    val ew:  f32          = context.px(ctx, rp.border_w);
+    var i:   usize        = 0;
+    for (i < t.n) {
+        val c: *Column = ?t.cols[i];
+        if (c.shown) {
+            var rx0: f32;
+            var rx1: f32;
+            strip(t, c, ?rx0, ?rx1);
+            val x1: f32 = left(t, c) + c.w;
+            if (x1 > rx0 && x1 - ew < rx1) {
+                context.push_clip(ctx, rx0, by0, rx1, t.vy1);
+                context.quad(ctx, x1 - ew, by0, x1, t.vy1, rp.border);
+                context.pop_clip(ctx);
+            }
+        }
+        i = i + 1;
+    }
+    if (t.fr > 0) {
+        val fy: f32 = by0 + t.fr::f32 * t.rh;
+        context.quad(ctx, t.x0, fy - ew, t.vx1, fy, rp.border);
+    }
+
+    chooser(ctx, t, st);
+
+    if (ctx.wheel_taken == 0 && ctx.hover_seen > t.seen && (ctx.in.wheel != 0.0::f32 || ctx.in.wheel_x != 0.0::f32)) {
+        st.sy           = st.sy - ctx.in.wheel::f64;
+        st.sx           = st.sx + ctx.in.wheel_x;
+        ctx.wheel_taken = 1;
+    }
+    val top: f32 = by0 + t.fr::f32 * t.rh;
+    st.sy = clampd(st.sy, 0.0::f64, most_y(t, maxf(t.vy1 - top, 0.0::f32)));
+    st.sx = clampf(st.sx, 0.0::f32, most_x(t));
+    bars(ctx, t, st);
+    context.pop_id(ctx);
+}
+
+fun column_save(cs: *ColumnState, w: *state.Writer) {
+    state.put_float(w, "width", cs.width::f64);
+    state.put_int(w, "pos", cs.pos::i64);
+    state.put_bool(w, "hidden", cs.hidden);
+}
+
+fun column_load(cs: *ColumnState, tb: *toml.Table) {
+    val wo: opt[f64]  = toml.get_float(tb, "width");
+    val po: opt[i64]  = toml.get_int(tb, "pos");
+    val ho: opt[bool] = toml.get_bool(tb, "hidden");
+    if (sel wo.some) { cs.width = wo.some::f32; }
+    if (sel po.some) {
+        if (po.some >= 0) { cs.pos = po.some::u32; }
+    }
+    if (sel ho.some) { cs.hidden = ho.some; }
+    cs.set    = 1;
+    cs.custom = 1;
+}
+
+fun table_save(st: *TableState, w: *state.Writer) {
+    state.put_int(w, "sort", st.sort:~i64);
+    state.put_int(w, "dir", st.dir::i64);
+}
+
+fun table_load(st: *TableState, tb: *toml.Table) {
+    val so: opt[i64] = toml.get_int(tb, "sort");
+    val dr: opt[i64] = toml.get_int(tb, "dir");
+    if (sel so.some) { st.sort = so.some:~u64; }
+    if (sel dr.some) {
+        if (dr.some >= 0 && dr.some <= 2) { st.dir = dr.some::u8; }
+    }
+    st.custom = 1;
+}
+
+# make tables' column layout and sort persist through state.save and
+# state.load, as "table_column" and "table" tables
+#
+# scroll positions are not saved.
+# ---
+# ctx: context
+# ret: ok, or the registry's refusal
+pub fun register(ctx: *context.Context) err[state.Error] {
+    val a: err[state.Error] = state.register[ColumnState](ctx, "table_column", column_save, column_load);
+    if (sel a.err) { ret a; }
+    ret state.register[TableState](ctx, "table", table_save, table_load);
+}
+
+# a cell's checkbox state, kept in the store under the checkbox's id
+#[testing]
+rec Mark {
+    on: u8;
+}
+
+# the probe table's columns, options and what its last frame did
+#[testing]
+rec Probe {
+    cols:   [3]Column;
+    rows:   usize;
+    freeze: usize;
+    frows:  usize;
+    t:      Table;
+    drawn:  usize;
+    keys:   usize;
+    sorts:  usize;
+}
+
+#[testing]
+fun probe_key(user: ptr, r: usize) u64 {
+    val p: *Probe = user::*Probe;
+    p.keys = p.keys + 1;
+    ret r::u64;
+}
+
+# a table 100 pixels tall over the 200 pixel screen, three 80 pixel columns:
+# a checkbox, then two texts
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p: *Probe  = user::*Probe;
+    var o: Options = options(p.rows, 100.0::f32);
+    o.freeze_cols = p.freeze;
+    o.freeze_rows = p.frows;
+    o.user        = user;
+    o.key         = probe_key;
+    p.drawn       = 0;
+    p.keys        = 0;
+    var t: Table = begin(ctx, "grid", ?p.cols[0], 3, o);
+    if (t.sorted) { p.sorts = p.sorts + 1; }
+    for (next_row(ctx, ?t)) {
+        p.drawn = p.drawn + 1;
+        if (cell(ctx, ?t, 0)) {
+            val m: *Mark = state.get[Mark](ctx, context.id_of(ctx, "x"));
+            widget.checkbox(ctx, "x", ?m.on);
+        }
+        if (cell(ctx, ?t, 1)) { widget.text(ctx, "b"); }
+        if (cell(ctx, ?t, 2)) { widget.text(ctx, "c"); }
+    }
+    end(ctx, ?t);
+    p.t = t;
+}
+
+# a driver over the probe table with rows rows, its layout persisting
+#[testing]
+fun probe(d: *drv.Driver, a: *allo.Allocator, p: *Probe, rows: usize, freeze: usize) bool {
+    p.rows    = rows;
+    p.freeze  = freeze;
+    p.cols[0] = Column{label: "A", width: 80.0::f32};
+    p.cols[1] = Column{label: "B", width: 80.0::f32};
+    p.cols[2] = Column{label: "C", width: 80.0::f32};
+    val e: err[allo.Error] = drv.init(d, a, 200.0::f32, 300.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret false; }
+    val r: err[state.Error] = register(?d.ctx);
+    if (sel r.err) { ret false; }
+    drv.step(d);
+    ret true;
+}
+
+# the checkbox in row r's first cell
+#[testing]
+fun mark_id(p: *Probe, r: u64) u64 {
+    ret bid.of_label(cell_id(?p.t, r, 0), "x");
+}
+
+# a widget's claimed rect, clipped, as x0 and x1, or (-1, -1) when not drawn
+#[testing]
+fun span_x(d: *drv.Driver, id: u64, x0: *f32, x1: *f32) {
+    @x0 = -1.0::f32;
+    @x1 = -1.0::f32;
+    val r: opt[context.Area] = drv.rect(d, id);
+    if (sel r.some) {
+        @x0 = r.some.x0;
+        @x1 = r.some.x1;
+    }
+}
+
+test table__a_million_rows_cost_only_those_in_view {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p, 1000000, 0)) { ret 1; }
+
+    # 78 pixels of 16 pixel rows under the header, above the sideways bar
+    if (p.drawn != 5 || p.keys != 5 || p.t.first != 0 || p.t.last != 5) { ret 2; }
+
+    # half way down, still five rows
+    if (!drv.scroll(?d, mark_id(?p, 0), 0.0::f32, -8000000.0::f32)) { ret 3; }
+    drv.step(?d);
+    if (p.t.first != 500000 || p.drawn != 5 || p.keys != 5) { ret 4; }
+    if (!drv.drawn(?d, mark_id(?p, 500004)))                { ret 5; }
+
+    # the end, the last row whole at the bottom
+    drv.scroll(?d, mark_id(?p, 500000), 0.0::f32, -100000000.0::f32);
+    drv.step(?d);
+    if (p.t.last != 1000000 || p.drawn != 5 || p.t.first != 999995) { ret 6; }
+    val last: opt[context.Area] = drv.rect(?d, mark_id(?p, 999999));
+    if (sel last.none)             { ret 7; }
+    if (last.some.y1 != 94.0::f32) { ret 7; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test table__a_row_widget_keeps_its_state_while_rows_scroll {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p, 1000000, 0)) { ret 1; }
+
+    val x3: u64 = mark_id(?p, 3);
+    if (!drv.click(?d, x3) || state.get[Mark](?d.ctx, x3).on != 1) { ret 2; }
+    val was: opt[context.Area] = drv.rect(?d, x3);
+    if (sel was.none) { ret 3; }
+
+    # two rows up: the same id, still checked, and the row now where it was unchecked
+    drv.scroll(?d, x3, 0.0::f32, -32.0::f32);
+    drv.step(?d);
+    val now: opt[context.Area] = drv.rect(?d, x3);
+    if (sel now.none)                           { ret 4; }
+    if (now.some.y0 != was.some.y0 - 32.0::f32) { ret 4; }
+    if (state.get[Mark](?d.ctx, x3).on != 1)    { ret 5; }
+    val x5: u64               = mark_id(?p, 5);
+    val at: opt[context.Area] = drv.rect(?d, x5);
+    if (sel at.none)                         { ret 6; }
+    if (at.some.y0 != was.some.y0)           { ret 6; }
+    if (state.get[Mark](?d.ctx, x5).on != 0) { ret 7; }
+
+    # far away and back, row 3 is still checked
+    drv.scroll(?d, x3, 0.0::f32, -1600000.0::f32);
+    drv.step(?d);
+    if (drv.drawn(?d, x3)) { ret 8; }
+    drv.scroll(?d, mark_id(?p, p.t.first::u64), 0.0::f32, 2000000.0::f32);
+    drv.step(?d);
+    if (!drv.drawn(?d, x3) || state.get[Mark](?d.ctx, x3).on != 1) { ret 9; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test table__resizes_and_reorders_from_the_header {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p, 10, 0)) { ret 1; }
+    val ha: u64 = drv.find(?d, "grid/A");
+    val hb: u64 = drv.find(?d, "grid/B");
+    val hc: u64 = drv.find(?d, "grid/C");
+    var x0: f32;
+    var x1: f32;
+
+    # the grip at A's right edge drags its width 30 pixels wider
+    val grip: opt[context.Area] = drv.rect(?d, bid.child(ha, "#grip"));
+    if (sel grip.none) { ret 2; }
+    val gx: f32 = (grip.some.x0 + grip.some.x1) / 2.0::f32;
+    if (!drv.drag(?d, bid.child(ha, "#grip"), gx + 30.0::f32, 8.0::f32)) { ret 3; }
+    drv.step(?d);
+    span_x(?d, hb, ?x0, ?x1);
+    if (x0 != 110.0::f32 || p.cols[0].w != 110.0::f32) { ret 4; }
+    if (p.sorts != 0)                                  { ret 5; }
+
+    # A dropped on C takes C's place, B and C moving up
+    if (!drv.drag_onto(?d, ha, hc)) { ret 6; }
+    drv.step(?d);
+    span_x(?d, hb, ?x0, ?x1);
+    if (x0 != 0.0::f32) { ret 7; }
+    span_x(?d, hc, ?x0, ?x1);
+    if (x0 != 80.0::f32)                                                 { ret 8; }
+    if (p.cols[0].pos != 2 || p.cols[0].x != 160.0::f32 || p.sorts != 0) { ret 9; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test table__sorts_hides_and_freezes {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    p.frows = 1;
+    if (!probe(?d, ?a, ?p, 10, 1)) { ret 1; }
+    val hb: u64 = drv.find(?d, "grid/B");
+    var x0: f32;
+    var x1: f32;
+
+    # a click sorts ascending, the next descending, another column ascending
+    if (p.t.sort != 3) { ret 2; }
+    drv.click(?d, hb);
+    if (p.t.sort != 1 || p.t.dir != SORT_ASC || p.sorts != 1) { ret 3; }
+    drv.click(?d, hb);
+    if (p.t.sort != 1 || p.t.dir != SORT_DESC || p.sorts != 2) { ret 4; }
+    drv.click(?d, drv.find(?d, "grid/C"));
+    if (p.t.sort != 2 || p.t.dir != SORT_ASC || p.sorts != 3) { ret 5; }
+
+    # with A frozen, scrolling sideways slides B under nothing but the
+    # scrolled strip, which starts at A's right edge
+    drv.scroll(?d, mark_id(?p, 0), 40.0::f32, 0.0::f32);
+    drv.step(?d);
+    span_x(?d, drv.find(?d, "grid/A"), ?x0, ?x1);
+    if (x0 != 0.0::f32 || x1 != 80.0::f32) { ret 6; }
+    span_x(?d, hb, ?x0, ?x1);
+    if (x0 != 80.0::f32 || x1 != 120.0::f32) { ret 7; }
+    span_x(?d, mark_id(?p, 0), ?x0, ?x1);
+    if (x0 != 4.0::f32) { ret 8; }
+
+    # with row 0 frozen beneath the header, scrolling down two rows leaves it
+    # where it was and moves row 3 up under it
+    drv.scroll(?d, mark_id(?p, 0), 0.0::f32, -32.0::f32);
+    drv.step(?d);
+    val r0: opt[context.Area] = drv.rect(?d, mark_id(?p, 0));
+    val r3: opt[context.Area] = drv.rect(?d, mark_id(?p, 3));
+    if (sel r0.none)                                                                         { ret 14; }
+    if (sel r3.none)                                                                         { ret 14; }
+    if (r0.some.y0 != 16.0::f32 || r3.some.y0 != 32.0::f32 || drv.drawn(?d, mark_id(?p, 2))) { ret 15; }
+
+    # a right click on the header opens the column menu, where B hides
+    if (!drv.right_click(?d, hb))                        { ret 9; }
+    if (!drv.click(?d, drv.find(?d, "grid/#columns/B"))) { ret 10; }
+    drv.step(?d);
+    if (drv.drawn(?d, hb) || p.cols[1].shown) { ret 11; }
+    if (p.cols[2].x != 80.0::f32)             { ret 12; }
+    # and shows again
+    drv.right_click(?d, drv.find(?d, "grid/C"));
+    drv.click(?d, drv.find(?d, "grid/#columns/B"));
+    drv.step(?d);
+    if (!p.cols[1].shown) { ret 13; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test table__column_layout_survives_a_save_and_load {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p, 10, 0)) { ret 1; }
+    val ha: u64 = drv.find(?d, "grid/A");
+    val hc: u64 = drv.find(?d, "grid/C");
+
+    # A 20 pixels narrower and moved last, B hidden, sorted by C descending
+    val grip: opt[context.Area] = drv.rect(?d, bid.child(ha, "#grip"));
+    if (sel grip.none) { ret 2; }
+    drv.drag(?d, bid.child(ha, "#grip"), (grip.some.x0 + grip.some.x1) / 2.0::f32 - 20.0::f32, 8.0::f32);
+    drv.drag_onto(?d, ha, hc);
+    drv.step(?d);
+    drv.click(?d, hc);
+    drv.click(?d, hc);
+    drv.right_click(?d, drv.find(?d, "grid/B"));
+    drv.click(?d, drv.find(?d, "grid/#columns/B"));
+    drv.step(?d);
+    if (p.cols[0].w != 60.0::f32 || p.cols[0].pos != 2 || p.cols[1].shown || p.t.sort != 2) { ret 3; }
+
+    val doc: res[str, allo.Error] = state.save(?d.ctx);
+    if (sel doc.err) { ret 4; }
+
+    var q: Probe;
+    var e: drv.Driver;
+    if (!probe(?e, ?a, ?q, 10, 0)) { ret 1; }
+    val ld: err[toml.TomlError] = state.load(?e.ctx, doc.ok);
+    if (sel ld.err) { ret 5; }
+    drv.step(?e);
+    if (q.cols[0].w != 60.0::f32 || q.cols[0].pos != 2 || q.cols[0].x != 80.0::f32) { ret 6; }
+    if (q.cols[1].shown || drv.drawn(?e, drv.find(?e, "grid/B")))                   { ret 7; }
+    if (q.t.sort != 2 || q.t.dir != SORT_DESC)                                      { ret 8; }
+
+    # the loaded layout is pinned: it outlives frames the table is not drawn in
+    state.set_max_age(?e.ctx, 1);
+    q.rows = 0;
+    drv.steps(?e, 3);
+    if (q.cols[0].pos != 2 || q.cols[1].shown) { ret 9; }
+
+    val f0: err[allo.Error] = drv.free(?d);
+    if (sel f0.err) { ret 1; }
+    val f1: err[allo.Error] = drv.free(?e);
+    if (sel f1.err) { ret 1; }
+    ret 0;
+}

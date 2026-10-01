@@ -13,7 +13,7 @@
 # [<name>.<id>] table per entry, and load reads one back through std.data.toml.
 #
 # the store is one owner among several: a widget taking a caller-owned record
-# (Window, Scroll, List, Field) keeps it, so an app can still own its state.
+# (Scroll, List, Field) keeps it, so an app can still own its state.
 
 use std.types.bool.bool;
 use std.types.error.err;
@@ -62,6 +62,31 @@ pub fun get[T](ctx: *context.Context, id: u64) *T {
     ret r.ok::*T;
 }
 
+# the T an id keeps, without making one
+#
+# unlike get it neither creates the entry nor counts as reaching it.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: the entry, valid until end, or nil when the id keeps no T
+pub fun find[T](ctx: *context.Context, id: u64) *T {
+    val e: *store.Entry = store.entry(?ctx.store, id, $type_id(T));
+    if (e == nil) { ret nil; }
+    ret e.data::*T;
+}
+
+# drop the T an id keeps, at once rather than when it ages out
+#
+# a pointer to it is dangling from here on, and the next get hands back a
+# zeroed T. a refused release sets the context's oom.
+# ---
+# ctx: context
+# id:  the widget's id
+pub fun drop[T](ctx: *context.Context, id: u64) {
+    val e: err[allo.Error] = store.drop(?ctx.store, id, $type_id(T));
+    if (sel e.err) { ctx.oom = 1; }
+}
+
 # keep an id's T through any number of untouched frames, or stop keeping it
 #
 # pinning reaches the entry, creating it zeroed when there is none.
@@ -81,6 +106,18 @@ pub fun pin[T](ctx: *context.Context, id: u64, on: u8) {
 # frames: the age, 0 to keep every entry until the context is freed
 pub fun set_max_age(ctx: *context.Context, frames: u64) {
     ctx.store.max_age = frames;
+}
+
+# hand every T the store keeps, under any id, to f
+#
+# for state that is ordered or counted across ids, such as the windows' stack
+# order. f must not reach for other state while it walks.
+# ---
+# ctx:  context
+# f:    called with each entry and user
+# user: passed through to f
+pub fun each[T](ctx: *context.Context, f: fun(*T, ptr), user: ptr) {
+    store.walk(?ctx.store, $type_id(T), f:~fun(ptr, ptr), user);
 }
 
 # register T for persistence under a name
@@ -104,6 +141,16 @@ pub fun register[T](ctx: *context.Context, name: str, save: fun(*T, *store.Write
     k.save  = save:~store.SaveFun;
     k.load  = load:~store.LoadFun;
     ret store.register(?ctx.store, k);
+}
+
+# pin every T a load reads, as pin does, so loaded state outlives the frames
+# before anything reaches it
+# ---
+# ctx: context
+# on:  1 to pin loaded entries, 0 to load them unpinned
+# ret: false when T is not registered
+pub fun keep[T](ctx: *context.Context, on: u8) bool {
+    ret store.keep(?ctx.store, $type_id(T), on) != 0;
 }
 
 # write every entry of a registered kind as one TOML document
@@ -230,6 +277,11 @@ test get__keeps_ages_out_and_pins {
     idle(?ctx);
     if (get[Pane](?ctx, 8).x != 0.0::f32) { ret 9; }
     if (context.ok(?ctx) == 0)            { ret 10; }
+
+    # found without being made, and dropped at once
+    if (find[Pane](?ctx, 8) == nil || find[Pane](?ctx, 9) != nil) { ret 11; }
+    drop[Pane](?ctx, 8);
+    if (find[Pane](?ctx, 8) != nil) { ret 12; }
 
     val freed: err[allo.Error] = context.free(?ctx);
     if (sel freed.err) { ret 1; }

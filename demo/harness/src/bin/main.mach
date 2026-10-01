@@ -30,9 +30,9 @@ fun main(argc: i64, argv: **u8) i64 {
     # a target that encodes sRGB gets linear colors
     blit.context.set_srgb(?ctx, 1);
     # a rounder look at 150%: every theme metric and all text scale with it
-    var look: blit.theme.Theme = blit.theme.default();
+    val look: *blit.theme.Theme = blit.context.theme_of(?ctx);
     look.corner = 3.0::f32;
-    blit.context.set_theme(?ctx, look);
+    blit.theme.derive(look);
     blit.context.set_scale(?ctx, 1.5::f32);
 
     var checked: u8    = 1;
@@ -43,14 +43,11 @@ fun main(argc: i64, argv: **u8) i64 {
     opts[1] = "sub";
     opts[2] = "mul";
 
-    var win: blit.widget.Window;
-    win.x     = 380.0::f32;
-    win.y     = 8.0::f32;
-    win.w     = 180.0::f32;
-    win.open  = 1;
-    win.title = "tools";
+    # a window that opens at (380, 8), sized to its content
+    var win: blit.widget.Window = blit.widget.window("tools", 380.0::f32, 8.0::f32, 180.0::f32, 0.0::f32);
+    win.flags = blit.widget.WINDOW_AUTO_SIZE;
 
-    var side: blit.widget.Dock;
+    var side: blit.dock.Dock;
     side.side = blit.context.Side.right{};
     side.size = blit.context.px(?ctx, 160.0::f32);
     var view_open: u8 = 1;
@@ -90,7 +87,7 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.context.begin(?ctx, in, 800.0::f32, 600.0::f32);
 
     # a side panel docked to the right edge, in collapsible sections
-    val dock: blit.widget.DockArea = blit.widget.begin_dock(?ctx, "side", ?side);
+    val dock: blit.dock.DockArea = blit.dock.begin_dock(?ctx, "side", ?side);
     if (blit.widget.section(?ctx, "view", ?view_open)) {
         blit.widget.checkbox(?ctx, "grid", ?checked);
         blit.widget.slider_f(?ctx, "zoom", ?amount, 0.0::f32, 1.0::f32);
@@ -99,7 +96,7 @@ fun main(argc: i64, argv: **u8) i64 {
         # utf-8, with a codepoint the bitmap font lacks drawn as its replacement
         blit.widget.text(?ctx, "caf\xC3\xA9");
     }
-    blit.widget.end_dock(?ctx, ?side, dock);
+    blit.dock.end_dock(?ctx, ?side, dock);
     val panel: blit.widget.Block = blit.widget.begin_panel(?ctx, 8.0::f32, 8.0::f32, 200.0::f32);
     blit.widget.text(?ctx, "blit headless smoke");
     blit.widget.button(?ctx, "step");
@@ -132,11 +129,13 @@ fun main(argc: i64, argv: **u8) i64 {
     blit.widget.grid(?ctx, heat, 96.0::f32, 48.0::f32);
     blit.widget.end_panel(?ctx, p2);
 
-    # a draggable, collapsible window with a couple of widgets
-    val wh: blit.widget.Block = blit.widget.begin_window(?ctx, ?win);
-    blit.widget.text(?ctx, "drag me");
-    blit.widget.button(?ctx, "go");
-    blit.widget.end_window(?ctx, ?win, wh);
+    # a window that drags, resizes, collapses and closes, with a couple of widgets
+    val wh: blit.widget.WindowArea = blit.widget.begin_window(?ctx, win);
+    if (wh.body != 0) {
+        blit.widget.text(?ctx, "drag me");
+        blit.widget.button(?ctx, "go");
+    }
+    blit.widget.end_window(?ctx, wh);
 
     # charts from plain arrays: two series with the area under one filled, bars
     # either side of zero, and a sparkline for a row
@@ -144,11 +143,12 @@ fun main(argc: i64, argv: **u8) i64 {
     var income: [6]f32 = [6]f32{1.0::f32, 2.0::f32, 1.5::f32, 3.0::f32, 2.5::f32, 4.0::f32};
     var net:    [6]f32 = [6]f32{2.0::f32, -1.0::f32, 3.5::f32, -2.5::f32, 1.0::f32, 0.5::f32};
     var series: [2]blit.chart.Series;
-    series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
-    series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-    val lines: blit.chart.Hover = blit.chart.line(?ctx, "load", 240.0::f32, 300.0::f32, 300.0::f32, 150.0::f32, ?series[0], 2, 6, blit.chart.options());
-    val bars:  blit.chart.Hover = blit.chart.bars(?ctx, "net", 240.0::f32, 460.0::f32, 200.0::f32, 100.0::f32, ?net[0], 6, blit.chart.options());
-    val spark: blit.chart.Hover = blit.chart.sparkline(?ctx, "energy", 450.0::f32, 460.0::f32, 90.0::f32, 20.0::f32, ?energy[0], 6);
+    series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 6);
+    series[0].fill = 1;
+    series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 6);
+    val lines: blit.chart.Hover = blit.chart.line(?ctx, "load", 240.0::f32, 300.0::f32, 300.0::f32, 150.0::f32, ?series[0], 2, blit.chart.options());
+    val bars:  blit.chart.Hover = blit.chart.bars(?ctx, "net", 240.0::f32, 460.0::f32, 200.0::f32, 100.0::f32, blit.chart.f32s(?net[0]), 6, blit.chart.options());
+    val spark: blit.chart.Hover = blit.chart.sparkline(?ctx, "energy", 450.0::f32, 460.0::f32, 90.0::f32, 20.0::f32, series[0]);
 
     # a popup over everything drawn so far
     val pop: blit.widget.Popup = blit.widget.begin_popup(?ctx, "menu", 1, 420.0::f32, 60.0::f32, 120.0::f32);
@@ -158,9 +158,10 @@ fun main(argc: i64, argv: **u8) i64 {
 
     blit.context.end(?ctx);
 
-    print.printf("blit {}: {} vertices in {} spans, {} atlas pages, ok={}, field \"{}\", typing={}\n",
+    print.printf("blit {}: {} vertices, {} indices in {} runs, {} atlas pages, ok={}, field \"{}\", typing={}\n",
         blit.VERSION,
         blit.context.draw_count(?ctx),
+        blit.context.index_count(?ctx),
         blit.context.run_count(?ctx),
         blit.atlas.page_count(blit.context.atlas_of(?ctx)),
         blit.context.ok(?ctx)::u64,

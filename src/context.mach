@@ -1,8 +1,9 @@
 # the immediate-mode context: draw list, input, layout, and the
 # painter helpers widgets build on
 #
-# the context owns the per-frame draw list and the current input, tracks a simple
-# top-to-bottom layout cursor, and holds the id stack widget ids are scoped by.
+# the context owns the per-frame draw list and the current input, holds the
+# stack of layout frames containers push and pop (see blit.layout), and holds
+# the id stack widget ids are scoped by.
 # it is also the painter: quad/glyph/text_at emit into the draw list through
 # the font and its atlas so widgets never touch the draw list or font directly. a
 # draw-list growth failure is recorded in `oom` rather than silently dropping
@@ -18,16 +19,24 @@
 # in which case they are converted to linear light first.
 #
 # the look is data: the context holds a theme (see blit.theme), the default
-# one until set_theme swaps in another, and one interface scale (set_scale)
+# one until set_theme copies in another or it is changed in place through
+# theme_of, and one interface scale (set_scale)
 # that multiplies every theme metric widgets read through px and the size
 # text is laid out and rasterised at, so a scale of 2.0 doubles the interface
 # without any widget knowing.
 #
-# the painter also carries a CPU clip stack and a local-origin offset. every quad
-# is shifted by the local origin into screen space, then clipped to the active
-# rect; quads fully outside are dropped and partial ones are shrunk with their
-# uvs interpolated, so all clipping stays geometric and backend-agnostic. push a
-# sub-surface (begin_surface) to draw custom content in a scrolled local space.
+# the painter also carries a clip stack and a local-origin offset. every shape
+# is shifted by the local origin into screen space. a shape wholly outside the
+# active clip rect is dropped on the CPU, and the rest is left whole: each run
+# of the draw list carries the clip rect it was drawn under, which the renderer
+# sets as its scissor. push a sub-surface (begin_surface) to draw custom
+# content in a scrolled local space.
+#
+# the draw list is indexed and its colors premultiplied. a run is a span of
+# indices drawn with one texture, one scissor and on one layer. a container
+# that paints its background once its contents are known splits the runs
+# into channels (split, set_channel, merge), so the background it draws last
+# still sorts beneath its children.
 #
 # coordinates compose one way. every rect a caller passes (geometry, claims,
 # clips, surfaces) is in the current local space, which is screen space shifted
@@ -37,12 +46,13 @@
 # can escape it. a layer is a new root with the origin at zero. the cursor alone
 # stays in screen space, as it arrives from the platform.
 #
-# paint and input share one order. geometry is emitted on a layer (push_layer
-# raises it), and end() composes the draw list by layer, keeping emission order
-# within a layer. interactive widgets claim their rects with the same order as a
-# key (see blit.hit). frame N's input is routed by the claims recorded in frame
-# N-1, hit-tested with frame N's cursor and resolved once in begin(N): only the
-# topmost claimant under the cursor is hovered. a widget therefore becomes
+# paint and input share one order. geometry is emitted on a layer, a slot in
+# one of the bands blit.band lists (push_band opens one), and end() composes
+# the draw list by layer, keeping emission order within a layer. interactive
+# widgets claim their rects with the same order as a key (see blit.hit).
+# frame N's input is routed by the claims recorded in frame N-1, hit-tested
+# with frame N's cursor and resolved once in begin(N): only the topmost
+# claimant under the cursor is hovered. a widget therefore becomes
 # interactive one frame after it first claims. that is a chosen property, since
 # any way around it makes some widgets special.
 #
@@ -69,6 +79,17 @@
 # widgets. id_of hands out the id a key gets in the current scope. two claims
 # with one id in a frame are recorded as collisions, readable until the next
 # begin.
+#
+# windows stack in the windows band by a z the context hands out (raise), so
+# their order is the context's, not the call order's. each window keeps its z
+# in its own state and notes it every frame it is drawn (note_z). once z
+# passes Z_RENUMBER the windows renumber every z they keep from 1 and tell the
+# context where they ended (restack).
+#
+# the frame's claims double as a record of where each widget was drawn:
+# rect_of, widget_at and widget_in read them back for tests and tools (see
+# blit.driver). set_trace asks the context to keep each line of text it
+# draws as well, off by default so ordinary frames pay nothing for it.
 
 use std.types.error.err;
 use std.types.option.opt;
@@ -83,38 +104,75 @@ use std.types.bool.false;
 use std.types.bool.true;
 
 use blit.atlas;
+use blit.band;
 use blit.draw;
 use blit.font;
 use gly: blit.glyph;
 use blit.hit;
+use ico: blit.icon;
 use bid: blit.id;
 use blit.input;
+use blit.layout;
+use blit.path;
+use blit.payload;
+use blit.sheet;
 use blit.store;
+use blit.tess;
 use th:   blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
 use std.collections.set;
-use std.math.float.sqrt_f32;
+use vec: std.collections.vector;
 use std.text.utf8;
 
-# capacity the clip, origin, layer and id stacks and the collision list start
-# with, doubling from there
+# capacity the clip, origin, layer, layout and id stacks and the collision
+# list start with, doubling from there
 pub val CLIP_DEPTH: usize = 16;
 
-# capacity the span list starts with, doubling from there
+# capacity the held-back button events start with, doubling from there
+pub val BUTTON_DEPTH: usize = 16;
+
+# capacity the run list starts with, doubling from there
 pub val RUN_DEPTH: usize = 64;
+
+# the z past which the windows renumber their stack order from 1
+pub val Z_RENUMBER: u64 = 0x100000;
 
 # the claim handle reserve_claim returns when the claim was refused
 pub val NO_CLAIM: usize = 0xFFFFFFFFFFFFFFFF;
 
-# the fill handle reserve_fill returns when the fill could not be emitted whole
-pub val NO_VERTS: usize = 0xFFFFFFFFFFFFFFFF;
+# the default double-click time in seconds and distance in unscaled pixels
+# (see set_double_click)
+pub val DOUBLE_TIME: f64 = 0.3;
+pub val DOUBLE_DIST: f32 = 6.0;
+
+# a coordinate beyond any surface, where a measuring scope's clip sits
+val NOWHERE: f32 = 3.0e38;
 
 # which corners of a fill are rounded, combined with |
 pub val CORNERS_NONE:   u8 = 0;
 pub val CORNERS_TOP:    u8 = 1;
 pub val CORNERS_BOTTOM: u8 = 2;
 pub val CORNERS_ALL:    u8 = 3;
+
+# pointer buttons input.BUTTON_* names, one bit each from BUTTON_LEFT up
+pub val BUTTONS: usize = 5;
+
+# the last press of one pointer button, which runs of clicks and drags are
+# measured against
+# ---
+# time:   the host's clock at the press
+# x:      cursor x in screen pixels at the press
+# y:      cursor y in screen pixels at the press
+# id:     the topmost claimant under the press, 0 for none
+# clicks: presses in the run of clicks on id it extends, 0 before the first
+pub rec Press {
+    time:   f64;
+    x:      f32;
+    y:      f32;
+    id:     u64;
+    clicks: u32;
+}
 
 # a saved local origin in screen pixels
 # ---
@@ -125,27 +183,84 @@ rec Origin {
     y: f32;
 }
 
-# one contiguous span of the draw list sampling a single texture on one layer
-#
-# every vertex lies in exactly one span, so a span's tex is the texture handle
-# of each quad in it. a renderer binds atlas page `page` when tex is
-# draw.ATLAS, else the consumer texture tex with the sampling filter names,
-# and draws count vertices from start. the record is plain integers, so a
-# foreign renderer reads it field for field.
+# a parent layer saved by push_band, with the hovered widget's claim count
+# when the band opened
 # ---
-# tex:    consumer texture handle, draw.ATLAS (0) for the font atlas
-# page:   the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
-# layer:  layer the span was drawn on
-# start:  first vertex of the span
-# count:  vertices in the span
-# filter: draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
+# layer: the parent's layer
+# seen:  hover_seen at the push
+rec Root {
+    layer: u32;
+    seen:  u64;
+}
+
+# a run of indexed triangles: bind the texture, set the scissor, draw the indices
+pub val RUN_TRIANGLES: u32 = 0;
+
+# a consumer span: set the scissor and call the app's own drawing for id with
+# data in the rect, then resume blit's runs
+pub val RUN_CUSTOM: u32 = 1;
+
+# one span of the composed index list, drawn with one texture and one scissor
+# on one layer
+#
+# every index lies in exactly one run. for kind RUN_TRIANGLES a renderer binds
+# atlas page `page` when tex is draw.ATLAS, else the consumer texture tex with
+# the sampling filter it names, sets the scissor to the clip rect, and draws
+# count indices from start as triangles. a RUN_CUSTOM run holds no indices
+# (count 0): the renderer sets the scissor and calls back into the app with id,
+# data and the rect at that point in paint order (see custom). the record is
+# plain numbers, so a foreign renderer reads it field for field, and skips a
+# run of a kind it does not know.
+# ---
+# kind:    what the run asks of the renderer, RUN_TRIANGLES or RUN_CUSTOM
+# tex:     consumer texture handle, draw.ATLAS (0) for the font atlas
+# page:    the atlas page sampled when tex is draw.ATLAS (see blit.atlas), else 0
+# layer:   layer the run was drawn on
+# filter:  draw.FILTER_NEAREST or FILTER_LINEAR, always FILTER_NEAREST on the atlas
+# clip_x0: scissor left in screen pixels
+# clip_y0: scissor top in screen pixels, y down
+# clip_x1: scissor right in screen pixels
+# clip_y1: scissor bottom in screen pixels
+# start:   first index of the run
+# count:   indices in the run, three per triangle, 0 for RUN_CUSTOM
+# id:      RUN_CUSTOM: the app's callback id, else 0
+# data:    RUN_CUSTOM: the app's value passed back to the callback, else 0
+# x0:      RUN_CUSTOM: rect left in screen pixels, else 0
+# y0:      RUN_CUSTOM: rect top in screen pixels, y down, else 0
+# x1:      RUN_CUSTOM: rect right in screen pixels, else 0
+# y1:      RUN_CUSTOM: rect bottom in screen pixels, else 0
 pub rec Run {
-    tex:    u64;
-    page:   u32;
-    layer:  u32;
-    start:  usize;
-    count:  usize;
-    filter: u32;
+    kind:    u32;
+    tex:     u64;
+    page:    u32;
+    layer:   u32;
+    filter:  u32;
+    clip_x0: f32;
+    clip_y0: f32;
+    clip_x1: f32;
+    clip_y1: f32;
+    start:   usize;
+    count:   usize;
+    id:      u64;
+    data:    u64;
+    x0:      f32;
+    y0:      f32;
+    x1:      f32;
+    y1:      f32;
+}
+
+# the channels a container splits its runs into, from split, for set_channel
+# and merge
+# ---
+# base:  the first run drawn after the split
+# floor: the enclosing run floor, restored by merge
+# outer: the enclosing channel, restored by merge
+# count: how many channels the split made
+pub rec Channels {
+    base:  usize;
+    floor: usize;
+    outer: u32;
+    count: u32;
 }
 
 # a screen edge a docked container attaches to
@@ -169,21 +284,41 @@ pub rec Area {
     y1: f32;
 }
 
+# one line of text the frame drew, as the trace keeps it
+# ---
+# start: first byte of the line's text in the trace's bytes
+# len:   bytes of text
+# box:   the line box in screen pixels, before clipping
+rec Traced {
+    start: usize;
+    len:   usize;
+    box:   Area;
+}
+
+# one line of text the frame drew, read back from the trace (see set_trace)
+# ---
+# text: the line's utf-8 text, not NUL-terminated, valid until the next begin
+# len:  bytes of text
+# box:  the line box in screen pixels, from the pen's start to its end and
+#       from the line's top to its bottom, before clipping
+pub rec TextLine {
+    text: *u8;
+    len:  usize;
+    box:  Area;
+}
+
 # immediate-mode UI state for one consumer
 # ---
 # dl:           draw list accumulated each frame
 # in:           input for the current frame
 # sw:           screen width in pixels
 # sh:           screen height in pixels
-# ox:           layout origin x (panel left)
-# oy:           layout origin y (panel top)
-# cx:           layout cursor x
-# cy:           layout cursor y
-# pw:           current panel width
 # hot:          id of the widget hovered this frame (0 = none)
-# active:       id of the widget being interacted with, persists across frames (0 = none)
-# drag_off_x:   cursor-to-origin x offset captured when a drag begins
-# drag_off_y:   cursor-to-origin y offset captured when a drag begins
+# active:       id of the widget owning the pointer since a press on it, persists across frames (0 = none)
+# active_btn:   the input.BUTTON_* bit whose press made active the owner
+# dbl_time:     seconds within which a press extends a run of clicks
+# dbl_dist:     unscaled pixels within which a press extends a run of clicks
+# presses:      each button's last press, by bit index
 # lx:           local origin x added to emitted positions before clipping
 # ly:           local origin y added to emitted positions before clipping
 # clip_x0:      active clip rect left in screen pixels
@@ -199,25 +334,41 @@ pub rec Area {
 # tex:          texture handle subsequent geometry samples (draw.ATLAS = font atlas)
 # page:         atlas page subsequent atlas geometry samples
 # filter:       sampling filter subsequent consumer-texture geometry asks for
-# run_start:    first vertex of the span being accumulated
-# runs:         closed single-texture spans, in draw order, grown on demand
-# runs_cap:     spans allocated for runs
-# run_len:      how many spans are closed
+# run_start:    first index of the run being accumulated
+# pend:         the state the run being accumulated was opened with
+# runs:         closed runs, in draw order, grown on demand
+# runs_cap:     runs allocated for runs
+# run_len:      how many runs are closed
+# chans:        the channel each closed run was drawn in, parallel to runs
+# chans_cap:    channels allocated for chans
+# chan:         channel subsequent runs are drawn in
+# run_floor:    runs below this index are sealed and never reopened
 # oom:          1 if an allocation or a claim was refused this frame, else 0
-# out:          scratch draw list end() composes layers into
+# order:        scratch index list end() composes runs into
+# sc:           scratch the painter builds and tessellates shapes in
 # claims:       this frame's claims, which route the next frame
 # prior:        the previous frame's claims, which route this frame
 # hover:        id of the topmost claimant under the cursor, resolved in begin (0 = none)
+# hover_layer:  layer the hovered claim was made on, 0 when nothing is hovered
 # layer:        layer subsequent geometry and claims land on
 # ordinal:      claims made so far this frame
 # layer_sp:     layer stack depth
-# layers:       saved parent layers, grown on demand
+# layers:       saved parent layers and their hover_seen, grown on demand
 # layers_cap:   layers allocated for layers
 # font:         the glyph sources, the text styles, the glyph cache and the atlas
+# frames:       the open layout frames, innermost last, grown on demand
+# frames_cap:   frames allocated for frames
+# frame_sp:     open layout frames, saved or not
+# spare:        the frame handed out while the stack cannot grow
+# measuring:    open push_measure scopes, which draw and claim nothing
 # style:        id of the text style text is drawn in
 # style_sp:     text style stack depth
 # style_ids:    saved parent text styles, grown on demand
 # style_cap:    styles allocated for style_ids
+# alpha:        opacity every color is painted at, the product of the open push_alpha scopes
+# alpha_sp:     open push_alpha scopes
+# alphas:       saved parent opacities, grown on demand
+# alphas_cap:   opacities allocated for alphas
 # scale:        interface scale theme metrics and text are sized at, 1.0 by default
 # theme:        the colors and unscaled metrics widgets draw with
 # srgb:         1 if colors are converted to linear light for an sRGB target, else 0
@@ -232,6 +383,7 @@ pub rec Area {
 # clip_on:      1 if the frame copied text into clip, else 0
 # paste_wanted: 1 if a widget asked for the clipboard's text this frame, else 0
 # timed:        1 once a frame has carried the host's clock, else 0
+# clocked:      1 once time has advanced between frames, so the host supplies a clock
 # delta:        seconds since the previous frame, 0 on the first
 # wake:         the earliest time a widget asked for a frame by this frame
 # wake_on:      1 if a widget asked for a frame this frame, else 0
@@ -246,26 +398,39 @@ pub rec Area {
 # ids:          seeds of the open id scopes, innermost last
 # ids_cap:      seeds allocated for ids
 # id_sp:        open id scopes, saved or not
-# hover_seen:   claims the hovered widget recorded so far this frame
+# hover_seen:   claims the hovered widget recorded so far this frame in the
+#               open root: pop_band restores it, so a band's claims never count
+#               as inside a scroll region opened outside the band
 # seen:         ids claimed so far this frame
 # collided:     ids claimed again this frame, once per repeat claim
 # collided_cap: ids allocated for collided
 # collided_len: repeat claims recorded in collided
+# z_top:        the highest window z handed out or noted, 0 before any
 # store:        state kept by widget id across frames (see blit.state)
+# sheet:        the theme's open overrides and its classes (see blit.style)
+# drag:         the drag and drop in flight and how the last one ended (see blit.dnd)
+# backlog:      button events held back for the frames after, in arrival order
+# backlog_cap:  events allocated for backlog
+# backlog_len:  events held in backlog
+# lag:          1 if the frame left button events or the cursor behind the host's, else 0
+# trace_on:     1 if the frame's text lines are recorded (see set_trace), else 0
+# traced:       the frame's recorded text lines, grown on demand
+# traced_cap:   lines allocated for traced
+# traced_len:   lines recorded this frame
+# trace_bytes:  the recorded lines' text, back to back
+# trace_cap:    bytes allocated for trace_bytes
+# trace_len:    bytes recorded this frame
 pub rec Context {
     dl:           draw.DrawList;
     in:           input.Input;
     sw:           f32;
     sh:           f32;
-    ox:           f32;
-    oy:           f32;
-    cx:           f32;
-    cy:           f32;
-    pw:           f32;
     hot:          u64;
     active:       u64;
-    drag_off_x:   f32;
-    drag_off_y:   f32;
+    active_btn:   u8;
+    dbl_time:     f64;
+    dbl_dist:     f32;
+    presses:      [5]Press;
     lx:           f32;
     ly:           f32;
     clip_x0:      f32;
@@ -282,24 +447,40 @@ pub rec Context {
     page:         u32;
     filter:       u32;
     run_start:    usize;
+    pend:         Run;
     runs:         *Run;
     runs_cap:     usize;
     run_len:      usize;
+    chans:        *u32;
+    chans_cap:    usize;
+    chan:         u32;
+    run_floor:    usize;
     oom:          u8;
-    out:          draw.DrawList;
+    order:        vec.Vector[u32];
+    sc:           tess.Scratch;
     claims:       hit.ClaimList;
     prior:        hit.ClaimList;
     hover:        u64;
+    hover_layer:  u32;
     layer:        u32;
     ordinal:      u64;
     layer_sp:     usize;
-    layers:       *u32;
+    layers:       *Root;
     layers_cap:   usize;
     font:         font.Font;
+    frames:       *layout.Frame;
+    frames_cap:   usize;
+    frame_sp:     usize;
+    spare:        layout.Frame;
+    measuring:    usize;
     style:        u32;
     style_sp:     usize;
     style_ids:    *u32;
     style_cap:    usize;
+    alpha:        f32;
+    alpha_sp:     usize;
+    alphas:       *f32;
+    alphas_cap:   usize;
     scale:        f32;
     theme:        th.Theme;
     srgb:         u8;
@@ -314,6 +495,7 @@ pub rec Context {
     clip_on:      u8;
     paste_wanted: u8;
     timed:        u8;
+    clocked:      u8;
     delta:        f64;
     wake:         f64;
     wake_on:      u8;
@@ -333,7 +515,22 @@ pub rec Context {
     collided:     *u64;
     collided_cap: usize;
     collided_len: usize;
+    z_top:        u64;
     store:        store.Store;
+    sheet:        sheet.Sheet;
+    drag:         payload.Session;
+    backlog:      *input.Event;
+    backlog_cap:  usize;
+    backlog_len:  usize;
+    lag:          u8;
+    trace_on:     u8;
+    traced:       *Traced;
+    traced_cap:   usize;
+    traced_len:   usize;
+    trace_bytes:  *u8;
+    trace_cap:    usize;
+    trace_len:    usize;
+    icons:        ico.Set;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -353,15 +550,8 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
         val f6: err[allo.Error] = font.free(?ctx.font);
         ret e;
     }
-    val eo: err[allo.Error] = draw.init(?ctx.out, a);
-    if (sel eo.err) {
-        val f0: err[allo.Error] = draw.free(?ctx.dl);
-        val f7: err[allo.Error] = font.free(?ctx.font);
-        ret eo;
-    }
     val ec: err[allo.Error] = hit.init(?ctx.claims, a);
     if (sel ec.err) {
-        val f1: err[allo.Error] = draw.free(?ctx.out);
         val f2: err[allo.Error] = draw.free(?ctx.dl);
         val f8: err[allo.Error] = font.free(?ctx.font);
         ret ec;
@@ -369,26 +559,36 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     val ep: err[allo.Error] = hit.init(?ctx.prior, a);
     if (sel ep.err) {
         val f3: err[allo.Error] = hit.free(?ctx.claims);
-        val f4: err[allo.Error] = draw.free(?ctx.out);
         val f5: err[allo.Error] = draw.free(?ctx.dl);
         val f9: err[allo.Error] = font.free(?ctx.font);
         ret ep;
+    }
+    var bare: th.Theme;
+    ctx.theme = bare;
+    val et: err[allo.Error] = th.init(?ctx.theme, a);
+    if (sel et.err) {
+        val f10: err[allo.Error] = hit.free(?ctx.prior);
+        val f11: err[allo.Error] = hit.free(?ctx.claims);
+        val f12: err[allo.Error] = draw.free(?ctx.dl);
+        val f13: err[allo.Error] = font.free(?ctx.font);
+        ret et;
     }
 
     var none: input.Input;
     ctx.in = none;
 
-    ctx.sw           = 0.0::f32;
-    ctx.sh           = 0.0::f32;
-    ctx.ox           = 0.0::f32;
-    ctx.oy           = 0.0::f32;
-    ctx.cx           = 0.0::f32;
-    ctx.cy           = 0.0::f32;
-    ctx.pw           = 0.0::f32;
-    ctx.hot          = 0;
-    ctx.active       = 0;
-    ctx.drag_off_x   = 0.0::f32;
-    ctx.drag_off_y   = 0.0::f32;
+    ctx.sw         = 0.0::f32;
+    ctx.sh         = 0.0::f32;
+    ctx.hot        = 0;
+    ctx.active     = 0;
+    ctx.active_btn = 0;
+    ctx.dbl_time   = DOUBLE_TIME;
+    ctx.dbl_dist   = DOUBLE_DIST;
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        ctx.presses[b] = Press{time: 0.0::f64, x: 0.0::f32, y: 0.0::f32, id: 0, clicks: 0};
+        b              = b + 1;
+    }
     ctx.lx           = 0.0::f32;
     ctx.ly           = 0.0::f32;
     ctx.clip_x0      = 0.0::f32;
@@ -408,19 +608,33 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.runs         = nil;
     ctx.runs_cap     = 0;
     ctx.run_len      = 0;
+    ctx.chans        = nil;
+    ctx.chans_cap    = 0;
+    ctx.chan         = 0;
+    ctx.run_floor    = 0;
+    ctx.order        = vec.init[u32](a);
+    ctx.sc           = tess.init(a);
     ctx.oom          = 0;
     ctx.hover        = 0;
+    ctx.hover_layer  = 0;
     ctx.layer        = 0;
     ctx.ordinal      = 0;
     ctx.layer_sp     = 0;
     ctx.layers       = nil;
     ctx.layers_cap   = 0;
+    ctx.frames       = nil;
+    ctx.frames_cap   = 0;
+    ctx.frame_sp     = 0;
+    ctx.measuring    = 0;
     ctx.style        = font.STYLE_BODY;
     ctx.style_sp     = 0;
     ctx.style_ids    = nil;
     ctx.style_cap    = 0;
+    ctx.alpha        = 1.0::f32;
+    ctx.alpha_sp     = 0;
+    ctx.alphas       = nil;
+    ctx.alphas_cap   = 0;
     ctx.scale        = 1.0::f32;
-    ctx.theme        = th.default();
     ctx.srgb         = 0;
     ctx.lin          = draw.LinearCache{};
     ctx.wheel_taken  = 0;
@@ -433,6 +647,7 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.clip_on      = 0;
     ctx.paste_wanted = 0;
     ctx.timed        = 0;
+    ctx.clocked      = 0;
     ctx.delta        = 0.0::f64;
     ctx.wake         = 0.0::f64;
     ctx.wake_on      = 0;
@@ -452,18 +667,60 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.collided     = nil;
     ctx.collided_cap = 0;
     ctx.collided_len = 0;
+    ctx.z_top        = 0;
+    ctx.backlog      = nil;
+    ctx.backlog_cap  = 0;
+    ctx.backlog_len  = 0;
+    ctx.lag          = 0;
     store.init(?ctx.store, a);
+    sheet.init(?ctx.sheet, a);
+    payload.init(?ctx.drag, a);
+    ctx.trace_on    = 0;
+    ctx.traced      = nil;
+    ctx.traced_cap  = 0;
+    ctx.traced_len  = 0;
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
+    ctx.icons       = ico.init(a);
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, state and id bookkeeping
+# composition, held-back button events, state, drag payload, icons, id
+# bookkeeping and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
 pub fun free(ctx: *Context) err[allo.Error] {
     val es: err[allo.Error] = store.free(?ctx.store);
     if (sel es.err) { ret es; }
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
+    val esh: err[allo.Error] = sheet.free(?ctx.sheet);
+    if (sel esh.err) { ret esh; }
+    val eth: err[allo.Error] = th.free(?ctx.theme);
+    if (sel eth.err) { ret eth; }
+    val ex: err[allo.Error] = payload.free(?ctx.drag);
+    if (sel ex.err) { ret ex; }
+    val eic: err[allo.Error] = ico.free(?ctx.icons);
+    if (sel eic.err) { ret eic; }
+    if (ctx.backlog != nil) {
+        val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
+        if (sel eh.err) { ret eh; }
+        ctx.backlog     = nil;
+        ctx.backlog_cap = 0;
+        ctx.backlog_len = 0;
+    }
+    val el: err[allo.Error] = allo.deallocate[Traced](ctx.a, ctx.traced, ctx.traced_cap);
+    if (sel el.err) { ret el; }
+    ctx.traced     = nil;
+    ctx.traced_cap = 0;
+    ctx.traced_len = 0;
+    val eb: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.trace_bytes, ctx.trace_cap);
+    if (sel eb.err) { ret eb; }
+    ctx.trace_bytes = nil;
+    ctx.trace_cap   = 0;
+    ctx.trace_len   = 0;
     if (ctx.pre != nil) {
         val ep: err[allo.Error] = allo.deallocate[u8](ctx.a, ctx.pre, ctx.pre_cap);
         if (sel ep.err) { ret ep; }
@@ -481,6 +738,14 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel er.err) { ret er; }
     ctx.runs     = nil;
     ctx.runs_cap = 0;
+    val ech: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.chans, ctx.chans_cap);
+    if (sel ech.err) { ret ech; }
+    ctx.chans     = nil;
+    ctx.chans_cap = 0;
+    val eor: err[allo.Error] = vec.dnit[u32](?ctx.order);
+    if (sel eor.err) { ret eor; }
+    val esc: err[allo.Error] = tess.free(?ctx.sc);
+    if (sel esc.err) { ret esc; }
     val ek: err[allo.Error] = allo.deallocate[Area](ctx.a, ctx.clips, ctx.clips_cap);
     if (sel ek.err) { ret ek; }
     ctx.clips     = nil;
@@ -489,14 +754,22 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel eg.err) { ret eg; }
     ctx.origins     = nil;
     ctx.origins_cap = 0;
-    val ey: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.layers, ctx.layers_cap);
+    val ey: err[allo.Error] = allo.deallocate[Root](ctx.a, ctx.layers, ctx.layers_cap);
     if (sel ey.err) { ret ey; }
     ctx.layers     = nil;
     ctx.layers_cap = 0;
+    val ef: err[allo.Error] = allo.deallocate[layout.Frame](ctx.a, ctx.frames, ctx.frames_cap);
+    if (sel ef.err) { ret ef; }
+    ctx.frames     = nil;
+    ctx.frames_cap = 0;
     val et: err[allo.Error] = allo.deallocate[u32](ctx.a, ctx.style_ids, ctx.style_cap);
     if (sel et.err) { ret et; }
     ctx.style_ids = nil;
     ctx.style_cap = 0;
+    val ea: err[allo.Error] = allo.deallocate[f32](ctx.a, ctx.alphas, ctx.alphas_cap);
+    if (sel ea.err) { ret ea; }
+    ctx.alphas     = nil;
+    ctx.alphas_cap = 0;
     val ei: err[allo.Error] = allo.deallocate[u64](ctx.a, ctx.ids, ctx.ids_cap);
     if (sel ei.err) { ret ei; }
     ctx.ids     = nil;
@@ -509,8 +782,6 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel en.err) { ret en; }
     val e0: err[allo.Error] = draw.free(?ctx.dl);
     if (sel e0.err) { ret e0; }
-    val e1: err[allo.Error] = draw.free(?ctx.out);
-    if (sel e1.err) { ret e1; }
     val e2: err[allo.Error] = hit.free(?ctx.claims);
     if (sel e2.err) { ret e2; }
     val e3: err[allo.Error] = hit.free(?ctx.prior);
@@ -519,14 +790,24 @@ pub fun free(ctx: *Context) err[allo.Error] {
 }
 
 # start a frame: store input (carrying the previous buttons into prev_down),
-# take dt from the host's clock, resolve the hovered claimant, clear the draw
-# list, and reset the id scopes, collisions, layout and layers
+# apply its button events, take dt from the host's clock, resolve the hovered
+# claimant, clear the draw list, and reset the id scopes, collisions, layout
+# and layers
+#
+# button events queue behind any held back from earlier frames and apply in
+# order until one would change a button already changed this frame. the rest
+# wait for the frames after, which next_frame asks for, so a press and release
+# between two frames are a press in one frame and a release in the next. a
+# frame that applies one takes the cursor where the last applied happened. a
+# button no event is waiting on takes the input's down, so a host that only
+# samples the buttons is read as it always was.
 #
 # hover is the topmost of the previous frame's claims under this frame's
 # cursor, and nothing while no pointer is present. a primary press on anything
 # but the focus holder drops the focus. the last frame's copied text, paste
 # request, cursor shape, candidate window and wake time are cleared, and the
-# frame's last composition event replaces the composition in progress.
+# frame's last composition event replaces the composition in progress. each
+# button pressed becomes that button's last press (see last_press).
 # ---
 # ctx: context
 # in:  this frame's input (prev_down is managed here)
@@ -538,33 +819,38 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.in           = in;
     ctx.in.prev_down = prev;
     ctx.delta        = 0.0::f64;
-    if (ctx.timed != 0 && in.time > then) { ctx.delta = in.time - then; }
+    if (ctx.timed != 0 && in.time > then) {
+        ctx.delta   = in.time - then;
+        ctx.clocked = 1;
+    }
     ctx.timed = 1;
 
-    ctx.sw  = sw;
-    ctx.sh  = sh;
-    ctx.ox  = 0.0::f32;
-    ctx.oy  = 0.0::f32;
-    ctx.cx  = 0.0::f32;
-    ctx.cy  = 0.0::f32;
-    ctx.pw  = 0.0::f32;
-    ctx.hot = 0;
-    ctx.oom = 0;
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
 
-    ctx.lx      = 0.0::f32;
-    ctx.ly      = 0.0::f32;
-    ctx.clip_x0 = 0.0::f32;
-    ctx.clip_y0 = 0.0::f32;
-    ctx.clip_x1 = sw;
-    ctx.clip_y1 = sh;
-    ctx.clip_sp = 0;
-    ctx.org_sp  = 0;
+    ctx.sw       = sw;
+    ctx.sh       = sh;
+    ctx.frame_sp = 0;
+    ctx.hot      = 0;
+    ctx.oom      = 0;
+    trickle(ctx, prev);
+
+    ctx.lx        = 0.0::f32;
+    ctx.ly        = 0.0::f32;
+    ctx.clip_x0   = 0.0::f32;
+    ctx.clip_y0   = 0.0::f32;
+    ctx.clip_x1   = sw;
+    ctx.clip_y1   = sh;
+    ctx.clip_sp   = 0;
+    ctx.measuring = 0;
+    ctx.org_sp    = 0;
 
     ctx.tex       = draw.ATLAS;
     ctx.page      = 0;
     ctx.filter    = draw.FILTER_NEAREST;
     ctx.run_start = 0;
     ctx.run_len   = 0;
+    ctx.chan      = 0;
+    ctx.run_floor = 0;
 
     ctx.wheel_taken = 0;
     ctx.free        = Area{x0: 0.0::f32, y0: 0.0::f32, x1: sw, y1: sh};
@@ -573,14 +859,23 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.claims = ctx.prior;
     ctx.prior  = done;
     hit.reset(?ctx.claims);
-    ctx.hover = 0;
-    if (ctx.in.present != 0) { ctx.hover = hit.resolve(?ctx.prior, ctx.in.mx, ctx.in.my); }
-    ctx.layer    = 0;
+    ctx.hover       = 0;
+    ctx.hover_layer = 0;
+    if (ctx.in.present != 0) {
+        val at: usize = hit.top(?ctx.prior, ctx.in.mx, ctx.in.my);
+        if (at < ctx.prior.len) {
+            ctx.hover       = ctx.prior.items[at].id;
+            ctx.hover_layer = (ctx.prior.items[at].key >> 32)::u32;
+        }
+    }
+    ctx.layer    = band.layer(band.BASE, 0);
     ctx.ordinal  = 0;
     ctx.layer_sp = 0;
 
     ctx.style    = font.STYLE_BODY;
     ctx.style_sp = 0;
+    ctx.alpha    = 1.0::f32;
+    ctx.alpha_sp = 0;
     ctx.font.oom = 0;
     font.begin_frame(?ctx.font);
 
@@ -592,29 +887,94 @@ pub fun begin(ctx: *Context, in: input.Input, sw: f32, sh: f32) {
     ctx.shape        = input.CURSOR_ARROW;
     ctx.ime_on       = 0;
     take_preedit(ctx);
+    take_presses(ctx);
 
     ctx.id_sp        = 0;
     ctx.hover_seen   = 0;
     ctx.collided_len = 0;
     set.clear[u64](?ctx.seen);
+    ctx.traced_len = 0;
+    ctx.trace_len  = 0;
 
     draw.reset(?ctx.dl);
 }
 
-# finish a frame: close the last texture span, compose the draw list by layer,
-# drop the active widget once the primary button is released, drop the focus
-# when its holder was not drawn, and age out the state no widget reached
-#
-# vertex indices taken during the frame (begin_panel's handle) are emission
-# indices and are only valid until end().
+# finish a frame: close the last run, compose the runs by layer, drop the
+# active widget once its button is released, drop the focus when its
+# holder was not drawn, age out the state no widget reached, and settle the
+# drag and drop in flight (see blit.payload.settle)
 # ---
 # ctx: context
 pub fun end(ctx: *Context) {
     flush_run(ctx);
     compose(ctx);
-    if (input.held(ctx.in, input.BUTTON_LEFT) == 0) { ctx.active = 0; }
-    if (ctx.focus_drawn == 0)                       { ctx.focus = 0; }
-    if (store.sweep(?ctx.store) != 0)               { ctx.oom = 1; }
+    if (input.held(ctx.in, ctx.active_btn) == 0) { ctx.active = 0; }
+    if (ctx.focus_drawn == 0)                    { ctx.focus = 0; }
+    if (store.sweep(?ctx.store) != 0)            { ctx.oom = 1; }
+    payload.settle(?ctx.drag, ctx.in);
+}
+
+# set how close in time and space a press must follow the previous press on
+# the same widget to extend a run of clicks (see blit.interact)
+#
+# a host that knows its platform's double-click settings passes them here.
+# ---
+# ctx:  context
+# time: seconds, DOUBLE_TIME by default
+# dist: unscaled pixels, multiplied by the interface scale, DOUBLE_DIST by default
+pub fun set_double_click(ctx: *Context, time: f64, dist: f32) {
+    ctx.dbl_time = time;
+    ctx.dbl_dist = dist;
+}
+
+# the z above every window, for a window coming to the front
+#
+# a window takes it when it first opens and whenever a press lands on it, and
+# paints and takes input above every window with a lower z from then on.
+# ---
+# ctx: context
+# ret: the new z, above every z handed out or noted so far
+pub fun raise(ctx: *Context) u64 {
+    ctx.z_top = ctx.z_top + 1;
+    ret ctx.z_top;
+}
+
+# note a window's z, read from state that outlives the frame
+#
+# z handed out earlier, or loaded from a saved document, stays below every
+# later raise.
+# ---
+# ctx: context
+# z:   the window's z
+pub fun note_z(ctx: *Context, z: u64) {
+    if (z > ctx.z_top) { ctx.z_top = z; }
+}
+
+# the highest z handed out or noted
+# ---
+# ctx: context
+# ret: the z, 0 before any
+pub fun z_top(ctx: *Context) u64 {
+    ret ctx.z_top;
+}
+
+# say the windows renumbered every z they keep, the highest now top
+#
+# the next raise hands out top plus one.
+# ---
+# ctx: context
+# top: the highest z any window keeps
+pub fun restack(ctx: *Context, top: u64) {
+    ctx.z_top = top;
+}
+
+# the layer the hovered claim was made on, to tell whether a press landed on
+# a container's own layer
+# ---
+# ctx: context
+# ret: the layer, meaningful while hover is nonzero
+pub fun hovered_layer(ctx: *Context) u32 {
+    ret ctx.hover_layer;
 }
 
 # give a widget the keyboard
@@ -744,8 +1104,9 @@ pub fun wake_at(ctx: *Context, t: f64) {
 
 # when the host should draw the next frame, read after end
 #
-# some(0) asks for one now: a wake time has already passed, or a widget asked
-# for the clipboard, which only the next frame can deliver. some(t) asks for
+# some(0) asks for one now: a wake time has already passed, a widget asked
+# for the clipboard, which only the next frame can deliver, or button events
+# are held back for the frames after (see begin). some(t) asks for
 # one by time t on the host's clock. none means nothing is pending, and an
 # idle host can sleep until input arrives.
 # ---
@@ -753,6 +1114,7 @@ pub fun wake_at(ctx: *Context, t: f64) {
 # ret: some(0) for now, some(t) by time t, none for only on input
 pub fun next_frame(ctx: *Context) opt[f64] {
     if (ctx.paste_wanted != 0)   { ret opt[f64].some{0.0::f64}; }
+    if (ctx.lag != 0)            { ret opt[f64].some{0.0::f64}; }
     if (ctx.wake_on == 0)        { ret opt[f64].none{}; }
     if (ctx.wake <= ctx.in.time) { ret opt[f64].some{0.0::f64}; }
     ret opt[f64].some{ctx.wake};
@@ -816,6 +1178,111 @@ pub fun preedit(ctx: *Context, id: u64) str {
 # ret: the caret, 0 when nothing is being composed
 pub fun preedit_caret(ctx: *Context) usize {
     ret ctx.pre_caret;
+}
+
+# record each button pressed this frame as its last press, extending the run
+# of clicks when it lands on the claimant the one before did, soon and near
+# enough. without a host clock no press is soon, so every one is single
+fun take_presses(ctx: *Context) {
+    val near: f32   = px(ctx, ctx.dbl_dist);
+    var b:    usize = 0;
+    for (b < BUTTONS) {
+        if (input.pressed(ctx.in, (1::u8) << b::u8) != 0) {
+            val p:   *Press = ?ctx.presses[b];
+            val dx:  f32    = ctx.in.mx - p.x;
+            val dy:  f32    = ctx.in.my - p.y;
+            var run: u32    = 1;
+            if (ctx.clocked != 0 && p.clicks != 0 && p.id == ctx.hover && ctx.in.time - p.time <= ctx.dbl_time && dx * dx + dy * dy <= near * near) {
+                run = p.clicks + 1;
+            }
+            @p = Press{time: ctx.in.time, x: ctx.in.mx, y: ctx.in.my, id: ctx.hover, clicks: run};
+        }
+        b = b + 1;
+    }
+}
+
+# the last press of a pointer button (see Press)
+#
+# begin records every press, on a widget or not, against the topmost
+# claimant under it: a press on the same claimant within the double-click
+# time and distance (see set_double_click) of the one before extends its run.
+# ---
+# ctx:    context
+# button: an input.BUTTON_* bit
+# ret:    the press, a zeroed one for a bit that names no button
+pub fun last_press(ctx: *Context, button: u8) Press {
+    var b: usize = 0;
+    for (b < BUTTONS) {
+        if (button == (1::u8) << b::u8) { ret ctx.presses[b]; }
+        b = b + 1;
+    }
+    var none: Press;
+    ret none;
+}
+
+# queue the frame's button events behind those held back, apply them in order
+# until a button would change twice, and hold the rest for the frames after
+#
+# ctx.in is this frame's input, and prev the buttons held last frame.
+fun trickle(ctx: *Context, prev: u8) {
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        i = i + 1;
+        if (!sel e.down && !sel e.up) { cnt; }
+        ctx.backlog = room[input.Event](ctx, ctx.backlog, ?ctx.backlog_cap, ctx.backlog_len + 1, BUTTON_DEPTH);
+        if (ctx.backlog_len >= ctx.backlog_cap) { cnt; }
+        ctx.backlog[ctx.backlog_len] = e;
+        ctx.backlog_len              = ctx.backlog_len + 1;
+    }
+
+    var down:    u8    = prev;
+    var changed: u8    = 0;
+    var moved:   u8    = 0;
+    var x:       f32   = ctx.in.mx;
+    var y:       f32   = ctx.in.my;
+    var n:       usize = 0;
+    for (n < ctx.backlog_len) {
+        val e:  input.Event  = ctx.backlog[n];
+        var b:  input.Button = input.Button{button: 0, x: 0.0::f32, y: 0.0::f32};
+        var on: u8           = 0;
+        if (sel e.down) {
+            b  = e.down;
+            on = b.button;
+        }
+        if (sel e.up) { b = e.up; }
+        if ((down & b.button) == on) {
+            n = n + 1;
+            cnt;
+        }
+        if ((changed & b.button) != 0) { brk; }
+        down    = (down & (b.button ^ 0xFF)) | on;
+        changed = changed | b.button;
+        moved   = 1;
+        x       = b.x;
+        y       = b.y;
+        n       = n + 1;
+    }
+
+    var waiting: u8    = 0;
+    var k:       usize = 0;
+    for (n + k < ctx.backlog_len) {
+        val e: input.Event = ctx.backlog[n + k];
+        if (sel e.down) { waiting = waiting | e.down.button; }
+        if (sel e.up)   { waiting = waiting | e.up.button; }
+        ctx.backlog[k] = e;
+        k              = k + 1;
+    }
+    ctx.backlog_len = k;
+
+    ctx.in.down = (down & waiting) | (ctx.in.down & (waiting ^ 0xFF));
+    ctx.lag     = 0;
+    if (k != 0) { ctx.lag = 1; }
+    if (moved != 0) {
+        if (x != ctx.in.mx || y != ctx.in.my) { ctx.lag = 1; }
+        ctx.in.mx = x;
+        ctx.in.my = y;
+    }
 }
 
 # take the frame's last composition event as the composition in progress,
@@ -943,6 +1410,127 @@ pub fun collision_at(ctx: *Context, index: usize) u64 {
     ret ctx.collided[index];
 }
 
+# the screen rect a widget claimed this frame, the union of its visible claims
+#
+# while a frame is built it covers the claims made so far, and after end() the
+# whole frame's, until the next begin. a widget clipped out of sight or not
+# drawn has none, so this also says whether a widget was drawn.
+# ---
+# ctx: context
+# id:  the widget's id
+# ret: the rect in screen pixels, or none when the widget claimed nothing visible
+pub fun rect_of(ctx: *Context, id: u64) opt[Area] {
+    var found: u8    = 0;
+    var r:     Area;
+    var i:     usize = 0;
+    if (id == 0) { ret opt[Area].none{}; }
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id != id || c.x1 <= c.x0 || c.y1 <= c.y0) { cnt; }
+        if (found == 0) {
+            r     = Area{x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1};
+            found = 1;
+            cnt;
+        }
+        r.x0 = minf(r.x0, c.x0);
+        r.y0 = minf(r.y0, c.y0);
+        r.x1 = maxf(r.x1, c.x1);
+        r.y1 = maxf(r.y1, c.y1);
+    }
+    if (found == 0) { ret opt[Area].none{}; }
+    ret opt[Area].some{r};
+}
+
+# the widget a pointer at a screen point would reach next frame: the topmost
+# of this frame's claims holding it
+# ---
+# ctx: context
+# x:   point x in screen pixels
+# y:   point y in screen pixels
+# ret: the widget's id, 0 when nothing or only an anonymous container is there
+pub fun widget_at(ctx: *Context, x: f32, y: f32) u64 {
+    ret hit.resolve(?ctx.claims, x, y);
+}
+
+# the topmost widget whose claim this frame lies wholly inside a screen rect
+# ---
+# ctx: context
+# r:   the rect in screen pixels
+# ret: the widget's id, 0 when no widget's claim lies inside it
+pub fun widget_in(ctx: *Context, r: Area) u64 {
+    var found: u8    = 0;
+    var best:  u64   = 0;
+    var id:    u64   = 0;
+    var i:     usize = 0;
+    for (i < ctx.claims.len) {
+        val c: hit.Claim = ctx.claims.items[i];
+        i = i + 1;
+        if (c.id == 0 || c.x1 <= c.x0 || c.y1 <= c.y0)                { cnt; }
+        if (c.x0 < r.x0 || c.y0 < r.y0 || c.x1 > r.x1 || c.y1 > r.y1) { cnt; }
+        if (found == 0 || c.key > best) {
+            found = 1;
+            best  = c.key;
+            id    = c.id;
+        }
+    }
+    ret id;
+}
+
+# record the text each frame draws, line by line, for tests to read back
+#
+# off by default, so a frame pays nothing for it. while on, every line of text
+# drawn at least partly inside the clip is kept with its screen box until the
+# next begin (see traced_count and traced_at). a line the trace cannot grow to
+# hold sets oom and is left out.
+# ---
+# ctx: context
+# on:  1 to record, 0 to stop
+pub fun set_trace(ctx: *Context, on: u8) {
+    ctx.trace_on = on;
+}
+
+# how many lines of text the frame drew while tracing
+# ---
+# ctx: context
+# ret: the line count
+pub fun traced_count(ctx: *Context) usize {
+    ret ctx.traced_len;
+}
+
+# one line of text the frame drew while tracing, in drawing order
+# ---
+# ctx:   context
+# index: line index below traced_count()
+# ret:   the line, or an empty one for an index out of range
+pub fun traced_at(ctx: *Context, index: usize) TextLine {
+    var l: TextLine;
+    if (index >= ctx.traced_len) { ret l; }
+    val t: Traced = ctx.traced[index];
+    l.text = ?ctx.trace_bytes[t.start];
+    l.len  = t.len;
+    l.box  = t.box;
+    ret l;
+}
+
+# keep one drawn line of text in the trace, given in local coordinates
+fun trace_line(ctx: *Context, s: *u8, n: usize, x0: f32, y0: f32, x1: f32, y1: f32) {
+    val b: Area = Area{x0: x0 + ctx.lx, y0: y0 + ctx.ly, x1: x1 + ctx.lx, y1: y1 + ctx.ly};
+    if (b.x1 <= ctx.clip_x0 || b.x0 >= ctx.clip_x1) { ret; }
+    if (b.y1 <= ctx.clip_y0 || b.y0 >= ctx.clip_y1) { ret; }
+    ctx.traced      = room[Traced](ctx, ctx.traced, ?ctx.traced_cap, ctx.traced_len + 1, RUN_DEPTH);
+    ctx.trace_bytes = room[u8](ctx, ctx.trace_bytes, ?ctx.trace_cap, ctx.trace_len + n, 1024);
+    if (ctx.traced_len >= ctx.traced_cap || ctx.trace_len + n > ctx.trace_cap) { ret; }
+    var k: usize = 0;
+    for (k < n) {
+        ctx.trace_bytes[ctx.trace_len + k] = s[k];
+        k                                  = k + 1;
+    }
+    ctx.traced[ctx.traced_len] = Traced{start: ctx.trace_len, len: n, box: b};
+    ctx.traced_len             = ctx.traced_len + 1;
+    ctx.trace_len              = ctx.trace_len + n;
+}
+
 # note a claim's id: a repeat within the frame is a collision, and a claim by
 # the hovered widget is counted
 fun note_id(ctx: *Context, id: u64) {
@@ -978,12 +1566,31 @@ pub fun draw_verts(ctx: *Context) *draw.Vert {
     ret draw.data(?ctx.dl);
 }
 
-# number of vertices to draw this frame
+# number of vertices to upload this frame
 # ---
 # ctx: context
 # ret: vertex count
 pub fun draw_count(ctx: *Context) usize {
     ret draw.count(?ctx.dl);
+}
+
+# pointer to the frame's u32 indices in composed paint order, for the
+# consumer to upload
+#
+# runs name spans of this list (see Run).
+# ---
+# ctx: context
+# ret: pointer to the first index
+pub fun draw_indices(ctx: *Context) *u32 {
+    ret draw.indices(?ctx.dl);
+}
+
+# number of indices this frame, three per triangle
+# ---
+# ctx: context
+# ret: index count
+pub fun index_count(ctx: *Context) usize {
+    ret draw.index_count(?ctx.dl);
 }
 
 # grow a stack's backing array to hold need entries
@@ -1018,115 +1625,238 @@ fun record(ctx: *Context, e: err[allo.Error]) {
 
 # sample subsequent geometry from one consumer texture, draw.ATLAS for the atlas
 #
-# a switch with nothing emitted since the last one retargets in place, so
-# alternating between an image and the atlas records spans only where
-# something was drawn. the span list grows with the frame; if it cannot, oom is
-# set and the vertices stay in the open span, which mistextures them.
+# a switch with nothing emitted since the last one costs nothing, so
+# alternating between an image and the atlas records runs only where
+# something was drawn.
 # ---
 # ctx:    context
 # tex:    consumer texture handle, draw.ATLAS for the font atlas
 # filter: draw.FILTER_NEAREST or FILTER_LINEAR, ignored for the atlas
 pub fun set_texture(ctx: *Context, tex: u64, filter: u32) {
-    retarget(ctx, tex, ctx.page, filter);
-}
-
-# a texture target, the atlas's page and filter normalised so equal targets
-# compare equal field for field
-fun target(tex: u64, page: u32, filter: u32) Run {
-    if (tex == draw.ATLAS) {
-        ret Run{tex: tex, page: page, layer: 0, start: 0, count: 0, filter: draw.FILTER_NEAREST};
-    }
-    ret Run{tex: tex, page: 0, layer: 0, start: 0, count: 0, filter: filter};
-}
-
-# whether two spans sample the same texels the same way
-fun same_target(a: Run, b: Run) bool {
-    ret a.tex == b.tex && a.page == b.page && a.filter == b.filter;
-}
-
-# the target subsequent geometry samples
-fun current(ctx: *Context) Run {
-    ret target(ctx.tex, ctx.page, ctx.filter);
-}
-
-# sample subsequent geometry from a consumer texture, or from an atlas page
-# when tex is draw.ATLAS
-fun retarget(ctx: *Context, tex: u64, page: u32, filter: u32) {
-    val want: Run = target(tex, page, filter);
-    if (same_target(current(ctx), want)) {
-        ctx.page = page;
-        ret;
-    }
-    # a retarget with nothing drawn since the last span closed reopens that
-    # span when it sampled the same texture, so a row of images through one
-    # sheet costs one span however often the atlas was targeted between them
-    val len: usize = draw.count(?ctx.dl);
-    if (len == ctx.run_start && ctx.run_len > 0
-        && same_target(ctx.runs[ctx.run_len - 1], want)
-        && ctx.runs[ctx.run_len - 1].layer == ctx.layer
-        && ctx.runs[ctx.run_len - 1].start
-        + ctx.runs[ctx.run_len - 1].count == len) {
-        ctx.run_len   = ctx.run_len - 1;
-        ctx.run_start = ctx.runs[ctx.run_len].start;
-        ctx.tex       = tex;
-        ctx.page      = page;
-        ctx.filter    = filter;
-        ret;
-    }
-    flush_run(ctx);
     ctx.tex    = tex;
-    ctx.page   = page;
     ctx.filter = filter;
 }
 
-# number of single-texture spans the frame's draw list divides into
+# the run subsequent geometry lands in, the atlas's page and filter
+# normalised so equal states compare equal field for field
+fun state(ctx: *Context) Run {
+    var r: Run = Run{
+        kind:    RUN_TRIANGLES, tex: ctx.tex, page: 0, layer: ctx.layer, filter: ctx.filter,
+        clip_x0: ctx.clip_x0, clip_y0: ctx.clip_y0, clip_x1: ctx.clip_x1, clip_y1: ctx.clip_y1,
+        start:   0, count: 0, id: 0, data: 0,
+        x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
+    };
+    if (ctx.tex == draw.ATLAS) {
+        r.page   = ctx.page;
+        r.filter = draw.FILTER_NEAREST;
+    }
+    ret r;
+}
+
+# whether two runs draw the same way: kind, texture, layer and scissor
 #
-# complete only after end(); the span still accumulating is not counted.
+# a consumer span is a call of its own and never draws the same way as another
+# run.
+fun same_state(a: Run, b: Run) bool {
+    ret a.kind == RUN_TRIANGLES && a.kind == b.kind && a.tex == b.tex && a.page == b.page && a.filter == b.filter
+        && a.layer == b.layer && a.clip_x0 == b.clip_x0 && a.clip_y0 == b.clip_y0
+        && a.clip_x1 == b.clip_x1 && a.clip_y1 == b.clip_y1;
+}
+
+# make the run being accumulated match the current state before a shape's
+# indices are written
+#
+# a shape drawn under another texture, layer or clip than the pending run
+# closes it. with nothing pending, the last closed run reopens when it draws
+# the same way, ends where the list does and lies above the run floor, so a
+# row of images through one sheet costs one run however often the atlas was
+# targeted between them.
+fun open_run(ctx: *Context) {
+    val want: Run   = state(ctx);
+    val len:  usize = draw.index_count(?ctx.dl);
+    if (len > ctx.run_start) {
+        if (same_state(ctx.pend, want)) { ret; }
+        flush_run(ctx);
+    }
+    val n: usize = ctx.run_len;
+    if (n > ctx.run_floor) {
+        val last: Run = ctx.runs[n - 1];
+        if (same_state(last, want) && last.start + last.count == len) {
+            ctx.run_len   = n - 1;
+            ctx.run_start = last.start;
+        }
+    }
+    ctx.pend = want;
+}
+
+# number of runs the frame's draw list divides into
+#
+# complete only after end(); the run still accumulating is not counted.
 # ---
 # ctx: context
-# ret: span count
+# ret: run count
 pub fun run_count(ctx: *Context) usize {
     ret ctx.run_len;
 }
 
-# one single-texture span of the draw list, in composed paint order
+# one run of the draw list, in composed paint order
 # ---
 # ctx:   context
-# index: span index below run_count()
-# ret:   the span, or an empty one for an index out of range
+# index: run index below run_count()
+# ret:   the run, or an empty one for an index out of range
 pub fun run_at(ctx: *Context, index: usize) Run {
-    if (index >= ctx.run_len) { ret target(draw.ATLAS, 0, draw.FILTER_NEAREST); }
+    if (index >= ctx.run_len) {
+        ret Run{
+            kind:    RUN_TRIANGLES, tex: draw.ATLAS, page: 0, layer: 0, filter: draw.FILTER_NEAREST,
+            clip_x0: 0.0::f32, clip_y0: 0.0::f32, clip_x1: 0.0::f32, clip_y1: 0.0::f32,
+            start:   0, count: 0, id: 0, data: 0,
+            x0:      0.0::f32, y0: 0.0::f32, x1: 0.0::f32, y1: 0.0::f32
+        };
+    }
     ret ctx.runs[index];
 }
 
-# close the span being accumulated, if it holds any vertices
+# close the run being accumulated, if it holds any indices
 #
-# if the span list cannot grow, oom is set and the span stays open.
+# the run list grows with the frame; if it cannot, oom is set and the indices
+# stay in the open run, which draws them with whatever state it ends with.
 fun flush_run(ctx: *Context) {
-    val len: usize = draw.count(?ctx.dl);
+    val len: usize = draw.index_count(?ctx.dl);
     if (len == ctx.run_start) { ret; }
-    ctx.runs = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
-    if (ctx.run_len >= ctx.runs_cap) { ret; }
-    var run: Run = current(ctx);
-    run.layer             = ctx.layer;
-    run.start             = ctx.run_start;
-    run.count             = len - ctx.run_start;
-    ctx.runs[ctx.run_len] = run;
-    ctx.run_len           = ctx.run_len + 1;
-    ctx.run_start         = len;
+    ctx.runs  = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
+    ctx.chans = room[u32](ctx, ctx.chans, ?ctx.chans_cap, ctx.run_len + 1, RUN_DEPTH);
+    if (ctx.run_len >= ctx.runs_cap || ctx.run_len >= ctx.chans_cap) { ret; }
+    var run: Run = ctx.pend;
+    run.start              = ctx.run_start;
+    run.count              = len - ctx.run_start;
+    ctx.runs[ctx.run_len]  = run;
+    ctx.chans[ctx.run_len] = ctx.chan;
+    ctx.run_len            = ctx.run_len + 1;
+    ctx.run_start          = len;
 }
 
-# reorder the draw list so layers paint in ascending order
+# place a consumer span: the app draws into a rect itself at this point in
+# paint order
 #
-# the sort is stable, so emission order holds within a layer, and spans that
-# end up adjacent on one texture and layer merge. an already ordered frame is
-# left untouched. if the scratch list cannot grow, the frame keeps emission
-# order and oom is set.
+# the span is a run of kind RUN_CUSTOM with no indices, carrying id, data, the
+# rect in screen space and the current clip as its scissor. it lands on the
+# current layer and channel and sorts like any run, so geometry drawn after it
+# or on a higher layer paints over it. a rect wholly outside the clip is
+# dropped. if the run list cannot grow, oom is set and the span is dropped.
+# ---
+# ctx:  context
+# x0:   rect left in local pixels
+# y0:   rect top in local pixels
+# x1:   rect right in local pixels
+# y1:   rect bottom in local pixels
+# id:   the app's callback id, passed through untouched
+# data: the app's value for the callback, passed through untouched
+pub fun custom(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, id: u64, data: u64) {
+    val sx0: f32 = minf(x0, x1) + ctx.lx;
+    val sy0: f32 = minf(y0, y1) + ctx.ly;
+    val sx1: f32 = maxf(x0, x1) + ctx.lx;
+    val sy1: f32 = maxf(y0, y1) + ctx.ly;
+    if (culled(ctx, sx0, sy0, sx1, sy1)) { ret; }
+    flush_run(ctx);
+    ctx.runs  = room[Run](ctx, ctx.runs, ?ctx.runs_cap, ctx.run_len + 1, RUN_DEPTH);
+    ctx.chans = room[u32](ctx, ctx.chans, ?ctx.chans_cap, ctx.run_len + 1, RUN_DEPTH);
+    if (ctx.run_len >= ctx.runs_cap || ctx.run_len >= ctx.chans_cap) { ret; }
+    var run: Run = state(ctx);
+    run.kind               = RUN_CUSTOM;
+    run.tex                = draw.ATLAS;
+    run.page               = 0;
+    run.filter             = draw.FILTER_NEAREST;
+    run.start              = draw.index_count(?ctx.dl);
+    run.id                 = id;
+    run.data               = data;
+    run.x0                 = sx0;
+    run.y0                 = sy0;
+    run.x1                 = sx1;
+    run.y1                 = sy1;
+    ctx.runs[ctx.run_len]  = run;
+    ctx.chans[ctx.run_len] = ctx.chan;
+    ctx.run_len            = ctx.run_len + 1;
+}
+
+# split the runs drawn from here on into n channels, starting in channel 0
+#
+# runs drawn in a lower channel paint beneath those drawn in a higher one,
+# whatever the order they were drawn in, until merge folds them back into the
+# enclosing channel. a container draws its children in channel 1 and its
+# background in channel 0 at its end, once its size is known. splits nest,
+# and every split is paired with a merge on the same layer.
+# ---
+# ctx: context
+# n:   number of channels, at least 1
+# ret: the split, for set_channel and merge
+pub fun split(ctx: *Context, n: u32) Channels {
+    flush_run(ctx);
+    val ch: Channels = Channels{base: ctx.run_len, floor: ctx.run_floor, outer: ctx.chan, count: n};
+    ctx.chan      = 0;
+    ctx.run_floor = ctx.run_len;
+    ret ch;
+}
+
+# draw subsequent runs in channel i of a split
+# ---
+# ctx: context
+# ch:  the split from split
+# i:   channel index, clamped below ch.count
+pub fun set_channel(ctx: *Context, ch: Channels, i: u32) {
+    flush_run(ctx);
+    var c: u32 = i;
+    if (c >= ch.count && ch.count > 0) { c = ch.count - 1; }
+    ctx.chan      = c;
+    ctx.run_floor = ctx.run_len;
+}
+
+# fold a split's channels back into the enclosing channel, lowest first
+#
+# the order within a channel is kept, and the runs of the split then belong
+# to the channel the split was made in.
+# ---
+# ctx: context
+# ch:  the split from split
+pub fun merge(ctx: *Context, ch: Channels) {
+    flush_run(ctx);
+    var i: usize = ch.base + 1;
+    for (i < ctx.run_len) {
+        val run: Run   = ctx.runs[i];
+        val c:   u32   = ctx.chans[i];
+        var j:   usize = i;
+        for (j > ch.base && ctx.chans[j - 1] > c) {
+            ctx.runs[j]  = ctx.runs[j - 1];
+            ctx.chans[j] = ctx.chans[j - 1];
+            j            = j - 1;
+        }
+        ctx.runs[j]  = run;
+        ctx.chans[j] = c;
+        i            = i + 1;
+    }
+    var k: usize = ch.base;
+    for (k < ctx.run_len) {
+        ctx.chans[k] = ch.outer;
+        k            = k + 1;
+    }
+    ctx.chan      = ch.outer;
+    ctx.run_floor = ch.floor;
+}
+
+# order the runs so layers paint in ascending order and lay their indices out
+# in that order
+#
+# the sort is stable, so draw order holds within a layer, and runs that end
+# up adjacent and draw the same way merge. a frame whose runs already follow
+# their indices in layer order is left untouched. if the scratch list cannot
+# grow, the frame keeps draw order and oom is set.
 fun compose(ctx: *Context) {
+    val n:      usize = ctx.run_len;
     var i:      usize = 1;
     var sorted: u8    = 1;
-    for (i < ctx.run_len) {
-        if (ctx.runs[i].layer < ctx.runs[i - 1].layer) {
+    for (i < n) {
+        val prev: Run = ctx.runs[i - 1];
+        val cur:  Run = ctx.runs[i];
+        if (cur.layer < prev.layer || cur.start != prev.start + prev.count) {
             sorted = 0;
             brk;
         }
@@ -1134,15 +1864,15 @@ fun compose(ctx: *Context) {
     }
     if (sorted != 0) { ret; }
 
-    draw.reset(?ctx.out);
-    val grown: err[allo.Error] = draw.reserve(?ctx.out, draw.count(?ctx.dl));
+    vec.clear[u32](?ctx.order);
+    val grown: res[usize, allo.Error] = vec.reserve[u32](?ctx.order, draw.index_count(?ctx.dl));
     if (sel grown.err) {
         ctx.oom = 1;
         ret;
     }
 
     i = 1;
-    for (i < ctx.run_len) {
+    for (i < n) {
         val cur: Run   = ctx.runs[i];
         var j:   usize = i;
         for (j > 0 && ctx.runs[j - 1].layer > cur.layer) {
@@ -1153,33 +1883,33 @@ fun compose(ctx: *Context) {
         i           = i + 1;
     }
 
-    val src: *draw.Vert = draw.data(?ctx.dl);
-    var at:  usize      = 0;
-    var n:   usize      = 0;
-    var k:   usize      = 0;
-    for (k < ctx.run_len) {
+    val src: *u32  = draw.indices(?ctx.dl);
+    var m:   usize = 0;
+    var k:   usize = 0;
+    for (k < n) {
         val run: Run   = ctx.runs[k];
+        val at:  usize = ctx.order.len;
         var v:   usize = 0;
         for (v < run.count) {
-            record(ctx, draw.push_vert(?ctx.out, src[run.start + v]));
-            v = v + 1;
+            ctx.order.data[at + v] = src[run.start + v];
+            v                      = v + 1;
         }
-        if (n > 0 && same_target(ctx.runs[n - 1], run) && ctx.runs[n - 1].layer == run.layer) {
-            ctx.runs[n - 1].count = ctx.runs[n - 1].count + run.count;
+        ctx.order.len = at + run.count;
+        if (m > 0 && same_state(ctx.runs[m - 1], run)) {
+            ctx.runs[m - 1].count = ctx.runs[m - 1].count + run.count;
         }
         or {
-            ctx.runs[n]       = run;
-            ctx.runs[n].start = at;
-            n                 = n + 1;
+            ctx.runs[m]       = run;
+            ctx.runs[m].start = at;
+            m                 = m + 1;
         }
-        at = at + run.count;
-        k  = k + 1;
+        k = k + 1;
     }
-    ctx.run_len = n;
+    ctx.run_len = m;
 
-    val emitted: draw.DrawList = ctx.dl;
-    ctx.dl  = ctx.out;
-    ctx.out = emitted;
+    val emitted: vec.Vector[u32] = ctx.dl.idx;
+    ctx.dl.idx = ctx.order;
+    ctx.order  = emitted;
 }
 
 # draw a region of a consumer texture scaled into a rect
@@ -1285,6 +2015,25 @@ fun pop_origin(ctx: *Context) {
     }
 }
 
+# the cursor's x in the current local space
+#
+# the cursor arrives in screen space (ctx.in.mx). this is where it falls in
+# the coordinates rects are passed in, inside surfaces and layers alike.
+# ---
+# ctx: context
+# ret: cursor x in local pixels
+pub fun local_mx(ctx: *Context) f32 {
+    ret ctx.in.mx - ctx.lx;
+}
+
+# the cursor's y in the current local space (see local_mx)
+# ---
+# ctx: context
+# ret: cursor y in local pixels
+pub fun local_my(ctx: *Context) f32 {
+    ret ctx.in.my - ctx.ly;
+}
+
 # whether the screen point (x, y) lies inside the active clip rect
 #
 # the point is in screen space, not local space, because it is meant for the
@@ -1299,41 +2048,166 @@ pub fun input_visible(ctx: *Context, x: f32, y: f32) u8 {
     ret 0;
 }
 
-# raise geometry and claims onto a new layer above the current one
+# open a layer in a band (see blit.band) for subsequent geometry and claims
 #
-# a layer is an overlay: until the matching pop_layer it paints above, and its
-# claims win over, everything on lower layers, whatever the call order. the clip
-# resets to the whole screen and the local origin to zero, so coordinates inside
-# a layer are screen pixels. the stack grows with nesting; if it cannot, oom is
-# set, the parent is not saved and depth still balances.
+# the band's rule picks the slot: a flat band shares slot 0, a nesting band
+# stacks one above a parent of the same band, and an ordered band takes slot.
+# until the matching pop_band everything paints above, and its claims win
+# over, everything on lower layers, whatever the call order. the clip resets
+# to the whole screen and the local origin to zero, so coordinates inside a
+# band are screen pixels. the band is a root for wheel routing: claims made
+# in it never count as inside a scroll region opened outside it. the stack
+# grows with nesting; if it cannot, oom is set, the parent is not saved and
+# depth still balances.
 # ---
-# ctx: context
-pub fun push_layer(ctx: *Context) {
-    flush_run(ctx);
-    ctx.layers = room[u32](ctx, ctx.layers, ?ctx.layers_cap, ctx.layer_sp + 1, CLIP_DEPTH);
-    if (ctx.layer_sp < ctx.layers_cap) { ctx.layers[ctx.layer_sp] = ctx.layer; }
+# ctx:  context
+# b:    the band's index, such as band.POPUPS
+# slot: the slot in an ordered band, such as a window's z, ignored otherwise
+pub fun push_band(ctx: *Context, b: u32, slot: u32) {
+    ctx.layers = room[Root](ctx, ctx.layers, ?ctx.layers_cap, ctx.layer_sp + 1, CLIP_DEPTH);
+    if (ctx.layer_sp < ctx.layers_cap) { ctx.layers[ctx.layer_sp] = Root{layer: ctx.layer, seen: ctx.hover_seen}; }
     ctx.layer_sp = ctx.layer_sp + 1;
-    ctx.layer    = ctx.layer + 1;
+    ctx.layer    = band.open(b, slot, ctx.layer);
 
     save_clip(ctx);
     ctx.clip_x0 = 0.0::f32;
     ctx.clip_y0 = 0.0::f32;
     ctx.clip_x1 = ctx.sw;
     ctx.clip_y1 = ctx.sh;
+    if (ctx.measuring != 0) { clip_nowhere(ctx); }
     push_origin(ctx, 0.0::f32, 0.0::f32);
 }
 
-# return to the layer, clip and origin saved by the matching push_layer
+# return to the layer, clip, origin and hover count saved by the matching push_band
 # ---
 # ctx: context
-pub fun pop_layer(ctx: *Context) {
+pub fun pop_band(ctx: *Context) {
     if (ctx.layer_sp == 0) { ret; }
     pop_origin(ctx);
     pop_clip(ctx);
-    flush_run(ctx);
     ctx.layer_sp = ctx.layer_sp - 1;
-    if (ctx.layer_sp < ctx.layers_cap) { ctx.layer = ctx.layers[ctx.layer_sp]; }
-    or                                 { ctx.layer = ctx.layer - 1; }
+    if (ctx.layer_sp < ctx.layers_cap) {
+        ctx.layer      = ctx.layers[ctx.layer_sp].layer;
+        ctx.hover_seen = ctx.layers[ctx.layer_sp].seen;
+    }
+    or { ctx.layer = band.layer(band.BASE, 0); }
+}
+
+# the layer subsequent geometry and claims land on
+# ---
+# ctx: context
+# ret: the packed layer (see blit.band)
+pub fun layer_of(ctx: *Context) u32 {
+    ret ctx.layer;
+}
+
+# open an overlay in the popup band, nested above an enclosing popup
+# ---
+# ctx: context
+#[deprecated("use push_band(ctx, band.POPUPS, 0), or the band the overlay belongs in")]
+pub fun push_layer(ctx: *Context) {
+    push_band(ctx, band.POPUPS, 0);
+}
+
+# return from the overlay opened by push_layer
+# ---
+# ctx: context
+#[deprecated("use pop_band")]
+pub fun pop_layer(ctx: *Context) {
+    pop_band(ctx);
+}
+
+# lay out without drawing or claiming until the matching pop_measure
+#
+# everything placed in the scope is measured as usual, but its geometry is
+# dropped and its claims are never recorded, so nothing in it is hovered or
+# clicked. a layer opened inside it stays hidden too. a layout that needs a
+# size it has not measured yet (see blit.widget.begin_stack) spends its first
+# frame here, so a guess is never seen or clicked.
+# ---
+# ctx: context
+pub fun push_measure(ctx: *Context) {
+    save_clip(ctx);
+    clip_nowhere(ctx);
+    ctx.measuring = ctx.measuring + 1;
+}
+
+# end the scope push_measure opened, drawing and claiming again
+# ---
+# ctx: context
+pub fun pop_measure(ctx: *Context) {
+    if (ctx.measuring == 0) { ret; }
+    ctx.measuring = ctx.measuring - 1;
+    pop_clip(ctx);
+}
+
+# whether a push_measure scope is open
+# ---
+# ctx: context
+# ret: true while geometry and claims are dropped
+pub fun measuring(ctx: *Context) bool {
+    ret ctx.measuring != 0;
+}
+
+# clip to a rect no geometry or claim reaches, past any coordinate in use
+fun clip_nowhere(ctx: *Context) {
+    ctx.clip_x0 = NOWHERE;
+    ctx.clip_y0 = NOWHERE;
+    ctx.clip_x1 = NOWHERE;
+    ctx.clip_y1 = NOWHERE;
+}
+
+# open a layout frame inside the current one (see blit.layout)
+#
+# containers push the frame their content is laid out in and pop it at their
+# end, so the parent's pen is untouched until the container places itself.
+# the stack grows with nesting; if it cannot, oom is set, top_layout hands out a
+# spare frame until the matching pop and depth still balances.
+# ---
+# ctx: context
+# f:   the new frame
+pub fun push_layout(ctx: *Context, f: layout.Frame) {
+    ctx.frames = room[layout.Frame](ctx, ctx.frames, ?ctx.frames_cap, ctx.frame_sp + 1, CLIP_DEPTH);
+    if (ctx.frame_sp < ctx.frames_cap) { ctx.frames[ctx.frame_sp] = f; }
+    or                                 { ctx.spare = f; }
+    ctx.frame_sp = ctx.frame_sp + 1;
+}
+
+# close the innermost layout frame, back to its parent
+# ---
+# ctx: context
+pub fun pop_layout(ctx: *Context) {
+    if (ctx.frame_sp > 0) { ctx.frame_sp = ctx.frame_sp - 1; }
+}
+
+# the innermost layout frame, nil when none is open
+#
+# the pointer is valid until the next push_layout.
+# ---
+# ctx: context
+# ret: the frame
+pub fun top_layout(ctx: *Context) *layout.Frame {
+    ret layout_at(ctx, 0);
+}
+
+# the frame depth levels out from the innermost, nil past the root
+# ---
+# ctx:   context
+# depth: 0 for the innermost, 1 for its parent
+# ret:   the frame
+pub fun layout_at(ctx: *Context, depth: usize) *layout.Frame {
+    if (depth >= ctx.frame_sp) { ret nil; }
+    val i: usize = ctx.frame_sp - 1 - depth;
+    if (i < ctx.frames_cap) { ret ?ctx.frames[i]; }
+    ret ?ctx.spare;
+}
+
+# how many layout frames are open
+# ---
+# ctx: context
+# ret: the depth, 0 before the first is pushed
+pub fun layout_depth(ctx: *Context) usize {
+    ret ctx.frame_sp;
 }
 
 # move a local rect into screen space and clip it to the active rect
@@ -1407,12 +2281,13 @@ pub fun claim(ctx: *Context, id: u64, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
 #
 # containers use this: a window takes its ordinal before its children and fills
 # its rect once its height is known, so its empty body stops input without
-# covering its own widgets.
+# covering its own widgets. inside push_measure nothing is reserved.
 # ---
 # ctx: context
 # id:  the container's id, 0 for an anonymous one
-# ret: a handle for fill_claim, or NO_CLAIM when refused
+# ret: a handle for fill_claim, or NO_CLAIM when refused or measuring
 pub fun reserve_claim(ctx: *Context, id: u64) usize {
+    if (ctx.measuring != 0) { ret NO_CLAIM; }
     ret add_claim(ctx, id, 0.0::f32, 0.0::f32, 0.0::f32, 0.0::f32);
 }
 
@@ -1439,48 +2314,67 @@ pub fun fill_claim(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: 
     ctx.claims.items[handle].y1 = sy1;
 }
 
-# shift a textured quad by the local origin, clip it to the active rect with
-# its uvs interpolated across the surviving fraction, and push it
+# whether a screen-space box lies wholly outside the active clip rect
+fun culled(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    ret x1 <= ctx.clip_x0 || x0 >= ctx.clip_x1 || y1 <= ctx.clip_y0 || y0 >= ctx.clip_y1;
+}
+
+# shift a textured quad by the local origin and push it, unless it lies wholly
+# outside the clip rect
 #
-# quads fully outside the clip are dropped; zero-extent axes keep their uvs
-# unchanged.
+# a quad the clip cuts is pushed whole and its run's scissor cuts it.
 fun emit(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32, c: draw.Color) {
     val sx0: f32 = x0 + ctx.lx;
     val sy0: f32 = y0 + ctx.ly;
     val sx1: f32 = x1 + ctx.lx;
     val sy1: f32 = y1 + ctx.ly;
-
-    if (sx1 <= ctx.clip_x0 || sx0 >= ctx.clip_x1) { ret; }
-    if (sy1 <= ctx.clip_y0 || sy0 >= ctx.clip_y1) { ret; }
-
-    val nx0: f32 = maxf(sx0, ctx.clip_x0);
-    val ny0: f32 = maxf(sy0, ctx.clip_y0);
-    val nx1: f32 = minf(sx1, ctx.clip_x1);
-    val ny1: f32 = minf(sy1, ctx.clip_y1);
-
-    var nu0: f32 = u0;
-    var nu1: f32 = u1;
-    val w:   f32 = sx1 - sx0;
-    if (w > 0.0::f32) {
-        nu0 = u0 + (u1 - u0) * (nx0 - sx0) / w;
-        nu1 = u0 + (u1 - u0) * (nx1 - sx0) / w;
-    }
-
-    var nv0: f32 = v0;
-    var nv1: f32 = v1;
-    val h:   f32 = sy1 - sy0;
-    if (h > 0.0::f32) {
-        nv0 = v0 + (v1 - v0) * (ny0 - sy0) / h;
-        nv1 = v0 + (v1 - v0) * (ny1 - sy0) / h;
-    }
-
-    record(ctx, draw.push_quad(?ctx.dl, nx0, ny0, nx1, ny1, nu0, nv0, nu1, nv1, c));
+    if (culled(ctx, minf(sx0, sx1), minf(sy0, sy1), maxf(sx0, sx1), maxf(sy0, sy1))) { ret; }
+    open_run(ctx);
+    record(ctx, draw.push_quad(?ctx.dl, sx0, sy0, sx1, sy1, u0, v0, u1, v1, c));
 }
 
-# a color as it is emitted: converted to linear light for an sRGB target
+# a color as it is emitted: converted to linear light for an sRGB target,
+# faded by the open push_alpha scopes, then premultiplied by its alpha
 fun paint(ctx: *Context, c: draw.Color) draw.Color {
-    if (ctx.srgb != 0) { ret draw.linear_cached(?ctx.lin, c); }
-    ret c;
+    var k: draw.Color = c;
+    if (ctx.srgb != 0) { k = draw.linear_cached(?ctx.lin, c); }
+    k.a = k.a * ctx.alpha;
+    ret draw.premultiply(k);
+}
+
+# paint everything until the matching pop_alpha at a fraction of its opacity
+#
+# scopes nest and multiply, so an overlay fading to half inside another at half
+# paints at a quarter. every color passes through it: quads, shapes, paths,
+# text and image tints. a consumer span (see custom) is drawn by the consumer
+# and is not faded. the stack grows with nesting; if it cannot, oom is set, the
+# parent is not saved and depth still balances.
+# ---
+# ctx: context
+# a:   opacity in [0, 1], clamped
+pub fun push_alpha(ctx: *Context, a: f32) {
+    ctx.alphas = room[f32](ctx, ctx.alphas, ?ctx.alphas_cap, ctx.alpha_sp + 1, CLIP_DEPTH);
+    if (ctx.alpha_sp < ctx.alphas_cap) { ctx.alphas[ctx.alpha_sp] = ctx.alpha; }
+    ctx.alpha_sp = ctx.alpha_sp + 1;
+    ctx.alpha    = ctx.alpha * minf(maxf(a, 0.0::f32), 1.0::f32);
+}
+
+# return to the opacity saved by the matching push_alpha
+# ---
+# ctx: context
+pub fun pop_alpha(ctx: *Context) {
+    if (ctx.alpha_sp == 0) { ret; }
+    ctx.alpha_sp = ctx.alpha_sp - 1;
+    if (ctx.alpha_sp < ctx.alphas_cap) { ctx.alpha = ctx.alphas[ctx.alpha_sp]; }
+    or                                 { ctx.alpha = 1.0::f32; }
+}
+
+# the opacity colors are painted at, 1 outside any push_alpha
+# ---
+# ctx: context
+# ret: the product of the open scopes' opacities
+pub fun alpha_of(ctx: *Context) f32 {
+    ret ctx.alpha;
 }
 
 # say whether the target encodes sRGB on write
@@ -1596,7 +2490,8 @@ pub fun line_height(ctx: *Context) f32 {
 # s:   utf-8 text
 # ret: width in pixels
 pub fun text_width(ctx: *Context, s: str) f32 {
-    ret font.measure(?ctx.font, ctx.style, ctx.scale, s);
+    if (s == nil) { ret 0.0::f32; }
+    ret text_width_n(ctx, s, str_len(s));
 }
 
 # width of the widest line of the first n bytes of a string, as text_width
@@ -1607,7 +2502,17 @@ pub fun text_width(ctx: *Context, s: str) f32 {
 # n:   bytes to measure, on a codepoint boundary
 # ret: width in pixels
 pub fun text_width_n(ctx: *Context, s: str, n: usize) f32 {
-    ret font.measure_n(?ctx.font, ctx.style, ctx.scale, s, n);
+    if (s == nil) { ret 0.0::f32; }
+    var widest: f32   = 0.0::f32;
+    var a:      usize = 0;
+    for (a <= n) {
+        var b: usize = a;
+        for (b < n && s[b] != '\n') { b = b + 1; }
+        val w: f32 = line_width(ctx, ?s[a], b - a);
+        if (w > widest) { widest = w; }
+        a = b + 1;
+    }
+    ret widest;
 }
 
 # how far the pen moves over one codepoint after another in the current style
@@ -1620,15 +2525,35 @@ pub fun text_width_n(ctx: *Context, s: str, n: usize) f32 {
 # cp:   the codepoint
 # ret:  pen movement in pixels
 pub fun glyph_advance(ctx: *Context, left: u32, cp: u32) f32 {
+    var id: u32 = 0;
+    if (known_icon(ctx, cp, ?id))   { ret icon_width(ctx, id, inline_size(ctx)); }
+    if (known_icon(ctx, left, ?id)) { ret font.advance(?ctx.font, ctx.style, ctx.scale, 0, cp); }
     ret font.advance(?ctx.font, ctx.style, ctx.scale, left, cp);
 }
 
 # draw widgets with another theme from now on
+#
+# the theme is copied, its kinds with it, so the caller keeps and frees its
+# own. open overrides are dropped with the old theme.
 # ---
 # ctx: context
-# t:   the theme, copied into the context
-pub fun set_theme(ctx: *Context, t: th.Theme) {
-    ctx.theme = t;
+# t:   the theme
+# ret: ok, or the allocator's refusal with the context's theme unchanged
+pub fun set_theme(ctx: *Context, t: *th.Theme) err[allo.Error] {
+    if (t == ?ctx.theme) { ret err[allo.Error].ok{}; }
+    sheet.unwind(?ctx.sheet, ?ctx.theme);
+    val e: err[allo.Error] = th.copy(?ctx.theme, t);
+    if (sel e.ok) { sheet.forget(?ctx.sheet); }
+    ret e;
+}
+
+# forget the overrides open on the context's theme without restoring them,
+# for a caller that has just replaced the theme in place, such as with a
+# built-in look (see theme.set_builtin)
+# ---
+# ctx: context
+pub fun theme_replaced(ctx: *Context) {
+    sheet.forget(?ctx.sheet);
 }
 
 # the theme widgets draw with, to read or adjust in place
@@ -1685,170 +2610,704 @@ pub fun quad(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
     emit(ctx, x0, y0, x1, y1, wu, wv, wu, wv, paint(ctx, c));
 }
 
-# how many quads a fill of radius r with these corners is made of
-#
-# one for the body and one per pixel row of each rounded end, so a square fill
-# is a single quad. the count depends on the radius and corners alone, never
-# on the rect, which lets reserve_fill emit a fill before its height is known.
-fun fill_quads(r: f32, corners: u8) usize {
-    if (r <= 0.0::f32) { ret 1; }
-    var rows: usize = r::usize;
-    if (rows::f32 < r) { rows = rows + 1; }
-    var n: usize = 1;
-    if ((corners & CORNERS_TOP) != 0)    { n = n + rows; }
-    if ((corners & CORNERS_BOTTOM) != 0) { n = n + rows; }
-    ret n;
-}
-
-# the rect of quad k of a fill, empty when the radius left it no row
-#
-# quad 0 is the body between the rounded ends. then come the top end's pixel
-# rows from the edge inward, then the bottom end's, each inset from the sides
-# to follow a circle of the radius, clamped to what the rect can hold.
-fun fill_part(x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, k: usize) Area {
-    val top:    bool = (corners & CORNERS_TOP) != 0 && r > 0.0::f32;
-    val bottom: bool = (corners & CORNERS_BOTTOM) != 0 && r > 0.0::f32;
-    var rr:     f32  = minf(r, (x1 - x0) / 2.0::f32);
-    if (top && bottom) { rr = minf(rr, (y1 - y0) / 2.0::f32); }
-    or (top || bottom) { rr = minf(rr, y1 - y0); }
-    rr = maxf(rr, 0.0::f32);
-
-    if (k == 0) {
-        var b: Area = Area{x0: x0, y0: y0, x1: x1, y1: y1};
-        if (top)    { b.y0 = y0 + rr; }
-        if (bottom) { b.y1 = y1 - rr; }
-        ret b;
-    }
-    val empty:  Area  = Area{x0: x0, y0: y0, x1: x0, y1: y0};
-    val rows:   usize = fill_quads(r, CORNERS_TOP) - 1;
-    var i:      usize = k - 1;
-    var at_top: bool  = top;
-    if (!top || i >= rows) {
-        at_top = false;
-        if (top) { i = i - rows; }
-    }
-    val a: f32 = i::f32;
-    if (a >= rr) { ret empty; }
-    val b:     f32 = minf(a + 1.0::f32, rr);
-    val d:     f32 = rr - (a + b) / 2.0::f32;
-    val inset: f32 = rr - sqrt_f32(maxf(rr * rr - d * d, 0.0::f32));
-    if (at_top) { ret Area{x0: x0 + inset, y0: y0 + a, x1: x1 - inset, y1: y0 + b}; }
-    ret Area{x0: x0 + inset, y0: y1 - b, x1: x1 - inset, y1: y1 - a};
-}
-
 # fill a rectangle with its chosen corners rounded to radius r
 #
-# the rounding is built from quads, one per pixel row of each rounded end, so
-# it needs nothing of the renderer and clips like any quad. a radius of zero
-# or less, or no corners, is one quad, the same as quad.
+# the same as rounded_rect with r on the corners named and square corners
+# elsewhere. a radius of zero or less, or no corners, is one quad, the same as
+# quad.
 # ---
 # ctx:     context
 # x0:      left x in pixels
 # y0:      top y in pixels
 # x1:      right x in pixels
 # y1:      bottom y in pixels
-# r:       corner radius in pixels, clamped to what the rect can hold
-# corners: which corners are rounded, CORNERS_* combined with |
-# c:       fill color
-pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, c: draw.Color) {
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    val n: usize = fill_quads(rad, corners);
-    var k: usize = 0;
-    for (k < n) {
-        val q: Area = fill_part(x0, y0, x1, y1, rad, corners, k);
-        if (q.x1 > q.x0 && q.y1 > q.y0) { quad(ctx, q.x0, q.y0, q.x1, q.y1, c); }
-        k = k + 1;
-    }
-}
-
-# emit a zero-height fill at (x0, y0)-(x1, y0) to give its rect later with
-# grow_fill
-#
-# containers use this: a panel paints its background beneath its widgets
-# before it knows how tall they make it. the placeholder is not clipped until
-# grow_fill gives it its rect. r and corners must match the grow_fill call.
-# ---
-# ctx:     context
-# x0:      left x in pixels
-# y0:      top y in pixels
-# x1:      right x in pixels
 # r:       corner radius in pixels
 # corners: which corners are rounded, CORNERS_* combined with |
 # c:       fill color
-# ret:     a handle for grow_fill, or NO_VERTS if the fill was not emitted whole
-pub fun reserve_fill(ctx: *Context, x0: f32, y0: f32, x1: f32, r: f32, corners: u8, c: draw.Color) usize {
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    var wu: f32;
-    var wv: f32;
-    atlas.white_uv(?wu, ?wv);
-    # the placeholders skip the clip, which would drop a zero-height quad on
-    # its edge, and grow_fill clips them once the rect is known
-    val ink:    draw.Color = paint(ctx, c);
-    val sx0:    f32        = x0 + ctx.lx;
-    val sx1:    f32        = x1 + ctx.lx;
-    val sy:     f32        = y0 + ctx.ly;
-    val n:      usize      = fill_quads(rad, corners);
-    val before: usize      = draw.count(?ctx.dl);
-    var k:      usize      = 0;
+pub fun fill(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8, c: draw.Color) {
+    var rr: draw.Radii = draw.radii(0.0::f32);
+    if ((corners & CORNERS_TOP) != 0) {
+        rr.tl = r;
+        rr.tr = r;
+    }
+    if ((corners & CORNERS_BOTTOM) != 0) {
+        rr.br = r;
+        rr.bl = r;
+    }
+    rounded_rect(ctx, x0, y0, x1, y1, rr, c);
+}
+
+# the style a widget kind draws with, overrides included
+# ---
+# ctx:  context
+# kind: theme.LABEL .. theme.SCRIM
+# ret:  the style, in the context's theme
+pub fun look_of(ctx: *Context, kind: u32) *th.Style {
+    ret ?ctx.theme.styles[kind];
+}
+
+# how a widget kind draws in a state
+# ---
+# ctx:   context
+# kind:  theme.LABEL .. theme.SCRIM
+# state: theme.NORMAL .. theme.FOCUSED
+# ret:   the paint, in the context's theme
+pub fun paint_of(ctx: *Context, kind: u32, state: u8) *th.Paint {
+    ret ?ctx.theme.styles[kind].states[state];
+}
+
+# unscaled edges, in pixels at the context's scale
+# ---
+# ctx: context
+# e:   edges authored at scale 1.0
+# ret: the scaled edges
+pub fun px_edges(ctx: *Context, e: th.Edges) th.Edges {
+    ret th.Edges{l: e.l * ctx.scale, t: e.t * ctx.scale, r: e.r * ctx.scale, b: e.b * ctx.scale};
+}
+
+# which sides of a box are outlined, combined with |
+pub val SIDES_LEFT:   u8 = 1;
+pub val SIDES_TOP:    u8 = 2;
+pub val SIDES_RIGHT:  u8 = 4;
+pub val SIDES_BOTTOM: u8 = 8;
+pub val SIDES_ALL:    u8 = 15;
+
+# a soft shadow: a rounded rect whose edge fades out over blur pixels,
+# centered on the rect's edge
+#
+# the fade is drawn as stacked rounded rects, each a share of the color's
+# alpha, so it needs nothing of the renderer. a blur of zero is one hard
+# rounded rect.
+# ---
+# ctx:  context
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# r:    the corner radii in pixels
+# blur: the width the edge fades over, in pixels
+# c:    the shadow's color at full strength
+pub fun shadow(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, blur: f32, c: draw.Color) {
+    if (c.a <= 0.0::f32) { ret; }
+    if (blur <= 0.0::f32) {
+        rounded_rect(ctx, x0, y0, x1, y1, r, c);
+        ret;
+    }
+    var n: usize = (blur / 2.0::f32)::usize + 1;
+    if (n > 8) { n = 8; }
+    var layer: draw.Color = c;
+    layer.a = c.a / n::f32;
+    var k: usize = 0;
     for (k < n) {
-        record(ctx, draw.push_quad(?ctx.dl, sx0, sy, sx1, sy, wu, wv, wu, wv, ink));
+        val g: f32        = blur * (k + 1)::f32 / n::f32 - blur / 2.0::f32;
+        val e: draw.Radii = draw.Radii{
+            tl: maxf(r.tl + g, 0.0::f32), tr: maxf(r.tr + g, 0.0::f32), br: maxf(r.br + g, 0.0::f32),
+            bl: maxf(r.bl + g, 0.0::f32)
+        };
+        rounded_rect(ctx, x0 - g, y0 - g, x1 + g, y1 + g, e, layer);
         k = k + 1;
     }
-    if (draw.count(?ctx.dl) != before + n * 6) { ret NO_VERTS; }
-    ret before;
 }
 
-# move quad k of a reserved fill onto the local rect q, clipped like emit
-fun place_quad(ctx: *Context, p: *draw.Vert, k: usize, q: Area) {
-    var sx0: f32 = maxf(q.x0 + ctx.lx, ctx.clip_x0);
-    var sy0: f32 = maxf(q.y0 + ctx.ly, ctx.clip_y0);
-    var sx1: f32 = minf(q.x1 + ctx.lx, ctx.clip_x1);
-    var sy1: f32 = minf(q.y1 + ctx.ly, ctx.clip_y1);
-    if (sx1 <= sx0 || sy1 <= sy0) {
-        sx1 = sx0;
-        sy1 = sy0;
+# whether two colors are the same
+fun same_color(a: draw.Color, b: draw.Color) bool {
+    ret a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+
+# paint a widget kind's box in a state: its shadow, its flat or gradient
+# face and its outline, with its radii, at the context's scale
+# ---
+# ctx:   context
+# kind:  theme.LABEL .. theme.SCRIM
+# state: theme.NORMAL .. theme.FOCUSED
+# x0:    left x in pixels
+# y0:    top y in pixels
+# x1:    right x in pixels
+# y1:    bottom y in pixels
+pub fun box(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32) {
+    box_part(ctx, kind, state, x0, y0, x1, y1, CORNERS_ALL, SIDES_ALL);
+}
+
+# a kind's corner radii in pixels, on the corners named
+fun radii_of(ctx: *Context, s: *th.Style, corners: u8) draw.Radii {
+    var r: draw.Radii = draw.radii(0.0::f32);
+    if ((corners & CORNERS_TOP) != 0) {
+        r.tl = s.radius.tl * ctx.scale;
+        r.tr = s.radius.tr * ctx.scale;
     }
-    p[k + 0].x = sx0;
-    p[k + 0].y = sy0;
-    p[k + 1].x = sx1;
-    p[k + 1].y = sy0;
-    p[k + 2].x = sx1;
-    p[k + 2].y = sy1;
-    p[k + 3].x = sx0;
-    p[k + 3].y = sy0;
-    p[k + 4].x = sx1;
-    p[k + 4].y = sy1;
-    p[k + 5].x = sx0;
-    p[k + 5].y = sy1;
+    if ((corners & CORNERS_BOTTOM) != 0) {
+        r.br = s.radius.br * ctx.scale;
+        r.bl = s.radius.bl * ctx.scale;
+    }
+    ret r;
 }
 
-# give a fill reserved by reserve_fill its rect, in local coordinates clipped
-# like geometry
-#
-# a no-op for NO_VERTS. vertex handles are emission indices, valid until end().
+# paint part of a widget kind's box: box with only some corners rounded and
+# some sides outlined, for a box drawn in pieces, such as a window's titlebar
+# above its body or a dock's inner edge
 # ---
 # ctx:     context
-# handle:  the value returned by reserve_fill this frame
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
 # x0:      left x in pixels
 # y0:      top y in pixels
 # x1:      right x in pixels
 # y1:      bottom y in pixels
-# r:       corner radius in pixels, as passed to reserve_fill
-# corners: which corners are rounded, as passed to reserve_fill
-pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, corners: u8) {
-    if (handle == NO_VERTS) { ret; }
-    var rad: f32 = r;
-    if (corners == CORNERS_NONE) { rad = 0.0::f32; }
-    val n: usize = fill_quads(rad, corners);
-    if (handle + n * 6 > draw.count(?ctx.dl)) { ret; }
-    val p: *draw.Vert = draw.data(?ctx.dl);
-    var k: usize      = 0;
-    for (k < n) {
-        place_quad(ctx, p, handle + k * 6, fill_part(x0, y0, x1, y1, rad, corners, k));
-        k = k + 1;
+# corners: which corners are rounded, CORNERS_* combined with |
+# sides:   which sides are outlined, SIDES_* combined with |
+pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
+    box_shadow(ctx, kind, state, x0, y0, x1, y1, corners);
+    box_face(ctx, kind, state, x0, y0, x1, y1, corners, sides);
+}
+
+# paint a widget kind's shadow in a state alone, for a box whose pieces are
+# drawn apart, such as a window's titlebar and body under one shadow
+# ---
+# ctx:     context
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+pub fun box_shadow(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8) {
+    val s: *th.Style = ?ctx.theme.styles[kind];
+    val p: *th.Paint = ?s.states[state];
+    if (p.shadow.a <= 0.0::f32) { ret; }
+    val dx: f32 = s.shadow_x * ctx.scale;
+    val dy: f32 = s.shadow_y * ctx.scale;
+    shadow(ctx, x0 + dx, y0 + dy, x1 + dx, y1 + dy, radii_of(ctx, s, corners), s.shadow_blur * ctx.scale, p.shadow);
+}
+
+# paint a widget kind's face and outline in a state, without its shadow
+# ---
+# ctx:     context
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+# sides:   which sides are outlined, SIDES_* combined with |
+pub fun box_face(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
+    val s: *th.Style  = ?ctx.theme.styles[kind];
+    val p: *th.Paint  = ?s.states[state];
+    val r: draw.Radii = radii_of(ctx, s, corners);
+    if (same_color(p.fill, p.fill_to)) {
+        if (p.fill.a > 0.0::f32) { rounded_rect(ctx, x0, y0, x1, y1, r, p.fill); }
     }
+    or { rounded_rect_gradient(ctx, x0, y0, x1, y1, r, draw.gradient(x0, y0, p.fill, x0, y1, p.fill_to)); }
+    val bw: f32 = p.border_w * ctx.scale;
+    if (bw <= 0.0::f32 || p.border.a <= 0.0::f32 || sides == 0) { ret; }
+    if (sides == SIDES_ALL) {
+        if (square(r)) { frame(ctx, x0, y0, x1, y1, bw, p.border); }
+        or             { stroke_rounded_rect(ctx, x0, y0, x1, y1, r, bw, p.border); }
+        ret;
+    }
+    if ((sides & SIDES_LEFT) != 0)   { quad(ctx, x0, y0, x0 + bw, y1, p.border); }
+    if ((sides & SIDES_RIGHT) != 0)  { quad(ctx, x1 - bw, y0, x1, y1, p.border); }
+    if ((sides & SIDES_TOP) != 0)    { quad(ctx, x0, y0, x1, y0 + bw, p.border); }
+    if ((sides & SIDES_BOTTOM) != 0) { quad(ctx, x0, y1 - bw, x1, y1, p.border); }
+}
+
+# a brush of one color, as emitted, on the atlas white block
+fun solid(ctx: *Context, c: draw.Color) tess.Brush {
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    ret tess.solid(paint(ctx, c), wu, wv);
+}
+
+# a brush of a gradient in local space, as emitted, on the atlas white block
+fun shaded(ctx: *Context, g: draw.Gradient) tess.Brush {
+    var wu: f32;
+    var wv: f32;
+    atlas.white_uv(?wu, ?wv);
+    ret tess.linear(g.x0 + ctx.lx, g.y0 + ctx.ly, paint(ctx, g.c0), g.x1 + ctx.lx, g.y1 + ctx.ly, paint(ctx, g.c1), wu, wv);
+}
+
+# whether a local box, grown by m on every side, lies wholly outside the clip
+fun hidden(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, m: f32) bool {
+    ret culled(ctx, minf(x0, x1) + ctx.lx - m, minf(y0, y1) + ctx.ly - m, maxf(x0, x1) + ctx.lx + m, maxf(y0, y1) + ctx.ly + m);
+}
+
+# whether the shape built in the scratch, grown by m, lies wholly outside the clip
+fun hidden_shape(ctx: *Context, m: f32) bool {
+    var x0: f32;
+    var y0: f32;
+    var x1: f32;
+    var y1: f32;
+    if (!tess.bounds(?ctx.sc, ?x0, ?y0, ?x1, ?y1)) { ret true; }
+    ret culled(ctx, x0 - m, y0 - m, x1 + m, y1 + m);
+}
+
+# fill the convex shape built in the scratch with a brush
+fun put_convex(ctx: *Context, b: tess.Brush) {
+    if (hidden_shape(ctx, tess.FEATHER)) { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.fill_convex(?ctx.dl, ?ctx.sc, ?br));
+}
+
+# stroke the contours built in the scratch with a brush
+fun put_stroke(ctx: *Context, w: f32, join: u8, b: tess.Brush) {
+    var m: f32 = w * 0.5::f32 + tess.FEATHER;
+    if (join == draw.JOIN_MITER) { m = m * tess.MITER_LIMIT; }
+    if (hidden_shape(ctx, m))    { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.stroke(?ctx.dl, ?ctx.sc, w, join, ?br));
+}
+
+# fill a rectangle with a linear gradient
+#
+# the rect is one quad, not feathered, like quad.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# g:   the gradient, in local pixels
+pub fun quad_gradient(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, g: draw.Gradient) {
+    if (hidden(ctx, x0, y0, x1, y1, 0.0::f32)) { ret; }
+    var b: tess.Brush = shaded(ctx, g);
+    open_run(ctx);
+    record(ctx, tess.rect(?ctx.dl, x0 + ctx.lx, y0 + ctx.ly, x1 + ctx.lx, y1 + ctx.ly, b.u, b.v, b.u, b.v, ?b));
+}
+
+# outline a rectangle with a band w pixels wide inside its edges
+#
+# four quads, not feathered, so a frame on whole pixels is crisp. a band
+# reaching the middle fills the rect.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# w:   band width in pixels
+# c:   color
+pub fun frame(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: draw.Color) {
+    if (w <= 0.0::f32) { ret; }
+    if (w * 2.0::f32 >= x1 - x0 || w * 2.0::f32 >= y1 - y0) {
+        quad(ctx, x0, y0, x1, y1, c);
+        ret;
+    }
+    quad(ctx, x0, y0, x1, y0 + w, c);
+    quad(ctx, x0, y1 - w, x1, y1, c);
+    quad(ctx, x0, y0 + w, x0 + w, y1 - w, c);
+    quad(ctx, x1 - w, y0 + w, x1, y1 - w, c);
+}
+
+# fill a triangle, feathered
+# ---
+# ctx: context
+# x0:  first corner x in pixels
+# y0:  first corner y in pixels
+# x1:  second corner x in pixels
+# y1:  second corner y in pixels
+# x2:  third corner x in pixels
+# y2:  third corner y in pixels
+# c:   color
+pub fun tri(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.point(?ctx.sc, x0 + ctx.lx, y0 + ctx.ly);
+    tess.point(?ctx.sc, x1 + ctx.lx, y1 + ctx.ly);
+    tess.point(?ctx.sc, x2 + ctx.lx, y2 + ctx.ly);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# a line w pixels wide from (x0, y0) to (x1, y1), feathered, its ends square
+# at the points
+# ---
+# ctx: context
+# x0:  start x in pixels
+# y0:  start y in pixels
+# x1:  end x in pixels
+# y1:  end y in pixels
+# w:   width in pixels
+# c:   color
+pub fun line(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.point(?ctx.sc, x0 + ctx.lx, y0 + ctx.ly);
+    tess.point(?ctx.sc, x1 + ctx.lx, y1 + ctx.ly);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# a line w pixels wide through n points, feathered, turning each corner with
+# a join
+#
+# a closed polyline joins its last point back to its first, and an open one
+# ends square at its ends. a miter longer than tess.MITER_LIMIT half widths
+# bevels.
+# ---
+# ctx:    context
+# pts:    n points in local pixels
+# n:      point count
+# closed: true to join the last point back to the first
+# w:      width in pixels
+# join:   draw.JOIN_MITER, JOIN_BEVEL or JOIN_ROUND
+# c:      color
+pub fun polyline(ctx: *Context, pts: *draw.Point, n: usize, closed: bool, w: f32, join: u8, c: draw.Color) {
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, closed);
+    var i: usize = 0;
+    for (i < n) {
+        tess.point(?ctx.sc, pts[i].x + ctx.lx, pts[i].y + ctx.ly);
+        i = i + 1;
+    }
+    put_stroke(ctx, w, join, solid(ctx, c));
+}
+
+# radii scaled down together until adjacent corners fit along every side
+fun fit_radii(x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii) draw.Radii {
+    var o: draw.Radii = draw.Radii{
+        tl: maxf(r.tl, 0.0::f32), tr: maxf(r.tr, 0.0::f32), br: maxf(r.br, 0.0::f32), bl: maxf(r.bl, 0.0::f32)
+    };
+    val w: f32 = maxf(x1 - x0, 0.0::f32);
+    val h: f32 = maxf(y1 - y0, 0.0::f32);
+    var f: f32 = 1.0::f32;
+    if (o.tl + o.tr > w * f) { f = w / (o.tl + o.tr); }
+    if (o.bl + o.br > w * f) { f = w / (o.bl + o.br); }
+    if (o.tl + o.bl > h * f) { f = h / (o.tl + o.bl); }
+    if (o.tr + o.br > h * f) { f = h / (o.tr + o.br); }
+    if (f < 1.0::f32) {
+        o.tl = o.tl * f;
+        o.tr = o.tr * f;
+        o.br = o.br * f;
+        o.bl = o.bl * f;
+    }
+    ret o;
+}
+
+# build a rounded rect's outline in the scratch, in screen pixels, clockwise
+fun build_rounded(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, closed: u8) {
+    val f:  draw.Radii = fit_radii(x0, y0, x1, y1, r);
+    val sx: f32        = x0 + ctx.lx;
+    val sy: f32        = y0 + ctx.ly;
+    val ex: f32        = x1 + ctx.lx;
+    val ey: f32        = y1 + ctx.ly;
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, closed);
+    tess.quarter(?ctx.sc, sx + f.tl, sy + f.tl, f.tl, 2);
+    tess.quarter(?ctx.sc, ex - f.tr, sy + f.tr, f.tr, 3);
+    tess.quarter(?ctx.sc, ex - f.br, ey - f.br, f.br, 0);
+    tess.quarter(?ctx.sc, sx + f.bl, ey - f.bl, f.bl, 1);
+}
+
+# whether every radius is zero or less
+fun square(r: draw.Radii) bool {
+    ret r.tl <= 0.0::f32 && r.tr <= 0.0::f32 && r.br <= 0.0::f32 && r.bl <= 0.0::f32;
+}
+
+# fill a rectangle with a radius per corner, its curved edges feathered
+#
+# radii are scaled down together when adjacent corners would overlap. a rect
+# with every radius zero is one quad, not feathered, the same as quad.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the corner radii in pixels
+# c:   color
+pub fun rounded_rect(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, c: draw.Color) {
+    if (x1 <= x0 || y1 <= y0) { ret; }
+    if (square(r)) {
+        quad(ctx, x0, y0, x1, y1, c);
+        ret;
+    }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    build_rounded(ctx, x0, y0, x1, y1, r, 1);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# fill a rectangle with a radius per corner in a linear gradient
+#
+# as rounded_rect, with every vertex taking the gradient's color where it lies.
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the corner radii in pixels
+# g:   the gradient, in local pixels
+pub fun rounded_rect_gradient(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, g: draw.Gradient) {
+    if (x1 <= x0 || y1 <= y0) { ret; }
+    if (square(r)) {
+        quad_gradient(ctx, x0, y0, x1, y1, g);
+        ret;
+    }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    build_rounded(ctx, x0, y0, x1, y1, r, 1);
+    put_convex(ctx, shaded(ctx, g));
+}
+
+# outline a rectangle with a radius per corner, the band w pixels wide inside
+# its edges, feathered
+# ---
+# ctx: context
+# x0:  left x in pixels
+# y0:  top y in pixels
+# x1:  right x in pixels
+# y1:  bottom y in pixels
+# r:   the outer corner radii in pixels
+# w:   band width in pixels
+# c:   color
+pub fun stroke_rounded_rect(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, r: draw.Radii, w: f32, c: draw.Color) {
+    if (w <= 0.0::f32 || x1 <= x0 || y1 <= y0)     { ret; }
+    if (hidden(ctx, x0, y0, x1, y1, tess.FEATHER)) { ret; }
+    val h:  f32        = w * 0.5::f32;
+    val f:  draw.Radii = fit_radii(x0, y0, x1, y1, r);
+    val in: draw.Radii = draw.Radii{
+        tl: maxf(f.tl - h, 0.0::f32), tr: maxf(f.tr - h, 0.0::f32), br: maxf(f.br - h, 0.0::f32),
+        bl: maxf(f.bl - h, 0.0::f32)
+    };
+    build_rounded(ctx, x0 + h, y0 + h, x1 - h, y1 - h, in, 1);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# build a circle's outline in the scratch, in screen pixels
+fun build_circle(ctx: *Context, cx: f32, cy: f32, r: f32) {
+    val sx: f32 = cx + ctx.lx;
+    val sy: f32 = cy + ctx.ly;
+    tess.begin(?ctx.sc);
+    tess.contour(?ctx.sc, 1);
+    tess.quarter(?ctx.sc, sx, sy, r, 0);
+    tess.quarter(?ctx.sc, sx, sy, r, 1);
+    tess.quarter(?ctx.sc, sx, sy, r, 2);
+    tess.quarter(?ctx.sc, sx, sy, r, 3);
+}
+
+# fill a circle, feathered
+#
+# its segment count follows its radius in pixels, so it stays round at any
+# interface scale.
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   radius in pixels
+# c:   color
+pub fun circle(ctx: *Context, cx: f32, cy: f32, r: f32, c: draw.Color) {
+    if (r <= 0.0::f32)                                             { ret; }
+    if (hidden(ctx, cx - r, cy - r, cx + r, cy + r, tess.FEATHER)) { ret; }
+    build_circle(ctx, cx, cy, r);
+    put_convex(ctx, solid(ctx, c));
+}
+
+# outline a circle with a ring w pixels wide inside its radius, feathered
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   outer radius in pixels
+# w:   ring width in pixels
+# c:   color
+pub fun stroke_circle(ctx: *Context, cx: f32, cy: f32, r: f32, w: f32, c: draw.Color) {
+    if (r <= 0.0::f32 || w <= 0.0::f32)                            { ret; }
+    if (hidden(ctx, cx - r, cy - r, cx + r, cy + r, tess.FEATHER)) { ret; }
+    var mid: f32 = r - w * 0.5::f32;
+    if (mid <= 0.0::f32) {
+        circle(ctx, cx, cy, r, c);
+        ret;
+    }
+    build_circle(ctx, cx, cy, mid);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# an arc of radius r around (cx, cy) from angle a0 to a1, w pixels wide,
+# centred on the radius and feathered, its ends square
+#
+# angles are in radians from +x, increasing clockwise on screen since y runs
+# down, and a1 below a0 sweeps the other way.
+# ---
+# ctx: context
+# cx:  centre x in pixels
+# cy:  centre y in pixels
+# r:   radius in pixels
+# a0:  start angle in radians
+# a1:  end angle in radians
+# w:   width in pixels
+# c:   color
+pub fun arc(ctx: *Context, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, w: f32, c: draw.Color) {
+    if (r <= 0.0::f32 || w <= 0.0::f32) { ret; }
+    val m: f32 = r + w * 0.5::f32;
+    if (hidden(ctx, cx - m, cy - m, cx + m, cy + m, tess.FEATHER)) { ret; }
+    tess.begin(?ctx.sc);
+    tess.arc(?ctx.sc, cx + ctx.lx, cy + ctx.ly, r, a0, a1);
+    put_stroke(ctx, w, draw.JOIN_MITER, solid(ctx, c));
+}
+
+# build a path's contours in the scratch, in screen pixels, and say whether
+# it can be drawn, setting oom when the path or the scratch ran out
+fun build_path(ctx: *Context, p: *path.Path) bool {
+    if (p.oom != 0) {
+        ctx.oom = 1;
+        ret false;
+    }
+    tess.begin(?ctx.sc);
+    tess.flatten(?ctx.sc, p, ctx.lx, ctx.ly, 1.0::f32);
+    if (ctx.sc.bad != 0) {
+        ctx.oom = 1;
+        ret false;
+    }
+    ret true;
+}
+
+# fill a path by the nonzero rule, feathered
+#
+# every contour is filled as if closed. a hole is a contour wound against its
+# outline. contours that overlap fill their union, though the feathers of the
+# edges they hide still show faintly, so an icon is cleanest drawn as contours
+# that meet without overlapping.
+# ---
+# ctx: context
+# p:   the path, in local pixels
+# c:   color
+pub fun fill_path(ctx: *Context, p: *path.Path, c: draw.Color) {
+    fill_path_brush(ctx, p, solid(ctx, c));
+}
+
+# fill a path by the nonzero rule in a linear gradient, as fill_path
+# ---
+# ctx: context
+# p:   the path, in local pixels
+# g:   the gradient, in local pixels
+pub fun fill_path_gradient(ctx: *Context, p: *path.Path, g: draw.Gradient) {
+    fill_path_brush(ctx, p, shaded(ctx, g));
+}
+
+# fill a path with a brush
+fun fill_path_brush(ctx: *Context, p: *path.Path, b: tess.Brush) {
+    if (!build_path(ctx, p)) { ret; }
+    put_fill(ctx, b);
+}
+
+# fill the contours built in the scratch by the nonzero rule with a brush
+fun put_fill(ctx: *Context, b: tess.Brush) {
+    if (hidden_shape(ctx, tess.FEATHER)) { ret; }
+    open_run(ctx);
+    var br: tess.Brush = b;
+    record(ctx, tess.fill(?ctx.dl, ?ctx.sc, ?br));
+}
+
+# register an app's icon, copying its path data (see blit.icon)
+#
+# its id, and the codepoint that id stands for, draw it through icon_at and
+# inline in any text.
+# ---
+# ctx: context
+# ic:  the icon
+# ret: its id, or none for malformed data, an empty box or when the context cannot grow
+pub fun add_icon(ctx: *Context, ic: ico.Icon) opt[u32] {
+    ret ico.add(?ctx.icons, ic);
+}
+
+# the width an icon takes drawn size pixels tall
+# ---
+# ctx:  context
+# id:   icon id, built in or from add_icon
+# size: height in pixels
+# ret:  width in pixels, 0 for an id not known
+pub fun icon_width(ctx: *Context, id: u32, size: f32) f32 {
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, id);
+    if (sel ic.none) { ret 0.0::f32; }
+    ret size * ic.some.w / ic.some.h;
+}
+
+# draw an icon size pixels tall with its box's top-left at (x, y), filled
+# and feathered like fill_path
+# ---
+# ctx:  context
+# id:   icon id, built in or from add_icon; one not known draws nothing
+# x:    left x in pixels
+# y:    top y in pixels
+# size: height in pixels, the width following the icon's box
+# c:    color
+pub fun icon_at(ctx: *Context, id: u32, x: f32, y: f32, size: f32, c: draw.Color) {
+    put_icon(ctx, id, x, y, size, solid(ctx, c));
+}
+
+# fill an icon size pixels tall at (x, y) with a brush
+fun put_icon(ctx: *Context, id: u32, x: f32, y: f32, size: f32, b: tess.Brush) {
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, id);
+    if (sel ic.none)      { ret; }
+    if (size <= 0.0::f32) { ret; }
+    tess.begin(?ctx.sc);
+    tess.flatten_data(?ctx.sc, ic.some.data, ic.some.n, ctx.lx + x, ctx.ly + y, size / ic.some.h);
+    if (ctx.sc.bad != 0) {
+        ctx.oom = 1;
+        ret;
+    }
+    put_fill(ctx, b);
+}
+
+# the registered icon whose codepoint starts at byte i of the first n bytes of
+# s, as the bytes it takes, 0 when none does
+#
+# an icon codepoint is four bytes led by 0xF3, which is never a continuation
+# byte, so a scan byte by byte finds it on any boundary.
+fun inline_icon(ctx: *Context, s: str, i: usize, n: usize, id: *u32) usize {
+    if (s[i]::u8 != 0xF3 || n - i < 4) { ret 0; }
+    var cp:   u32   = 0;
+    val used: usize = font.next(s, i, n, ?cp);
+    if (!known_icon(ctx, cp, id)) { ret 0; }
+    ret used;
+}
+
+# whether a codepoint stands for a built-in or registered icon, and which
+fun known_icon(ctx: *Context, cp: u32, id: *u32) bool {
+    val k: opt[u32] = ico.id_of(cp);
+    if (sel k.none) { ret false; }
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, k.some);
+    if (sel ic.none) { ret false; }
+    @id = k.some;
+    ret true;
+}
+
+# the height an inline icon is drawn at: the current style's ascent and descent
+fun inline_size(ctx: *Context) f32 {
+    val m: gly.LineMetrics = font.line(?ctx.font, ctx.style, ctx.scale);
+    ret m.ascent + m.descent;
+}
+
+# width of one line of the first n bytes of s, inline icons included
+fun line_width(ctx: *Context, s: str, n: usize) f32 {
+    var w: f32   = 0.0::f32;
+    var a: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        var id: u32   = 0;
+        val k:  usize = inline_icon(ctx, s, i, n, ?id);
+        if (k == 0) {
+            i = i + 1;
+            cnt;
+        }
+        w = w + font.measure_n(?ctx.font, ctx.style, ctx.scale, ?s[a], i - a) + icon_width(ctx, id, inline_size(ctx));
+        i = i + k;
+        a = i;
+    }
+    ret w + font.measure_n(?ctx.font, ctx.style, ctx.scale, ?s[a], n - a);
+}
+
+# stroke a path w pixels wide, centred on it and feathered
+#
+# a closed contour joins back to its start, and an open one ends square.
+# ---
+# ctx:  context
+# p:    the path, in local pixels
+# w:    width in pixels
+# join: draw.JOIN_MITER, JOIN_BEVEL or JOIN_ROUND
+# c:    color
+pub fun stroke_path(ctx: *Context, p: *path.Path, w: f32, join: u8, c: draw.Color) {
+    if (!build_path(ctx, p)) { ret; }
+    put_stroke(ctx, w, join, solid(ctx, c));
 }
 
 # emit one glyph of the current style with its pen at x on the baseline,
@@ -1856,7 +3315,9 @@ pub fun grow_fill(ctx: *Context, handle: usize, x0: f32, y0: f32, x1: f32, y1: f
 fun pen_glyph(ctx: *Context, id: u32, x: f32, base: f32, c: draw.Color) {
     val p: font.Placed = font.place(?ctx.font, ctx.style, ctx.scale, id);
     if (p.drawn == 0) { ret; }
-    retarget(ctx, draw.ATLAS, p.page, draw.FILTER_NEAREST);
+    ctx.tex    = draw.ATLAS;
+    ctx.page   = p.page;
+    ctx.filter = draw.FILTER_NEAREST;
     emit(ctx, x + p.g.x0, base + p.g.y0, x + p.g.x1, base + p.g.y1, p.u0, p.v0, p.u1, p.v1, c);
 }
 
@@ -1883,6 +3344,8 @@ pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
 #
 # each line is shaped by the style's glyph source, control codepoints take no
 # space and a newline starts the next line box at x.
+# a codepoint that stands for an icon (see blit.icon) draws the icon in its
+# place, a line tall and tinted c, and text_width measures it the same way.
 # ---
 # ctx: context
 # s:   utf-8 text
@@ -1894,8 +3357,37 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
     text_span(ctx, s, str_len(s), x, y, c);
 }
 
-# draw one line of shaped glyphs with the pen starting at x on the baseline
-fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) {
+# draw one line with the pen starting at x on the baseline, inline icons
+# between runs of shaped glyphs, each icon's box from the ascent to the descent
+#
+# ret: the pen's x after the line
+fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
+    var px: f32   = x;
+    var a:  usize = 0;
+    var i:  usize = 0;
+    for (i < n) {
+        var id: u32   = 0;
+        val k:  usize = inline_icon(ctx, s, i, n, ?id);
+        if (k == 0) {
+            i = i + 1;
+            cnt;
+        }
+        px = pen_run(ctx, ?s[a], i - a, px, base, ink);
+        var wu: f32;
+        var wv: f32;
+        atlas.white_uv(?wu, ?wv);
+        val size: f32 = inline_size(ctx);
+        put_icon(ctx, id, px, base - font.line(?ctx.font, ctx.style, ctx.scale).ascent, size, tess.solid(ink, wu, wv));
+        px = px + icon_width(ctx, id, size);
+        i  = i + k;
+        a  = i;
+    }
+    ret pen_run(ctx, ?s[a], n - a, px, base, ink);
+}
+
+# draw a run of shaped glyphs with the pen starting at x on the baseline,
+# returning where the pen ends
+fun pen_run(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
     val g:  usize       = font.shape(?ctx.font, ctx.style, ctx.scale, s, n);
     val sh: *gly.Shaped = font.shaped(?ctx.font);
     var px: f32         = x;
@@ -1906,6 +3398,7 @@ fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color
         px = px + one.advance;
         k  = k + 1;
     }
+    ret px;
 }
 
 # draw the first n bytes of utf-8 text with its first line box's top-left at
@@ -1930,7 +3423,10 @@ pub fun text_span(ctx: *Context, s: str, n: usize, x: f32, y: f32, c: draw.Color
     for (a <= n) {
         var b: usize = a;
         for (b < n && s[b] != '\n') { b = b + 1; }
-        if (b > a) { pen_line(ctx, ?s[a], b - a, x, base, ink); }
+        if (b > a) {
+            val end: f32 = pen_line(ctx, ?s[a], b - a, x, base, ink);
+            if (ctx.trace_on != 0) { trace_line(ctx, ?s[a], b - a, x, base - m.ascent, end, base - m.ascent + lh); }
+        }
         base = base + lh;
         a    = b + 1;
     }
@@ -2024,8 +3520,8 @@ pub fun begin_surface(ctx: *Context, x: f32, y: f32, w: f32, h: f32, scroll_x: f
     s.y        = y;
     s.w        = w;
     s.h        = h;
-    s.local_mx = ctx.in.mx - ctx.lx;
-    s.local_my = ctx.in.my - ctx.ly;
+    s.local_mx = local_mx(ctx);
+    s.local_my = local_my(ctx);
     s.inside   = 0;
     if (ctx.in.present != 0) { s.inside = input_visible(ctx, ctx.in.mx, ctx.in.my); }
     ret s;
@@ -2040,43 +3536,131 @@ pub fun end_surface(ctx: *Context, surf: Surface) {
     pop_clip(ctx);
 }
 
-test clip__glyph_uvs_interpolate {
+test clip__runs_carry_their_scissor {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
     var ctx: Context;
     val ie:  err[allo.Error] = init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
-
-    var in: input.Input;
-    in.mx        = 0.0::f32;
-    in.my        = 0.0::f32;
-    in.down      = 0;
-    in.prev_down = 0;
-    begin(?ctx, in, 100.0::f32, 100.0::f32);
+    start_at(?ctx, 0.0::f32, 0.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    # clip to the left half of an 8px glyph cell
+    # clip to the left half of an 8px glyph cell: the glyph is kept whole
     push_clip(?ctx, 0.0::f32, 0.0::f32, 4.0::f32, 100.0::f32);
     glyph(?ctx, 'A', 0.0::f32, 0.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
-
-    val p: *draw.Vert = draw_verts(?ctx);
-    # right edge clipped from 8 to 4
-    if (p[1].x != 4.0::f32) { ret 1; }
-    # left edge and its u untouched
-    if (p[0].x != 0.0::f32) { ret 1; }
-
+    if (draw_count(?ctx) != 4) { ret 2; }
+    val p: *draw.Vert  = draw_verts(?ctx);
     val g: font.Placed = font.place(?ctx.font, font.STYLE_BODY, 1.0::f32, 'A');
-    if (p[0].u != g.u0) { ret 1; }
-    # clipped edge u interpolated to the cell midpoint
-    if (p[1].u != (g.u0 + g.u1) / 2.0::f32) { ret 1; }
+    if (p[1].x != 8.0::f32 || p[1].u != g.u1) { ret 3; }
 
-    # a quad fully outside the clip is dropped entirely
+    # a quad wholly outside the clip is dropped
     quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
-
+    if (draw_count(?ctx) != 4) { ret 4; }
     pop_clip(?ctx);
+    # the same quad under the screen's clip lands in a run of its own
+    quad(?ctx, 50.0::f32, 0.0::f32, 60.0::f32, 10.0::f32, white);
+    end(?ctx);
+
+    if (run_count(?ctx) != 2 || index_count(?ctx) != 12) { ret 5; }
+    val cut: Run = run_at(?ctx, 0);
+    if (cut.kind != RUN_TRIANGLES || cut.start != 0 || cut.count != 6) { ret 6; }
+    if (cut.clip_x0 != 0.0::f32 || cut.clip_y0 != 0.0::f32)            { ret 7; }
+    if (cut.clip_x1 != 4.0::f32 || cut.clip_y1 != 100.0::f32)          { ret 8; }
+    val full: Run = run_at(?ctx, 1);
+    if (full.start != 6 || full.clip_x1 != 100.0::f32) { ret 9; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test custom__span_sorts_with_its_rect_and_scissor {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    # a popup drawn before the span still paints over it
+    push_band(?ctx, band.POPUPS, 0);
+    quad(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, white);
+    pop_band(?ctx);
+    val surf: Surface = begin_surface(?ctx, 10.0::f32, 10.0::f32, 40.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    custom(?ctx, 0.0::f32, 0.0::f32, 100.0::f32, 100.0::f32, 7, 9);
+    # a span wholly outside the clip is dropped
+    custom(?ctx, 60.0::f32, 60.0::f32, 70.0::f32, 70.0::f32, 8, 0);
+    end_surface(?ctx, surf);
+    # the same state as the first quad, kept apart by the span between them
+    quad(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, white);
+    end(?ctx);
+
+    if (run_count(?ctx) != 4 || index_count(?ctx) != 18) { ret 2; }
+    val span: Run = run_at(?ctx, 1);
+    if (span.kind != RUN_CUSTOM || span.id != 7 || span.data != 9)                          { ret 3; }
+    if (span.start != 6 || span.count != 0 || span.layer != 0)                              { ret 4; }
+    if (span.x0 != 10.0::f32 || span.y0 != 10.0::f32)                                       { ret 5; }
+    if (span.x1 != 110.0::f32 || span.y1 != 110.0::f32)                                     { ret 6; }
+    if (span.clip_x0 != 10.0::f32 || span.clip_x1 != 50.0::f32)                             { ret 7; }
+    if (run_at(?ctx, 0).kind != RUN_TRIANGLES || run_at(?ctx, 0).count != 6)                { ret 8; }
+    if (run_at(?ctx, 2).start != 6 || run_at(?ctx, 2).count != 6)                           { ret 9; }
+    if (run_at(?ctx, 3).layer != band.layer(band.POPUPS, 0) || run_at(?ctx, 3).start != 12) { ret 10; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test channels__background_drawn_last_paints_first {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    val sheet: draw.Image = draw.whole(7, draw.FILTER_LINEAR);
+    # vertices 0..3: drawn before the container
+    quad(?ctx, 0.0::f32, 0.0::f32, 1.0::f32, 1.0::f32, white);
+    val outer: Channels = split(?ctx, 2);
+    set_channel(?ctx, outer, 1);
+    # 4..7: a child, then 8..11 an image in a nested container's body, and
+    # 12..15 that container's background
+    quad(?ctx, 2.0::f32, 0.0::f32, 3.0::f32, 1.0::f32, white);
+    val inner: Channels = split(?ctx, 2);
+    set_channel(?ctx, inner, 1);
+    image_at(?ctx, sheet, 4.0::f32, 0.0::f32, 5.0::f32, 1.0::f32, white);
+    set_channel(?ctx, inner, 0);
+    quad(?ctx, 6.0::f32, 0.0::f32, 7.0::f32, 1.0::f32, white);
+    merge(?ctx, inner);
+    # 16..19: the outer background, drawn last
+    set_channel(?ctx, outer, 0);
+    quad(?ctx, 8.0::f32, 0.0::f32, 9.0::f32, 1.0::f32, white);
+    merge(?ctx, outer);
+    # 20..23: after the container, joining nothing inside it
+    quad(?ctx, 10.0::f32, 0.0::f32, 11.0::f32, 1.0::f32, white);
+    end(?ctx);
+
+    # paint order: before, outer background, child, inner background, image, after
+    val ix:   *u32   = draw_indices(?ctx);
+    var want: [6]u32 = [6]u32{0, 16, 4, 12, 8, 20};
+    var k:    usize  = 0;
+    for (k < 6) {
+        if (ix[k * 6] != want[k]) { ret 2 + k::i32; }
+        k = k + 1;
+    }
+    # atlas quads on either side of the image share runs, the image binds apart
+    if (run_count(?ctx) != 3)                                      { ret 8; }
+    if (run_at(?ctx, 0).count != 24)                               { ret 9; }
+    if (run_at(?ctx, 1).tex != 7)                                  { ret 10; }
+    if (run_at(?ctx, 2).start != 30 || run_at(?ctx, 2).count != 6) { ret 11; }
+
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
@@ -2093,9 +3677,9 @@ test surface__maps_cursor_and_clips {
     var in: input.Input;
     in.mx        = 60.0::f32;
     in.my        = 70.0::f32;
-    in.present   = 1;
     in.down      = 0;
     in.prev_down = 0;
+    in.present   = 1;
     begin(?ctx, in, 200.0::f32, 200.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
@@ -2107,7 +3691,7 @@ test surface__maps_cursor_and_clips {
 
     # content at local (20,30)-(40,50) lands at screen (60,60)-(80,80), inside the clip
     quad(?ctx, 20.0::f32, 30.0::f32, 40.0::f32, 50.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
+    if (draw_count(?ctx) != 4) { ret 1; }
     val p: *draw.Vert = draw_verts(?ctx);
     if (p[0].x != 60.0::f32) { ret 1; }
     if (p[0].y != 60.0::f32) { ret 1; }
@@ -2116,7 +3700,7 @@ test surface__maps_cursor_and_clips {
 
     # content scrolled past the region is dropped
     quad(?ctx, 200.0::f32, 200.0::f32, 210.0::f32, 210.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 1; }
+    if (draw_count(?ctx) != 4) { ret 1; }
 
     end_surface(?ctx, s);
     if (ctx.clip_sp != 0)          { ret 1; }
@@ -2184,22 +3768,23 @@ test stacks__nest_far_past_the_initial_capacity {
     # 64 nested surfaces, each inside a layer, every level moving the clip and origin
     var i: usize = 0;
     for (i < 64) {
-        push_layer(?ctx);
+        push_band(?ctx, band.POPUPS, 0);
         push_clip(?ctx, i::f32, i::f32, 200.0::f32, 200.0::f32);
         push_origin(?ctx, i::f32, 0.0::f32);
         i = i + 1;
     }
-    if (ctx.layer != 64 || ctx.clip_x0 != 63.0::f32 || ctx.lx != 63.0::f32) { ret 1; }
+    if (ctx.layer != band.layer(band.POPUPS, 63) || ctx.clip_x0 != 63.0::f32 || ctx.lx != 63.0::f32) { ret 1; }
 
     # each pop restores the level it opened, back to the root
     for (i > 0) {
         i = i - 1;
         pop_origin(?ctx);
         pop_clip(?ctx);
-        pop_layer(?ctx);
-        if (ctx.layer != i::u32)                                       { ret 1; }
-        if (ctx.clip_x1 != 200.0::f32)                                 { ret 1; }
-        if (i == 0 && (ctx.clip_x0 != 0.0::f32 || ctx.lx != 0.0::f32)) { ret 1; }
+        pop_band(?ctx);
+        if (i == 0 && ctx.layer != 0)                                    { ret 1; }
+        if (i > 0 && ctx.layer != band.layer(band.POPUPS, (i - 1)::u32)) { ret 1; }
+        if (ctx.clip_x1 != 200.0::f32)                                   { ret 1; }
+        if (i == 0 && (ctx.clip_x0 != 0.0::f32 || ctx.lx != 0.0::f32))   { ret 1; }
     }
     if (ctx.oom != 0) { ret 1; }
 
@@ -2283,22 +3868,39 @@ test layer__ascending_paint_order {
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
-    push_layer(?ctx);
+    push_band(?ctx, band.POPUPS, 0);
     quad(?ctx, 10.0::f32, 0.0::f32, 15.0::f32, 5.0::f32, white);
-    pop_layer(?ctx);
+    pop_band(?ctx);
     quad(?ctx, 20.0::f32, 0.0::f32, 25.0::f32, 5.0::f32, white);
     end(?ctx);
 
-    # the layer-0 quads merge into one span ahead of the layer-1 quad
-    val p: *draw.Vert = draw_verts(?ctx);
-    if (draw_count(?ctx) != 18)                                            { ret 2; }
-    if (p[0].x != 0.0::f32 || p[6].x != 20.0::f32 || p[12].x != 10.0::f32) { ret 3; }
-    if (run_count(?ctx) != 2)                                              { ret 4; }
+    # the layer-0 quads merge into one run ahead of the layer-1 quad, and the
+    # vertices stay where they were drawn
+    val ix: *u32 = draw_indices(?ctx);
+    if (draw_count(?ctx) != 12)                  { ret 2; }
+    if (ix[0] != 0 || ix[6] != 8 || ix[12] != 4) { ret 3; }
+    if (run_count(?ctx) != 2)                    { ret 4; }
     val low: Run = run_at(?ctx, 0);
     if (low.layer != 0 || low.start != 0 || low.count != 12) { ret 5; }
     val high: Run = run_at(?ctx, 1);
-    if (high.layer != 1 || high.start != 12 || high.count != 6) { ret 6; }
-    if (ok(?ctx) != 1)                                          { ret 7; }
+    if (high.layer != band.layer(band.POPUPS, 0) || high.start != 12 || high.count != 6) { ret 6; }
+    if (ok(?ctx) != 1)                                                                   { ret 7; }
+
+    # a window drawn after a popup still paints beneath it, and the window
+    # raised later paints above the one called after it
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    push_band(?ctx, band.POPUPS, 0);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
+    pop_band(?ctx);
+    push_band(?ctx, band.WINDOWS, 2);
+    quad(?ctx, 10.0::f32, 0.0::f32, 15.0::f32, 5.0::f32, white);
+    pop_band(?ctx);
+    push_band(?ctx, band.WINDOWS, 1);
+    quad(?ctx, 20.0::f32, 0.0::f32, 25.0::f32, 5.0::f32, white);
+    pop_band(?ctx);
+    end(?ctx);
+    val order: *u32 = draw_indices(?ctx);
+    if (order[0] != 8 || order[6] != 4 || order[12] != 0) { ret 8; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
@@ -2315,20 +3917,20 @@ test layer__screen_space_overlay_restores {
     start_at(?ctx, 0.0::f32, 0.0::f32);
 
     val s: Surface = begin_surface(?ctx, 20.0::f32, 20.0::f32, 10.0::f32, 10.0::f32, 5.0::f32, 5.0::f32);
-    push_layer(?ctx);
-    if (ctx.layer != 1)                                       { ret 2; }
+    push_band(?ctx, band.POPUPS, 0);
+    if (ctx.layer != band.layer(band.POPUPS, 0))              { ret 2; }
     if (ctx.lx != 0.0::f32 || ctx.ly != 0.0::f32)             { ret 3; }
     if (ctx.clip_x0 != 0.0::f32 || ctx.clip_x1 != 100.0::f32) { ret 4; }
-    push_layer(?ctx);
-    if (ctx.layer != 2) { ret 5; }
-    pop_layer(?ctx);
-    pop_layer(?ctx);
+    push_band(?ctx, band.POPUPS, 0);
+    if (ctx.layer != band.layer(band.POPUPS, 1)) { ret 5; }
+    pop_band(?ctx);
+    pop_band(?ctx);
     if (ctx.layer != 0 || ctx.layer_sp != 0)             { ret 6; }
     if (ctx.lx != 15.0::f32 || ctx.clip_x0 != 20.0::f32) { ret 7; }
     if (ctx.clip_x1 != 30.0::f32)                        { ret 8; }
     end_surface(?ctx, s);
     # an unmatched pop is ignored
-    pop_layer(?ctx);
+    pop_band(?ctx);
     if (ctx.layer != 0) { ret 9; }
 
     val freed: err[allo.Error] = free(?ctx);
@@ -2449,7 +4051,7 @@ test surface__nested_placed_relative_to_parent {
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
     quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
-    if (draw_count(?ctx) != 6) { ret 8; }
+    if (draw_count(?ctx) != 4) { ret 8; }
     val p: *draw.Vert = draw_verts(?ctx);
     if (p[0].x != 60.0::f32 || p[0].y != 60.0::f32 || p[2].x != 65.0::f32 || p[2].y != 65.0::f32) { ret 9; }
 
@@ -2535,18 +4137,19 @@ test srgb__painter_emits_linear_colors {
     quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, grey);
     text_at(?ctx, "A", 0.0::f32, 0.0::f32, grey);
 
+    # emitted premultiplied, after conversion
     val p:    *draw.Vert = draw_verts(?ctx);
-    val want: f32        = draw.srgb_to_linear(0.5::f32);
-    if (p[0].r != 0.5::f32)                   { ret 2; }
-    if (p[6].r != want || p[6].a != 0.5::f32) { ret 3; }
-    if (p[12].g != want)                      { ret 4; }
+    val want: f32        = draw.srgb_to_linear(0.5::f32) * 0.5::f32;
+    if (p[0].r != 0.25::f32)                  { ret 2; }
+    if (p[4].r != want || p[4].a != 0.5::f32) { ret 3; }
+    if (p[8].g != want)                       { ret 4; }
 
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;
 }
 
-test fill__rounds_corners_and_grows_reserved {
+test alpha__scopes_multiply_and_unwind {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
@@ -2556,27 +4159,246 @@ test fill__rounds_corners_and_grows_reserved {
     start_at(?ctx, 0.0::f32, 0.0::f32);
 
     val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
-    # a square fill is one quad
-    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
-    if (draw_count(?ctx) != 6) { ret 2; }
+    push_alpha(?ctx, 0.5::f32);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
+    push_alpha(?ctx, 0.5::f32);
+    text_at(?ctx, "A", 0.0::f32, 0.0::f32, white);
+    pop_alpha(?ctx);
+    pop_alpha(?ctx);
+    quad(?ctx, 0.0::f32, 0.0::f32, 5.0::f32, 5.0::f32, white);
 
-    # radius 4 on every corner: the body plus four rows at each end
-    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
-    if (draw_count(?ctx) != 60) { ret 3; }
+    # premultiplied at half, then a quarter, then whole again
     val p: *draw.Vert = draw_verts(?ctx);
-    if (p[6].y != 4.0::f32 || p[8].y != 16.0::f32 || p[6].x != 0.0::f32) { ret 4; }
-    # the outermost top row is inset from both sides, the innermost barely
-    if (p[12].y != 0.0::f32 || p[12].x <= 1.0::f32 || p[13].x >= 19.0::f32) { ret 5; }
-    if (p[30].y != 3.0::f32 || p[30].x >= 0.5::f32)                         { ret 6; }
+    if (p[0].r != 0.5::f32 || p[0].a != 0.5::f32)   { ret 2; }
+    if (p[4].r != 0.25::f32 || p[4].a != 0.25::f32) { ret 3; }
+    val n: usize = draw_count(?ctx);
+    if (p[n - 1].a != 1.0::f32 || alpha_of(?ctx) != 1.0::f32) { ret 4; }
 
-    # a reserved fill rounded at the bottom takes its rect when grown
-    val h: usize = reserve_fill(?ctx, 0.0::f32, 30.0::f32, 20.0::f32, 4.0::f32, CORNERS_BOTTOM, white);
-    if (h != 60 || draw_count(?ctx) != 90) { ret 7; }
-    grow_fill(?ctx, h, 0.0::f32, 30.0::f32, 20.0::f32, 50.0::f32, 4.0::f32, CORNERS_BOTTOM);
-    if (p[60].y != 30.0::f32 || p[62].y != 46.0::f32) { ret 8; }
-    if (p[66].y != 49.0::f32 || p[68].y != 50.0::f32) { ret 9; }
-    if (p[66].x <= 1.0::f32)                          { ret 10; }
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
 
+test fill__rounds_corners {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+
+    val white: draw.Color = draw.rgba(1.0::f32, 1.0::f32, 1.0::f32, 1.0::f32);
+    # a square fill is one quad
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 0.0::f32, CORNERS_ALL, white);
+    if (draw_count(?ctx) != 4) { ret 2; }
+
+    # radius 4 on every corner covers the rect less four corners of 16 - 4 pi,
+    # less what the chords within tolerance cut off
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_ALL, white);
+    val all: f32 = tess.coverage(?ctx.dl);
+    if (all < 383.0::f32 || all > 387.0::f32) { ret 3; }
+    # rounding the top alone cuts two
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    fill(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, 4.0::f32, CORNERS_TOP, white);
+    val top: f32 = tess.coverage(?ctx.dl);
+    if (top < 391.0::f32 || top > 394.0::f32) { ret 4; }
+
+    # radii that cannot fit are scaled down together into a circle
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+    rounded_rect(?ctx, 0.0::f32, 0.0::f32, 20.0::f32, 20.0::f32, draw.radii(50.0::f32), white);
+    val disc: f32 = tess.coverage(?ctx.dl);
+    if (disc < 304.0::f32 || disc > 315.0::f32) { ret 5; }
+
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test primitives__clip_to_their_run_scissor {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val white: draw.Color = draw.hex(0xFFFFFF, 1.0::f32);
+    var icon:  path.Path  = path.init(?a);
+    path.move(?icon, 20.0::f32, 20.0::f32);
+    path.cubic(?icon, 30.0::f32, 0.0::f32, 50.0::f32, 40.0::f32, 60.0::f32, 20.0::f32);
+    path.line(?icon, 40.0::f32, 60.0::f32);
+    path.close(?icon);
+    var pts: [3]draw.Point = [3]draw.Point{
+        draw.Point{x: 0.0::f32, y: 0.0::f32}, draw.Point{x: 40.0::f32, y: 20.0::f32},
+        draw.Point{x: 0.0::f32, y: 45.0::f32}
+    };
+
+    push_clip(?ctx, 10.0::f32, 10.0::f32, 50.0::f32, 50.0::f32);
+    # every shape here crosses the clip and is drawn whole
+    circle(?ctx, 30.0::f32, 30.0::f32, 30.0::f32, white);
+    stroke_circle(?ctx, 30.0::f32, 30.0::f32, 25.0::f32, 2.0::f32, white);
+    line(?ctx, 0.0::f32, 30.0::f32, 100.0::f32, 30.0::f32, 2.0::f32, white);
+    polyline(?ctx, ?pts[0], 3, false, 3.0::f32, draw.JOIN_ROUND, white);
+    arc(?ctx, 30.0::f32, 30.0::f32, 22.0::f32, 0.0::f32, 3.0::f32, 2.0::f32, white);
+    tri(?ctx, 0.0::f32, 0.0::f32, 40.0::f32, 0.0::f32, 0.0::f32, 40.0::f32, white);
+    frame(?ctx, 5.0::f32, 5.0::f32, 45.0::f32, 45.0::f32, 2.0::f32, white);
+    stroke_rounded_rect(?ctx, 5.0::f32, 5.0::f32, 45.0::f32, 45.0::f32, draw.radii(6.0::f32), 2.0::f32, white);
+    fill_path(?ctx, ?icon, white);
+    stroke_path(?ctx, ?icon, 1.5::f32, draw.JOIN_BEVEL, white);
+    val drawn: usize = draw_count(?ctx);
+    # shapes wholly outside the clip are culled
+    circle(?ctx, 80.0::f32, 80.0::f32, 5.0::f32, white);
+    line(?ctx, 60.0::f32, 60.0::f32, 90.0::f32, 90.0::f32, 2.0::f32, white);
+    rounded_rect(?ctx, 60.0::f32, 0.0::f32, 90.0::f32, 8.0::f32, draw.radii(2.0::f32), white);
+    if (draw_count(?ctx) != drawn) { ret 2; }
+    pop_clip(?ctx);
+    end(?ctx);
+
+    # one run carries the clip as its scissor, and geometry reaches past it
+    if (run_count(?ctx) != 1 || ok(?ctx) != 1) { ret 3; }
+    val r: Run = run_at(?ctx, 0);
+    if (r.clip_x0 != 10.0::f32 || r.clip_y0 != 10.0::f32 || r.clip_x1 != 50.0::f32 || r.clip_y1 != 50.0::f32) { ret 4; }
+    if (r.count != index_count(?ctx))                                                                         { ret 5; }
+    val p:    *draw.Vert = draw_verts(?ctx);
+    var past: u8         = 0;
+    var i:    usize      = 0;
+    for (i < draw_count(?ctx)) {
+        if (p[i].x < 10.0::f32 || p[i].x > 50.0::f32) { past = 1; }
+        i = i + 1;
+    }
+    if (past == 0) { ret 6; }
+
+    val fp:    err[allo.Error] = path.free(?icon);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test gradients__shade_quads_rounded_rects_and_paths {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    val black: draw.Color    = draw.hex(0x000000, 1.0::f32);
+    val clear: draw.Color    = draw.hex(0xFFFFFF, 0.0::f32);
+    val g:     draw.Gradient = draw.gradient(0.0::f32, 0.0::f32, black, 10.0::f32, 0.0::f32, draw.hex(0xFFFFFF, 1.0::f32));
+    # across a quad, each corner takes the gradient where it lies
+    quad_gradient(?ctx, 0.0::f32, 0.0::f32, 10.0::f32, 10.0::f32, g);
+    var p: *draw.Vert = draw_verts(?ctx);
+    if (p[0].r != 0.0::f32 || p[1].r != 1.0::f32 || p[2].r != 1.0::f32 || p[3].r != 0.0::f32) { ret 2; }
+
+    # a vertical fade to clear on a rounded rect: premultiplied, top opaque
+    # and bottom gone
+    val fade: draw.Gradient = draw.gradient(0.0::f32, 20.0::f32, black, 0.0::f32, 40.0::f32, clear);
+    rounded_rect_gradient(?ctx, 0.0::f32, 20.0::f32, 10.0::f32, 40.0::f32, draw.radii(3.0::f32), fade);
+    p = draw_verts(?ctx);
+    var top: u8    = 0;
+    var bot: u8    = 0;
+    var i:   usize = 4;
+    for (i < draw_count(?ctx)) {
+        if (p[i].y < 22.0::f32 && p[i].a > 0.9::f32) { top = 1; }
+        if (p[i].y > 38.0::f32 && p[i].a > 0.1::f32) { bot = 1; }
+        i = i + 1;
+    }
+    if (top == 0 || bot != 0) { ret 3; }
+
+    # a path takes the gradient in its own local space, moved with the origin
+    val before: usize     = draw_count(?ctx);
+    var tri:    path.Path = path.init(?a);
+    path.move(?tri, 0.0::f32, 0.0::f32);
+    path.line(?tri, 10.0::f32, 0.0::f32);
+    path.line(?tri, 0.0::f32, 10.0::f32);
+    val s: Surface = begin_surface(?ctx, 50.0::f32, 50.0::f32, 40.0::f32, 40.0::f32, 0.0::f32, 0.0::f32);
+    fill_path_gradient(?ctx, ?tri, g);
+    end_surface(?ctx, s);
+    p = draw_verts(?ctx);
+    var dark:  u8 = 0;
+    var light: u8 = 0;
+    i = before;
+    for (i < draw_count(?ctx)) {
+        if (p[i].x < 52.0::f32 && p[i].a > 0.9::f32 && p[i].r < 0.2::f32) { dark = 1; }
+        if (p[i].x > 57.0::f32 && p[i].a > 0.9::f32 && p[i].r > 0.7::f32) { light = 1; }
+        i = i + 1;
+    }
+    if (dark == 0 || light == 0) { ret 4; }
+
+    val fp:    err[allo.Error] = path.free(?tri);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the x extent of the vertices from index from on
+fun span_x(ctx: *Context, from: usize, x0: *f32, x1: *f32) {
+    val p: *draw.Vert = draw_verts(ctx);
+    @x0 = 1.0e9::f32;
+    @x1 = -1.0e9::f32;
+    var i: usize = from;
+    for (i < draw_count(ctx)) {
+        @x0 = minf(@x0, p[i].x);
+        @x1 = maxf(@x1, p[i].x);
+        i   = i + 1;
+    }
+}
+
+test icons__draw_at_any_size_and_inline_in_text {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    # at any size, in its box plus the feather, in the color asked for
+    val red: draw.Color = draw.hex(0xFF0000, 1.0::f32);
+    var x0:  f32;
+    var x1:  f32;
+    icon_at(?ctx, ico.SETTINGS, 10.0::f32, 0.0::f32, 64.0::f32, red);
+    span_x(?ctx, 0, ?x0, ?x1);
+    if (draw_count(?ctx) == 0)                                                  { ret 2; }
+    if (x0 < 9.0::f32 || x1 > 75.0::f32)                                        { ret 3; }
+    if (x1 - x0 < 56.0::f32)                                                    { ret 4; }
+    if (draw_verts(?ctx)[0].r <= 0.0::f32 || draw_verts(?ctx)[0].g != 0.0::f32) { ret 5; }
+    val big: usize = draw_count(?ctx);
+    icon_at(?ctx, ico.SETTINGS, 0.0::f32, 0.0::f32, 8.0::f32, red);
+    span_x(?ctx, big, ?x0, ?x1);
+    if (x0 < -1.0::f32 || x1 > 9.0::f32)                                                                   { ret 6; }
+    if (icon_width(?ctx, ico.PLAY, 16.0::f32) != 16.0::f32 || icon_width(?ctx, 77, 16.0::f32) != 0.0::f32) { ret 7; }
+
+    # inline, an icon is a line tall and square in the 8px bitmap font, and
+    # text runs on after it
+    val line: str = "a\xF3\xB0\x80\x80b";
+    if (text_width(?ctx, line) != 24.0::f32)                           { ret 8; }
+    if (glyph_advance(?ctx, 'a', ico.codepoint(ico.PLAY)) != 8.0::f32) { ret 9; }
+    if (glyph_advance(?ctx, ico.codepoint(ico.PLAY), 'b') != 8.0::f32) { ret 10; }
+    val before: usize = draw_count(?ctx);
+    text_at(?ctx, line, 0.0::f32, 50.0::f32, red);
+    # two glyph quads and the icon's feathered fill between them
+    if (draw_count(?ctx) <= before + 8)                        { ret 11; }
+    if (draw_verts(?ctx)[draw_count(?ctx) - 4].x != 16.0::f32) { ret 12; }
+
+    # an app's icon, by the codepoint its id stands for
+    var tri: [10]f32  = [10]f32{0.0, 0.0, 0.0, 1.0, 12.0, 6.0, 1.0, 0.0, 12.0, 4.0};
+    val own: opt[u32] = add_icon(?ctx, ico.Icon{data: ?tri[0], n: 10, w: 24.0::f32, h: 12.0::f32});
+    if (sel own.none) { ret 13; }
+    var buf:  [8]u8;
+    val used: usize = ico.encode(own.some, ?buf[0], 4);
+    buf[used]     = 'x';
+    buf[used + 1] = 0;
+    if (text_width(?ctx, (?buf[0])::str) != 24.0::f32) { ret 14; }
+    # a codepoint in the icon range that no icon has is left to the font
+    if (text_width(?ctx, "\xF3\xB0\x80\xBF") != 8.0::f32) { ret 15; }
+
+    end(?ctx);
+    if (ok(?ctx) != 1) { ret 16; }
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;

@@ -1,0 +1,837 @@
+# tab bars: tabs that select a page, close, reorder by drag, and shrink and
+# then scroll when they overflow
+#
+# the caller passes its tabs each frame as an array of Tab, keyed by its own
+# keys. the bar's id is its key in the current id scope, and a tab's id is its
+# key under the bar's id (see tab_id), so everything a bar keeps is reachable
+# by id from outside the call: the selected tab (selected, select) and the
+# order (index, move), which docking's tab stacks drive the same way the bar
+# does.
+#
+# the order is a rank per tab id in the state store. each frame the bar sorts
+# the caller's array into that order in place, so a caller keeping its array
+# keeps the order too, however long the store went without it. a tab new to
+# the bar takes its place after the tab before it in the caller's array.
+#
+# a press on a tab selects it. the selection is the bar's state in the store
+# (see State), and when the selected tab goes the tab now at its index takes
+# over. a closable tab draws a close box, and a click on it or a middle click
+# on the tab asks to close it: the bar reports the key and the caller removes
+# the tab.
+#
+# every tab is a drag source (see blit.dnd) of KIND, carrying the bar's id and
+# the tab's key, and the bar is a target of it. a tab dropped on its own bar
+# moves there. a tab dropped from another bar arrives: the bar reports it with
+# the index it landed at, and takes it there once the caller adds it. a tab
+# released over no target at all is torn off, which docking (#83) turns into
+# a floating window.
+#
+# tabs wider together than the bar shrink, down to a few characters of their
+# label. past that the strip scrolls: arrows step it a tab at a time, and a
+# list button opens a popup of every tab, hidden or not. a tab selected from
+# outside the strip is scrolled into view.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.context;
+use blit.dnd;
+use blit.draw;
+use blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.store;
+use blit.theme;
+use blit.widget;
+
+# the payload type a dragged tab carries, a Carried
+pub val KIND: str = "tab";
+
+# one tab as the caller describes it
+# ---
+# key:      the tab's identity in the bar, hashed into its id
+# label:    the text drawn on it
+# closable: true to draw a close box and take a middle click as a close
+pub rec Tab {
+    key:      u64;
+    label:    str;
+    closable: bool;
+}
+
+# what a dragged tab carries
+# ---
+# bar: the id of the bar it was dragged from
+# key: its key
+pub rec Carried {
+    bar: u64;
+    key: u64;
+}
+
+# what a bar keeps in the state store under its id
+# ---
+# key:    the selected tab's key
+# has:    1 once a tab is selected
+# index:  the selected tab's index, where the selection falls when it goes
+# scroll: pixels the strip is scrolled by
+# follow: 1 to scroll the selected tab into view next frame
+# list:   1 while the list of tabs is open
+# told:   the selected key the last event reported
+# toldh:  has as the last event reported it
+pub rec State {
+    key:    u64;
+    has:    u8;
+    index:  usize;
+    scroll: f32;
+    follow: u8;
+    list:   u8;
+    told:   u64;
+    toldh:  u8;
+}
+
+# a tab's place in its bar's order, 0 before it has one
+rec Rank {
+    at: f64;
+}
+
+# what a bar did this frame
+#
+# at most one of closed, moved, arrived and torn is set, and key names its tab.
+# ---
+# selected: the selected tab's key, 0 with no tabs
+# changed:  true when the selection changed this frame
+# closed:   true when the tab's close box was clicked, or it was middle clicked
+# moved:    true when a drop moved the tab within the bar, already done in the array
+# arrived:  true when a tab of another bar was dropped here, for the caller to add
+# torn:     true when the tab was dragged off and released over no target
+# key:      the tab closed, moved, arrived or torn
+# from:     the bar an arrived tab came from
+# at:       the index a moved tab is now at, or an arrived tab takes
+pub rec Event {
+    selected: u64;
+    changed:  bool;
+    closed:   bool;
+    moved:    bool;
+    arrived:  bool;
+    torn:     bool;
+    key:      u64;
+    from:     u64;
+    at:       usize;
+}
+
+# one frame's geometry of a bar
+# ---
+# rh:    tab height
+# pad:   the theme's padding
+# lh:    line height, the close box's side
+# x0:    strip left
+# x1:    strip right, before the overflow buttons
+# y0:    top
+# y1:    bottom
+# fit:   0 to 1, how far each tab is from its least width to its natural one
+# total: the tabs' width together
+# over:  true when the tabs overflow the strip at their least width
+rec Geom {
+    rh:    f32;
+    pad:   f32;
+    lh:    f32;
+    x0:    f32;
+    x1:    f32;
+    y0:    f32;
+    y1:    f32;
+    fit:   f32;
+    total: f32;
+    over:  bool;
+}
+
+# the id of a tab with a key in a bar
+# ---
+# bar: the bar's id
+# key: the tab's key
+# ret: a nonzero id
+pub fun tab_id(bar: u64, key: u64) u64 {
+    ret bid.of_int(bar, key);
+}
+
+# the state a bar keeps, nil before it was first drawn or after it aged out
+fun state_of(ctx: *context.Context, bar: u64) *State {
+    val e: *store.Entry = store.entry(?ctx.store, bar, $type_id(State));
+    if (e == nil) { ret nil; }
+    ret e.data::*State;
+}
+
+# the selected tab of a bar
+# ---
+# ctx: context
+# bar: the bar's id
+# ret: its key, or none when the bar has no selection
+pub fun selected(ctx: *context.Context, bar: u64) opt[u64] {
+    val s: *State = state_of(ctx, bar);
+    if (s == nil || s.has == 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{s.key};
+}
+
+# select a tab of a bar from code, scrolling it into view
+#
+# the change shows from the next frame, and that frame's event reports it.
+# ---
+# ctx: context
+# bar: the bar's id
+# key: the tab's key
+pub fun select(ctx: *context.Context, bar: u64, key: u64) {
+    val s: *State = state.get[State](ctx, bar);
+    s.key    = key;
+    s.has    = 1;
+    s.follow = 1;
+}
+
+# where a tab stands in its bar's order
+# ---
+# ctx: context
+# bar: the bar's id
+# key: the tab's key
+# ret: its index as of the last frame, or none when the bar has not placed it
+pub fun index(ctx: *context.Context, bar: u64, key: u64) opt[usize] {
+    val e: *store.Entry = store.entry(?ctx.store, tab_id(bar, key), $type_id(Rank));
+    if (e == nil) { ret opt[usize].none{}; }
+    val r: *Rank = e.data::*Rank;
+    if (r.at < 1.0::f64) { ret opt[usize].none{}; }
+    ret opt[usize].some{(r.at - 1.0::f64)::usize};
+}
+
+# move a tab of a bar to an index from code, as a drag within the bar does
+#
+# the tabs between shift along. the move shows from the next frame. a tab the
+# bar has not placed yet takes the index when it first appears.
+# ---
+# ctx: context
+# bar: the bar's id
+# key: the tab's key
+# to:  the index it moves to
+pub fun move(ctx: *context.Context, bar: u64, key: u64, to: usize) {
+    val r: *Rank = state.get[Rank](ctx, tab_id(bar, key));
+    val t: f64   = to::f64;
+    if (r.at < 1.0::f64) {
+        r.at = t + 0.5::f64;
+        ret;
+    }
+    val old: f64 = r.at - 1.0::f64;
+    if (t < old) { r.at = t + 0.5::f64; }
+    or (t > old) { r.at = t + 1.5::f64; }
+}
+
+# a tab's rank, 0 when it has none
+fun rank_of(ctx: *context.Context, bar: u64, key: u64) f64 {
+    ret state.get[Rank](ctx, tab_id(bar, key)).at;
+}
+
+# sort the caller's tabs into the bar's order in place and number the ranks
+# again from 1
+fun order(ctx: *context.Context, bar: u64, tabs: *Tab, n: usize) {
+    var i: usize = 1;
+    for (i < n) {
+        val t:  Tab   = tabs[i];
+        val rt: f64   = rank_of(ctx, bar, t.key);
+        var j:  usize = i;
+        for (j > 0 && rank_of(ctx, bar, tabs[j - 1].key) > rt) {
+            tabs[j] = tabs[j - 1];
+            j       = j - 1;
+        }
+        tabs[j] = t;
+        i       = i + 1;
+    }
+    var k: usize = 0;
+    for (k < n) {
+        state.get[Rank](ctx, tab_id(bar, tabs[k].key)).at = (k + 1)::f64;
+        k                                                 = k + 1;
+    }
+}
+
+# give each tab new to the bar a rank just after the tab before it, then sort
+fun place_new(ctx: *context.Context, bar: u64, tabs: *Tab, n: usize) {
+    var prev: f64   = 0.0::f64;
+    var i:    usize = 0;
+    for (i < n) {
+        val r: *Rank = state.get[Rank](ctx, tab_id(bar, tabs[i].key));
+        if (r.at <= 0.0::f64) { r.at = prev + 0.5::f64; }
+        prev = r.at;
+        i    = i + 1;
+    }
+    order(ctx, bar, tabs, n);
+}
+
+# the index of the tab with a key, n when none has it
+fun find(tabs: *Tab, n: usize, key: u64) usize {
+    var i: usize = 0;
+    for (i < n) {
+        if (tabs[i].key == key) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# keep the selection on a tab that is there, the one at the old index when
+# the selected one went
+fun settle(s: *State, tabs: *Tab, n: usize) {
+    if (n == 0) {
+        s.has   = 0;
+        s.index = 0;
+        ret;
+    }
+    var i: usize = n;
+    if (s.has != 0) { i = find(tabs, n, s.key); }
+    if (i == n) {
+        i = s.index;
+        if (i >= n) { i = n - 1; }
+        s.key    = tabs[i].key;
+        s.has    = 1;
+        s.follow = 1;
+    }
+    s.index = i;
+}
+
+# report the selection, and whether it changed since the last report
+fun report(s: *State, ev: *Event) {
+    ev.selected = 0;
+    if (s.has != 0) { ev.selected = s.key; }
+    ev.changed = s.has != s.toldh || (s.has != 0 && s.key != s.told);
+    s.told     = s.key;
+    s.toldh    = s.has;
+}
+
+# the smaller of two f32 values
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# the larger of two f32 values
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# clamp v to [lo, hi]
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# room a tab's close box takes, 0 when it has none
+fun close_w(g: *Geom, t: *Tab) f32 {
+    if (t.closable) { ret g.lh + g.pad; }
+    ret 0.0::f32;
+}
+
+# a tab's width with its whole label
+fun natural(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    var lw: f32 = 0.0::f32;
+    if (t.label != nil) { lw = context.text_width(ctx, t.label); }
+    ret g.pad * 2.0::f32 + lw + close_w(g, t);
+}
+
+# a tab's least width: room for a couple of characters of its label
+fun least(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    ret minf(natural(ctx, g, t), g.pad * 2.0::f32 + g.lh * 2.0::f32 + close_w(g, t));
+}
+
+# a tab's width this frame
+fun width(ctx: *context.Context, g: *Geom, t: *Tab) f32 {
+    val lo: f32 = least(ctx, g, t);
+    ret lo + (natural(ctx, g, t) - lo) * g.fit;
+}
+
+# the furthest the strip scrolls
+fun most(g: *Geom) f32 {
+    ret maxf(g.total - (g.x1 - g.x0), 0.0::f32);
+}
+
+# lay the bar out: its row, how far the tabs shrink, and whether they overflow
+fun measure(ctx: *context.Context, tabs: *Tab, n: usize) Geom {
+    var g:  Geom;
+    val ts: *theme.Style = context.look_of(ctx, theme.TAB);
+    g.pad = context.px(ctx, ts.inset.l);
+    g.lh  = context.line_height(ctx);
+    g.rh  = maxf(context.px(ctx, ts.min_h), g.lh + context.px(ctx, ts.inset.t + ts.inset.b));
+    var nat: f32   = 0.0::f32;
+    var lo:  f32   = 0.0::f32;
+    var i:   usize = 0;
+    for (i < n) {
+        nat = nat + natural(ctx, ?g, ?tabs[i]);
+        lo  = lo + least(ctx, ?g, ?tabs[i]);
+        i   = i + 1;
+    }
+    val r: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nat, g.rh);
+    g.x0  = r.x0;
+    g.x1  = r.x1;
+    g.y0  = r.y0;
+    g.y1  = r.y1;
+    g.fit = 1.0::f32;
+    val w: f32 = g.x1 - g.x0;
+    if (nat > w) {
+        if (lo >= w) {
+            g.fit  = 0.0::f32;
+            g.over = true;
+            g.x1   = maxf(g.x0, g.x1 - g.rh * 3.0::f32);
+        }
+        or { g.fit = (w - lo) / (nat - lo); }
+    }
+    g.total = 0.0::f32;
+    i       = 0;
+    for (i < n) {
+        g.total = g.total + width(ctx, ?g, ?tabs[i]);
+        i       = i + 1;
+    }
+    ret g;
+}
+
+# scroll the strip so the tab at index sel lies wholly in view
+fun reveal(ctx: *context.Context, g: *Geom, s: *State, tabs: *Tab, n: usize) {
+    var x: f32   = 0.0::f32;
+    var i: usize = 0;
+    for (i < n) {
+        val w: f32 = width(ctx, g, ?tabs[i]);
+        if (i == s.index) {
+            val view: f32 = g.x1 - g.x0;
+            if (x < s.scroll)            { s.scroll = x; }
+            if (x + w > s.scroll + view) { s.scroll = x + w - view; }
+            ret;
+        }
+        x = x + w;
+        i = i + 1;
+    }
+}
+
+# the scroll that brings the next hidden tab into view, leftwards or rightwards
+fun step(ctx: *context.Context, g: *Geom, s: *State, tabs: *Tab, n: usize, right: bool) f32 {
+    val view: f32   = g.x1 - g.x0;
+    var x:    f32   = 0.0::f32;
+    var to:   f32   = s.scroll;
+    var i:    usize = 0;
+    val eps:  f32   = 0.5::f32;
+    for (i < n) {
+        val w: f32 = width(ctx, g, ?tabs[i]);
+        if (right && x + w > s.scroll + view + eps) { ret x + w - view; }
+        if (!right && x < s.scroll - eps)           { to = x; }
+        x = x + w;
+        i = i + 1;
+    }
+    if (right) { ret most(g); }
+    ret to;
+}
+
+# the state an overflow button paints in: disabled when it cannot act
+fun button_state(h: interact.Hit, live: bool) u8 {
+    if (!live) { ret theme.DISABLED; }
+    ret theme.pick(h.hot, h.active, false, false);
+}
+
+# one overflow button, square at x0, drawing its mark through glyph
+fun button(ctx: *context.Context, id: u64, g: *Geom, x0: f32, live: bool) interact.Hit {
+    val x1: f32          = x0 + g.rh;
+    val h:  interact.Hit = interact.hit(ctx, id, x0, g.y0, x1, g.y1, input.BUTTON_LEFT);
+    context.box(ctx, theme.TAB, button_state(h, live), x0, g.y0, x1, g.y1);
+    ret h;
+}
+
+# the arrows and the list button past the strip's right end
+fun overflow(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usize) {
+    val cy: f32 = (g.y0 + g.y1) / 2.0::f32;
+    val k:  f32 = g.lh / 3.0::f32;
+
+    val canl: bool         = s.scroll > 0.0::f32;
+    val hl:   interact.Hit = button(ctx, bid.child(id, "#left"), g, g.x1, canl);
+    val cl:   draw.Color   = context.paint_of(ctx, theme.TAB, button_state(hl, canl)).text;
+    val lx:   f32          = g.x1 + g.rh / 2.0::f32;
+    context.tri(ctx, lx - k, cy, lx + k / 2.0::f32, cy - k, lx + k / 2.0::f32, cy + k, cl);
+    if (canl && hl.clicked) { s.scroll = step(ctx, g, s, tabs, n, false); }
+
+    val canr: bool         = s.scroll < most(g);
+    val hr:   interact.Hit = button(ctx, bid.child(id, "#right"), g, g.x1 + g.rh, canr);
+    val cr:   draw.Color   = context.paint_of(ctx, theme.TAB, button_state(hr, canr)).text;
+    val rx:   f32          = g.x1 + g.rh * 1.5::f32;
+    context.tri(ctx, rx + k, cy, rx - k / 2.0::f32, cy + k, rx - k / 2.0::f32, cy - k, cr);
+    if (canr && hr.clicked) { s.scroll = step(ctx, g, s, tabs, n, true); }
+
+    val hm: interact.Hit = button(ctx, bid.child(id, "#more"), g, g.x1 + g.rh * 2.0::f32, true);
+    val mx: f32          = g.x1 + g.rh * 2.5::f32;
+    context.tri(ctx, mx - k, cy - k / 2.0::f32, mx + k, cy - k / 2.0::f32, mx, cy + k / 2.0::f32, context.paint_of(ctx, theme.TAB, button_state(hm, true)).text);
+    if (hm.clicked) {
+        if (s.list != 0) { s.list = 0; }
+        or               { s.list = 1; }
+    }
+}
+
+# the popup listing every tab, a click selecting one
+fun list(ctx: *context.Context, id: u64, g: *Geom, s: *State, tabs: *Tab, n: usize) {
+    var w: f32   = g.lh * 4.0::f32;
+    var i: usize = 0;
+    for (i < n) {
+        w = maxf(w, natural(ctx, g, ?tabs[i]));
+        i = i + 1;
+    }
+    context.push_id(ctx, id);
+    val pid: u64          = context.id_of(ctx, "#list");
+    val pop: widget.Popup = widget.begin_popup(ctx, "#list", s.list, g.x1 + g.rh * 3.0::f32 - w, g.y1, w);
+    i = 0;
+    for (pop.open != 0 && i < n) {
+        val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), w, g.rh);
+        val h:  interact.Hit = interact.hit(ctx, bid.of_int(pid, tabs[i].key), r.x0, r.y0, r.x1, r.y1, input.BUTTON_LEFT);
+        val os: u8           = theme.pick(h.hot, h.active, s.has != 0 && tabs[i].key == s.key, false);
+        context.box(ctx, theme.OPTION, os, r.x0, r.y0, r.x1, r.y1);
+        if (tabs[i].label != nil) {
+            val oin: f32 = context.px(ctx, context.look_of(ctx, theme.OPTION).inset.l);
+            context.text_at(ctx, tabs[i].label, r.x0 + oin, r.y0 + (r.y1 - r.y0 - g.lh) / 2.0::f32, context.paint_of(ctx, theme.OPTION, os).text);
+        }
+        if (h.clicked) {
+            s.key    = tabs[i].key;
+            s.has    = 1;
+            s.index  = i;
+            s.follow = 1;
+            s.list   = 0;
+        }
+        i = i + 1;
+    }
+    widget.end_popup(ctx, pop);
+    context.pop_id(ctx);
+    if (pop.dismissed != 0) { s.list = 0; }
+}
+
+# a tab's body and label in a rect, as drawn on the strip and in its preview
+fun body(ctx: *context.Context, g: *Geom, t: *Tab, x0: f32, y0: f32, x1: f32, y1: f32, st: u8) {
+    context.box(ctx, theme.TAB, st, x0, y0, x1, y1);
+    if (t.label == nil) { ret; }
+    val ink: draw.Color = context.paint_of(ctx, theme.TAB, st).text;
+    context.push_clip(ctx, x0 + g.pad, y0, maxf(x0 + g.pad, x1 - g.pad - close_w(g, t)), y1);
+    context.text_at(ctx, t.label, x0 + g.pad, y0 + (y1 - y0 - g.lh) / 2.0::f32, ink);
+    context.pop_clip(ctx);
+}
+
+# a tab's close box at the right of its rect: two crossed strokes
+fun close_box(ctx: *context.Context, g: *Geom, tid: u64, x1: f32, ink: draw.Color) bool {
+    val bx1: f32          = x1 - g.pad;
+    val bx0: f32          = bx1 - g.lh;
+    val by0: f32          = (g.y0 + g.y1 - g.lh) / 2.0::f32;
+    val by1: f32          = by0 + g.lh;
+    val h:   interact.Hit = interact.hit(ctx, bid.child(tid, "#close"), bx0, by0, bx1, by1, input.BUTTON_LEFT);
+    val cs:  u8           = theme.pick(h.hot, h.active, false, false);
+    context.box(ctx, theme.TAB_CLOSE, cs, bx0, by0, bx1, by1);
+    val k:  f32 = g.lh / 4.0::f32;
+    val lw: f32 = maxf(context.px(ctx, context.paint_of(ctx, theme.TAB_CLOSE, cs).border_w), g.lh / 10.0::f32);
+    context.line(ctx, bx0 + k, by0 + k, bx1 - k, by1 - k, lw, ink);
+    context.line(ctx, bx0 + k, by1 - k, bx1 - k, by0 + k, lw, ink);
+    ret h.clicked;
+}
+
+# a tab bar across the current row
+#
+# the tabs are sorted into the bar's order in place before anything is drawn,
+# and a drop within the bar moves them again, so after the call the array is
+# in the order shown. the bar is an id scope for the overflow list.
+# ---
+# ctx:  context
+# key:  the bar's key in the current id scope
+# tabs: the caller's tabs, reordered in place (pass ?tabs[0], or nil when n is 0)
+# n:    how many tabs
+# ret:  what the bar did this frame
+pub fun bar(ctx: *context.Context, key: str, tabs: *Tab, n: usize) Event {
+    var ev: Event;
+    val id: u64    = context.id_of(ctx, key);
+    val s:  *State = state.get[State](ctx, id);
+    place_new(ctx, id, tabs, n);
+    settle(s, tabs, n);
+
+    var g: Geom = measure(ctx, tabs, n);
+    if (s.follow != 0) { reveal(ctx, ?g, s, tabs, n); }
+    s.follow = 0;
+    s.scroll = clampf(s.scroll, 0.0::f32, most(?g));
+    if (g.over) { overflow(ctx, id, ?g, s, tabs, n); }
+    or {
+        s.scroll = 0.0::f32;
+        s.list   = 0;
+    }
+
+    context.push_clip(ctx, g.x0, g.y0, g.x1, g.y1);
+    context.box(ctx, theme.TAB_BAR, theme.NORMAL, g.x0, g.y0, g.x1, g.y1);
+    val strip: interact.Hit = interact.hit(ctx, bid.child(id, "#strip"), g.x0, g.y0, g.x1, g.y1, 0);
+
+    # the tab under the pointer and the slot a drop there lands in
+    var over: interact.Hit;
+    var slot: usize = n;
+    var mark: f32   = g.x0 + g.total - s.scroll;
+    val seps: f32   = context.px(ctx, context.look_of(ctx, theme.TAB).margin.r);
+    var x:    f32   = g.x0 - s.scroll;
+    var i:    usize = 0;
+    for (i < n) {
+        val t:  *Tab = ?tabs[i];
+        val x0: f32  = x;
+        val x1: f32  = x + width(ctx, ?g, t);
+        x = x1;
+        val tid: u64          = tab_id(id, t.key);
+        val h:   interact.Hit = interact.hit(ctx, tid, x0, g.y0, x1 - seps, g.y1, input.BUTTON_LEFT | input.BUTTON_MIDDLE);
+        val on:  bool         = s.has != 0 && s.key == t.key;
+        if (h.pressed && h.button == input.BUTTON_LEFT && !on) {
+            s.key    = t.key;
+            s.has    = 1;
+            s.index  = i;
+            s.follow = 1;
+        }
+        val tst: u8         = theme.pick(h.hot, h.active, s.has != 0 && s.key == t.key, false);
+        val ink: draw.Color = context.paint_of(ctx, theme.TAB, tst).text;
+        body(ctx, ?g, t, x0, g.y0, x1 - seps, g.y1, tst);
+        var shut: bool = h.clicked && h.button == input.BUTTON_MIDDLE;
+        if (t.closable && close_box(ctx, ?g, tid, x1 - seps, ink)) { shut = true; }
+        if (t.closable && shut) {
+            ev.closed = true;
+            ev.key    = t.key;
+        }
+
+        var c: Carried  = Carried{bar: id, key: t.key};
+        val d: dnd.Drag = dnd.source(ctx, h, KIND, (?c)::ptr, $size_of(Carried), x0, g.y0, x1 - seps, g.y1);
+        if (d.missed) {
+            ev.torn = true;
+            ev.key  = t.key;
+        }
+        if (d.on) {
+            val pv: dnd.Preview = dnd.begin_preview(ctx);
+            body(ctx, ?g, t, pv.x0, pv.y0, pv.x1, pv.y1, theme.HOT);
+            dnd.end_preview(ctx, pv);
+        }
+
+        if (h.hot) {
+            over = h;
+            if (h.mx < (x0 + x1) / 2.0::f32) {
+                slot = i;
+                mark = x0;
+            }
+            or {
+                slot = i + 1;
+                mark = x1;
+            }
+        }
+        i = i + 1;
+    }
+    if (over.id == 0) { over = strip; }
+
+    val half: f32      = maxf(seps, 1.0::f32);
+    val drop: dnd.Drop = dnd.target(ctx, over, KIND, mark - half, g.y0, mark + half, g.y1);
+    context.pop_clip(ctx);
+    if (drop.dropped && drop.n == $size_of(Carried)) {
+        val c: Carried = @(drop.data::*Carried);
+        if (c.bar == id) {
+            val from: usize = find(tabs, n, c.key);
+            var to:   usize = slot;
+            if (to > from) { to = to - 1; }
+            if (from < n && to != from) {
+                move(ctx, id, c.key, to);
+                order(ctx, id, tabs, n);
+                ev.moved = true;
+                ev.key   = c.key;
+                ev.at    = to;
+                s.index  = find(tabs, n, s.key);
+            }
+        }
+        or {
+            state.get[Rank](ctx, tab_id(id, c.key)).at = slot::f64 + 0.5::f64;
+            ev.arrived                                 = true;
+            ev.key                                     = c.key;
+            ev.from                                    = c.bar;
+            ev.at                                      = slot;
+            s.key                                      = c.key;
+            s.has                                      = 1;
+            s.follow                                   = 1;
+        }
+    }
+
+    if (g.over) { list(ctx, id, ?g, s, tabs, n); }
+    report(s, ?ev);
+    ret ev;
+}
+
+# an app holding up to eight tabs in one bar, removing the ones it is asked to
+# close and recording what the bar did
+# ---
+# tabs:    the tabs, in the order the bar keeps them
+# n:       how many
+# ev:      the bar's event this frame
+# closed:  key of the last tab closed, 0 before any
+# moved:   key of the last tab moved, 0 before any
+# at:      the index it moved to
+# torn:    key of the last tab torn off, 0 before any
+# changes: frames the selection changed in
+#[testing]
+rec App {
+    tabs:    [8]Tab;
+    n:       usize;
+    ev:      Event;
+    closed:  u64;
+    moved:   u64;
+    at:      usize;
+    torn:    u64;
+    changes: usize;
+}
+
+#[testing]
+fun app_ui(ctx: *context.Context, user: ptr) {
+    val a: *App = user::*App;
+    a.ev = bar(ctx, "tabs", ?a.tabs[0], a.n);
+    if (a.ev.changed) { a.changes = a.changes + 1; }
+    if (a.ev.moved) {
+        a.moved = a.ev.key;
+        a.at    = a.ev.at;
+    }
+    if (a.ev.torn) { a.torn = a.ev.key; }
+    if (a.ev.closed) {
+        a.closed = a.ev.key;
+        val i: usize = find(?a.tabs[0], a.n, a.ev.key);
+        var j: usize = i;
+        for (j + 1 < a.n) {
+            a.tabs[j] = a.tabs[j + 1];
+            j         = j + 1;
+        }
+        a.n = a.n - 1;
+    }
+}
+
+#[testing]
+fun app(d: *driver.Driver, al: *allo.Allocator, a: *App, n: usize, w: f32) bool {
+    val labels: [8]str = [8]str{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"};
+    var i:      usize  = 0;
+    for (i < n) {
+        a.tabs[i] = Tab{key: (i + 1)::u64, label: labels[i], closable: true};
+        i         = i + 1;
+    }
+    a.n = n;
+    val e: err[allo.Error] = driver.init(d, al, w, 240.0::f32, app_ui, a::ptr);
+    if (sel e.err) { ret false; }
+    driver.step(d);
+    ret true;
+}
+
+# the keys of the app's tabs, in order, as one number: 312 for keys 3, 1, 2
+#[testing]
+fun keys(a: *App) u64 {
+    var k: u64   = 0;
+    var i: usize = 0;
+    for (i < a.n) {
+        k = k * 10 + a.tabs[i].key;
+        i = i + 1;
+    }
+    ret k;
+}
+
+test bar__selects_closes_and_reorders {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: App;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?a, 3, 400.0::f32)) { ret 1; }
+    val b: u64 = driver.find(?d, "tabs");
+
+    # the first tab is selected from the start
+    if (a.ev.selected != 1 || a.changes != 1) { ret 2; }
+    val cur: opt[u64] = selected(?d.ctx, b);
+    if (!(sel cur.some && cur.some == 1)) { ret 3; }
+
+    # a click selects
+    if (!driver.click(?d, tab_id(b, 2)))      { ret 4; }
+    if (a.ev.selected != 2 || a.changes != 2) { ret 5; }
+
+    # closing the selected tab hands the selection to the one taking its place
+    if (!driver.click(?d, bid.child(tab_id(b, 2), "#close"))) { ret 6; }
+    if (a.closed != 2 || keys(?a) != 13)                      { ret 7; }
+    driver.step(?d);
+    if (a.ev.selected != 3) { ret 8; }
+
+    # a middle click closes too
+    a.tabs[2] = Tab{key: 4, label: "delta", closable: true};
+    a.n       = 3;
+    driver.step(?d);
+    if (!driver.click_with(?d, tab_id(b, 4), input.BUTTON_MIDDLE)) { ret 9; }
+    if (a.closed != 4 || keys(?a) != 13)                           { ret 10; }
+
+    # dragging the first tab past the second's middle moves it after it, and
+    # the press that started the drag selected it
+    val r3: opt[context.Area] = driver.rect(?d, tab_id(b, 3));
+    if (sel r3.none)                                                                                 { ret 11; }
+    if (!driver.drag(?d, tab_id(b, 1), r3.some.x1 - 2.0::f32, (r3.some.y0 + r3.some.y1) / 2.0::f32)) { ret 12; }
+    if (a.moved != 1 || a.at != 1 || keys(?a) != 31)                                                 { ret 13; }
+    val i1: opt[usize] = index(?d.ctx, b, 1);
+    if (!(sel i1.some && i1.some == 1)) { ret 14; }
+    if (a.ev.selected != 1)             { ret 15; }
+
+    # the order outlives the caller's array: given back unsorted, it is sorted again
+    a.tabs[0] = Tab{key: 1, label: "alpha", closable: true};
+    a.tabs[1] = Tab{key: 3, label: "gamma", closable: true};
+    driver.step(?d);
+    if (keys(?a) != 31) { ret 16; }
+
+    # moved and selected from outside the call
+    move(?d.ctx, b, 1, 0);
+    select(?d.ctx, b, 3);
+    driver.step(?d);
+    if (keys(?a) != 13 || a.ev.selected != 3 || !a.ev.changed) { ret 17; }
+
+    # a tab dragged off and released over no target is torn off
+    if (!driver.drag(?d, tab_id(b, 3), 200.0::f32, 200.0::f32)) { ret 18; }
+    driver.step(?d);
+    if (a.torn != 3 || keys(?a) != 13) { ret 19; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test bar__overflow_scrolls_and_lists {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: App;
+    var d: driver.Driver;
+    if (!app(?d, ?al, ?a, 8, 160.0::f32)) { ret 1; }
+    val b: u64 = driver.find(?d, "tabs");
+
+    # the strip overflows: the last tab is out of view, the first in it
+    if (!driver.drawn(?d, tab_id(b, 1)) || driver.drawn(?d, tab_id(b, 8))) { ret 2; }
+
+    # the right arrow steps a tab at a time, and the left one back
+    val right: u64   = bid.child(b, "#right");
+    val left:  u64   = bid.child(b, "#left");
+    var k:     usize = 0;
+    for (k < 8 && !driver.drawn(?d, tab_id(b, 8))) {
+        if (!driver.click(?d, right)) { ret 3; }
+        k = k + 1;
+    }
+    if (!driver.drawn(?d, tab_id(b, 8)) || k < 2) { ret 4; }
+    if (driver.drawn(?d, tab_id(b, 1)))           { ret 5; }
+    k = 0;
+    for (k < 8 && !driver.drawn(?d, tab_id(b, 1))) {
+        if (!driver.click(?d, left)) { ret 6; }
+        k = k + 1;
+    }
+    if (!driver.drawn(?d, tab_id(b, 1)) || driver.drawn(?d, tab_id(b, 8))) { ret 7; }
+
+    # the list holds the hidden tabs, and picking one selects it and brings it in view
+    if (!driver.click(?d, bid.child(b, "#more"))) { ret 8; }
+    val pid: u64 = bid.of_label(b, "#list");
+    if (!driver.click(?d, bid.of_int(pid, 7))) { ret 9; }
+    driver.step(?d);
+    if (a.ev.selected != 7 || !driver.drawn(?d, tab_id(b, 7))) { ret 10; }
+    if (driver.drawn(?d, bid.of_int(pid, 1)))                  { ret 11; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

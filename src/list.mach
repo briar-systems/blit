@@ -1,0 +1,551 @@
+# a scrolling list of rows: labels with a right-aligned secondary label, a
+# caller matcher, single or multiple selection, and rows drawn by the caller
+#
+# the rows a list shows are described each frame by a Rows record the caller
+# fills: how many items there are, their labels and secondary labels, the
+# query and the matcher that decides which items it shows, and optionally a
+# drawer that paints a row in place of the built-in labels. the selection and
+# the scroll position are the caller's List, kept across frames.
+#
+# a list is a scroll region (see widget.begin_scroll) and so an id scope: a
+# row's id is its item index under the list's id, so a row keeps its hit
+# identity as the query, the matcher or the scroll position changes. the list
+# claims each shown row through interact.hit and paints its hover, press and
+# selection face before the row's content, so a row drawn by the caller keeps
+# hit, selection and scrolling. anything the drawer claims sits above the row
+# and takes its own input. rows scrolled out of view are skipped rather than
+# emitted.
+#
+# a row's id and hit are passed to its drawer, which is where a drag source or
+# a drop target for reordering rows attaches.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.context;
+use blit.draw;
+use blit.driver;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.theme;
+use blit.widget;
+
+# whether item index is shown for query; user is Rows.user
+pub def Matcher: fun(ptr, usize, str) bool;
+
+# paint a shown row's content inside its rect; user is Rows.user
+pub def Drawer: fun(*context.Context, ptr, Row);
+
+# consumer-owned state of a list, kept across frames
+# ---
+# selected: the selected item, or with marks the anchor a shift click extends
+#           from: the item last clicked. at least the item count for none
+# scroll:   the list's scroll state
+# marks:    nil for single selection, else one byte per item, nonzero while
+#           it is selected, which makes the list a multiple selection
+pub rec List {
+    selected: usize;
+    scroll:   widget.Scroll;
+    marks:    *u8;
+}
+
+# what a list shows this frame
+# ---
+# count:   number of items
+# labels:  count item labels, nil when a drawer paints every row
+# details: count secondary labels drawn right-aligned in the row, nil for
+#          none, and any one nil for none on that row
+# query:   the text the matcher is given, nil or empty for all
+# match:   decides which items are shown, nil for the default: items whose
+#          label holds the query, ignoring ascii case (see widget.matches)
+# draw:    paints a row's content, nil for the label and secondary label
+# user:    passed to match and draw
+# row_h:   row height in pixels, 0 for the theme's control row height
+pub rec Rows {
+    count:   usize;
+    labels:  *str;
+    details: *str;
+    query:   str;
+    match:   Matcher;
+    draw:    Drawer;
+    user:    ptr;
+    row_h:   f32;
+}
+
+# one shown row, as a drawer receives it
+# ---
+# index:    the item
+# id:       the row's id, its index under the list's id
+# hit:      what the pointer did to the row this frame
+# selected: true while the item is selected
+# x0:       row left in the list's local pixels
+# y0:       row top
+# x1:       row right
+# y1:       row bottom
+# ink:      the color the row's text is drawn in, for its selection
+# dim:      the color its secondary text is drawn in, for its selection
+pub rec Row {
+    index:    usize;
+    id:       u64;
+    hit:      interact.Hit;
+    selected: bool;
+    x0:       f32;
+    y0:       f32;
+    x1:       f32;
+    y1:       f32;
+    ink:      draw.Color;
+    dim:      draw.Color;
+}
+
+# rows of count items labeled by labels, every one shown
+# ---
+# labels: pointer to an array of count labels (pass ?labels[0])
+# count:  number of items
+# ret:    the rows, with no details, matcher, drawer or query
+pub fun rows(labels: *str, count: usize) Rows {
+    var r: Rows;
+    r.labels = labels;
+    r.count  = count;
+    ret r;
+}
+
+# a row's inset between its edges and its labels, at the context's scale
+fun row_pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, context.look_of(ctx, theme.LIST_ITEM).inset.l);
+}
+
+# whether item i is shown
+fun shown(r: *Rows, i: usize) bool {
+    if (r.match != nil)  { ret r.match(r.user, i, r.query); }
+    if (r.labels == nil) { ret true; }
+    ret widget.matches(r.labels[i], r.query);
+}
+
+# whether item i is selected
+fun is_selected(l: *List, i: usize) bool {
+    if (l.marks != nil) { ret l.marks[i] != 0; }
+    ret l.selected == i;
+}
+
+# set item i's mark to on, reporting whether it changed
+fun mark(l: *List, i: usize, on: u8) bool {
+    if ((l.marks[i] != 0) == (on != 0)) { ret false; }
+    l.marks[i] = on;
+    ret true;
+}
+
+# apply a click on item i with modifiers mods to a multiple selection
+#
+# a plain click selects i alone, a shortcut click (ctrl, or command on
+# darwin) toggles it, and a shift click selects the shown items from the
+# anchor to i, alone or, with the shortcut held too, added to the rest.
+fun click_many(l: *List, r: *Rows, i: usize, mods: u8) bool {
+    val add:     bool = input.shortcut(mods);
+    val range:   bool = (mods & input.MOD_SHIFT) != 0 && l.selected < r.count;
+    var changed: bool = false;
+    if (add && !range) {
+        changed    = mark(l, i, (l.marks[i] == 0)::u8);
+        l.selected = i;
+        ret changed;
+    }
+
+    var lo: usize = i;
+    var hi: usize = i;
+    if (range) {
+        if (l.selected < lo) { lo = l.selected; }
+        if (l.selected > hi) { hi = l.selected; }
+    }
+    var j: usize = 0;
+    for (j < r.count) {
+        if (j >= lo && j <= hi && shown(r, j)) {
+            if (mark(l, j, 1)) { changed = true; }
+        }
+        or (!add) {
+            if (mark(l, j, 0)) { changed = true; }
+        }
+        j = j + 1;
+    }
+    if (!range) { l.selected = i; }
+    ret changed;
+}
+
+# paint a row's label at its left and its secondary label right-aligned, the
+# label clipped short of the secondary one when it would reach it
+fun draw_labels(ctx: *context.Context, r: *Rows, row: Row) {
+    val pad:    f32  = row_pad(ctx);
+    val ty:     f32  = row.y0 + (row.y1 - row.y0 - context.line_height(ctx)) / 2.0::f32;
+    val label:  bool = r.labels != nil && r.labels[row.index] != nil;
+    val detail: bool = r.details != nil && r.details[row.index] != nil;
+    var dw:     f32  = 0.0::f32;
+    var clip:   bool = false;
+    if (detail) {
+        dw   = context.text_width(ctx, r.details[row.index]);
+        clip = label && row.x0 + pad + context.text_width(ctx, r.labels[row.index]) > row.x1 - pad * 2.0::f32 - dw;
+    }
+    if (label) {
+        if (clip) { context.push_clip(ctx, row.x0, row.y0, row.x1 - pad * 2.0::f32 - dw, row.y1); }
+        context.text_at(ctx, r.labels[row.index], row.x0 + pad, ty, row.ink);
+        if (clip) { context.pop_clip(ctx); }
+    }
+    if (detail) { context.text_at(ctx, r.details[row.index], row.x1 - pad - dw, ty, row.dim); }
+}
+
+# the width item i's labels need with the padding they are drawn with, or 0
+# for a row with neither, which a drawer sizes by the list's width alone
+fun natural_w(ctx: *context.Context, r: *Rows, i: usize) f32 {
+    val pad: f32 = row_pad(ctx);
+    var w:   f32 = 0.0::f32;
+    if (r.labels != nil && r.labels[i] != nil)   { w = context.text_width(ctx, r.labels[i]) + pad; }
+    if (r.details != nil && r.details[i] != nil) { w = w + context.text_width(ctx, r.details[i]) + pad; }
+    if (w > 0.0::f32)                            { w = w + pad; }
+    ret w;
+}
+
+# a scrolling list of rows, h pixels tall, whose items can be selected
+#
+# only the items the matcher shows are laid out. clicking a shown row selects
+# its item: with l.marks nil it becomes the one selected item, else the click
+# edits the multiple selection (a plain click selects it alone, ctrl or
+# command toggles it, shift selects the shown items from the anchor to it).
+# selected rows are drawn in the accent. the list scrolls by the wheel and a
+# scrollbar like any scroll region.
+# ---
+# ctx: context
+# key: the list's key in the current id scope
+# l:   the list's state; l.marks, when set, holds rows.count bytes
+# r:   what the list shows this frame
+# h:   list height in pixels
+# ret: true if the selection changed this frame
+pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
+    val area:    widget.ScrollArea = widget.begin_scroll(ctx, key, ?l.scroll, h);
+    var rh:      f32               = r.row_h;
+    var changed: bool              = false;
+    if (rh <= 0.0::f32) { rh = widget.control_height(ctx); }
+    val top: f32 = l.scroll.offset;
+
+    var i: usize = 0;
+    for (i < r.count) {
+        if (shown(?r, i)) {
+            val a: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), natural_w(ctx, ?r, i), rh);
+            if (a.y1 > top && a.y0 < top + area.h) {
+                var row: Row;
+                row.index = i;
+                row.id    = bid.child_int(area.id, i::u64);
+                row.x0    = a.x0;
+                row.y0    = a.y0;
+                row.x1    = a.x1;
+                row.y1    = a.y1;
+                row.hit   = interact.hit(ctx, row.id, row.x0, row.y0, row.x1, row.y1, input.BUTTON_LEFT);
+                if (row.hit.clicked) {
+                    if (l.marks != nil) {
+                        if (click_many(l, ?r, i, ctx.in.mods)) { changed = true; }
+                    }
+                    or (l.selected != i) {
+                        l.selected = i;
+                        changed    = true;
+                    }
+                }
+
+                row.selected = is_selected(l, i);
+                val st: u8           = theme.pick(row.hit.hot, row.hit.active, row.selected, false);
+                val p:  *theme.Paint = context.paint_of(ctx, theme.LIST_ITEM, st);
+                row.ink = p.text;
+                row.dim = p.mark;
+                context.box(ctx, theme.LIST_ITEM, st, row.x0, row.y0, row.x1, row.y1);
+
+                if (r.draw != nil) { r.draw(ctx, r.user, row); }
+                or                 { draw_labels(ctx, ?r, row); }
+            }
+        }
+        i = i + 1;
+    }
+    widget.end_scroll(ctx, ?l.scroll, area);
+    ret changed;
+}
+
+# a list in a 100 pixel panel at the screen's top left, and what its drawer saw
+# ---
+# l:       the list's state
+# r:       the rows it shows
+# h:       its height
+# changed: frames its selection changed on
+# drawn:   rows the drawer painted in the last frame
+# first:   the first item the drawer painted in the last frame
+# hot:     the item the drawer last saw hot, r.count for none
+# seen:    the item the drawer last saw selected, r.count for none
+#[testing]
+rec Probe {
+    l:       List;
+    r:       Rows;
+    h:       f32;
+    changed: usize;
+    drawn:   usize;
+    first:   usize;
+    hot:     usize;
+    seen:    usize;
+}
+
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val p: *Probe       = user::*Probe;
+    val b: widget.Block = widget.begin_panel(ctx, 0.0::f32, 0.0::f32, 100.0::f32);
+    p.drawn = 0;
+    if (show(ctx, "list", ?p.l, p.r, p.h)) { p.changed = p.changed + 1; }
+    widget.end_panel(ctx, b);
+}
+
+# a driver over a probe on a 200 pixel screen, laid out once
+#[testing]
+fun probe(d: *driver.Driver, a: *allo.Allocator, p: *Probe) u8 {
+    p.h    = 100.0::f32;
+    p.hot  = p.r.count;
+    p.seen = p.r.count;
+    val e: err[allo.Error] = driver.init(d, a, 200.0::f32, 200.0::f32, probe_ui, p::ptr);
+    if (sel e.err) { ret 0; }
+    driver.step(d);
+    ret 1;
+}
+
+# the id of the row showing item i
+#[testing]
+fun row_id(d: *driver.Driver, i: usize) u64 {
+    ret bid.child_int(driver.find(d, "list"), i::u64);
+}
+
+# click the row showing item i with modifiers mods held
+#[testing]
+fun click_row(d: *driver.Driver, i: usize, mods: u8) bool {
+    d.in.mods = mods;
+    val ok: bool = driver.click(d, row_id(d, i));
+    d.in.mods = 0;
+    ret ok;
+}
+
+test list__selects_scrolls_and_searches {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var items: [20]str;
+    var k:     usize = 0;
+    for (k < 20) {
+        items[k] = "item";
+        k        = k + 1;
+    }
+    items[0] = "apple";
+    items[1] = "banana";
+    items[2] = "cherry";
+    items[3] = "Date";
+    var p: Probe;
+    p.r          = rows(?items[0], 20);
+    p.l.selected = 20;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # rows are 16 tall at a 20 pixel pitch, and a click selects one
+    if (p.l.scroll.content != 400.0::f32)                         { ret 2; }
+    if (!str_equals(driver.text_of(?d, row_id(?d, 1)), "banana")) { ret 3; }
+    click_row(?d, 1, 0);
+    if (p.l.selected != 1 || p.changed != 1) { ret 4; }
+    click_row(?d, 1, 0);
+    if (p.changed != 1) { ret 5; }
+
+    # the wheel scrolls the list and the rows follow
+    driver.scroll(?d, row_id(?d, 1), 0.0::f32, -40.0::f32);
+    driver.step(?d);
+    if (p.l.scroll.offset != 40.0::f32 || driver.drawn(?d, row_id(?d, 0))) { ret 6; }
+    click_row(?d, 2, 0);
+    if (p.l.selected != 2) { ret 7; }
+
+    # a query shows only the items holding it, ignoring case, and a row's id is
+    # its item, so it is the same row. the list scrolls back as its content
+    # shrinks, so the match claims its row from the next frame
+    p.r.query = "dAT";
+    driver.steps(?d, 2);
+    if (p.l.scroll.content != 20.0::f32 || p.l.scroll.offset != 0.0::f32) { ret 8; }
+    if (driver.drawn(?d, row_id(?d, 2)))                                  { ret 9; }
+    click_row(?d, 3, 0);
+    if (p.l.selected != 3) { ret 10; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the rightmost x of any vertex in color c
+#[testing]
+fun right_of(ctx: *context.Context, c: draw.Color) f32 {
+    val p: *draw.Vert = context.draw_verts(ctx);
+    val n: usize      = context.draw_count(ctx);
+    var x: f32        = -1.0::f32;
+    var i: usize      = 0;
+    for (i < n) {
+        if (p[i].r == c.r && p[i].g == c.g && p[i].b == c.b && p[i].a == c.a && p[i].x > x) { x = p[i].x; }
+        i = i + 1;
+    }
+    ret x;
+}
+
+test list__secondary_labels_sit_right_aligned {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var labels: [3]str;
+    labels[0] = "a";
+    labels[1] = "b";
+    labels[2] = "a long long name";
+    var details: [3]str;
+    details[0] = "1 kb";
+    details[1] = nil;
+    details[2] = "300";
+    var p: Probe;
+    p.r         = rows(?labels[0], 3);
+    p.r.details = ?details[0];
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # each secondary label ends a pad short of its row's right edge, after the
+    # label, and a row without one shows its label alone
+    val pad: f32   = context.px(?d.ctx, d.ctx.theme.pad);
+    var i:   usize = 0;
+    for (i < context.traced_count(?d.ctx)) {
+        val t: context.TextLine = context.traced_at(?d.ctx, i);
+        if (t.len == 4 && t.text[0] == '1' && t.box.x1 != 100.0::f32 - pad) { ret 2; }
+        if (t.len == 1 && t.text[0] == 'a' && t.box.x0 != pad)              { ret 3; }
+        i = i + 1;
+    }
+    if (!str_equals(driver.text_of(?d, row_id(?d, 0)), "a 1 kb")) { ret 4; }
+    if (!str_equals(driver.text_of(?d, row_id(?d, 1)), "b"))      { ret 5; }
+
+    # a label that would reach its secondary label is clipped short of it
+    val room: f32 = 100.0::f32 - pad * 2.0::f32 - context.text_width(?d.ctx, "300");
+    val x:    f32 = right_of(?d.ctx, draw.premultiply(d.ctx.theme.text));
+    if (x < 0.0::f32 || x > room) { ret 6; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# shows the even items alone
+#[testing]
+fun even(user: ptr, i: usize, query: str) bool {
+    ret i % 2 == 0;
+}
+
+# whether exactly the items set in want are marked among the first n
+#[testing]
+fun marked(l: *List, n: usize, want: u32) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if ((l.marks[i] != 0) != ((want & (1::u32 << i::u32)) != 0)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test list__matcher_and_multiple_selection {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var labels: [10]str;
+    var k:      usize = 0;
+    for (k < 10) {
+        labels[k] = "row";
+        k         = k + 1;
+    }
+    var marks: [10]u8;
+    var p:     Probe;
+    p.r          = rows(?labels[0], 10);
+    p.r.match    = even;
+    p.l.selected = 10;
+    p.l.marks    = ?marks[0];
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # the matcher shows the even items alone
+    if (driver.drawn(?d, row_id(?d, 1)) || !driver.drawn(?d, row_id(?d, 8))) { ret 2; }
+    if (p.l.scroll.content != 100.0::f32)                                    { ret 3; }
+
+    # a click selects one, ctrl toggles another in, and shift selects the shown
+    # items from the last clicked in place of the rest
+    click_row(?d, 2, 0);
+    if (!marked(?p.l, 10, 0x004) || p.l.selected != 2 || p.changed != 1) { ret 4; }
+    click_row(?d, 6, input.MOD_CTRL);
+    if (!marked(?p.l, 10, 0x044) || p.l.selected != 6) { ret 5; }
+    click_row(?d, 8, input.MOD_SHIFT);
+    if (!marked(?p.l, 10, 0x140) || p.l.selected != 6) { ret 6; }
+
+    # ctrl and shift add the range, skipping hidden items, ctrl toggles one
+    # out, and a plain click on a marked item leaves it alone
+    click_row(?d, 2, input.MOD_CTRL | input.MOD_SHIFT);
+    if (!marked(?p.l, 10, 0x154)) { ret 7; }
+    click_row(?d, 4, input.MOD_CTRL);
+    if (!marked(?p.l, 10, 0x144) || p.l.selected != 4) { ret 8; }
+    click_row(?d, 8, 0);
+    if (!marked(?p.l, 10, 0x100) || p.changed != 6) { ret 9; }
+    click_row(?d, 8, 0);
+    if (p.changed != 6) { ret 10; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# paints a bar in each row and records what it was given
+#[testing]
+fun paint_row(ctx: *context.Context, user: ptr, row: Row) {
+    val p: *Probe = user::*Probe;
+    if (p.drawn == 0) { p.first = row.index; }
+    p.drawn = p.drawn + 1;
+    if (row.hit.hot)  { p.hot = row.index; }
+    if (row.selected) { p.seen = row.index; }
+    context.quad(ctx, row.x0, row.y0, row.x0 + 4.0::f32, row.y1, row.ink);
+}
+
+test list__drawn_rows_keep_hit_selection_and_scrolling {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    p.r.count    = 10;
+    p.r.draw     = paint_row;
+    p.r.user     = (?p)::ptr;
+    p.r.row_h    = 30.0::f32;
+    p.l.selected = 10;
+    var d: driver.Driver;
+    if (probe(?d, ?a, ?p) == 0) { ret 1; }
+
+    # rows 30 tall at a 34 pixel pitch, the three in view drawn by the caller
+    if (p.drawn != 3 || p.first != 0 || p.l.scroll.content != 340.0::f32) { ret 2; }
+    val r1: opt[context.Area] = driver.rect(?d, row_id(?d, 1));
+    if (sel r1.none)                                        { ret 3; }
+    if (r1.some.y0 != 34.0::f32 || r1.some.y1 != 64.0::f32) { ret 3; }
+
+    # the row is hit and selected under the caller's drawing
+    driver.hover(?d, row_id(?d, 1));
+    if (p.hot != 1) { ret 4; }
+    click_row(?d, 1, 0);
+    if (p.l.selected != 1 || p.seen != 1 || p.changed != 1) { ret 5; }
+
+    # and scrolls: two rows down, the first drawn is the third
+    driver.scroll(?d, row_id(?d, 1), 0.0::f32, -68.0::f32);
+    driver.step(?d);
+    if (p.first != 2 || driver.drawn(?d, row_id(?d, 1))) { ret 6; }
+    click_row(?d, 3, 0);
+    if (p.l.selected != 3 || p.seen != 3) { ret 7; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

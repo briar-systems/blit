@@ -1,0 +1,292 @@
+# toasts: a stack of timed notifications at an anchor, built on an overlay
+#
+# a Toasts record owns its notifications and a copy of each one's text, so
+# post can be called from anywhere, with or without a frame open. show draws
+# them each frame as cards in one overlay anchored to the surface, the newest
+# nearest the anchor and the older ones stacked away from it, and drops the
+# ones whose time is up. a toast's clock starts the first frame it is shown,
+# and it fades in over its first FADE seconds and out over its last.
+#
+# show asks for frames only while a toast is fading, and otherwise for the
+# moment the next one starts to fade out (see context.wake_at), so an
+# interface whose toasts are all gone reports no pending frame.
+#
+# the overlay claims nothing and neither do the cards, so the world under a
+# toast stays interactive.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use blit.context;
+use drv: blit.driver;
+use blit.layout;
+use blit.overlay;
+use blit.theme;
+use blit.widget;
+use allo: std.allocator;
+use std.allocator.page;
+
+# seconds a toast takes to fade in, and to fade out
+pub val FADE: f64 = 0.2;
+
+# seconds a toast is shown for when its post names none
+pub val SECONDS: f64 = 4.0;
+
+# least room a toast list grows to
+val INIT_CAP: usize = 8;
+
+# one notification
+# ---
+# text:    its text, owned, NUL-terminated
+# len:     bytes of text before the NUL
+# seconds: how long it is shown, fades included
+# born:    the time it was first shown
+# shown:   1 once a frame has shown it
+rec Toast {
+    text:    *u8;
+    len:     usize;
+    seconds: f64;
+    born:    f64;
+    shown:   u8;
+}
+
+# the notifications a toast stack holds, oldest first
+# ---
+# a:     allocator backing the list and the texts
+# items: the notifications
+# cap:   notifications allocated
+# len:   notifications held
+pub rec Toasts {
+    a:     *allo.Allocator;
+    items: *Toast;
+    cap:   usize;
+    len:   usize;
+}
+
+# start an empty toast stack
+# ---
+# t: the stack
+# a: allocator backing it
+pub fun init(t: *Toasts, a: *allo.Allocator) {
+    t.a     = a;
+    t.items = nil;
+    t.cap   = 0;
+    t.len   = 0;
+}
+
+# release the stack and every text it holds
+# ---
+# t:   the stack
+# ret: ok, or the first refusal
+pub fun free(t: *Toasts) err[allo.Error] {
+    for (t.len > 0) {
+        val e: err[allo.Error] = drop(t, t.len - 1);
+        if (sel e.err) { ret e; }
+    }
+    val ef: err[allo.Error] = allo.deallocate[Toast](t.a, t.items, t.cap);
+    if (sel ef.err) { ret ef; }
+    t.items = nil;
+    t.cap   = 0;
+    ret err[allo.Error].ok{};
+}
+
+# remove the toast at i, keeping the others in order
+fun drop(t: *Toasts, i: usize) err[allo.Error] {
+    val e: err[allo.Error] = allo.deallocate[u8](t.a, t.items[i].text, t.items[i].len + 1);
+    var k: usize           = i;
+    for (k + 1 < t.len) {
+        t.items[k] = t.items[k + 1];
+        k          = k + 1;
+    }
+    t.len = t.len - 1;
+    ret e;
+}
+
+# add a notification, shown for seconds once the next show draws it
+# ---
+# t:       the stack
+# text:    its text, copied
+# seconds: how long it is shown, fades included; 0 or less for SECONDS
+# ret:     ok, or the allocator's refusal with nothing added
+pub fun post(t: *Toasts, text: str, seconds: f64) err[allo.Error] {
+    if (t.len == t.cap) {
+        var n: usize = t.cap * 2;
+        if (n < INIT_CAP) { n = INIT_CAP; }
+        val r: res[*Toast, allo.Error] = allo.reallocate[Toast](t.a, t.items, t.cap, n);
+        if (sel r.err) { ret err[allo.Error].err{r.err}; }
+        t.items = r.ok;
+        t.cap   = n;
+    }
+    val n:  usize                = str_len(text);
+    val rb: res[*u8, allo.Error] = allo.allocate[u8](t.a, n + 1);
+    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        rb.ok[i] = text[i];
+        i        = i + 1;
+    }
+    rb.ok[n] = 0;
+
+    var s: f64 = seconds;
+    if (s <= 0.0) { s = SECONDS; }
+    t.items[t.len] = Toast{text: rb.ok, len: n, seconds: s, born: 0.0, shown: 0};
+    t.len          = t.len + 1;
+    ret err[allo.Error].ok{};
+}
+
+# how many notifications the stack holds
+# ---
+# t:   the stack
+# ret: the count, shown or still waiting for a show
+pub fun count(t: *Toasts) usize {
+    ret t.len;
+}
+
+# the opacity of a toast age seconds into its life of seconds
+fun opacity(age: f64, seconds: f64) f32 {
+    var a: f64 = 1.0;
+    if (age < FADE) { a = age / FADE; }
+    if (seconds - age < FADE) {
+        val out: f64 = (seconds - age) / FADE;
+        if (out < a) { a = out; }
+    }
+    if (a < 0.0) { a = 0.0; }
+    ret a::f32;
+}
+
+# draw one toast as a card at the next place in the overlay's column
+fun card(ctx: *context.Context, c: overlay.Chrome, s: str) {
+    val tw: f32          = context.text_width(ctx, s);
+    val lh: f32          = context.line_height(ctx);
+    val r:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), tw + c.pad * 2.0::f32, lh + c.pad * 2.0::f32);
+    overlay.paint(ctx, c, r.x0, r.y0, r.x1, r.y1);
+    context.text_at(ctx, s, r.x0 + c.pad, r.y0 + c.pad, c.text);
+}
+
+# show the stack's toasts at an anchor of the surface, and drop the ones
+# whose time is up
+#
+# the stack grows away from the anchor's edge: up from a bottom anchor, down
+# from any other, the newest nearest the anchor, and the cards line up on the
+# anchor's side. the toast style's margin keeps it off the edges.
+# ---
+# ctx: context
+# key: the overlay's key in the current id scope
+# t:   the stack
+# at:  the point of the surface it is anchored at
+pub fun show(ctx: *context.Context, key: str, t: *Toasts, at: overlay.Anchor) {
+    val now: f64   = ctx.in.time;
+    var i:   usize = 0;
+    for (i < t.len) {
+        if (t.items[i].shown == 0) {
+            t.items[i].born  = now;
+            t.items[i].shown = 1;
+        }
+        if (now - t.items[i].born >= t.items[i].seconds) {
+            val e: err[allo.Error] = drop(t, i);
+            if (sel e.err) { ctx.oom = 1; }
+            cnt;
+        }
+        i = i + 1;
+    }
+    if (t.len == 0) { ret; }
+
+    val m: theme.Edges     = context.px_edges(ctx, context.look_of(ctx, theme.TOAST).margin);
+    var o: overlay.Overlay = overlay.on_surface(at);
+    o.dx = m.l * (1.0::f32 - at.x) - m.r * at.x;
+    o.dy = m.t * (1.0::f32 - at.y) - m.b * at.y;
+    if (at.x > 0.5::f32)  { o.align = layout.Align.end{}; }
+    or (at.x == 0.5::f32) { o.align = layout.Align.center{}; }
+    val up: bool = at.y > 0.5::f32;
+
+    val c: overlay.Chrome = overlay.chrome(ctx, overlay.KIND_TOAST);
+    val s: overlay.Shown  = overlay.begin(ctx, key, o);
+    var k: usize          = 0;
+    for (k < t.len) {
+        var j: usize = t.len - 1 - k;
+        if (up) { j = k; }
+        val it:  Toast = t.items[j];
+        val age: f64   = now - it.born;
+        context.push_alpha(ctx, opacity(age, it.seconds));
+        card(ctx, c, it.text::str);
+        context.pop_alpha(ctx);
+        if (age < FADE || it.seconds - age < FADE) { context.wake_at(ctx, now); }
+        or                                         { context.wake_at(ctx, it.born + it.seconds - FADE); }
+        k = k + 1;
+    }
+    overlay.end(ctx, s);
+}
+
+# a toast stack in the bottom right corner
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    show(ctx, "toasts", user::*Toasts, overlay.BOTTOM_RIGHT);
+}
+
+# the top of the first text line drawn whose text is s, or -1
+#[testing]
+fun line_y(ctx: *context.Context, s: str) f32 {
+    var i: usize = 0;
+    for (i < context.traced_count(ctx)) {
+        val l: context.TextLine = context.traced_at(ctx, i);
+        i = i + 1;
+        if (l.len != str_len(s)) { cnt; }
+        var k: usize = 0;
+        for (k < l.len && l.text[k] == s[k]) { k = k + 1; }
+        if (k == l.len) { ret l.box.y0; }
+    }
+    ret 0.0::f32 - 1.0::f32;
+}
+
+test toast__stacks_fades_and_goes_idle {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var t: Toasts;
+    init(?t, ?a);
+    var d: drv.Driver;
+    val e: err[allo.Error] = drv.init(?d, ?a, 300.0::f32, 200.0::f32, probe_ui, (?t)::ptr);
+    if (sel e.err) { ret 1; }
+
+    # nothing posted: nothing drawn and nothing pending
+    drv.step(?d);
+    val none: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel none.none) { ret 2; }
+
+    val p1: err[allo.Error] = post(?t, "saved", 1.0);
+    val p2: err[allo.Error] = post(?t, "exported", 1.0);
+    if ((sel p1.err) || (sel p2.err) || count(?t) != 2) { ret 3; }
+    drv.steps(?d, 3);
+
+    # stacked up from the corner, the newest at the bottom, fading in
+    val ys: f32 = line_y(?d.ctx, "saved");
+    val ye: f32 = line_y(?d.ctx, "exported");
+    if (ys < 0.0::f32 || ye <= ys || ye > 200.0::f32) { ret 4; }
+    val fading: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel fading.some)        { ret 5; }
+    if (fading.some != 0.0::f64) { ret 5; }
+
+    # held at full: the next frame wanted is when the fade out starts
+    drv.steps(?d, 20);
+    val born: f64      = t.items[0].born;
+    val hold: opt[f64] = context.next_frame(?d.ctx);
+    if (!sel hold.some)                      { ret 6; }
+    if (hold.some != born + 1.0::f64 - FADE) { ret 6; }
+
+    # gone once their time is up, and the interface idle again
+    drv.steps(?d, 60);
+    val idle: opt[f64] = context.next_frame(?d.ctx);
+    if (count(?t) != 0 || line_y(?d.ctx, "saved") >= 0.0::f32) { ret 7; }
+    if (!sel idle.none)                                        { ret 8; }
+
+    val ft: err[allo.Error] = free(?t);
+    if (sel ft.err) { ret 1; }
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
