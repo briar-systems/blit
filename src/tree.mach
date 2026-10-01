@@ -46,6 +46,7 @@ use blit.input;
 use blit.interact;
 use blit.state;
 use blit.store;
+use blit.theme;
 use blit.widget;
 
 # clicks do not select
@@ -269,7 +270,7 @@ pub fun invalidate(t: *Tree) {
 # draw one row and record what a click on it asks for
 fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
     val ctx: *context.Context = w.ctx;
-    val pad: f32              = context.px(ctx, ctx.theme.pad);
+    val pad: f32              = context.px(ctx, context.look_of(ctx, theme.TREE_ITEM).inset.l);
     val x0:  f32              = w.x0;
     val x1:  f32              = w.x1;
     val y0:  f32              = w.y + row::f32 * w.rh;
@@ -303,21 +304,12 @@ fun emit(w: *Walk, it: *Item, id: u64, depth: usize, row: usize, open: bool) {
         w.ev.handle  = it.handle;
     }
 
-    val corner: f32        = context.px(ctx, ctx.theme.corner);
-    var ink:    draw.Color = ctx.theme.text;
-    if (it.selected) {
-        context.fill(ctx, x0, y0, x1, y1, corner, context.CORNERS_ALL, ctx.theme.accent);
-        ink = ctx.theme.accent_text;
-    }
-    or (h.active) { context.fill(ctx, x0, y0, x1, y1, corner, context.CORNERS_ALL, ctx.theme.control_on); }
-    or (h.hot)    { context.fill(ctx, x0, y0, x1, y1, corner, context.CORNERS_ALL, ctx.theme.control_hot); }
+    val st:  u8           = theme.pick(h.hot, h.active, it.selected, false);
+    val ink: *theme.Paint = context.paint_of(ctx, theme.TREE_ITEM, st);
+    context.box(ctx, theme.TREE_ITEM, st, x0, y0, x1, y1);
     val ty: f32 = y0 + (w.rh - w.lh) / 2.0::f32;
-    if (!it.leaf) {
-        var cc: draw.Color = ctx.theme.text_dim;
-        if (it.selected) { cc = ink; }
-        widget.caret(ctx, cx, ty, w.lh, open, cc);
-    }
-    if (it.label != nil) { context.text_at(ctx, it.label, tx, ty, ink); }
+    if (!it.leaf)        { widget.caret(ctx, cx, ty, w.lh, open, ink.mark); }
+    if (it.label != nil) { context.text_at(ctx, it.label, tx, ty, ink.text); }
 
     if (w.src.row != nil) {
         var r: Row;
@@ -542,8 +534,9 @@ pub fun tree(ctx: *context.Context, key: str, t: *Tree, src: *Source, h: f32) Ev
     w.src   = src;
     w.stamp = t.epoch + 1;
     w.lh    = context.line_height(ctx);
-    w.rh    = context.px(ctx, ctx.theme.row);
-    val fit: f32 = w.lh + context.px(ctx, ctx.theme.pad) * 2.0::f32;
+    val ts: *theme.Style = context.look_of(ctx, theme.TREE_ITEM);
+    w.rh = context.px(ctx, ts.min_h);
+    val fit: f32 = w.lh + context.px(ctx, ts.inset.t + ts.inset.b);
     if (fit > w.rh) { w.rh = fit; }
     val a: context.Area = widget.avail(ctx);
     w.x0 = a.x0;

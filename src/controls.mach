@@ -31,6 +31,7 @@ use blit.input;
 use blit.interact;
 use blit.layout;
 use blit.state;
+use blit.theme;
 use blit.widget;
 use allo: std.allocator;
 use std.allocator.page;
@@ -44,24 +45,29 @@ pub val COMBO_ROWS: usize = 8;
 # bytes a combo's filter text holds, the terminator included
 pub val COMBO_FILTER: usize = 256;
 
-# the theme's space inside chrome, at the context's scale
-fun pad(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.pad);
+# a kind's control inset, at the context's scale
+fun inset(ctx: *context.Context, kind: u32) theme.Edges {
+    ret context.px_edges(ctx, context.look_of(ctx, kind).inset);
 }
 
-# the corner radius of a control, at the context's scale
-fun corner(ctx: *context.Context) f32 {
-    ret context.px(ctx, ctx.theme.corner);
+# height of a kind's row: its least height, grown to fit a line of text with
+# its inset above and below
+fun row_of(ctx: *context.Context, kind: u32) f32 {
+    val i: theme.Edges = inset(ctx, kind);
+    ret maxf(context.px(ctx, context.look_of(ctx, kind).min_h), context.line_height(ctx) + i.t + i.b);
 }
 
-# height of a control row, without the gap below it
-fun row_h(ctx: *context.Context) f32 {
-    ret widget.control_row_height(ctx) - widget.row_gap(ctx);
+# a kind's paint in a state
+fun ink(ctx: *context.Context, kind: u32, state: u8) *theme.Paint {
+    ret context.paint_of(ctx, kind, state);
 }
 
-# a control-shaped fill: rounded to the theme's corner on every side
-fun face(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
-    context.fill(ctx, x0, y0, x1, y1, corner(ctx), context.CORNERS_ALL, c);
+# a circle in a kind's paint: its fill and its outline
+fun disc(ctx: *context.Context, kind: u32, state: u8, cx: f32, cy: f32, r: f32) {
+    val p: *theme.Paint = ink(ctx, kind, state);
+    if (p.fill.a > 0.0::f32) { context.circle(ctx, cx, cy, r, p.fill); }
+    val bw: f32 = context.px(ctx, p.border_w);
+    if (bw > 0.0::f32 && p.border.a > 0.0::f32) { context.stroke_circle(ctx, cx, cy, r - bw / 2.0::f32, bw, p.border); }
 }
 
 # ask for the hand pointer over a clickable control while it is hovered
@@ -99,12 +105,13 @@ fun maxf(a: f32, b: f32) f32 {
 # ret:    true if the choice changed this frame
 pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) bool {
     val id:  u64          = context.id_of(ctx, label);
-    val box: f32          = row_h(ctx);
+    val box: f32          = row_of(ctx, theme.RADIO);
+    val sp:  f32          = inset(ctx, theme.RADIO).l;
     val tw:  f32          = context.text_width_n(ctx, label, bid.shown(label));
-    val at:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), box + pad(ctx) + tw, box);
+    val at:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), box + sp + tw, box);
     val x0:  f32          = at.x0;
     val y0:  f32          = at.y0;
-    val tx:  f32          = x0 + box + pad(ctx);
+    val tx:  f32          = x0 + box + sp;
     val x1:  f32          = tx + tw;
     val hr:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y0 + box, input.BUTTON_LEFT);
     hand(ctx, hr);
@@ -115,15 +122,14 @@ pub fun radio(ctx: *context.Context, label: str, choice: *usize, value: usize) b
         changed = true;
     }
 
-    var bg: draw.Color = ctx.theme.control;
-    if (hr.hot) { bg = ctx.theme.control_hot; }
+    val st: u8  = theme.pick(hr.hot, hr.active, false, false);
     val r:  f32 = box / 2.0::f32;
     val cx: f32 = x0 + r;
     val cy: f32 = y0 + r;
-    context.circle(ctx, cx, cy, r, bg);
-    if (@choice == value) { context.circle(ctx, cx, cy, r - pad(ctx), ctx.theme.accent); }
+    disc(ctx, theme.RADIO, st, cx, cy, r);
+    if (@choice == value) { disc(ctx, theme.RADIO_MARK, theme.ON, cx, cy, r - context.px(ctx, context.look_of(ctx, theme.RADIO).pad.l)); }
 
-    context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ctx.theme.text);
+    context.text_span(ctx, label, bid.shown(label), tx, text_top(ctx, y0, box), ink(ctx, theme.RADIO, st).text);
     ret changed;
 }
 
@@ -148,14 +154,15 @@ pub fun radios(ctx: *context.Context, labels: *str, n: usize, choice: *usize) bo
 fun bar_at(ctx: *context.Context, s: str) context.Area {
     var tw: f32 = 0.0::f32;
     if (s != nil) { tw = context.text_width(ctx, s); }
-    ret widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx) * 2.0::f32, row_h(ctx));
+    val in: theme.Edges = inset(ctx, theme.PROGRESS);
+    ret widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + in.l + in.r, row_of(ctx, theme.PROGRESS));
 }
 
 # text centred over a progress bar from x0 to x1, h tall at y0
 fun bar_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, h: f32) {
     if (s == nil) { ret; }
     val tw: f32 = context.text_width(ctx, s);
-    context.text_at(ctx, s, x0 + (x1 - x0 - tw) / 2.0::f32, text_top(ctx, y0, h), ctx.theme.text);
+    context.text_at(ctx, s, x0 + (x1 - x0 - tw) / 2.0::f32, text_top(ctx, y0, h), ink(ctx, theme.PROGRESS, theme.NORMAL).text);
 }
 
 # a progress bar across the column filled to frac of its width
@@ -169,9 +176,9 @@ pub fun progress(ctx: *context.Context, frac: f32, s: str) {
     val y0: f32          = at.y0;
     val h:  f32          = at.y1 - at.y0;
     val x1: f32          = at.x1;
-    face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
+    context.box(ctx, theme.PROGRESS, theme.NORMAL, x0, y0, x1, y0 + h);
     val fx: f32 = x0 + (x1 - x0) * clampf(frac, 0.0::f32, 1.0::f32);
-    if (fx > x0) { face(ctx, x0, y0, fx, y0 + h, ctx.theme.accent); }
+    if (fx > x0) { context.box(ctx, theme.PROGRESS_BAR, theme.NORMAL, x0, y0, fx, y0 + h); }
     bar_text(ctx, s, x0, y0, x1, h);
 }
 
@@ -192,7 +199,7 @@ pub fun progress_busy(ctx: *context.Context, s: str) {
     val h:  f32          = at.y1 - at.y0;
     val x1: f32          = at.x1;
     val w:  f32          = x1 - x0;
-    face(ctx, x0, y0, x1, y0 + h, ctx.theme.track);
+    context.box(ctx, theme.PROGRESS, theme.NORMAL, x0, y0, x1, y0 + h);
 
     # the segment enters from the left and leaves at the right, travelling w + seg
     val seg:    f32 = w / 3.0::f32;
@@ -203,7 +210,7 @@ pub fun progress_busy(ctx: *context.Context, s: str) {
         val sx:    f32 = x0 - seg + travel * phase;
         val s0:    f32 = clampf(sx, x0, x1);
         val s1:    f32 = clampf(sx + seg, x0, x1);
-        if (s1 > s0) { face(ctx, s0, y0, s1, y0 + h, ctx.theme.accent); }
+        if (s1 > s0) { context.box(ctx, theme.PROGRESS_BAR, theme.NORMAL, s0, y0, s1, y0 + h); }
         context.wake_at(ctx, ctx.in.time + BUSY_PERIOD / travel::f64);
     }
     bar_text(ctx, s, x0, y0, x1, h);
@@ -213,9 +220,10 @@ pub fun progress_busy(ctx: *context.Context, s: str) {
 # ---
 # ctx: context
 pub fun separator(ctx: *context.Context) {
-    val ew: f32          = context.px(ctx, ctx.theme.edge_w);
+    val p:  *theme.Paint = ink(ctx, theme.SEPARATOR, theme.NORMAL);
+    val ew: f32          = context.px(ctx, p.border_w);
     val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), 0.0::f32, ew);
-    context.quad(ctx, at.x0, at.y0, at.x1, at.y1, ctx.theme.edge);
+    context.quad(ctx, at.x0, at.y0, at.x1, at.y1, p.border);
 }
 
 # a labelled rule: dim text on the left and the rule running on from it to
@@ -227,17 +235,19 @@ pub fun separator_label(ctx: *context.Context, label: str) {
     val lh: f32          = context.line_height(ctx);
     val n:  usize        = bid.shown(label);
     val tw: f32          = context.text_width_n(ctx, label, n);
-    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + pad(ctx), lh);
+    val p:  *theme.Paint = ink(ctx, theme.SEPARATOR, theme.NORMAL);
+    val sp: f32          = inset(ctx, theme.SEPARATOR).r;
+    val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), tw + sp, lh);
     val x0: f32          = at.x0;
     val y0: f32          = at.y0;
     val x1: f32          = at.x1;
-    context.text_span(ctx, label, n, x0, y0, ctx.theme.text_dim);
+    context.text_span(ctx, label, n, x0, y0, p.mark);
 
     var rx: f32 = x0;
-    if (n > 0) { rx = x0 + tw + pad(ctx); }
-    val ew: f32 = context.px(ctx, ctx.theme.edge_w);
+    if (n > 0) { rx = x0 + tw + sp; }
+    val ew: f32 = context.px(ctx, p.border_w);
     val ry: f32 = y0 + (lh - ew) / 2.0::f32;
-    if (rx < x1) { context.quad(ctx, rx, ry, x1, ry + ew, ctx.theme.edge); }
+    if (rx < x1) { context.quad(ctx, rx, ry, x1, ry + ew, p.border); }
 }
 
 # the state a combo keeps in the context's store under its header's id
@@ -340,8 +350,9 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
         wo = maxf(wo, context.text_width(ctx, options[k]));
         k  = k + 1;
     }
-    val h:  f32          = row_h(ctx);
-    val nw: f32          = context.text_width_n(ctx, label, bid.shown(label)) + wo + pad(ctx) * 3.0::f32;
+    val h:  f32          = row_of(ctx, theme.DROPDOWN);
+    val in: theme.Edges  = inset(ctx, theme.DROPDOWN);
+    val nw: f32          = context.text_width_n(ctx, label, bid.shown(label)) + wo + in.l * 2.0::f32 + in.r;
     val at: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nw, h);
     val x0: f32          = at.x0;
     val y0: f32          = at.y0;
@@ -360,15 +371,14 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
         if (st.hi >= count) { st.hi = combo_step(st, options, count, 0, 1); }
     }
 
-    var bg: draw.Color = ctx.theme.control;
-    if (hd.hot)       { bg = ctx.theme.control_hot; }
-    if (st.open != 0) { bg = ctx.theme.control_on; }
-    face(ctx, x0, y0, x1, y0 + h, bg);
+    val hs:  u8          = theme.pick(hd.hot, hd.active, st.open != 0, false);
+    val oin: theme.Edges = inset(ctx, theme.LIST_ITEM);
+    context.box(ctx, theme.DROPDOWN, hs, x0, y0, x1, y0 + h);
     val ty: f32 = text_top(ctx, y0, h);
-    context.text_span(ctx, label, bid.shown(label), x0 + pad(ctx), ty, ctx.theme.text);
+    context.text_span(ctx, label, bid.shown(label), x0 + in.l, ty, ink(ctx, theme.DROPDOWN, hs).text);
     if (@selected < count) {
         val cur: str = options[@selected];
-        context.text_at(ctx, cur, x1 - pad(ctx) - context.text_width(ctx, cur), ty, ctx.theme.text);
+        context.text_at(ctx, cur, x1 - in.r - context.text_width(ctx, cur), ty, ink(ctx, theme.DROPDOWN, hs).text);
     }
 
     context.push_id(ctx, id);
@@ -418,7 +428,7 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
             i = 0;
             for (i < count) {
                 if (widget.matches(options[i], field.text(?st.filter))) {
-                    val row: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), context.text_width(ctx, options[i]) + pad(ctx) * 2.0::f32, h);
+                    val row: context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), context.text_width(ctx, options[i]) + oin.l + oin.r, h);
                     val oy0: f32          = row.y0;
                     val oy1: f32          = row.y1;
                     if (oy1 > top && oy0 < top + r.h) {
@@ -429,13 +439,9 @@ pub fun combo(ctx: *context.Context, label: str, selected: *usize, options: *str
                         if (ho.hot && follow) { st.hi = i; }
                         if (ho.clicked)       { pick = i; }
 
-                        var ink: draw.Color = ctx.theme.text;
-                        if (i == @selected) {
-                            face(ctx, ox0, oy0, ox1, oy1, ctx.theme.accent);
-                            ink = ctx.theme.accent_text;
-                        }
-                        or (i == st.hi) { face(ctx, ox0, oy0, ox1, oy1, ctx.theme.control_hot); }
-                        context.text_at(ctx, options[i], ox0 + pad(ctx), text_top(ctx, oy0, h), ink);
+                        val os: u8 = theme.pick(i == st.hi, ho.active, i == @selected, false);
+                        context.box(ctx, theme.LIST_ITEM, os, ox0, oy0, ox1, oy1);
+                        context.text_at(ctx, options[i], ox0 + oin.l, text_top(ctx, oy0, h), ink(ctx, theme.LIST_ITEM, os).text);
                     }
                 }
                 i = i + 1;

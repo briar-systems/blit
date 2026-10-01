@@ -52,7 +52,7 @@ use std.memory;
 pub val SERIES: usize = 8;
 
 # how many widget kinds a theme styles
-pub val KINDS: u32 = 31;
+pub val KINDS: u32 = 39;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -119,6 +119,22 @@ pub val OVERLAY: u32 = 28;
 pub val MODAL: u32 = 29;
 # the scrim behind a modal dialog
 pub val SCRIM: u32 = 30;
+# a radio button's ring: pad around the dot, inset.l between ring and label
+pub val RADIO: u32 = 31;
+# a radio button's dot, drawn in its on state
+pub val RADIO_MARK: u32 = 32;
+# a progress bar's track and its text
+pub val PROGRESS: u32 = 33;
+# a progress bar's done part
+pub val PROGRESS_BAR: u32 = 34;
+# a separator: border its rule and border_w its width, mark a label, inset.r between label and rule
+pub val SEPARATOR: u32 = 35;
+# a tree's row, on while selected: mark the caret
+pub val TREE_ITEM: u32 = 36;
+# where a drag would drop: fill and border
+pub val DROP_TARGET: u32 = 37;
+# what a drag carries, drawn at the cursor
+pub val DRAG_PREVIEW: u32 = 38;
 
 # at rest
 pub val NORMAL: u8 = 0;
@@ -132,6 +148,22 @@ pub val ON: u8 = 3;
 pub val DISABLED: u8 = 4;
 # holding the keyboard
 pub val FOCUSED: u8 = 5;
+
+# the state a widget paints in, the first that holds of on, focused, active
+# and hot, else normal
+# ---
+# hot:     under the cursor
+# active:  pressed or dragged
+# on:      set: checked, chosen, selected or open
+# focused: holding the keyboard
+# ret:     NORMAL, HOT, ACTIVE, ON or FOCUSED
+pub fun pick(hot: bool, active: bool, on: bool, focused: bool) u8 {
+    if (on)      { ret ON; }
+    if (focused) { ret FOCUSED; }
+    if (active)  { ret ACTIVE; }
+    if (hot)     { ret HOT; }
+    ret NORMAL;
+}
 
 # a length on each side of a rect, in unscaled pixels
 # ---
@@ -240,7 +272,7 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
-    styles:      [31]Style;
+    styles:      [39]Style;
 }
 
 # a field holding a color, four floats
@@ -348,7 +380,7 @@ pub rec Name {
 }
 
 # every widget kind, indexed by the kind constants
-pub val KIND_NAMES: [31]Name = [31]Name{
+pub val KIND_NAMES: [39]Name = [39]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin between cells, columns and rows placed by hand, and a generic container's pad"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -379,7 +411,15 @@ pub val KIND_NAMES: [31]Name = [31]Name{
     Name{name: "menu_item", doc: "a row of a menu, and a dropdown's option"},
     Name{name: "overlay", doc: "an overlay, chrome-free unless its style gives it a fill"},
     Name{name: "modal", doc: "a modal dialog's body"},
-    Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"}
+    Name{name: "scrim", doc: "the scrim over everything behind a modal dialog"},
+    Name{name: "radio", doc: "a radio button's ring: pad around the dot, inset.l between the ring and the label"},
+    Name{name: "radio_mark", doc: "a radio button's dot, drawn in its on state"},
+    Name{name: "progress", doc: "a progress bar's track and its text"},
+    Name{name: "progress_bar", doc: "a progress bar's done part"},
+    Name{name: "separator", doc: "a separator: border its rule and border_w the rule's width, mark a label, inset.r between label and rule"},
+    Name{name: "tree_item", doc: "a tree's row, on while selected: mark the caret"},
+    Name{name: "drop_target", doc: "where a drag would drop: fill and border"},
+    Name{name: "drag_preview", doc: "what a drag carries, drawn at the cursor"}
 };
 
 # every state, indexed by the state constants
@@ -1064,6 +1104,47 @@ pub fun derive(t: *Theme) {
     s.radius        = draw.radii(0.0::f32);
     fill_all(?s, draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));
     t.styles[SCRIM] = s;
+
+    s = base(t);
+    fills(?s, t.control, t.control_hot, t.control_hot, t.control);
+    t.styles[RADIO] = s;
+    s               = base(t);
+    fill_all(?s, t.accent);
+    t.styles[RADIO_MARK] = s;
+
+    s = base(t);
+    fill_all(?s, t.track);
+    t.styles[PROGRESS] = s;
+    s                  = base(t);
+    fill_all(?s, t.accent);
+    t.styles[PROGRESS_BAR] = s;
+
+    s = base(t);
+    i = 0;
+    for (i < STATES::usize) {
+        s.states[i].border   = t.edge;
+        s.states[i].border_w = t.edge_w;
+        i                    = i + 1;
+    }
+    t.styles[SEPARATOR] = s;
+
+    s                   = t.styles[LIST_ITEM];
+    t.styles[TREE_ITEM] = s;
+
+    s        = base(t);
+    s.radius = draw.radii(0.0::f32);
+    fill_all(?s, t.select);
+    i = 0;
+    for (i < STATES::usize) {
+        s.states[i].border   = t.accent;
+        s.states[i].border_w = t.edge_w;
+        i                    = i + 1;
+    }
+    t.styles[DROP_TARGET] = s;
+    s                     = base(t);
+    s.radius              = draw.radii(0.0::f32);
+    fill_all(?s, t.control);
+    t.styles[DRAG_PREVIEW] = s;
 }
 
 # the floats of a theme's styles
@@ -1208,7 +1289,7 @@ pub fun dark() Theme {
     derive(?t);
     shade(?t, BUTTON, 0.85::f32);
     val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.35::f32);
-    elevate(?t, WINDOW_TITLE, sh, 2.0::f32, 8.0::f32);
+    elevate(?t, WINDOW, sh, 2.0::f32, 8.0::f32);
     elevate(?t, POPUP, sh, 3.0::f32, 10.0::f32);
     elevate(?t, MENU, sh, 3.0::f32, 10.0::f32);
     elevate(?t, TOOLTIP, sh, 2.0::f32, 6.0::f32);
@@ -1248,7 +1329,7 @@ pub fun light() Theme {
     outline(?t, FIELD, t.edge, 1.0::f32);
     t.styles[FIELD].states[FOCUSED].border = t.accent;
     val sh: draw.Color = draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.15::f32);
-    elevate(?t, WINDOW_TITLE, sh, 1.0::f32, 6.0::f32);
+    elevate(?t, WINDOW, sh, 1.0::f32, 6.0::f32);
     elevate(?t, POPUP, sh, 2.0::f32, 8.0::f32);
     elevate(?t, MENU, sh, 2.0::f32, 8.0::f32);
     elevate(?t, TOOLTIP, sh, 1.0::f32, 4.0::f32);
@@ -1297,6 +1378,8 @@ pub fun contrast() Theme {
     outline(?t, DROPDOWN, white, 1.0::f32);
     outline(?t, FIELD, white, 1.0::f32);
     outline(?t, TAB, white, 1.0::f32);
+    outline(?t, RADIO, white, 1.0::f32);
+    outline(?t, PROGRESS, white, 1.0::f32);
     outline(?t, WINDOW_TITLE, white, 1.0::f32);
     outline(?t, POPUP, white, 1.0::f32);
     outline(?t, MENU, white, 1.0::f32);

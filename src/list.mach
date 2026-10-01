@@ -38,6 +38,7 @@ use bid: blit.id;
 use blit.input;
 use blit.interact;
 use blit.layout;
+use blit.theme;
 use blit.widget;
 
 # whether item index is shown for query; user is Rows.user
@@ -119,9 +120,9 @@ pub fun rows(labels: *str, count: usize) Rows {
     ret r;
 }
 
-# a control-shaped fill: rounded to the theme's corner on every side
-fun face(ctx: *context.Context, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
-    context.fill(ctx, x0, y0, x1, y1, context.px(ctx, ctx.theme.corner), context.CORNERS_ALL, c);
+# a row's inset between its edges and its labels, at the context's scale
+fun row_pad(ctx: *context.Context) f32 {
+    ret context.px(ctx, context.look_of(ctx, theme.LIST_ITEM).inset.l);
 }
 
 # whether item i is shown
@@ -182,7 +183,7 @@ fun click_many(l: *List, r: *Rows, i: usize, mods: u8) bool {
 # paint a row's label at its left and its secondary label right-aligned, the
 # label clipped short of the secondary one when it would reach it
 fun draw_labels(ctx: *context.Context, r: *Rows, row: Row) {
-    val pad:    f32  = context.px(ctx, ctx.theme.pad);
+    val pad:    f32  = row_pad(ctx);
     val ty:     f32  = row.y0 + (row.y1 - row.y0 - context.line_height(ctx)) / 2.0::f32;
     val label:  bool = r.labels != nil && r.labels[row.index] != nil;
     val detail: bool = r.details != nil && r.details[row.index] != nil;
@@ -203,7 +204,7 @@ fun draw_labels(ctx: *context.Context, r: *Rows, row: Row) {
 # the width item i's labels need with the padding they are drawn with, or 0
 # for a row with neither, which a drawer sizes by the list's width alone
 fun natural_w(ctx: *context.Context, r: *Rows, i: usize) f32 {
-    val pad: f32 = context.px(ctx, ctx.theme.pad);
+    val pad: f32 = row_pad(ctx);
     var w:   f32 = 0.0::f32;
     if (r.labels != nil && r.labels[i] != nil)   { w = context.text_width(ctx, r.labels[i]) + pad; }
     if (r.details != nil && r.details[i] != nil) { w = w + context.text_width(ctx, r.details[i]) + pad; }
@@ -257,15 +258,11 @@ pub fun show(ctx: *context.Context, key: str, l: *List, r: Rows, h: f32) bool {
                 }
 
                 row.selected = is_selected(l, i);
-                row.ink      = ctx.theme.text;
-                row.dim      = ctx.theme.text_dim;
-                if (row.selected) {
-                    face(ctx, row.x0, row.y0, row.x1, row.y1, ctx.theme.accent);
-                    row.ink = ctx.theme.accent_text;
-                    row.dim = ctx.theme.accent_text;
-                }
-                or (row.hit.active) { face(ctx, row.x0, row.y0, row.x1, row.y1, ctx.theme.control_on); }
-                or (row.hit.hot)    { face(ctx, row.x0, row.y0, row.x1, row.y1, ctx.theme.control_hot); }
+                val st: u8           = theme.pick(row.hit.hot, row.hit.active, row.selected, false);
+                val p:  *theme.Paint = context.paint_of(ctx, theme.LIST_ITEM, st);
+                row.ink = p.text;
+                row.dim = p.mark;
+                context.box(ctx, theme.LIST_ITEM, st, row.x0, row.y0, row.x1, row.y1);
 
                 if (r.draw != nil) { r.draw(ctx, r.user, row); }
                 or                 { draw_labels(ctx, ?r, row); }

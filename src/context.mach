@@ -2506,6 +2506,20 @@ pub fun box(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: 
     box_part(ctx, kind, state, x0, y0, x1, y1, CORNERS_ALL, SIDES_ALL);
 }
 
+# a kind's corner radii in pixels, on the corners named
+fun radii_of(ctx: *Context, s: *th.Style, corners: u8) draw.Radii {
+    var r: draw.Radii = draw.radii(0.0::f32);
+    if ((corners & CORNERS_TOP) != 0) {
+        r.tl = s.radius.tl * ctx.scale;
+        r.tr = s.radius.tr * ctx.scale;
+    }
+    if ((corners & CORNERS_BOTTOM) != 0) {
+        r.br = s.radius.br * ctx.scale;
+        r.bl = s.radius.bl * ctx.scale;
+    }
+    ret r;
+}
+
 # paint part of a widget kind's box: box with only some corners rounded and
 # some sides outlined, for a box drawn in pieces, such as a window's titlebar
 # above its body or a dock's inner edge
@@ -2520,22 +2534,45 @@ pub fun box(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: 
 # corners: which corners are rounded, CORNERS_* combined with |
 # sides:   which sides are outlined, SIDES_* combined with |
 pub fun box_part(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
+    box_shadow(ctx, kind, state, x0, y0, x1, y1, corners);
+    box_face(ctx, kind, state, x0, y0, x1, y1, corners, sides);
+}
+
+# paint a widget kind's shadow in a state alone, for a box whose pieces are
+# drawn apart, such as a window's titlebar and body under one shadow
+# ---
+# ctx:     context
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+pub fun box_shadow(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8) {
+    val s: *th.Style = ?ctx.theme.styles[kind];
+    val p: *th.Paint = ?s.states[state];
+    if (p.shadow.a <= 0.0::f32) { ret; }
+    val dx: f32 = s.shadow_x * ctx.scale;
+    val dy: f32 = s.shadow_y * ctx.scale;
+    shadow(ctx, x0 + dx, y0 + dy, x1 + dx, y1 + dy, radii_of(ctx, s, corners), s.shadow_blur * ctx.scale, p.shadow);
+}
+
+# paint a widget kind's face and outline in a state, without its shadow
+# ---
+# ctx:     context
+# kind:    theme.LABEL .. theme.SCRIM
+# state:   theme.NORMAL .. theme.FOCUSED
+# x0:      left x in pixels
+# y0:      top y in pixels
+# x1:      right x in pixels
+# y1:      bottom y in pixels
+# corners: which corners are rounded, CORNERS_* combined with |
+# sides:   which sides are outlined, SIDES_* combined with |
+pub fun box_face(ctx: *Context, kind: u32, state: u8, x0: f32, y0: f32, x1: f32, y1: f32, corners: u8, sides: u8) {
     val s: *th.Style  = ?ctx.theme.styles[kind];
     val p: *th.Paint  = ?s.states[state];
-    var r: draw.Radii = draw.radii(0.0::f32);
-    if ((corners & CORNERS_TOP) != 0) {
-        r.tl = s.radius.tl * ctx.scale;
-        r.tr = s.radius.tr * ctx.scale;
-    }
-    if ((corners & CORNERS_BOTTOM) != 0) {
-        r.br = s.radius.br * ctx.scale;
-        r.bl = s.radius.bl * ctx.scale;
-    }
-    if (p.shadow.a > 0.0::f32) {
-        val dx: f32 = s.shadow_x * ctx.scale;
-        val dy: f32 = s.shadow_y * ctx.scale;
-        shadow(ctx, x0 + dx, y0 + dy, x1 + dx, y1 + dy, r, s.shadow_blur * ctx.scale, p.shadow);
-    }
+    val r: draw.Radii = radii_of(ctx, s, corners);
     if (same_color(p.fill, p.fill_to)) {
         if (p.fill.a > 0.0::f32) { rounded_rect(ctx, x0, y0, x1, y1, r, p.fill); }
     }
