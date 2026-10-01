@@ -1,0 +1,1293 @@
+# value editors: numbers dragged or typed, vectors of them and ranges
+#
+# a drag editor changes a number by dragging across it: the value moves by
+# speed per pixel of horizontal travel, and FINE times as far while shift is
+# held, so a held modifier slows only the motion made while it is down. a
+# double click turns it into a text field holding the value, all selected:
+# enter or a press elsewhere commits what was typed and escape leaves the
+# value as it was. a number editor is that text field always, with steppers
+# that add or take away a step. drag_n edits 2 to 4 values side by side in
+# one row, and drag_range a low and a high value that never cross.
+#
+# a value is one of the kinds I8 to I64, U8 to U64, F32 and F64, held while
+# it is edited as a Num, wide enough for every kind, so nothing an editor
+# does passes a 64-bit integer through a float or an f64 through anything
+# narrower. integers move by whole steps, saturating at the bounds of their
+# type: the fraction of a step a drag has not yet made waits for the next
+# pixel. a float moves by its drag's travel since the press, rounded to the
+# decimals of the value at the press or of the speed, whichever has more, so
+# dragging 1.5 by 0.01 a pixel lands on 1.6, never on 1.6000000000000003. a
+# value shows as the shortest text that reads back as exactly that value of
+# its kind, and typed text is read exactly, so a value typed back as it is
+# shown is unchanged. typed text that is not a number of the kind leaves the
+# value as it was, and a number beyond the editor's bounds or its type's is
+# clamped to them.
+#
+# bounds lo and hi clamp a value when lo < hi, and leave it to its type's
+# range otherwise (pass equal bounds, such as 0 and 0, for none).
+#
+# an editor's label is its key (see context.id_of) and is drawn on the left of
+# the row, so "##" hides it. each value's cell is a part of the editor keyed
+# "#0" to "#3" in the editor's id scope, so "speed/#0" names the first cell of
+# the editor labelled "speed" to a driver, and a number editor's steppers are
+# its parts "-" and "+".
+#
+# Entry, the typed text cell beneath them, is public for a control that edits
+# a value of its own as text, as the colour picker's hex field does.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use allo: std.allocator;
+use std.allocator.page;
+use fmt: std.format;
+use io:  std.io.writer;
+use tp:  std.text.parse;
+
+use blit.context;
+use blit.draw;
+use drv: blit.driver;
+use blit.edit;
+use blit.field;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.theme;
+use blit.widget;
+
+# the kinds of value an editor edits
+pub val I8:  u8 = 0;
+pub val I16: u8 = 1;
+pub val I32: u8 = 2;
+pub val I64: u8 = 3;
+pub val U8:  u8 = 4;
+pub val U16: u8 = 5;
+pub val U32: u8 = 6;
+pub val U64: u8 = 7;
+pub val F32: u8 = 8;
+pub val F64: u8 = 9;
+
+# how much slower a drag moves while shift is held
+pub val FINE: f64 = 0.1;
+
+# bytes the text of a value takes at most, the terminator included
+pub val TEXT_CAP: usize = 48;
+
+# bytes an Entry's text holds, the terminator included
+pub val ENTRY_CAP: usize = 64;
+
+# bytes of undo history an Entry keeps
+val HISTORY_CAP: usize = 384;
+
+# the keys of an editor's cells, in its id scope
+val CELLS: [4]str = [4]str{"#0", "#1", "#2", "#3"};
+
+# a value of any kind, widened without loss: i for I8 to I64, u for U8 to U64,
+# f for F32 and F64
+pub uni Num {
+    i: i64;
+    u: u64;
+    f: f64;
+}
+
+# the kind of a type an editor takes, a compile error for any other
+# ---
+# ret: I8 to F64
+pub fun kind_of[T]() u8 {
+    var x: T;
+    $if ($type_of(x) == i8)  { ret I8; }
+    $or ($type_of(x) == i16) { ret I16; }
+    $or ($type_of(x) == i32) { ret I32; }
+    $or ($type_of(x) == i64) { ret I64; }
+    $or ($type_of(x) == u8)  { ret U8; }
+    $or ($type_of(x) == u16) { ret U16; }
+    $or ($type_of(x) == u32) { ret U32; }
+    $or ($type_of(x) == u64) { ret U64; }
+    $or ($type_of(x) == f32) { ret F32; }
+    $or ($type_of(x) == f64) { ret F64; }
+    $or                      { $error("a value editor takes i8 to i64, u8 to u64, f32 or f64"); }
+}
+
+# a value of a type an editor takes, widened to a Num
+# ---
+# x:   the value
+# ret: it as a Num of its kind
+pub fun num[T](x: T) Num {
+    var n: Num;
+    $if ($type_of(x) == f32 || $type_of(x) == f64)                                            { n.f = x::f64; }
+    $or ($type_of(x) == u8 || $type_of(x) == u16 || $type_of(x) == u32 || $type_of(x) == u64) { n.u = x::u64; }
+    $or                                                                                       { n.i = x::i64; }
+    ret n;
+}
+
+# whether a kind is a signed integer
+fun signed(k: u8) bool {
+    ret k <= I64;
+}
+
+# whether a kind is a float
+fun float(k: u8) bool {
+    ret k >= F32;
+}
+
+# bytes one value of a kind takes
+fun width_of(k: u8) usize {
+    if (k == I8 || k == U8)               { ret 1; }
+    if (k == I16 || k == U16)             { ret 2; }
+    if (k == I32 || k == U32 || k == F32) { ret 4; }
+    ret 8;
+}
+
+# the least value of a kind
+fun type_lo(k: u8) Num {
+    var n: Num;
+    if (k == I8)  { n.i = -128; }
+    or (k == I16) { n.i = -32768; }
+    or (k == I32) { n.i = -2147483648; }
+    or (k == I64) { n.i = -9223372036854775807 - 1; }
+    or (k == F32) { n.f = -3.4028234663852886e38; }
+    or (k == F64) { n.f = -1.7976931348623157e308; }
+    or            { n.u = 0; }
+    ret n;
+}
+
+# the greatest value of a kind
+fun type_hi(k: u8) Num {
+    var n: Num;
+    if (k == I8)  { n.i = 127; }
+    or (k == I16) { n.i = 32767; }
+    or (k == I32) { n.i = 2147483647; }
+    or (k == I64) { n.i = 9223372036854775807; }
+    or (k == U8)  { n.u = 255; }
+    or (k == U16) { n.u = 65535; }
+    or (k == U32) { n.u = 4294967295; }
+    or (k == U64) { n.u = 0xFFFFFFFFFFFFFFFF; }
+    or (k == F32) { n.f = 3.4028234663852886e38; }
+    or            { n.f = 1.7976931348623157e308; }
+    ret n;
+}
+
+# whether a is below b, both of kind k
+fun less(k: u8, a: Num, b: Num) bool {
+    if (signed(k)) { ret a.i < b.i; }
+    if (float(k))  { ret a.f < b.f; }
+    ret a.u < b.u;
+}
+
+# v held within [lo, hi]
+fun clamp(k: u8, v: Num, lo: Num, hi: Num) Num {
+    if (less(k, v, lo)) { ret lo; }
+    if (less(k, hi, v)) { ret hi; }
+    ret v;
+}
+
+# the value of kind k at p
+fun load(k: u8, p: ptr) Num {
+    var n: Num;
+    if (k == I8)  { n.i = (@(p::*i8))::i64; }
+    or (k == I16) { n.i = (@(p::*i16))::i64; }
+    or (k == I32) { n.i = (@(p::*i32))::i64; }
+    or (k == I64) { n.i = @(p::*i64); }
+    or (k == U8)  { n.u = (@(p::*u8))::u64; }
+    or (k == U16) { n.u = (@(p::*u16))::u64; }
+    or (k == U32) { n.u = (@(p::*u32))::u64; }
+    or (k == U64) { n.u = @(p::*u64); }
+    or (k == F32) { n.f = (@(p::*f32))::f64; }
+    or            { n.f = @(p::*f64); }
+    ret n;
+}
+
+# store v, already within kind k's range, at p, and say whether that changed it
+fun store(k: u8, p: ptr, v: Num) bool {
+    val was: Num = load(k, p);
+    if (k == I8)  { @(p::*i8) = v.i::i8; }
+    or (k == I16) { @(p::*i16) = v.i::i16; }
+    or (k == I32) { @(p::*i32) = v.i::i32; }
+    or (k == I64) { @(p::*i64) = v.i; }
+    or (k == U8)  { @(p::*u8) = v.u::u8; }
+    or (k == U16) { @(p::*u16) = v.u::u16; }
+    or (k == U32) { @(p::*u32) = v.u::u32; }
+    or (k == U64) { @(p::*u64) = v.u; }
+    or (k == F32) { @(p::*f32) = v.f::f32; }
+    or            { @(p::*f64) = v.f; }
+    ret load(k, p).u != was.u;
+}
+
+# the i-th value of kind k in an array at p
+fun nth(k: u8, p: ptr, i: usize) ptr {
+    ret (?(p::*u8)[i * width_of(k)])::ptr;
+}
+
+# integer v of kind k moved by n whole steps, saturating at the type's bounds
+fun add_int(k: u8, v: Num, n: i64) Num {
+    var r: Num = v;
+    if (signed(k)) {
+        val s: i64 = v.i + n;
+        if (n > 0 && s < v.i) { r.i = type_hi(k).i; }
+        or (n < 0 && s > v.i) { r.i = type_lo(k).i; }
+        or                    { r.i = s; }
+    }
+    or (n >= 0) {
+        val s: u64 = v.u + n::u64;
+        if (s < v.u) { r.u = type_hi(k).u; }
+        or           { r.u = s; }
+    }
+    or {
+        val m: u64 = (0 - (n + 1))::u64 + 1;
+        if (m > v.u) { r.u = 0; }
+        or           { r.u = v.u - m; }
+    }
+    ret clamp(k, r, type_lo(k), type_hi(k));
+}
+
+# what an editor's values may be: its kind, its speed and its bounds
+# ---
+# kind:  I8 to F64
+# speed: the change for each pixel dragged
+# lo:    least value, the type's when the bounds were not ordered
+# hi:    greatest value, the type's when the bounds were not ordered
+pub rec Spec {
+    kind:  u8;
+    speed: f64;
+    lo:    Num;
+    hi:    Num;
+}
+
+# a Spec, with unordered bounds taken as the type's range
+# ---
+# k:     I8 to F64
+# speed: the change for each pixel dragged
+# lo:    least value
+# hi:    greatest value, at or below lo for no bounds
+# ret:   the spec
+pub fun spec(k: u8, speed: f64, lo: Num, hi: Num) Spec {
+    var s: Spec = Spec{kind: k, speed: speed, lo: lo, hi: hi};
+    if (!less(k, lo, hi)) {
+        s.lo = type_lo(k);
+        s.hi = type_hi(k);
+    }
+    s.lo = clamp(k, s.lo, type_lo(k), type_hi(k));
+    s.hi = clamp(k, s.hi, type_lo(k), type_hi(k));
+    ret s;
+}
+
+# a std.io sink over a fixed buffer, kept NUL-terminated
+rec Sink {
+    buf: *u8;
+    cap: usize;
+    len: usize;
+}
+
+fun sink_write(c: ptr, b: *u8, n: usize) res[usize, io.WriteError] {
+    val s: *Sink = c::*Sink;
+    var i: usize = 0;
+    for (i < n && s.len + 1 < s.cap) {
+        s.buf[s.len] = b[i];
+        s.len        = s.len + 1;
+        i            = i + 1;
+    }
+    s.buf[s.len] = 0;
+    if (i == 0) { ret res[usize, io.WriteError].err{io.WriteError.stalled{0}}; }
+    ret res[usize, io.WriteError].ok{i};
+}
+
+fun put(s: *Sink, b: u8) {
+    var one: u8                        = b;
+    val r:   res[usize, io.WriteError] = sink_write(s::ptr, ?one, 1);
+}
+
+# a decimal 0.d[0]d[1]..d[n-1] times 10^e, its digits values 0 to 9
+rec Dec {
+    neg: bool;
+    d:   [40]u8;
+    n:   usize;
+    e:   i64;
+}
+
+# the decimal std.format.write_f64 wrote, when ordinary
+fun dec_of(t: str) Dec {
+    var x:    Dec;
+    var i:    usize = 0;
+    var ints: i64   = 0;
+    var dot:  bool  = false;
+    if (t[0] == '-') {
+        x.neg = true;
+        i     = 1;
+    }
+    for (t[i] != 0 && t[i] != 'e') {
+        if (t[i] == '.') { dot = true; }
+        or {
+            if (!dot)                    { ints = ints + 1; }
+            if (x.n == 0 && t[i] == '0') { ints = ints - 1; }
+            or (x.n < 40) {
+                x.d[x.n] = t[i] - '0';
+                x.n      = x.n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var ex: i64 = 0;
+    if (t[i] == 'e') {
+        i = i + 1;
+        var neg: bool = false;
+        if (t[i] == '-') {
+            neg = true;
+            i   = i + 1;
+        }
+        for (t[i] >= '0' && t[i] <= '9') {
+            ex = ex * 10 + (t[i] - '0')::i64;
+            i  = i + 1;
+        }
+        if (neg) { ex = 0 - ex; }
+    }
+    x.e = ints + ex;
+    for (x.n > 1 && x.d[x.n - 1] == 0) { x.n = x.n - 1; }
+    ret x;
+}
+
+# x rounded half up to its first p digits
+fun dec_round(x: Dec, p: usize) Dec {
+    var r: Dec = x;
+    if (p >= x.n) { ret r; }
+    r.n = p;
+    if (x.d[p] >= 5) {
+        var i:     usize = p;
+        var carry: bool  = true;
+        for (carry && i > 0) {
+            i = i - 1;
+            if (r.d[i] == 9) { r.d[i] = 0; }
+            or {
+                r.d[i] = r.d[i] + 1;
+                carry  = false;
+            }
+        }
+        if (carry) {
+            r.d[0] = 1;
+            r.n    = 1;
+            r.e    = r.e + 1;
+        }
+    }
+    for (r.n > 1 && r.d[r.n - 1] == 0) { r.n = r.n - 1; }
+    ret r;
+}
+
+# write a decimal as std.format.write_f64 lays one out
+fun dec_put(s: *Sink, x: Dec) {
+    if (x.neg) { put(s, '-'); }
+    var i: usize = 0;
+    if (x.e > 17 || x.e < -3) {
+        put(s, x.d[0] + '0');
+        if (x.n > 1) {
+            put(s, '.');
+            i = 1;
+            for (i < x.n) {
+                put(s, x.d[i] + '0');
+                i = i + 1;
+            }
+        }
+        put(s, 'e');
+        var w: io.Writer                 = io.Writer{ctx: s::ptr, f_write: sink_write};
+        val r: res[usize, io.WriteError] = fmt.write_i64(?w, x.e - 1);
+        ret;
+    }
+    if (x.e <= 0) {
+        put(s, '0');
+        put(s, '.');
+        var z: i64 = 0 - x.e;
+        for (z > 0) {
+            put(s, '0');
+            z = z - 1;
+        }
+        for (i < x.n) {
+            put(s, x.d[i] + '0');
+            i = i + 1;
+        }
+        ret;
+    }
+    for (i < x.n || i::i64 < x.e) {
+        if (i::i64 == x.e) { put(s, '.'); }
+        var dg: u8 = 0;
+        if (i < x.n) { dg = x.d[i]; }
+        put(s, dg + '0');
+        i = i + 1;
+    }
+}
+
+# the shortest text std.format gives an f64, into s
+fun put_f64(s: *Sink, v: f64) {
+    var w: io.Writer                 = io.Writer{ctx: s::ptr, f_write: sink_write};
+    val r: res[usize, io.WriteError] = fmt.write_f64(?w, v);
+}
+
+# whether text is an ordinary number, not zero, an infinity or a nan
+fun ordinary(t: str) bool {
+    var i: usize = 0;
+    for (t[i] != 0 && t[i] != 'e') {
+        if (t[i] == 'i' || t[i] == 'n') { ret false; }
+        if (t[i] >= '1' && t[i] <= '9') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the shortest text that reads back as exactly x as an f32, into s
+fun put_f32(s: *Sink, x: f32) {
+    var wide: [TEXT_CAP]u8;
+    var ws:   Sink = Sink{buf: ?wide[0], cap: TEXT_CAP, len: 0};
+    put_f64(?ws, x::f64);
+    if (!ordinary(?wide[0])) {
+        var i: usize = 0;
+        for (wide[i] != 0) {
+            put(s, wide[i]);
+            i = i + 1;
+        }
+        ret;
+    }
+    val d:   Dec   = dec_of(?wide[0]);
+    var p:   usize = 1;
+    val at0: usize = s.len;
+    for (p <= d.n) {
+        s.len        = at0;
+        s.buf[s.len] = 0;
+        dec_put(s, dec_round(d, p));
+        val r: res[f64, tp.ParseError] = tp.parse_f64_exact(?s.buf[at0]);
+        if (sel r.ok && r.ok::f32 == x) { ret; }
+        p = p + 1;
+    }
+}
+
+# how many decimals the shortest text of v has after its point
+fun decimals(v: f64) i64 {
+    var t: [TEXT_CAP]u8;
+    var s: Sink = Sink{buf: ?t[0], cap: TEXT_CAP, len: 0};
+    put_f64(?s, v);
+    if (!ordinary(?t[0])) { ret 0; }
+    val d: Dec = dec_of(?t[0]);
+    if (d.n::i64 <= d.e) { ret 0; }
+    ret d.n::i64 - d.e;
+}
+
+# v rounded to d decimals, or v as it is where that is beyond an f64's
+# precision
+fun round_to(v: f64, d: i64) f64 {
+    if (d < 0 || d > 15) { ret v; }
+    var p: f64 = 1.0;
+    var i: i64 = 0;
+    for (i < d) {
+        p = p * 10.0;
+        i = i + 1;
+    }
+    val y: f64 = v * p;
+    if (y >= 4503599627370496.0 || y <= -4503599627370496.0) { ret v; }
+    var r: f64 = 0.0;
+    if (y >= 0.0) { r = (y + 0.5)::i64::f64; }
+    or            { r = 0.0 - (0.5 - y)::i64::f64; }
+    ret r / p;
+}
+
+# the larger of two decimal counts
+fun most(a: i64, b: i64) i64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# the shortest text that reads back as exactly v as a value of kind k
+# ---
+# k:   I8 to F64
+# v:   the value
+# out: TEXT_CAP bytes for the text
+# ret: the text, in out
+pub fun format(k: u8, v: Num, out: *u8) str {
+    var s: Sink      = Sink{buf: out, cap: TEXT_CAP, len: 0};
+    var w: io.Writer = io.Writer{ctx: (?s)::ptr, f_write: sink_write};
+    out[0] = 0;
+    if (signed(k)) {
+        val r: res[usize, io.WriteError] = fmt.write_i64(?w, v.i);
+    }
+    or (k == F32) { put_f32(?s, v.f::f32); }
+    or (k == F64) { put_f64(?s, v.f); }
+    or {
+        val r: res[usize, io.WriteError] = fmt.write_u64(?w, v.u);
+    }
+    ret out;
+}
+
+# read typed text as a value of kind k
+#
+# spaces around the number are ignored. integers take a 0x, 0b or 0o prefix,
+# and floats an exponent and inf. a number beyond the type's range is
+# clamped to it, a negative one to an unsigned type's 0 among them, and an
+# f32 is the f32 nearest the text.
+# ---
+# k:   I8 to F64
+# s:   the text
+# ret: the value, none when the text is not a number of the kind
+pub fun parse(k: u8, s: str) opt[Num] {
+    var t: [ENTRY_CAP]u8;
+    var n: usize = 0;
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    for (s[i] != 0 && n + 1 < ENTRY_CAP) {
+        t[n] = s[i];
+        n    = n + 1;
+        i    = i + 1;
+    }
+    for (n > 0 && t[n - 1] == ' ') { n = n - 1; }
+    t[n] = 0;
+    if (n == 0) { ret opt[Num].none{}; }
+
+    var v:   Num;
+    val neg: bool = t[0] == '-';
+    if (float(k)) {
+        val r: res[f64, tp.ParseError] = tp.parse_f64_exact(?t[0]);
+        if (sel r.err)    { ret opt[Num].none{}; }
+        if (r.ok != r.ok) { ret opt[Num].none{}; }
+        v.f = r.ok;
+    }
+    or (signed(k)) {
+        val r: res[i64, tp.ParseError] = tp.parse_i64_exact(?t[0], 0);
+        if (sel r.ok) { v.i = r.ok; }
+        or (sel r.err && sel r.err.overflow) {
+            v.i = type_hi(I64).i;
+            if (neg) { v.i = type_lo(I64).i; }
+        }
+        or { ret opt[Num].none{}; }
+    }
+    or (neg) {
+        val r: res[i64, tp.ParseError] = tp.parse_i64_exact(?t[0], 0);
+        if (sel r.err && !(sel r.err.overflow)) { ret opt[Num].none{}; }
+        v.u = 0;
+    }
+    or {
+        val r: res[u64, tp.ParseError] = tp.parse_u64_exact(?t[0], 0);
+        if (sel r.ok)                        { v.u = r.ok; }
+        or (sel r.err && sel r.err.overflow) { v.u = type_hi(U64).u; }
+        or                                   { ret opt[Num].none{}; }
+    }
+    var c: Num = clamp(k, v, type_lo(k), type_hi(k));
+    if (k == F32) { c.f = c.f::f32::f64; }
+    ret opt[Num].some{c};
+}
+
+# whether a typed codepoint may be part of a number: any printable ASCII
+# character but a space, the parse deciding the rest
+# ---
+# cp:  the codepoint
+# ret: true to take it
+pub fun number_char(cp: u32) bool {
+    ret cp > 0x20 && cp < 0x7F;
+}
+
+# the text cell a value is typed into, kept under its id
+# ---
+# typing: 1 while it holds the keyboard for an edit not yet committed
+# f:      the field, over buf and hist
+# buf:    the text
+# hist:   the undo history
+pub rec Entry {
+    typing: u8;
+    f:      field.Field;
+    buf:    [64]u8;
+    hist:   [384]u8;
+}
+
+# the entry an id keeps, its field pointed at its own buffers
+fun entry_of(ctx: *context.Context, id: u64, accept: fun(u32) bool) *Entry {
+    val e: *Entry = state.get[Entry](ctx, id);
+    if (e.f.cap == 0) { field.init(?e.f, ?e.buf[0], ENTRY_CAP, 0, accept); }
+    e.f.buf      = ?e.buf[0];
+    e.f.cap      = ENTRY_CAP;
+    e.f.accept   = accept;
+    e.f.hist.buf = ?e.hist[0];
+    e.f.hist.cap = HISTORY_CAP;
+    ret e;
+}
+
+# whether an entry is being typed in
+# ---
+# ctx: context
+# key: the entry's key in the current id scope
+# ret: true from the edit's start until it is committed or escaped
+pub fun typing(ctx: *context.Context, key: str) bool {
+    ret state.get[Entry](ctx, context.id_of(ctx, key)).typing != 0;
+}
+
+# start typing in an entry: it takes the keyboard holding shown, all selected
+# ---
+# ctx:    context
+# key:    the entry's key in the current id scope
+# shown:  the value's text
+# accept: which typed codepoints it takes, nil for any printable one
+pub fun start(ctx: *context.Context, key: str, shown: str, accept: fun(u32) bool) {
+    val id: u64    = context.id_of(ctx, key);
+    val e:  *Entry = entry_of(ctx, id, accept);
+    field.set(?e.f, shown);
+    e.typing = 1;
+    context.focus(ctx, id);
+    edit.press(ctx, id, ?e.f, 0, 3);
+}
+
+# the text an entry commits because it lost the keyboard mid-edit, to a press
+# elsewhere or a frame that did not draw it
+# ---
+# ctx:    context
+# key:    the entry's key in the current id scope
+# accept: which typed codepoints it takes, nil for any printable one
+# ret:    the text, valid until end, nil when it commits nothing
+pub fun settle(ctx: *context.Context, key: str, accept: fun(u32) bool) str {
+    val id: u64    = context.id_of(ctx, key);
+    val e:  *Entry = entry_of(ctx, id, accept);
+    if (e.typing == 0 || ctx.focus == id) { ret nil; }
+    e.typing = 0;
+    ret field.text(?e.f);
+}
+
+# a text cell in a rect showing a value's text, typed in while it holds the
+# keyboard
+#
+# while it is not being typed in it shows shown. a press gives it the
+# keyboard, as a text field (see widget.text_field_at), and the edit commits
+# on enter or when the keyboard goes elsewhere, or ends without committing on
+# escape.
+# ---
+# ctx:    context
+# key:    the entry's key in the current id scope
+# shown:  the value's text
+# accept: which typed codepoints it takes, nil for any printable one
+# x0:     left x in pixels
+# y0:     top y in pixels
+# x1:     right x in pixels
+# y1:     bottom y in pixels
+# ret:    the text committed this frame, valid until end, nil for none
+pub fun entry(ctx: *context.Context, key: str, shown: str, accept: fun(u32) bool, x0: f32, y0: f32, x1: f32, y1: f32) str {
+    val id:   u64    = context.id_of(ctx, key);
+    val lost: str    = settle(ctx, key, accept);
+    val e:    *Entry = entry_of(ctx, id, accept);
+    if (e.typing == 0 && ctx.focus != id && !str_equals(field.text(?e.f), shown)) { field.set(?e.f, shown); }
+    val out: u8 = widget.text_field_at(ctx, key, ?e.f, nil, x0, y0, x1, y1);
+    if ((out & field.ESCAPED) != 0) { e.typing = 0; }
+    or ((out & field.ENTERED) != 0) {
+        e.typing = 0;
+        ret field.text(?e.f);
+    }
+    or (ctx.focus == id) { e.typing = 1; }
+    ret lost;
+}
+
+# commit typed text to the value at p, saying whether it changed
+fun commit(sp: *Spec, p: ptr, text: str) bool {
+    if (text == nil) { ret false; }
+    val v: opt[Num] = parse(sp.kind, text);
+    if (sel v.none) { ret false; }
+    ret store(sp.kind, p, clamp(sp.kind, v.some, sp.lo, sp.hi));
+}
+
+# what a drag cell keeps under its id between frames
+# ---
+# last:  the travel since the press as of the last frame
+# acc:   an integer's fraction of a step not yet made
+# moved: a float's change since the press
+# start: the value at the press
+rec Drag {
+    last:  f32;
+    acc:   f64;
+    moved: f64;
+    start: Num;
+}
+
+# move the value at p by a drag's travel this frame, saying whether it changed
+fun pull(ctx: *context.Context, sp: *Spec, p: ptr, d: *Drag, dx: f32) bool {
+    val step: f32 = dx - d.last;
+    d.last = dx;
+    val fine: bool = (ctx.in.mods & input.MOD_SHIFT) != 0;
+    var rate: f64  = sp.speed;
+    var dec:  i64  = decimals(sp.speed);
+    if (fine) {
+        rate = rate * FINE;
+        dec  = dec + decimals(FINE);
+    }
+    val k: u8 = sp.kind;
+    var v: Num;
+    if (float(k)) {
+        d.moved = d.moved + step::f64 * rate;
+        v.f     = round_to(d.start.f + d.moved, most(dec, decimals(d.start.f)));
+        if (k == F32) { v.f = v.f::f32::f64; }
+    }
+    or {
+        d.acc = d.acc + step::f64 * rate;
+        if (d.acc > 9.0e18)  { d.acc = 9.0e18; }
+        if (d.acc < -9.0e18) { d.acc = -9.0e18; }
+        val whole: i64 = d.acc::i64;
+        d.acc = d.acc - whole::f64;
+        if (whole == 0) { ret false; }
+        v = add_int(k, load(k, p), whole);
+    }
+    ret store(k, p, clamp(k, v, sp.lo, sp.hi));
+}
+
+# a value's text drawn in a cell, centred when it fits
+fun cell_text(ctx: *context.Context, s: str, x0: f32, y0: f32, x1: f32, y1: f32, c: draw.Color) {
+    val pad: f32 = context.px(ctx, context.look_of(ctx, theme.VALUE).inset.l);
+    val tw:  f32 = context.text_width(ctx, s);
+    var tx:  f32 = x0 + (x1 - x0 - tw) / 2.0::f32;
+    if (tx < x0 + pad) { tx = x0 + pad; }
+    val ty: f32 = y0 + (y1 - y0 - context.line_height(ctx)) / 2.0::f32;
+    context.push_clip(ctx, x0, y0, x1, y1);
+    context.text_at(ctx, s, tx, ty, c);
+    context.pop_clip(ctx);
+}
+
+# one drag cell editing the value at p in a rect, keyed in the current scope
+fun drag_cell(ctx: *context.Context, key: str, sp: *Spec, p: ptr, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    var changed: bool = commit(sp, p, settle(ctx, key, number_char));
+    var text:    [TEXT_CAP]u8;
+    if (typing(ctx, key)) {
+        val shown: str = format(sp.kind, load(sp.kind, p), ?text[0]);
+        if (commit(sp, p, entry(ctx, key, shown, number_char, x0, y0, x1, y1))) { changed = true; }
+        ret changed;
+    }
+
+    val id: u64          = context.id_of(ctx, key);
+    val h:  interact.Hit = interact.hit(ctx, id, x0, y0, x1, y1, input.BUTTON_LEFT);
+    if (h.hot || h.active) { context.set_cursor(ctx, input.CURSOR_RESIZE_EW); }
+    val d: *Drag = state.get[Drag](ctx, id);
+    if (h.pressed) {
+        d.last  = 0.0::f32;
+        d.acc   = 0.0;
+        d.moved = 0.0;
+        d.start = load(sp.kind, p);
+    }
+    if (h.double)                            { start(ctx, key, format(sp.kind, load(sp.kind, p), ?text[0]), number_char); }
+    or (h.held && pull(ctx, sp, p, d, h.dx)) { changed = true; }
+
+    val st: u8 = theme.pick(h.hot, h.active, false, false);
+    context.box(ctx, theme.VALUE, st, x0, y0, x1, y1);
+    cell_text(ctx, format(sp.kind, load(sp.kind, p), ?text[0]), x0, y0, x1, y1, context.paint_of(ctx, theme.VALUE, st).text);
+    ret changed;
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# height of a value row: the value style's least height, grown to fit a line
+# of text with its inset
+fun row_h(ctx: *context.Context) f32 {
+    val s: *theme.Style = context.look_of(ctx, theme.VALUE);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
+}
+
+# place an editor's row and draw its label, returning the rect its cells share
+fun row(ctx: *context.Context, label: str, cells: usize, extra: f32) context.Area {
+    val pad: f32   = context.px(ctx, context.look_of(ctx, theme.VALUE).inset.l);
+    val n:   usize = bid.shown(label);
+    var lw:  f32   = 0.0::f32;
+    if (n > 0) { lw = context.text_width_n(ctx, label, n) + pad; }
+    val nw: f32          = lw + cells::f32 * context.px(ctx, context.look_of(ctx, theme.VALUE).min_w) + extra;
+    val r:  context.Area = widget.place(ctx, layout.fill(1.0::f32), layout.fit(), nw, row_h(ctx));
+    if (n > 0) {
+        val ty: f32 = r.y0 + (r.y1 - r.y0 - context.line_height(ctx)) / 2.0::f32;
+        context.text_span(ctx, label, n, r.x0, ty, context.paint_of(ctx, theme.LABEL, theme.NORMAL).text);
+    }
+    ret context.Area{x0: r.x0 + lw, y0: r.y0, x1: r.x1, y1: r.y1};
+}
+
+# the left edge of cell i of n across a row's cells, g pixels apart
+fun cell_x0(r: context.Area, g: f32, i: usize, n: usize) f32 {
+    var w: f32 = (r.x1 - r.x0 - g * (n - 1)::f32) / n::f32;
+    if (w < 0.0::f32) { w = 0.0::f32; }
+    ret r.x0 + i::f32 * (w + g);
+}
+
+# the right edge of cell i of n
+fun cell_x1(r: context.Area, g: f32, i: usize, n: usize) f32 {
+    if (i + 1 == n) { ret r.x1; }
+    ret cell_x0(r, g, i + 1, n) - g;
+}
+
+# a row of n drag cells, one for each value of kind k in an array at v
+#
+# the non-generic form of drag_n, for values whose kind is known only at run
+# time.
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# k:     the values' kind, I8 to F64
+# v:     the first of n values of kind k
+# n:     how many values, 1 to 4
+# speed: the change for each pixel dragged
+# lo:    least value
+# hi:    greatest value, at or below lo for no bounds
+# ret:   true if a value changed this frame
+pub fun drag_scalars(ctx: *context.Context, label: str, k: u8, v: ptr, n: usize, speed: f64, lo: Num, hi: Num) bool {
+    var cells: usize = n;
+    if (cells < 1) { cells = 1; }
+    if (cells > 4) { cells = 4; }
+    var sp: Spec         = spec(k, speed, lo, hi);
+    val r:  context.Area = row(ctx, label, cells, 0.0::f32);
+    val g:  f32          = widget.row_gap(ctx);
+    context.push_id(ctx, context.id_of(ctx, label));
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < cells) {
+        if (drag_cell(ctx, CELLS[i], ?sp, nth(k, v, i), cell_x0(r, g, i, cells), r.y0, cell_x1(r, g, i, cells), r.y1)) { changed = true; }
+        i = i + 1;
+    }
+    context.pop_id(ctx);
+    ret changed;
+}
+
+# a number dragged across, or typed after a double click
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# v:     the value, edited in place
+# speed: the change for each pixel dragged
+# lo:    least value
+# hi:    greatest value, at or below lo for no bounds
+# ret:   true if the value changed this frame
+pub fun drag[T](ctx: *context.Context, label: str, v: *T, speed: f64, lo: T, hi: T) bool {
+    ret drag_scalars(ctx, label, kind_of[T](), v::ptr, 1, speed, num[T](lo), num[T](hi));
+}
+
+# a vector of 2 to 4 numbers side by side in one row, each a drag editor
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# v:     the first of n values, edited in place (pass ?vec[0])
+# n:     how many values, 2 to 4
+# speed: the change for each pixel dragged
+# lo:    least value of each
+# hi:    greatest value of each, at or below lo for no bounds
+# ret:   true if a value changed this frame
+pub fun drag_n[T](ctx: *context.Context, label: str, v: *T, n: usize, speed: f64, lo: T, hi: T) bool {
+    ret drag_scalars(ctx, label, kind_of[T](), v::ptr, n, speed, num[T](lo), num[T](hi));
+}
+
+# a low and a high value in one row, each a drag editor, the low one held at
+# or below the high one
+#
+# the non-generic form of drag_range.
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# k:     the values' kind, I8 to F64
+# a:     the low value
+# b:     the high value
+# speed: the change for each pixel dragged
+# lo:    least value of either
+# hi:    greatest value of either, at or below lo for no bounds
+# ret:   true if either changed this frame
+pub fun range_scalars(ctx: *context.Context, label: str, k: u8, a: ptr, b: ptr, speed: f64, lo: Num, hi: Num) bool {
+    val whole: Spec         = spec(k, speed, lo, hi);
+    val r:     context.Area = row(ctx, label, 2, 0.0::f32);
+    val g:     f32          = widget.row_gap(ctx);
+    context.push_id(ctx, context.id_of(ctx, label));
+    var sa: Spec = whole;
+    sa.hi = clamp(k, load(k, b), whole.lo, whole.hi);
+    var changed: bool = drag_cell(ctx, CELLS[0], ?sa, a, cell_x0(r, g, 0, 2), r.y0, cell_x1(r, g, 0, 2), r.y1);
+    var sb:      Spec = whole;
+    sb.lo = clamp(k, load(k, a), whole.lo, whole.hi);
+    if (drag_cell(ctx, CELLS[1], ?sb, b, cell_x0(r, g, 1, 2), r.y0, cell_x1(r, g, 1, 2), r.y1)) { changed = true; }
+    context.pop_id(ctx);
+    ret changed;
+}
+
+# a low and a high value in one row, the low one held at or below the high one
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# a:     the low value, edited in place
+# b:     the high value, edited in place
+# speed: the change for each pixel dragged
+# lo:    least value of either
+# hi:    greatest value of either, at or below lo for no bounds
+# ret:   true if either changed this frame
+pub fun drag_range[T](ctx: *context.Context, label: str, a: *T, b: *T, speed: f64, lo: T, hi: T) bool {
+    ret range_scalars(ctx, label, kind_of[T](), a::ptr, b::ptr, speed, num[T](lo), num[T](hi));
+}
+
+# v moved by step, up or down, within sp's bounds
+fun stepped(sp: *Spec, v: Num, step: Num, up: bool) Num {
+    val k: u8 = sp.kind;
+    var r: Num;
+    if (float(k)) {
+        var s: f64 = step.f;
+        if (!up) { s = 0.0 - s; }
+        r.f = round_to(v.f + s, most(decimals(v.f), decimals(step.f)));
+    }
+    or {
+        var n: i64 = step.i;
+        if (!signed(k)) {
+            n = type_hi(I64).i;
+            if (step.u < n::u64) { n = step.u::i64; }
+        }
+        if (!up) { n = 0 - n; }
+        r = add_int(k, v, n);
+    }
+    ret clamp(k, r, sp.lo, sp.hi);
+}
+
+# a typed number with steppers, the non-generic form of number
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# k:     the value's kind, I8 to F64
+# v:     the value
+# step:  what each stepper adds or takes away, 0 for no steppers
+# lo:    least value
+# hi:    greatest value, at or below lo for no bounds
+# ret:   true if the value changed this frame
+pub fun number_scalar(ctx: *context.Context, label: str, k: u8, v: ptr, step: Num, lo: Num, hi: Num) bool {
+    var sp:    Spec = spec(k, 0.0, lo, hi);
+    val steps: bool = step.u != 0;
+    val rh:    f32  = row_h(ctx);
+    val g:     f32  = widget.row_gap(ctx);
+    var extra: f32  = 0.0::f32;
+    if (steps) { extra = (rh + g) * 2.0::f32; }
+    val r: context.Area = row(ctx, label, 1, extra);
+    context.push_id(ctx, context.id_of(ctx, label));
+    var text:    [TEXT_CAP]u8;
+    val shown:   str  = format(k, load(k, v), ?text[0]);
+    var changed: bool = commit(?sp, v, entry(ctx, CELLS[0], shown, number_char, r.x0, r.y0, r.x1 - extra, r.y1));
+    if (steps) {
+        val bx: f32 = r.x1 - extra + g;
+        if (widget.button_at(ctx, "-", bx, r.y0, bx + rh, r.y1, false) && store(k, v, stepped(?sp, load(k, v), step, false))) {
+            changed = true;
+        }
+        if (widget.button_at(ctx, "+", bx + rh + g, r.y0, bx + rh * 2.0::f32 + g, r.y1, false) && store(k, v, stepped(?sp, load(k, v), step, true))) {
+            changed = true;
+        }
+    }
+    context.pop_id(ctx);
+    ret changed;
+}
+
+# a typed number with steppers
+#
+# a press on its text gives it the keyboard. the value takes what was typed
+# on enter or when the keyboard goes elsewhere, and keeps what it had on
+# escape. the steppers on the right take step away and add it.
+# ---
+# ctx:   context
+# label: the editor's text, drawn on the left, and its key
+# v:     the value, edited in place
+# step:  what each stepper adds or takes away, 0 for no steppers
+# lo:    least value
+# hi:    greatest value, at or below lo for no bounds
+# ret:   true if the value changed this frame
+pub fun number[T](ctx: *context.Context, label: str, v: *T, step: T, lo: T, hi: T) bool {
+    ret number_scalar(ctx, label, kind_of[T](), v::ptr, num[T](step), num[T](lo), num[T](hi));
+}
+
+# text of a value of kind k, for comparing in tests
+#[testing]
+fun text_is(k: u8, v: Num, want: str) bool {
+    var out: [TEXT_CAP]u8;
+    ret str_equals(format(k, v, ?out[0]), want);
+}
+
+# whether text reads back as v, bit for bit
+#[testing]
+fun reads_as(k: u8, s: str, v: Num) bool {
+    val r: opt[Num] = parse(k, s);
+    ret sel r.some && r.some.u == v.u;
+}
+
+# whether v's text reads back as v, bit for bit
+#[testing]
+fun round_trips(k: u8, v: Num) bool {
+    var out: [TEXT_CAP]u8;
+    ret reads_as(k, format(k, v, ?out[0]), v);
+}
+
+test format__round_trips_every_kind_exactly {
+    if (!round_trips(I64, num[i64](-9223372036854775807 - 1)))               { ret 1; }
+    if (!round_trips(I64, num[i64](9223372036854775807)))                    { ret 2; }
+    if (!round_trips(U64, num[u64](0xFFFFFFFFFFFFFFFF)))                     { ret 3; }
+    if (!round_trips(I64, num[i64](9007199254740993)))                       { ret 4; }
+    if (!text_is(U64, num[u64](0xFFFFFFFFFFFFFFFF), "18446744073709551615")) { ret 5; }
+    if (!text_is(I8, num[i8]((0 - 128)::i8), "-128"))                        { ret 6; }
+
+    if (!round_trips(F64, num[f64](0.1 + 0.2)))                    { ret 7; }
+    if (!text_is(F64, num[f64](0.1 + 0.2), "0.30000000000000004")) { ret 8; }
+    if (!round_trips(F64, num[f64](5.0e-324)))                     { ret 9; }
+    if (!round_trips(F64, num[f64](1.7976931348623157e308)))       { ret 10; }
+    if (!round_trips(F64, num[f64](0x8000000000000000u64:~f64)))   { ret 11; }
+    if (!round_trips(F64, num[f64](123456789.125)))                { ret 12; }
+
+    # an f32 shows the shortest text that reads back as that f32
+    if (!text_is(F32, num[f32](0.1::f32), "0.1"))                { ret 13; }
+    if (!text_is(F32, num[f32](16777216.0::f32), "16777216"))    { ret 14; }
+    if (!text_is(F32, num[f32]((0.0 - 2.5e-7)::f32), "-2.5e-7")) { ret 15; }
+    if (!round_trips(F32, num[f32](1.0e-45::f32)))               { ret 16; }
+    if (!round_trips(F32, num[f32](3.4028235e38::f32)))          { ret 17; }
+    if (!round_trips(F32, num[f32](0.3::f32)))                   { ret 18; }
+    if (!round_trips(F32, num[f32](1.1754944e-38::f32)))         { ret 19; }
+    if (!round_trips(F32, num[f32](9.999999e-4::f32)))           { ret 20; }
+    ret 0;
+}
+
+test parse__clamps_to_the_type_and_refuses_what_is_not_a_number {
+    if (!reads_as(U8, "300", num[u8](255::u8)))                                { ret 1; }
+    if (!reads_as(U8, "-1", num[u8](0::u8)))                                   { ret 2; }
+    if (!reads_as(I8, "-1000", num[i8]((0 - 128)::i8)))                        { ret 3; }
+    if (!reads_as(I64, "99999999999999999999", num[i64](9223372036854775807))) { ret 4; }
+    if (!reads_as(U64, "99999999999999999999", num[u64](0xFFFFFFFFFFFFFFFF)))  { ret 5; }
+    if (!reads_as(I32, " 0x1F ", num[i32](31)))                                { ret 6; }
+    if (!reads_as(F32, "1e39", num[f32](3.4028235e38::f32)))                   { ret 7; }
+    if (!reads_as(F64, "inf", num[f64](1.7976931348623157e308)))               { ret 8; }
+    val bad: [4]str = [4]str{"", "1.5x", "nan", "--1"};
+    var i:   usize  = 0;
+    for (i < 4) {
+        val pf: opt[Num] = parse(F64, bad[i]);
+        val pi: opt[Num] = parse(I32, bad[i]);
+        if (sel pf.some) { ret 9; }
+        if (sel pi.some) { ret 10; }
+        i = i + 1;
+    }
+    val half: opt[Num] = parse(I32, "2.5");
+    if (sel half.some) { ret 11; }
+    ret 0;
+}
+
+test round_to__lands_on_the_decimal {
+    if (round_to(1.5 + 0.1, 2) != 1.6)                      { ret 1; }
+    if (round_to(0.1 + 0.2, most(1, decimals(0.1))) != 0.3) { ret 2; }
+    if (decimals(0.01) != 2 || decimals(1500.0) != 0)       { ret 3; }
+    if (round_to(1.0e300, 3) != 1.0e300)                    { ret 4; }
+    if (round_to(0.0 - 2.25, 1) != 0.0 - 2.3)               { ret 5; }
+    ret 0;
+}
+
+# what the test interface edits
+rec Vals {
+    i:  i64;
+    u:  u64;
+    f:  f64;
+    g:  f32;
+    b:  i8;
+    v3: [3]i32;
+    lo: f64;
+    hi: f64;
+    n:  u8;
+    m:  f64;
+}
+
+#[testing]
+fun vals_ui(ctx: *context.Context, user: ptr) {
+    val s: *Vals = user::*Vals;
+    drag[i64](ctx, "i", ?s.i, 1.0, 0, 0);
+    drag[u64](ctx, "u", ?s.u, 1.0, 0, 0);
+    drag[f64](ctx, "f", ?s.f, 0.01, 0.0, 0.0);
+    drag[f32](ctx, "g", ?s.g, 0.5, 0.0::f32, 0.0::f32);
+    drag[i8](ctx, "b", ?s.b, 1.0, (0 - 10)::i8, 10::i8);
+    drag_n[i32](ctx, "v3", ?s.v3[0], 3, 1.0, 0, 0);
+    drag_range[f64](ctx, "range", ?s.lo, ?s.hi, 1.0, 0.0, 100.0);
+    number[u8](ctx, "n", ?s.n, 5::u8, 0::u8, 20::u8);
+    number[f64](ctx, "m", ?s.m, 0.1, 0.0, 0.0);
+}
+
+#[testing]
+fun open(d: *drv.Driver, a: *allo.Allocator, s: *Vals) bool {
+    val e: err[allo.Error] = drv.init(d, a, 400.0::f32, 600.0::f32, vals_ui, s::ptr);
+    if (sel e.err) { ret false; }
+    drv.step(d);
+    ret true;
+}
+
+# drag a cell by dx pixels from its centre with mods held
+#[testing]
+fun drag_by(d: *drv.Driver, path: str, dx: f32, mods: u8) bool {
+    val id: u64               = drv.find(d, path);
+    val r:  opt[context.Area] = drv.rect(d, id);
+    if (sel r.none) { ret false; }
+    val cx: f32 = (r.some.x0 + r.some.x1) / 2.0::f32;
+    val cy: f32 = (r.some.y0 + r.some.y1) / 2.0::f32;
+    d.time    = d.time + 1.0;
+    d.in.mods = mods;
+    val ok: bool = drv.drag(d, id, cx + dx, cy);
+    d.in.mods = 0;
+    ret ok;
+}
+
+# double click a drag cell, type text over its value and press enter
+#[testing]
+fun type_in(d: *drv.Driver, path: str, s: str) bool {
+    val id: u64 = drv.find(d, path);
+    d.time = d.time + 1.0;
+    if (!drv.double_click(d, id)) { ret false; }
+    if (!drv.focused(d, id))      { ret false; }
+    drv.type_text(d, s);
+    drv.key(d, input.KEY_ENTER, 0);
+    ret !drv.focused(d, id);
+}
+
+test drag__moves_integers_by_whole_steps_without_loss {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s: Vals;
+    s.i = 9007199254740993;
+    s.u = 0xFFFFFFFFFFFFFFFD;
+    var d: drv.Driver;
+    if (!open(?d, ?a, ?s)) { ret 1; }
+
+    # past 2^53 an integer still moves by exactly one a pixel
+    if (!drag_by(?d, "i/#0", 3.0::f32, 0))  { ret 2; }
+    if (s.i != 9007199254740996)            { ret 3; }
+    if (!drag_by(?d, "i/#0", -5.0::f32, 0)) { ret 4; }
+    if (s.i != 9007199254740991)            { ret 5; }
+
+    # a u64 saturates at its top and comes back down exactly
+    if (!drag_by(?d, "u/#0", 8.0::f32, 0))  { ret 6; }
+    if (s.u != 0xFFFFFFFFFFFFFFFF)          { ret 7; }
+    if (!drag_by(?d, "u/#0", -2.0::f32, 0)) { ret 8; }
+    if (s.u != 0xFFFFFFFFFFFFFFFD)          { ret 9; }
+
+    # shift moves a tenth as far
+    s.i = 0;
+    if (!drag_by(?d, "i/#0", 20.0::f32, input.MOD_SHIFT)) { ret 10; }
+    if (s.i != 2)                                         { ret 11; }
+
+    # bounds clamp
+    if (!drag_by(?d, "b/#0", 40.0::f32, 0)) { ret 12; }
+    if (s.b != 10)                          { ret 13; }
+
+    # each cell of a vector moves its own value
+    if (!drag_by(?d, "v3/#1", 4.0::f32, 0))           { ret 14; }
+    if (s.v3[0] != 0 || s.v3[1] != 4 || s.v3[2] != 0) { ret 15; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test drag__moves_floats_onto_the_decimal_of_the_speed {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s: Vals;
+    s.f = 1.5;
+    s.g = 0.25::f32;
+    var d: drv.Driver;
+    if (!open(?d, ?a, ?s)) { ret 1; }
+
+    if (!drag_by(?d, "f/#0", 10.0::f32, 0))              { ret 2; }
+    if (s.f != 1.6)                                      { ret 3; }
+    if (!drag_by(?d, "f/#0", 7.0::f32, input.MOD_SHIFT)) { ret 4; }
+    if (s.f != 1.607)                                    { ret 5; }
+    if (!drag_by(?d, "g/#0", -3.0::f32, 0))              { ret 6; }
+    if (s.g != (0.0 - 1.25)::f32)                        { ret 7; }
+
+    # a value with more decimals than the speed keeps them
+    s.f = 0.125;
+    if (!drag_by(?d, "f/#0", 10.0::f32, 0)) { ret 8; }
+    if (s.f != 0.225)                       { ret 9; }
+
+    # the range's ends never cross
+    s.lo = 10.0;
+    s.hi = 20.0;
+    if (!drag_by(?d, "range/#0", 50.0::f32, 0))  { ret 10; }
+    if (s.lo != 20.0 || s.hi != 20.0)            { ret 11; }
+    if (!drag_by(?d, "range/#1", 200.0::f32, 0)) { ret 12; }
+    if (s.hi != 100.0)                           { ret 13; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test drag__double_click_types_a_value_exactly {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s: Vals;
+    var d: drv.Driver;
+    if (!open(?d, ?a, ?s)) { ret 1; }
+
+    if (!type_in(?d, "u/#0", "18446744073709551615")) { ret 2; }
+    if (s.u != 0xFFFFFFFFFFFFFFFF)                    { ret 3; }
+    if (!type_in(?d, "i/#0", "-9223372036854775808")) { ret 4; }
+    if (s.i != -9223372036854775807 - 1)              { ret 5; }
+    if (!type_in(?d, "f/#0", "0.30000000000000004"))  { ret 6; }
+    if (s.f != 0.1 + 0.2)                             { ret 7; }
+    if (!type_in(?d, "g/#0", "0.1"))                  { ret 8; }
+    if (s.g != 0.1::f32)                              { ret 9; }
+
+    # what is shown is what was typed, and typing it back changes nothing
+    if (!str_equals(drv.text_of(?d, drv.find(?d, "f/#0")), "0.30000000000000004")) { ret 10; }
+
+    # typed values clamp, and text that is no number leaves the value
+    if (!type_in(?d, "b/#0", "500"))   { ret 11; }
+    if (s.b != 10)                     { ret 12; }
+    if (!type_in(?d, "b/#0", "seven")) { ret 13; }
+    if (s.b != 10)                     { ret 14; }
+
+    # escape leaves the value as it was
+    val id: u64 = drv.find(?d, "i/#0");
+    d.time = d.time + 1.0;
+    drv.double_click(?d, id);
+    drv.type_text(?d, "5");
+    drv.key(?d, input.KEY_ESCAPE, 0);
+    if (s.i != -9223372036854775807 - 1 || drv.focused(?d, id)) { ret 15; }
+
+    # a press elsewhere commits
+    d.time = d.time + 1.0;
+    drv.double_click(?d, id);
+    drv.type_text(?d, "42");
+    drv.click(?d, drv.find(?d, "u/#0"));
+    if (s.i != 42) { ret 16; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test number__types_steps_and_clamps {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s: Vals;
+    s.n = 3;
+    var d: drv.Driver;
+    if (!open(?d, ?a, ?s)) { ret 1; }
+
+    # the steppers add and take away a step within the bounds
+    val plus:  u64 = drv.find(?d, "n/+");
+    val minus: u64 = drv.find(?d, "n/-");
+    if (!drv.click(?d, plus) || s.n != 8) { ret 2; }
+    drv.click(?d, plus);
+    drv.click(?d, plus);
+    drv.click(?d, plus);
+    if (s.n != 20)                          { ret 3; }
+    if (!drv.click(?d, minus) || s.n != 15) { ret 4; }
+
+    # typing commits on enter and clamps
+    val id: u64 = drv.find(?d, "n/#0");
+    if (!drv.click(?d, id) || !drv.focused(?d, id)) { ret 5; }
+    drv.key(?d, 'A', input.MOD_CTRL);
+    drv.type_text(?d, "99");
+    if (s.n != 15) { ret 6; }
+    drv.key(?d, input.KEY_ENTER, 0);
+    if (s.n != 20) { ret 7; }
+
+    # a float stepper lands on the decimal
+    s.m = 0.2;
+    drv.step(?d);
+    if (!drv.click(?d, drv.find(?d, "m/+")) || s.m != 0.3) { ret 8; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

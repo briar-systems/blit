@@ -52,7 +52,7 @@ use std.memory;
 pub val SERIES: usize = 8;
 
 # how many widget kinds a theme styles
-pub val KINDS: u32 = 44;
+pub val KINDS: u32 = 50;
 
 # how many states a style paints
 pub val STATES: u8 = 6;
@@ -145,6 +145,18 @@ pub val OPTION: u32 = 41;
 pub val TAB_BAR: u32 = 42;
 # a tab's close box: fill under the cursor, border_w the cross's stroke
 pub val TAB_CLOSE: u32 = 43;
+# a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width
+pub val TABLE_HEADER: u32 = 44;
+# a table's body cell: inset around its widgets, its row height from min_h and inset
+pub val TABLE_CELL: u32 = 45;
+# a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width
+pub val TABLE_RULE: u32 = 46;
+# a value editor's drag cell: inset around its text and before its row's cells, min_w its least width
+pub val VALUE: u32 = 47;
+# a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label
+pub val PICKER: u32 = 48;
+# the checkerboard alpha shows through: fill and mark its two cells
+pub val CHECKER: u32 = 49;
 
 # at rest
 pub val NORMAL: u8 = 0;
@@ -282,7 +294,7 @@ pub rec Theme {
     line_w:      f32;
     tick:        f32;
     area:        f32;
-    styles:      [44]Style;
+    styles:      [50]Style;
 }
 
 # a field holding a color, four floats
@@ -390,7 +402,7 @@ pub rec Name {
 }
 
 # every widget kind, indexed by the kind constants
-pub val KIND_NAMES: [44]Name = [44]Name{
+pub val KIND_NAMES: [50]Name = [50]Name{
     Name{name: "label", doc: "a line of text, and a wrapped note in mark"},
     Name{name: "layout", doc: "layout itself: margin.b between items down a column, margin.r between cells, columns and items across a row"},
     Name{name: "panel", doc: "a panel's background, pad around its column"},
@@ -434,7 +446,13 @@ pub val KIND_NAMES: [44]Name = [44]Name{
     Name{name: "menu_title", doc: "a menu's header in a menu bar, on while its menu is open"},
     Name{name: "option", doc: "a row of a dropdown's or a tab list's options, on while chosen"},
     Name{name: "tab_bar", doc: "a tab bar's strip behind its tabs"},
-    Name{name: "tab_close", doc: "a tab's close box: fill under the cursor, border_w the cross's stroke"}
+    Name{name: "tab_close", doc: "a tab's close box: fill under the cursor, border_w the cross's stroke"},
+    Name{name: "table_header", doc: "a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width"},
+    Name{name: "table_cell", doc: "a table's body cell: inset around its widgets, its row height from min_h and inset"},
+    Name{name: "table_rule", doc: "a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width"},
+    Name{name: "value", doc: "a value editor's drag cell: inset around its text and before its row's cells, min_w its least width"},
+    Name{name: "picker", doc: "a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label"},
+    Name{name: "checker", doc: "the checkerboard alpha shows through: fill and mark its two cells"}
 };
 
 # every state, indexed by the state constants
@@ -998,6 +1016,7 @@ pub fun derive(t: *Theme) {
     t.styles[MENU].pad.t    = t.pad;
     t.styles[MENU].min_w    = t.row * 8.0::f32;
     t.styles[MODAL]         = below(t, t.window);
+    t.styles[MODAL].pad     = edges(t.pad);
     fill_all(?t.styles[TOOLTIP], t.window);
 
     fills(?t.styles[WINDOW_TITLE], t.header, t.header_hot, t.header_hot, t.header);
@@ -1085,6 +1104,27 @@ pub fun derive(t: *Theme) {
     outline(t, DROP_TARGET, t.accent, t.edge_w);
     t.styles[DRAG_PREVIEW].radius = draw.radii(0.0::f32);
     fill_all(?t.styles[DRAG_PREVIEW], t.control);
+
+    t.styles[TABLE_HEADER].radius = draw.radii(0.0::f32);
+    t.styles[TABLE_HEADER].min_w  = t.row;
+    fills(?t.styles[TABLE_HEADER], t.header, t.header_hot, t.header_hot, t.header);
+    t.styles[TABLE_CELL].radius = draw.radii(0.0::f32);
+    t.styles[TABLE_RULE].min_w  = t.pad * 2.0::f32;
+    outline(t, TABLE_RULE, t.edge, t.edge_w);
+    t.styles[TABLE_RULE].states[HOT].border    = t.accent;
+    t.styles[TABLE_RULE].states[ACTIVE].border = t.accent;
+
+    t.styles[VALUE].min_w = 48.0::f32;
+    fills(?t.styles[VALUE], t.control, t.control_hot, t.control_on, t.control);
+
+    i = 0;
+    for (i < STATES::usize) {
+        t.styles[PICKER].states[i].mark   = t.text;
+        t.styles[PICKER].states[i].border = t.track;
+        t.styles[CHECKER].states[i].mark  = t.control;
+        i                                 = i + 1;
+    }
+    fill_all(?t.styles[CHECKER], t.text_dim);
 
     t.styles[SCRIM].radius = draw.radii(0.0::f32);
     fill_all(?t.styles[SCRIM], draw.rgba(0.0::f32, 0.0::f32, 0.0::f32, 0.45::f32));

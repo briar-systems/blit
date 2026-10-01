@@ -108,6 +108,7 @@ use blit.draw;
 use blit.font;
 use gly: blit.glyph;
 use blit.hit;
+use ico: blit.icon;
 use bid: blit.id;
 use blit.input;
 use blit.layout;
@@ -508,6 +509,7 @@ pub rec Context {
     trace_bytes:  *u8;
     trace_cap:    usize;
     trace_len:    usize;
+    icons:        ico.Set;
 }
 
 # initialize a context, its draw lists, its claim lists and its font
@@ -646,12 +648,13 @@ pub fun init(ctx: *Context, a: *allo.Allocator) err[allo.Error] {
     ctx.trace_bytes = nil;
     ctx.trace_cap   = 0;
     ctx.trace_len   = 0;
+    ctx.icons       = ico.init(a);
     ret err[allo.Error].ok{};
 }
 
 # release the context's draw lists, claim lists, font, clipboard text,
-# composition, held-back button events, state, drag payload, id bookkeeping
-# and text trace
+# composition, held-back button events, state, drag payload, icons, id
+# bookkeeping and text trace
 # ---
 # ctx: context to free
 # ret: ok, or the first refusal, with that list and the ones after it still owned
@@ -663,6 +666,8 @@ pub fun free(ctx: *Context) err[allo.Error] {
     if (sel esh.err) { ret esh; }
     val ex: err[allo.Error] = payload.free(?ctx.drag);
     if (sel ex.err) { ret ex; }
+    val eic: err[allo.Error] = ico.free(?ctx.icons);
+    if (sel eic.err) { ret eic; }
     if (ctx.backlog != nil) {
         val eh: err[allo.Error] = allo.deallocate[input.Event](ctx.a, ctx.backlog, ctx.backlog_cap);
         if (sel eh.err) { ret eh; }
@@ -2401,7 +2406,8 @@ pub fun line_height(ctx: *Context) f32 {
 # s:   utf-8 text
 # ret: width in pixels
 pub fun text_width(ctx: *Context, s: str) f32 {
-    ret font.measure(?ctx.font, ctx.style, ctx.scale, s);
+    if (s == nil) { ret 0.0::f32; }
+    ret text_width_n(ctx, s, str_len(s));
 }
 
 # width of the widest line of the first n bytes of a string, as text_width
@@ -2412,7 +2418,17 @@ pub fun text_width(ctx: *Context, s: str) f32 {
 # n:   bytes to measure, on a codepoint boundary
 # ret: width in pixels
 pub fun text_width_n(ctx: *Context, s: str, n: usize) f32 {
-    ret font.measure_n(?ctx.font, ctx.style, ctx.scale, s, n);
+    if (s == nil) { ret 0.0::f32; }
+    var widest: f32   = 0.0::f32;
+    var a:      usize = 0;
+    for (a <= n) {
+        var b: usize = a;
+        for (b < n && s[b] != '\n') { b = b + 1; }
+        val w: f32 = line_width(ctx, ?s[a], b - a);
+        if (w > widest) { widest = w; }
+        a = b + 1;
+    }
+    ret widest;
 }
 
 # how far the pen moves over one codepoint after another in the current style
@@ -2425,6 +2441,9 @@ pub fun text_width_n(ctx: *Context, s: str, n: usize) f32 {
 # cp:   the codepoint
 # ret:  pen movement in pixels
 pub fun glyph_advance(ctx: *Context, left: u32, cp: u32) f32 {
+    var id: u32 = 0;
+    if (known_icon(ctx, cp, ?id))   { ret icon_width(ctx, id, inline_size(ctx)); }
+    if (known_icon(ctx, left, ?id)) { ret font.advance(?ctx.font, ctx.style, ctx.scale, 0, cp); }
     ret font.advance(?ctx.font, ctx.style, ctx.scale, left, cp);
 }
 
@@ -3066,11 +3085,115 @@ pub fun fill_path_gradient(ctx: *Context, p: *path.Path, g: draw.Gradient) {
 
 # fill a path with a brush
 fun fill_path_brush(ctx: *Context, p: *path.Path, b: tess.Brush) {
-    if (!build_path(ctx, p))             { ret; }
+    if (!build_path(ctx, p)) { ret; }
+    put_fill(ctx, b);
+}
+
+# fill the contours built in the scratch by the nonzero rule with a brush
+fun put_fill(ctx: *Context, b: tess.Brush) {
     if (hidden_shape(ctx, tess.FEATHER)) { ret; }
     open_run(ctx);
     var br: tess.Brush = b;
     record(ctx, tess.fill(?ctx.dl, ?ctx.sc, ?br));
+}
+
+# register an app's icon, copying its path data (see blit.icon)
+#
+# its id, and the codepoint that id stands for, draw it through icon_at and
+# inline in any text.
+# ---
+# ctx: context
+# ic:  the icon
+# ret: its id, or none for malformed data, an empty box or when the context cannot grow
+pub fun add_icon(ctx: *Context, ic: ico.Icon) opt[u32] {
+    ret ico.add(?ctx.icons, ic);
+}
+
+# the width an icon takes drawn size pixels tall
+# ---
+# ctx:  context
+# id:   icon id, built in or from add_icon
+# size: height in pixels
+# ret:  width in pixels, 0 for an id not known
+pub fun icon_width(ctx: *Context, id: u32, size: f32) f32 {
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, id);
+    if (sel ic.none) { ret 0.0::f32; }
+    ret size * ic.some.w / ic.some.h;
+}
+
+# draw an icon size pixels tall with its box's top-left at (x, y), filled
+# and feathered like fill_path
+# ---
+# ctx:  context
+# id:   icon id, built in or from add_icon; one not known draws nothing
+# x:    left x in pixels
+# y:    top y in pixels
+# size: height in pixels, the width following the icon's box
+# c:    color
+pub fun icon_at(ctx: *Context, id: u32, x: f32, y: f32, size: f32, c: draw.Color) {
+    put_icon(ctx, id, x, y, size, solid(ctx, c));
+}
+
+# fill an icon size pixels tall at (x, y) with a brush
+fun put_icon(ctx: *Context, id: u32, x: f32, y: f32, size: f32, b: tess.Brush) {
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, id);
+    if (sel ic.none)      { ret; }
+    if (size <= 0.0::f32) { ret; }
+    tess.begin(?ctx.sc);
+    tess.flatten_data(?ctx.sc, ic.some.data, ic.some.n, ctx.lx + x, ctx.ly + y, size / ic.some.h);
+    if (ctx.sc.bad != 0) {
+        ctx.oom = 1;
+        ret;
+    }
+    put_fill(ctx, b);
+}
+
+# the registered icon whose codepoint starts at byte i of the first n bytes of
+# s, as the bytes it takes, 0 when none does
+#
+# an icon codepoint is four bytes led by 0xF3, which is never a continuation
+# byte, so a scan byte by byte finds it on any boundary.
+fun inline_icon(ctx: *Context, s: str, i: usize, n: usize, id: *u32) usize {
+    if (s[i]::u8 != 0xF3 || n - i < 4) { ret 0; }
+    var cp:   u32   = 0;
+    val used: usize = font.next(s, i, n, ?cp);
+    if (!known_icon(ctx, cp, id)) { ret 0; }
+    ret used;
+}
+
+# whether a codepoint stands for a built-in or registered icon, and which
+fun known_icon(ctx: *Context, cp: u32, id: *u32) bool {
+    val k: opt[u32] = ico.id_of(cp);
+    if (sel k.none) { ret false; }
+    val ic: opt[ico.Icon] = ico.get(?ctx.icons, k.some);
+    if (sel ic.none) { ret false; }
+    @id = k.some;
+    ret true;
+}
+
+# the height an inline icon is drawn at: the current style's ascent and descent
+fun inline_size(ctx: *Context) f32 {
+    val m: gly.LineMetrics = font.line(?ctx.font, ctx.style, ctx.scale);
+    ret m.ascent + m.descent;
+}
+
+# width of one line of the first n bytes of s, inline icons included
+fun line_width(ctx: *Context, s: str, n: usize) f32 {
+    var w: f32   = 0.0::f32;
+    var a: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        var id: u32   = 0;
+        val k:  usize = inline_icon(ctx, s, i, n, ?id);
+        if (k == 0) {
+            i = i + 1;
+            cnt;
+        }
+        w = w + font.measure_n(?ctx.font, ctx.style, ctx.scale, ?s[a], i - a) + icon_width(ctx, id, inline_size(ctx));
+        i = i + k;
+        a = i;
+    }
+    ret w + font.measure_n(?ctx.font, ctx.style, ctx.scale, ?s[a], n - a);
 }
 
 # stroke a path w pixels wide, centred on it and feathered
@@ -3121,6 +3244,8 @@ pub fun glyph(ctx: *Context, cp: u32, x: f32, y: f32, c: draw.Color) {
 #
 # each line is shaped by the style's glyph source, control codepoints take no
 # space and a newline starts the next line box at x.
+# a codepoint that stands for an icon (see blit.icon) draws the icon in its
+# place, a line tall and tinted c, and text_width measures it the same way.
 # ---
 # ctx: context
 # s:   utf-8 text
@@ -3132,10 +3257,37 @@ pub fun text_at(ctx: *Context, s: str, x: f32, y: f32, c: draw.Color) {
     text_span(ctx, s, str_len(s), x, y, c);
 }
 
-# draw one line of shaped glyphs with the pen starting at x on the baseline
+# draw one line with the pen starting at x on the baseline, inline icons
+# between runs of shaped glyphs, each icon's box from the ascent to the descent
 #
 # ret: the pen's x after the line
 fun pen_line(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
+    var px: f32   = x;
+    var a:  usize = 0;
+    var i:  usize = 0;
+    for (i < n) {
+        var id: u32   = 0;
+        val k:  usize = inline_icon(ctx, s, i, n, ?id);
+        if (k == 0) {
+            i = i + 1;
+            cnt;
+        }
+        px = pen_run(ctx, ?s[a], i - a, px, base, ink);
+        var wu: f32;
+        var wv: f32;
+        atlas.white_uv(?wu, ?wv);
+        val size: f32 = inline_size(ctx);
+        put_icon(ctx, id, px, base - font.line(?ctx.font, ctx.style, ctx.scale).ascent, size, tess.solid(ink, wu, wv));
+        px = px + icon_width(ctx, id, size);
+        i  = i + k;
+        a  = i;
+    }
+    ret pen_run(ctx, ?s[a], n - a, px, base, ink);
+}
+
+# draw a run of shaped glyphs with the pen starting at x on the baseline,
+# returning where the pen ends
+fun pen_run(ctx: *Context, s: str, n: usize, x: f32, base: f32, ink: draw.Color) f32 {
     val g:  usize       = font.shape(?ctx.font, ctx.style, ctx.scale, s, n);
     val sh: *gly.Shaped = font.shaped(?ctx.font);
     var px: f32         = x;
@@ -4048,6 +4200,75 @@ test gradients__shade_quads_rounded_rects_and_paths {
     if (dark == 0 || light == 0) { ret 4; }
 
     val fp:    err[allo.Error] = path.free(?tri);
+    val freed: err[allo.Error] = free(?ctx);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+# the x extent of the vertices from index from on
+fun span_x(ctx: *Context, from: usize, x0: *f32, x1: *f32) {
+    val p: *draw.Vert = draw_verts(ctx);
+    @x0 = 1.0e9::f32;
+    @x1 = -1.0e9::f32;
+    var i: usize = from;
+    for (i < draw_count(ctx)) {
+        @x0 = minf(@x0, p[i].x);
+        @x1 = maxf(@x1, p[i].x);
+        i   = i + 1;
+    }
+}
+
+test icons__draw_at_any_size_and_inline_in_text {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var ctx: Context;
+    val ie:  err[allo.Error] = init(?ctx, ?a);
+    if (sel ie.err) { ret 1; }
+    start_at(?ctx, 0.0::f32, 0.0::f32);
+
+    # at any size, in its box plus the feather, in the color asked for
+    val red: draw.Color = draw.hex(0xFF0000, 1.0::f32);
+    var x0:  f32;
+    var x1:  f32;
+    icon_at(?ctx, ico.SETTINGS, 10.0::f32, 0.0::f32, 64.0::f32, red);
+    span_x(?ctx, 0, ?x0, ?x1);
+    if (draw_count(?ctx) == 0)                                                  { ret 2; }
+    if (x0 < 9.0::f32 || x1 > 75.0::f32)                                        { ret 3; }
+    if (x1 - x0 < 56.0::f32)                                                    { ret 4; }
+    if (draw_verts(?ctx)[0].r <= 0.0::f32 || draw_verts(?ctx)[0].g != 0.0::f32) { ret 5; }
+    val big: usize = draw_count(?ctx);
+    icon_at(?ctx, ico.SETTINGS, 0.0::f32, 0.0::f32, 8.0::f32, red);
+    span_x(?ctx, big, ?x0, ?x1);
+    if (x0 < -1.0::f32 || x1 > 9.0::f32)                                                                   { ret 6; }
+    if (icon_width(?ctx, ico.PLAY, 16.0::f32) != 16.0::f32 || icon_width(?ctx, 77, 16.0::f32) != 0.0::f32) { ret 7; }
+
+    # inline, an icon is a line tall and square in the 8px bitmap font, and
+    # text runs on after it
+    val line: str = "a\xF3\xB0\x80\x80b";
+    if (text_width(?ctx, line) != 24.0::f32)                           { ret 8; }
+    if (glyph_advance(?ctx, 'a', ico.codepoint(ico.PLAY)) != 8.0::f32) { ret 9; }
+    if (glyph_advance(?ctx, ico.codepoint(ico.PLAY), 'b') != 8.0::f32) { ret 10; }
+    val before: usize = draw_count(?ctx);
+    text_at(?ctx, line, 0.0::f32, 50.0::f32, red);
+    # two glyph quads and the icon's feathered fill between them
+    if (draw_count(?ctx) <= before + 8)                        { ret 11; }
+    if (draw_verts(?ctx)[draw_count(?ctx) - 4].x != 16.0::f32) { ret 12; }
+
+    # an app's icon, by the codepoint its id stands for
+    var tri: [10]f32  = [10]f32{0.0, 0.0, 0.0, 1.0, 12.0, 6.0, 1.0, 0.0, 12.0, 4.0};
+    val own: opt[u32] = add_icon(?ctx, ico.Icon{data: ?tri[0], n: 10, w: 24.0::f32, h: 12.0::f32});
+    if (sel own.none) { ret 13; }
+    var buf:  [8]u8;
+    val used: usize = ico.encode(own.some, ?buf[0], 4);
+    buf[used]     = 'x';
+    buf[used + 1] = 0;
+    if (text_width(?ctx, (?buf[0])::str) != 24.0::f32) { ret 14; }
+    # a codepoint in the icon range that no icon has is left to the font
+    if (text_width(?ctx, "\xF3\xB0\x80\xBF") != 8.0::f32) { ret 15; }
+
+    end(?ctx);
+    if (ok(?ctx) != 1) { ret 16; }
     val freed: err[allo.Error] = free(?ctx);
     if (sel freed.err) { ret 1; }
     ret 0;

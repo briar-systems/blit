@@ -1284,18 +1284,34 @@ fun caret_at(ctx: *context.Context, f: *field.Field, x: f32) usize {
 # hint: dim text shown while it is empty and unfocused, nil for none
 # ret:  this frame's outcome bits: field.EDITED, field.ENTERED, field.ESCAPED
 pub fun text_field(ctx: *context.Context, key: str, f: *field.Field, hint: str) u8 {
-    val id: u64          = context.id_of(ctx, key);
     val in: theme.Edges  = inset(ctx, theme.FIELD);
     val cw: f32          = context.px(ctx, look(ctx, theme.FIELD_CARET).min_w);
     val nw: f32          = context.text_width(ctx, hint) + in.l + in.r + cw;
     val r:  context.Area = place(ctx, wide(), layout.fit(), nw, row_of(ctx, theme.FIELD));
-    val x0: f32          = r.x0;
-    val y0: f32          = r.y0;
-    val x1: f32          = r.x1;
-    val y1: f32          = r.y1;
-    val h:  f32          = y1 - y0;
-    val tx: f32          = x0 + in.l;
-    var tw: f32          = maxf(x1 - x0 - in.l - in.r, 0.0::f32);
+    ret text_field_at(ctx, key, f, hint, r.x0, r.y0, r.x1, r.y1);
+}
+
+# a one-line text field editing @f in a rect, placing nothing
+#
+# the same field as text_field, for a control that lays out its own parts,
+# such as a cell of a value editor (see blit.value).
+# ---
+# ctx:  context
+# key:  the field's key in the current id scope
+# f:    the field's state, edited in place
+# hint: dim text shown while it is empty and unfocused, nil for none
+# x0:   left x in pixels
+# y0:   top y in pixels
+# x1:   right x in pixels
+# y1:   bottom y in pixels
+# ret:  this frame's outcome bits: field.EDITED, field.ENTERED, field.ESCAPED
+pub fun text_field_at(ctx: *context.Context, key: str, f: *field.Field, hint: str, x0: f32, y0: f32, x1: f32, y1: f32) u8 {
+    val id: u64         = context.id_of(ctx, key);
+    val in: theme.Edges = inset(ctx, theme.FIELD);
+    val cw: f32         = context.px(ctx, look(ctx, theme.FIELD_CARET).min_w);
+    val h:  f32         = y1 - y0;
+    val tx: f32         = x0 + in.l;
+    var tw: f32         = maxf(x1 - x0 - in.l - in.r, 0.0::f32);
 
     var counted: [42]u8;
     var count:   str = nil;

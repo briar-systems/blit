@@ -57,6 +57,7 @@ use blit.context;
 use blit.draw;
 use blit.driver;
 use blit.field;
+use ico: blit.icon;
 use bid: blit.id;
 use blit.input;
 use blit.interact;
@@ -115,8 +116,8 @@ pub rec Shortcut {
 #           at its right; code 0 for none
 # check:    nil for an entry that is not checkable, else its 0/1 state, drawn
 #           as a check mark when nonzero and flipped when the item fires
-# icon:     text drawn in the icon column before the label, such as an icon
-#           codepoint, nil for none
+# icon:     text drawn in the icon column before the label, such as an icon's
+#           codepoint (blit.icon.STR_* for a built-in), nil for none
 # disabled: true to draw it dimmed and never fire it
 pub rec Item {
     label:    str;
@@ -941,7 +942,7 @@ fun probe_ui(ctx: *context.Context, user: ptr) {
     var view: Menu = begin_menu(ctx, ?bar, "View");
     var grid: Item = of("Grid");
     grid.check = ?pr.grid;
-    grid.icon  = "#";
+    grid.icon  = ico.STR_PLUS;
     item(ctx, ?view, grid);
     var zoom: Item = of("Zoom");
     zoom.shortcut = keys('Z', MOD_PRIMARY);

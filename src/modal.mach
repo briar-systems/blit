@@ -1,0 +1,685 @@
+# modal dialogs: a window that blocks everything beneath it until it closes
+#
+# a modal opens in the modals band (see blit.band), above the base content,
+# docks, windows, overlays and popups, and covers the whole screen beneath
+# its body with a scrim. the scrim claims the screen for every button, so no
+# claim under it is hovered, pressed or scrolled, while the widgets inside the
+# modal take input as usual. a press on the scrim closes the modal only when
+# its declaration says so (MODAL_SCRIM_CLOSES).
+#
+# a modal's open state is kept in the context's store under its title's id
+# (see blit.state): open puts it up, close takes it down, and begin_modal and
+# end_modal run every frame, open or not, like a window. it opens centred on
+# the screen, or at a point (MODAL_ANCHORED), kept on the screen, and is as
+# wide as its widest widget needs unless its declaration fixes a width. its
+# size is measured as it is drawn and applied the frame after, so the frame it
+# opens it lays out hidden, only to measure, behind a scrim that already
+# blocks.
+#
+# modals stack. a modal opened inside another's body nests one slot above it,
+# and modals called one after another stack by call order, so the scrim of
+# the top one covers every modal beneath it and only the top one takes the
+# pointer. the keyboard follows: a modal takes the focus the frame it opens
+# (see context.focus), takes it back whenever it is the top modal and no
+# widget holds it, and gives it back to the widget that held it before the
+# frame after it closes, as an open menu does. escape closes the top modal
+# while it holds the keyboard itself, so escape in a text field inside it
+# ends the edit first. its titlebar's close button closes it too.
+#
+# confirm is a whole dialog built from it: a message and a row of buttons,
+# returning the button chosen.
+#
+# the scrim and the chrome draw from the theme through look, the one place
+# this module reads its colors.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use allo: std.allocator;
+use std.allocator.page;
+
+use blit.band;
+use blit.context;
+use blit.draw;
+use blit.driver;
+use blit.hit;
+use bid: blit.id;
+use blit.input;
+use blit.interact;
+use blit.layout;
+use blit.state;
+use blit.theme;
+use blit.widget;
+
+# modal flags a declaration combines with |
+# ---
+# MODAL_NO_TITLE:     no titlebar, so no close button
+# MODAL_NO_CLOSE:     no close button in the titlebar
+# MODAL_SCRIM_CLOSES: a press on the scrim closes the modal
+# MODAL_ANCHORED:     open with the top left at (x, y) instead of centred
+pub val MODAL_NO_TITLE:     u32 = 1;
+pub val MODAL_NO_CLOSE:     u32 = 2;
+pub val MODAL_SCRIM_CLOSES: u32 = 4;
+pub val MODAL_ANCHORED:     u32 = 8;
+
+# why a modal closed, as ModalArea.why
+pub val CLOSE_NONE:   u8 = 0;
+pub val CLOSE_ESCAPE: u8 = 1;
+pub val CLOSE_BUTTON: u8 = 2;
+pub val CLOSE_SCRIM:  u8 = 3;
+
+# what confirm returns while no choice is made, and when the dialog is
+# closed without one
+pub val NO_CHOICE: usize = 0xFFFFFFFFFFFFFFFF;
+pub val CANCELLED: usize = 0xFFFFFFFFFFFFFFFE;
+
+# what a call declares about a modal, every frame it is drawn
+# ---
+# title: titlebar text, and the modal's key (see context.id_of)
+# w:     width in pixels, 0 to follow the widest widget
+# max_w: greatest width, 0 for none; a modal is never wider than the screen
+# x:     left in screen pixels, with MODAL_ANCHORED
+# y:     top in screen pixels, with MODAL_ANCHORED
+# flags: MODAL_* flags
+pub rec Modal {
+    title: str;
+    w:     f32;
+    max_w: f32;
+    x:     f32;
+    y:     f32;
+    flags: u32;
+}
+
+# the state a modal keeps in the context's store under its id
+# ---
+# open: 1 while the modal is up
+# w:    the width it took last frame, 0 before it was measured
+# h:    the height it took last frame, 0 before it was measured
+# key:  the claim key it opened at this frame, which orders it among modals
+# owns: 1 while it holds the keyboard for itself, 2 the frame after it closed
+# prev: the focus holder before it took the keyboard, given back on close
+pub rec ModalState {
+    open: u8;
+    w:    f32;
+    h:    f32;
+    key:  u64;
+    owns: u8;
+    prev: u64;
+}
+
+# the handle begin_modal returns for end_modal
+# ---
+# id:     the modal's id, the id scope of its widgets
+# st:     its state, valid until the frame ends
+# flags:  the MODAL_* flags declared
+# shown:  1 if its body takes widgets this frame
+# closed: true on the frame escape, its close button or the scrim closed it
+# why:    the CLOSE_* reason it closed this frame, CLOSE_NONE otherwise
+# hidden: 1 while it lays out only to measure, drawing and claiming nothing
+# x0:     its left in screen pixels
+# y0:     its top in screen pixels
+# w:      its width this frame
+# th:     titlebar height, 0 without one
+# auto:   true when its width follows its widgets
+# min_w:  least width, what the titlebar needs
+# max_w:  greatest width
+# ch:     the channels its body's background and widgets draw in
+# claim:  its body's reserved claim, beneath its widgets
+# seen:   the hovered widget's claims before it, to tell whether the
+#         cursor is over it
+pub rec ModalArea {
+    id:     u64;
+    st:     *ModalState;
+    flags:  u32;
+    shown:  u8;
+    closed: bool;
+    why:    u8;
+    hidden: u8;
+    x0:     f32;
+    y0:     f32;
+    w:      f32;
+    th:     f32;
+    auto:   bool;
+    min_w:  f32;
+    max_w:  f32;
+    ch:     context.Channels;
+    claim:  usize;
+    seen:   u64;
+}
+
+# which modal is on top, kept in the store under one id for every modal
+# ---
+# frame: the store's frame cur was gathered in
+# top:   the modal on top at the end of the frame before, 0 for none
+# cur:   the open modal with the highest key so far this frame
+# key:   cur's key
+rec Stack {
+    frame: u64;
+    top:   u64;
+    cur:   u64;
+    key:   u64;
+}
+
+# the modal style's padding around its body column, at the context's scale
+fun pads(ctx: *context.Context) theme.Edges {
+    ret context.px_edges(ctx, context.look_of(ctx, theme.MODAL).pad);
+}
+
+# the layout style's space between items down a column, at the context's scale
+fun gap(ctx: *context.Context) f32 {
+    ret context.px(ctx, context.look_of(ctx, theme.LAYOUT).margin.b);
+}
+
+# a titlebar's height: the window title style's least height, grown to fit a
+# line of text with its inset
+fun row_h(ctx: *context.Context) f32 {
+    val s: *theme.Style = context.look_of(ctx, theme.WINDOW_TITLE);
+    ret maxf(context.px(ctx, s.min_h), context.line_height(ctx) + context.px(ctx, s.inset.t + s.inset.b));
+}
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun clampf(v: f32, lo: f32, hi: f32) f32 {
+    if (v > hi) { ret maxf(hi, lo); }
+    if (v < lo) { ret lo; }
+    ret v;
+}
+
+# a modal centred on the screen, as wide as its widgets, with a titlebar and
+# a close button
+# ---
+# title: titlebar text, and the modal's key
+# ret:   the declaration
+pub fun dialog(title: str) Modal {
+    ret Modal{title: title, w: 0.0::f32, max_w: 0.0::f32, x: 0.0::f32, y: 0.0::f32, flags: 0};
+}
+
+# put up the modal keyed key in the current id scope
+# ---
+# ctx: context
+# key: the modal's title or key
+pub fun open(ctx: *context.Context, key: str) {
+    state.get[ModalState](ctx, context.id_of(ctx, key)).open = 1;
+}
+
+# take down the modal keyed key in the current id scope
+# ---
+# ctx: context
+# key: the modal's title or key
+pub fun close(ctx: *context.Context, key: str) {
+    state.get[ModalState](ctx, context.id_of(ctx, key)).open = 0;
+}
+
+# whether the modal keyed key in the current id scope is up
+# ---
+# ctx: context
+# key: the modal's title or key
+# ret: true while it is open
+pub fun is_open(ctx: *context.Context, key: str) bool {
+    ret state.get[ModalState](ctx, context.id_of(ctx, key)).open != 0;
+}
+
+# the record of which modal is on top, moved on to this frame
+fun stack(ctx: *context.Context) *Stack {
+    val s:   *Stack = state.get[Stack](ctx, bid.of_str(bid.ROOT, "#modals"));
+    val now: u64    = ctx.store.frame;
+    if (s.frame != now) {
+        s.top = 0;
+        if (s.frame + 1 == now) { s.top = s.cur; }
+        s.cur   = 0;
+        s.key   = 0;
+        s.frame = now;
+    }
+    ret s;
+}
+
+# whether escape was pressed this frame
+fun escaped(ctx: *context.Context) bool {
+    var i: usize = 0;
+    for (i < ctx.in.events.len) {
+        val e: input.Event = ctx.in.events.data[i];
+        if (sel e.key) {
+            if (e.key.code == input.KEY_ESCAPE) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# keep the keyboard with an open modal, taking it the frame it opens and
+# whenever it is on top with no holder, and giving it back the frame after it
+# closes, so the key that closed it never reaches the widget it goes back to
+fun hold(ctx: *context.Context, id: u64, st: *ModalState, open: bool, top: bool) {
+    if (open) {
+        if (st.owns == 0) {
+            st.owns = 1;
+            st.prev = ctx.focus;
+            context.focus(ctx, id);
+            ret;
+        }
+        st.owns = 1;
+        if (top && ctx.focus == 0) { context.focus(ctx, id); }
+        context.focused(ctx, id);
+        ret;
+    }
+    if (st.owns == 0) { ret; }
+    if (st.owns == 1) {
+        st.owns = 2;
+        context.focused(ctx, id);
+        ret;
+    }
+    st.owns = 0;
+    if (ctx.focus == id || ctx.focus == 0) { context.focus(ctx, st.prev); }
+    st.prev = 0;
+}
+
+# close a modal on this frame's input, leaving whatever begin_modal opened
+fun dismiss(ctx: *context.Context, r: *ModalArea, why: u8) {
+    val st: *ModalState = r.st;
+    st.open  = 0;
+    st.w     = 0.0::f32;
+    st.h     = 0.0::f32;
+    r.closed = true;
+    r.why    = why;
+    hold(ctx, r.id, st, false, false);
+    if (r.shown == 0) { ret; }
+    r.shown = 0;
+    if (r.hidden != 0) { context.pop_measure(ctx); }
+    context.pop_id(ctx);
+    context.pop_band(ctx);
+}
+
+# draw a modal's scrim and chrome and, while it is open, start its body column
+#
+# call it every frame, open or not, and pair it with end_modal. widgets placed
+# while the returned shown is 1 fill its body, in screen pixels, and the modal
+# is their id scope, so a label path through it is "<title>/<label>".
+# ---
+# ctx: context
+# m:   what the call declares about the modal
+# ret: a handle for end_modal
+pub fun begin_modal(ctx: *context.Context, m: Modal) ModalArea {
+    var r: ModalArea;
+    r.claim = context.NO_CLAIM;
+    r.flags = m.flags;
+    r.id    = context.id_of(ctx, m.title);
+    val st:  *ModalState = state.get[ModalState](ctx, r.id);
+    val top: bool        = stack(ctx).top == r.id;
+    r.st = st;
+    if (st.open == 0) {
+        hold(ctx, r.id, st, false, false);
+        ret r;
+    }
+    hold(ctx, r.id, st, true, top);
+    if (top && ctx.focus == r.id && escaped(ctx)) {
+        dismiss(ctx, ?r, CLOSE_ESCAPE);
+        ret r;
+    }
+
+    r.shown = 1;
+    r.seen  = ctx.hover_seen;
+    context.push_band(ctx, band.MODALS, 0);
+    context.push_id(ctx, r.id);
+    st.key = hit.key(context.layer_of(ctx), ctx.ordinal);
+
+    val every: u8           = input.BUTTON_LEFT | input.BUTTON_RIGHT | input.BUTTON_MIDDLE | input.BUTTON_X1 | input.BUTTON_X2;
+    val sh:    interact.Hit = interact.hit(ctx, bid.child(r.id, "#scrim"), 0.0::f32, 0.0::f32, ctx.sw, ctx.sh, every);
+    if (sh.pressed && (m.flags & MODAL_SCRIM_CLOSES) != 0) {
+        dismiss(ctx, ?r, CLOSE_SCRIM);
+        ret r;
+    }
+    context.box(ctx, theme.SCRIM, theme.NORMAL, 0.0::f32, 0.0::f32, ctx.sw, ctx.sh);
+
+    val pd: theme.Edges = pads(ctx);
+    val ti: theme.Edges = context.px_edges(ctx, context.look_of(ctx, theme.WINDOW_TITLE).inset);
+    var th: f32         = row_h(ctx);
+    if ((m.flags & MODAL_NO_TITLE) != 0) { th = 0.0::f32; }
+    r.th = th;
+    val closer:  bool = th > 0.0::f32 && (m.flags & MODAL_NO_CLOSE) == 0;
+    var close_w: f32  = 0.0::f32;
+    if (closer) { close_w = th; }
+    r.min_w = pd.l + pd.r;
+    if (th > 0.0::f32) { r.min_w = maxf(r.min_w, ti.l + ti.r + context.text_width_n(ctx, m.title, bid.shown(m.title)) + close_w); }
+    r.max_w = maxf(ctx.sw - pd.l - pd.r, r.min_w);
+    if (m.max_w > 0.0::f32) { r.max_w = clampf(m.max_w, r.min_w, r.max_w); }
+    r.auto = m.w <= 0.0::f32;
+
+    # the frame it opens it has no size yet, so it lays out hidden to measure
+    if (st.h <= 0.0::f32) {
+        r.hidden = 1;
+        context.push_measure(ctx);
+        context.wake_at(ctx, ctx.in.time);
+    }
+    var w: f32 = clampf(m.w, r.min_w, r.max_w);
+    if (r.auto) {
+        w = r.max_w;
+        if (st.w > 0.0::f32) { w = clampf(st.w, r.min_w, r.max_w); }
+    }
+    r.w = w;
+
+    var x0: f32 = (ctx.sw - w) / 2.0::f32;
+    var y0: f32 = (ctx.sh - st.h) / 2.0::f32;
+    if ((m.flags & MODAL_ANCHORED) != 0) {
+        x0 = m.x;
+        y0 = m.y;
+    }
+    x0   = clampf(x0, 0.0::f32, ctx.sw - w);
+    y0   = clampf(y0, 0.0::f32, ctx.sh - st.h);
+    r.x0 = x0;
+    r.y0 = y0;
+
+    r.claim = context.reserve_claim(ctx, r.id);
+    # the modal's shadow and body draw beneath its titlebar, which draws
+    # beneath its widgets
+    r.ch = context.split(ctx, 3);
+    context.set_channel(ctx, r.ch, 1);
+
+    if (th > 0.0::f32) {
+        val x1: f32 = x0 + w;
+        val y1: f32 = y0 + th;
+        var hx: interact.Hit;
+        if (closer) {
+            hx = interact.hit(ctx, bid.child(r.id, "#close"), x1 - th, y0, x1, y1, input.BUTTON_LEFT);
+            if (hx.hot) { context.set_cursor(ctx, input.CURSOR_HAND); }
+            if (hx.clicked) {
+                dismiss(ctx, ?r, CLOSE_BUTTON);
+                ret r;
+            }
+        }
+        val ts: u8           = theme.pick(hx.hot, hx.active, false, false);
+        val tp: *theme.Paint = context.paint_of(ctx, theme.WINDOW_TITLE, ts);
+        context.box_face(ctx, theme.WINDOW_TITLE, ts, x0, y0, x1, y1, context.CORNERS_TOP, context.SIDES_ALL);
+        val ty: f32 = y0 + (th - context.line_height(ctx)) / 2.0::f32;
+        context.text_span(ctx, m.title, bid.shown(m.title), x0 + ti.l, ty, tp.text);
+        if (closer) {
+            var xc: draw.Color = tp.mark;
+            if (hx.hot) { xc = tp.text; }
+            val gw: f32 = context.text_width(ctx, "x");
+            context.glyph(ctx, 'x', x1 - th + (th - gw) / 2.0::f32, ty, xc);
+        }
+    }
+
+    context.set_channel(ctx, r.ch, 2);
+    context.push_layout(ctx, layout.column(x0 + pd.l, y0 + th + pd.t, maxf(w - pd.l - pd.r, 0.0::f32), 0.0::f32, gap(ctx)));
+    ret r;
+}
+
+# close a modal begun by begin_modal: paint its body beneath its widgets,
+# give its claim its rect, take the size its widgets need for the next frame
+# and leave its band
+#
+# a wheel turned over the modal stops at it, so a scroll region the modal is
+# called inside never scrolls beneath it.
+# ---
+# ctx: context
+# r:   the value begin_modal returned
+pub fun end_modal(ctx: *context.Context, r: ModalArea) {
+    if (r.shown == 0) { ret; }
+    val st: *ModalState   = r.st;
+    val pd: theme.Edges   = pads(ctx);
+    val f:  *layout.Frame = context.top_layout(ctx);
+    val nw: f32           = f.need_w;
+    val nh: f32           = f.need_h;
+    context.pop_layout(ctx);
+
+    val h:  f32 = r.th + nh + pd.t + pd.b;
+    val x1: f32 = r.x0 + r.w;
+    val y1: f32 = r.y0 + h;
+    context.set_channel(ctx, r.ch, 0);
+    var ends: u8 = context.CORNERS_BOTTOM;
+    if (r.th == 0.0::f32) { ends = context.CORNERS_ALL; }
+    context.box_shadow(ctx, theme.MODAL, theme.NORMAL, r.x0, r.y0, x1, y1, context.CORNERS_ALL);
+    context.box_face(ctx, theme.MODAL, theme.NORMAL, r.x0, r.y0 + r.th, x1, y1, ends, context.SIDES_ALL);
+    context.merge(ctx, r.ch);
+    context.fill_claim(ctx, r.claim, r.x0, r.y0, x1, y1);
+
+    if (ctx.hover_seen > r.seen) { ctx.wheel_taken = 1; }
+    if (r.hidden != 0)           { context.pop_measure(ctx); }
+    context.pop_id(ctx);
+    context.pop_band(ctx);
+
+    if (st.open == 0) {
+        st.w = 0.0::f32;
+        st.h = 0.0::f32;
+        hold(ctx, r.id, st, false, false);
+        ret;
+    }
+    st.h = h;
+    st.w = r.w;
+    if (r.auto) { st.w = clampf(nw + pd.l + pd.r, r.min_w, r.max_w); }
+    val s: *Stack = stack(ctx);
+    if (st.key > s.key) {
+        s.cur = r.id;
+        s.key = st.key;
+    }
+}
+
+# a modal asking a question: a message and a row of buttons
+#
+# open it with open(ctx, title), and call it every frame, open or not. it
+# closes once a button is chosen, and escape, its close button and the scrim
+# close it with no choice.
+# ---
+# ctx:     context
+# title:   titlebar text, and the dialog's key
+# message: the question, wrapped to the dialog's width
+# labels:  pointer to an array of n button labels, each its key in the dialog
+# n:       how many buttons
+# ret:     the index of the button chosen this frame, CANCELLED on the frame
+#          it closed without one, NO_CHOICE otherwise
+pub fun confirm(ctx: *context.Context, title: str, message: str, labels: *str, n: usize) usize {
+    var m: Modal = dialog(title);
+    m.flags = MODAL_SCRIM_CLOSES;
+    m.max_w = context.line_height(ctx) * 24.0::f32;
+    val r:   ModalArea = begin_modal(ctx, m);
+    var got: usize     = NO_CHOICE;
+    if (r.closed) { got = CANCELLED; }
+    if (r.shown != 0) {
+        widget.note(ctx, message);
+        val i: usize = widget.buttons(ctx, labels, n);
+        if (i < n) {
+            r.st.open = 0;
+            got       = i;
+        }
+    }
+    end_modal(ctx, r);
+    ret got;
+}
+
+# what the test interface did
+# ---
+# under:  clicks on the button beneath every modal
+# docked: clicks on the button in the dock
+# inner:  clicks on the first modal's button
+# outer:  clicks on the second modal's button
+# second: 1 to open the second modal from the first one's body
+# choice: confirm's last answer other than NO_CHOICE
+# dock:   the dock's state
+rec Probe {
+    under:  u32;
+    docked: u32;
+    inner:  u32;
+    outer:  u32;
+    choice: usize;
+    dock:   widget.Dock;
+}
+
+# a dock with a button, a button on the base, a modal "First" holding a
+# button and opening "Second" over it, and a confirm dialog
+#[testing]
+fun probe_ui(ctx: *context.Context, user: ptr) {
+    val pr: *Probe          = user::*Probe;
+    val da: widget.DockArea = widget.begin_dock(ctx, "side", ?pr.dock);
+    if (widget.button(ctx, "docked")) { pr.docked = pr.docked + 1; }
+    widget.end_dock(ctx, ?pr.dock, da);
+
+    val free: context.Area = context.free_area(ctx);
+    if (widget.button_at(ctx, "under", free.x0, 0.0::f32, free.x1, 300.0::f32, false)) { pr.under = pr.under + 1; }
+
+    val a: ModalArea = begin_modal(ctx, dialog("First"));
+    if (a.shown != 0) {
+        widget.text(ctx, "first modal");
+        if (widget.button(ctx, "Act"))  { pr.inner = pr.inner + 1; }
+        if (widget.button(ctx, "More")) { open(ctx, "Second"); }
+        val b: ModalArea = begin_modal(ctx, dialog("Second"));
+        if (b.shown != 0 && widget.button(ctx, "Act")) { pr.outer = pr.outer + 1; }
+        end_modal(ctx, b);
+    }
+    end_modal(ctx, a);
+
+    var labels: [2]str = [2]str{"Yes", "No"};
+    val c:      usize  = confirm(ctx, "Sure?", "discard the changes?", ?labels[0], 2);
+    if (c != NO_CHOICE) { pr.choice = c; }
+}
+
+# the rect the last frame drew a widget in, empty when it drew none
+#[testing]
+fun rect_of(d: *driver.Driver, id: u64) context.Area {
+    val r: opt[context.Area] = driver.rect(d, id);
+    if (sel r.some) { ret r.some; }
+    var none: context.Area;
+    ret none;
+}
+
+# whether the modal at a label path is open
+#[testing]
+fun up(d: *driver.Driver, path: str) bool {
+    ret state.get[ModalState](?d.ctx, driver.find(d, path)).open != 0;
+}
+
+#[testing]
+fun start(d: *driver.Driver, a: *allo.Allocator, pr: *Probe) bool {
+    pr.dock.side = context.Side.left{};
+    pr.dock.size = 100.0::f32;
+    pr.choice    = NO_CHOICE;
+    val ie: err[allo.Error] = driver.init(d, a, 600.0::f32, 400.0::f32, probe_ui, pr::ptr);
+    if (sel ie.err) { ret false; }
+    driver.step(d);
+    ret true;
+}
+
+test modal__blocks_beneath_while_its_own_widgets_work {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    val under:  u64 = driver.find(?d, "under");
+    val docked: u64 = driver.find(?d, "side/docked");
+    if (!driver.click(?d, under) || pr.under != 1)   { ret 2; }
+    if (!driver.click(?d, docked) || pr.docked != 1) { ret 3; }
+    val ur: context.Area = rect_of(?d, under);
+    val dr: context.Area = rect_of(?d, docked);
+
+    # once open, the modal's scrim takes every press beneath it
+    open(?d.ctx, "First");
+    driver.steps(?d, 3);
+    val act: u64 = driver.find(?d, "First/Act");
+    if (!driver.drawn(?d, act)) { ret 4; }
+    # it sits centred on the screen, as wide as its widgets
+    val mr: context.Area = rect_of(?d, driver.find(?d, "First"));
+    val cx: f32          = (mr.x0 + mr.x1) / 2.0::f32 - 300.0::f32;
+    val cy: f32          = (mr.y0 + mr.y1) / 2.0::f32 - 200.0::f32;
+    if (mr.x1 - mr.x0 < 40.0::f32 || mr.x1 - mr.x0 > 300.0::f32) { ret 12; }
+    if (cx * cx > 1.0::f32 || cy * cy > 1.0::f32)                { ret 13; }
+    driver.move(?d, ur.x1 - 2.0::f32, ur.y1 - 2.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    driver.move(?d, (dr.x0 + dr.x1) / 2.0::f32, (dr.y0 + dr.y1) / 2.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (pr.under != 1 || pr.docked != 1) { ret 5; }
+    if (!is_open(?d.ctx, "First"))       { ret 6; }
+
+    # its own button works, and escape closes it
+    if (!driver.click(?d, act) || pr.inner != 1)       { ret 7; }
+    if (!driver.focused(?d, driver.find(?d, "First"))) { ret 8; }
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (is_open(?d.ctx, "First")) { ret 9; }
+    driver.step(?d);
+    if (driver.drawn(?d, act))                     { ret 10; }
+    if (!driver.click(?d, under) || pr.under != 2) { ret 11; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test modal__stacked_modals_route_input_to_the_top {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    open(?d.ctx, "First");
+    driver.steps(?d, 3);
+    val inner: u64 = driver.find(?d, "First/Act");
+    if (!driver.click(?d, driver.find(?d, "First/More"))) { ret 2; }
+    driver.steps(?d, 3);
+    val outer: u64 = driver.find(?d, "First/Second/Act");
+    if (!driver.drawn(?d, outer)) { ret 3; }
+
+    # the first modal's button lies under the second's scrim
+    val ir: context.Area = rect_of(?d, inner);
+    driver.move(?d, ir.x0 + 1.0::f32, ir.y0 + 1.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (pr.inner != 0)                             { ret 4; }
+    if (!driver.click(?d, outer) || pr.outer != 1) { ret 5; }
+
+    # escape closes the top one alone, then the one beneath has the keyboard
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (up(?d, "First/Second") || !up(?d, "First")) { ret 6; }
+    driver.steps(?d, 2);
+    if (!driver.focused(?d, driver.find(?d, "First"))) { ret 7; }
+    if (!driver.click(?d, inner) || pr.inner != 1)     { ret 8; }
+    driver.key(?d, input.KEY_ESCAPE, 0);
+    if (is_open(?d.ctx, "First")) { ret 9; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test modal__confirm_returns_the_choice {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var pr: Probe;
+    var d:  driver.Driver;
+    if (!start(?d, ?a, ?pr)) { ret 1; }
+
+    open(?d.ctx, "Sure?");
+    driver.steps(?d, 3);
+    if (!driver.click(?d, driver.find(?d, "Sure?/No")) || pr.choice != 1) { ret 2; }
+    if (is_open(?d.ctx, "Sure?"))                                         { ret 3; }
+
+    # a press on the scrim closes it without a choice
+    open(?d.ctx, "Sure?");
+    driver.steps(?d, 3);
+    driver.move(?d, 590.0::f32, 390.0::f32);
+    driver.press(?d, input.BUTTON_LEFT);
+    driver.release(?d, input.BUTTON_LEFT);
+    if (pr.choice != CANCELLED || is_open(?d.ctx, "Sure?")) { ret 4; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}

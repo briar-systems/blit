@@ -28,8 +28,8 @@ blit.context.end(?ctx);
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
-`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`, `blit.editor`. A submodule can also be
+`blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`, `blit.editor`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
 ## Text & glyph sources
@@ -370,6 +370,12 @@ test holds this README's copy to it (`blit.theme.document` writes it).
 | `option` | a row of a dropdown's or a tab list's options, on while chosen |
 | `tab_bar` | a tab bar's strip behind its tabs |
 | `tab_close` | a tab's close box: fill under the cursor, border_w the cross's stroke |
+| `table_header` | a table's header row and cells: mark the sort arrow, inset around labels, min_w a column's least width |
+| `table_cell` | a table's body cell: inset around its widgets, its row height from min_h and inset |
+| `table_rule` | a table's column and frozen-row rules: border and border_w, hot over a resize grip, min_w the grip's width |
+| `value` | a value editor's drag cell: inset around its text and before its row's cells, min_w its least width |
+| `picker` | a color picker: text its label, mark and border a marker's inner and outer rings, inset.l between swatch and label |
+| `checker` | the checkerboard alpha shows through: fill and mark its two cells |
 
 | state | when |
 |---|---|
@@ -881,6 +887,104 @@ layout cursor across the column like `blit.widget`'s:
   path: `pick/popup/filter` is the filter and `pick/popup/options` the list,
   each option an index under it.
 
+## Tables
+
+`blit.table` lays rows of any widgets out under columns the user can resize,
+reorder, sort and hide, with frozen leading columns and rows, and draws only
+the rows in view, so a table of a million rows costs what one of a screenful
+does. The caller describes its columns and runs its rows:
+
+```mach
+var cols: [3]blit.table.Column;
+cols[0] = blit.table.Column{label: "Name", width: 160.0::f32};
+cols[1] = blit.table.Column{label: "Size", width: 60.0::f32};
+cols[2] = blit.table.Column{label: "Done", flags: blit.table.NO_SORT};
+
+# per frame:
+var o: blit.table.Options = blit.table.options(count, 300.0::f32);
+o.freeze_cols = 1;
+var t: blit.table.Table = blit.table.begin(?ctx, "files", ?cols[0], 3, o);
+if (t.sorted) { order_rows(t.sort, t.dir); }
+for (blit.table.next_row(?ctx, ?t)) {
+    val f: *File = ?files[order[t.row]];
+    if (blit.table.cell(?ctx, ?t, 0)) { blit.widget.text(?ctx, f.name); }
+    if (blit.table.cell(?ctx, ?t, 1)) { blit.widget.text(?ctx, f.size_text); }
+    if (blit.table.cell(?ctx, ?t, 2)) { blit.widget.checkbox(?ctx, "done", ?f.done); }
+}
+blit.table.end(?ctx, ?t);
+```
+
+- **Rows in view.** `next_row` yields the frozen rows, then only the rows the
+  view shows, setting `t.row`. Rows are one height (`Options.row_h`, a control
+  row by default), so the first row in view is found by arithmetic and a frame
+  never walks the rows above it.
+- **Cells.** `cell(?ctx, ?t, c)` opens column `c`'s cell in the current row
+  and returns false for a hidden column or one scrolled out of view. A cell
+  is a horizontal stack across the column, its widgets centred down the row
+  and clipped to the cell.
+- **Ids.** A row is an id scope keyed by its key under the table's id, its
+  index unless `Options.key` maps it (a caller that sorts keys rows by their
+  data), and a cell a scope keyed by its column's label under the row. A
+  widget in a cell keeps its id and its state however the rows scroll.
+  `cell_id(?t, key, c)` is a cell's scope, the parent of its widgets' ids.
+- **The header.** Dragging the grip at a header cell's right edge resizes the
+  column. A click sorts by the column, ascending and then descending, and the
+  table reports it as `t.sort` (the column's index, the column count for
+  none) and `t.dir`, with `t.sorted` set on the frame it changed: the table
+  never sorts, the caller orders its rows. Dragging a header drops the column
+  on another's place through `blit.dnd`, and a right click opens a context
+  menu (`blit.menu`, under `MENU_KEY`) whose checked items show and hide
+  columns. `NO_RESIZE`, `NO_REORDER`, `NO_HIDE` and `NO_SORT`
+  turn each off per column and `HIDDEN` starts a column hidden.
+- **Frozen columns and rows.** The header, the first `freeze_cols` shown
+  columns and the first `freeze_rows` rows stay put while the rest scrolls,
+  by the wheels and by scrollbars that appear when the content outgrows the
+  table. Frozen and scrolled parts are clipped to rects that do not overlap.
+- **Column state.** Each column's width, place and visibility live in the
+  state store under the column's id (its label under the table's id), and
+  the sort and scroll under the table's. A change the user makes pins them,
+  so a table not drawn for a while keeps its layout.
+  `blit.table.register(?ctx)` makes the layout and sort persist through
+  `blit.state.save` and `load`, as `table_column` and `table` tables.
+- **Where things went.** `begin` fills each `Column`'s `id`, `shown`,
+  `frozen`, `pos` (its place in the display order), `x` and `w`, and `order`,
+  the index of the column shown at that record's own place.
+
+## Value editors & the colour picker
+
+`blit.value` edits numbers of any of `i8` to `i64`, `u8` to `u64`, `f32` and
+`f64` without loss: nothing passes a 64-bit integer through a float or an
+`f64` through anything narrower, a value shows as the shortest text that
+reads back as exactly that value, and typed text is read exactly.
+
+- **Drag.** `drag[T](?ctx, label, ?v, speed, lo, hi)` moves `@v` by `speed`
+  per pixel dragged across it, `FINE` times as far while shift is held. An
+  integer moves by whole steps and keeps the fraction for the next pixel, and
+  a float lands on the decimals of its value at the press or of the speed, so
+  dragging 1.5 by 0.01 a pixel gives 1.6. A double click turns it into a text
+  field with the value selected: enter or a press elsewhere commits, escape
+  leaves the value. `drag_n[T](?ctx, label, ?vec[0], n, speed, lo, hi)` edits
+  2 to 4 values in one row, and `drag_range[T](?ctx, label, ?a, ?b, speed, lo,
+  hi)` a low and a high value that never cross.
+- **Typed numbers.** `number[T](?ctx, label, ?v, step, lo, hi)` is a text
+  field with `-` and `+` steppers, committing as a double-clicked drag does.
+- **Bounds.** `lo < hi` clamps dragged, stepped and typed values, and equal
+  bounds leave a value to its type's range. Typed text that is no number of
+  the type leaves the value as it was.
+
+Each value's cell is a part of its editor keyed `#0` to `#3`, so a driver
+reaches the first cell of `speed` as `speed/#0`, and a number's steppers as
+`speed/-` and `speed/+`. `drag_scalars`, `range_scalars` and `number_scalar`
+take a kind (`I8` to `F64`) and a pointer for values typed at run time, and
+`value.entry` is the typed text cell under them all.
+
+`blit.color.picker(?ctx, label, ?c, flags)` edits a colour in hue, saturation
+and value: a square of saturation and value beside a hue bar, or inside a hue
+ring with `RING`, an alpha bar over a checkerboard with `ALPHA`, and beneath
+them a swatch, the label and hex text (`#RRGGBB`, `#RRGGBBAA` with alpha)
+typed in like a value. The picker keeps its hue across greys and black, and
+hex text read back shows as the same text.
+
 ## Widget ids
 
 A widget's id is a 64-bit FNV-1a hash of its key folded into the seed of the
@@ -985,7 +1089,8 @@ blit.menu.end_menu(?ctx, ?cm);
   `open_context`.
 - **Items.** An `Item` carries a label, a `Shortcut` shown at its right, a
   check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
-  drawn before the label (text, nil for none) and a disabled flag.
+  drawn before the label (text, such as a `blit.icon.STR_*` icon, nil for
+  none) and a disabled flag.
 - **Shortcuts.** An item fires when its key is pressed with exactly its
   modifiers, open or closed, and stays quiet while another widget holds the
   keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
@@ -1001,45 +1106,122 @@ blit.menu.end_menu(?ctx, ?cm);
 - **Ids.** A bar's key, then each header and submenu label, then the item's
   label: `driver.find(?d, "main/File/Recent/notes.txt")`.
 
+## Modals
+
+`blit.modal` puts up a dialog that blocks everything beneath it until it
+closes. Its open state lives in the state store under its title's id, so
+`open` and `close` take it up and down from anywhere in the same id scope,
+and `begin_modal` and `end_modal` run every frame, open or not:
+
+```mach
+if (blit.widget.button(?ctx, "Delete")) { blit.modal.open(?ctx, "Delete file"); }
+
+val m: blit.modal.ModalArea = blit.modal.begin_modal(?ctx, blit.modal.dialog("Delete file"));
+if (m.shown != 0) {
+    blit.widget.text(?ctx, "notes.txt goes for good.");
+    if (blit.widget.button(?ctx, "Delete")) { ...; blit.modal.close(?ctx, "Delete file"); }
+}
+blit.modal.end_modal(?ctx, m);
+
+var labels: [2]str = [2]str{"Save", "Discard"};
+val c: usize = blit.modal.confirm(?ctx, "Unsaved", "Save the changes first?", ?labels[0], 2);
+if (c == 0) { ... }   # c is the button chosen, CANCELLED, or NO_CHOICE
+```
+
+- **Blocking.** A modal paints and claims in the modals band, above docks,
+  windows, overlays and popups, behind a scrim over the whole screen. The scrim
+  claims every button, so nothing beneath it is hovered, pressed or scrolled,
+  while the widgets inside the modal work as usual. Popups, dropdowns and menus
+  opened inside a modal stack above it.
+  The scrim paints in the `scrim` style, the body and its shadow in `modal`
+  and the titlebar in `window_title`.
+- **Placement.** A `Modal` declares a title, a width (0 to fit its widgets),
+  a greatest width and `MODAL_*` flags. It opens centred, or with its top left
+  at `x`, `y` under `MODAL_ANCHORED`, and stays on the screen. Its size is
+  measured as it is drawn, so the frame it opens lays out hidden behind a scrim
+  that already blocks.
+- **Closing.** Escape closes the top modal while it holds the keyboard itself
+  (escape in a text field inside it ends the edit first), and so does the close
+  button in its titlebar (`MODAL_NO_CLOSE`, `MODAL_NO_TITLE`). A press on the
+  scrim closes it only with `MODAL_SCRIM_CLOSES`. `ModalArea.closed` and `why`
+  report the frame it closed.
+- **Stacking.** A modal opened inside another's body nests above it, and
+  modals called one after another stack by call order. Only the top one takes
+  the pointer and escape.
+- **Focus.** A modal takes the keyboard the frame it opens, so a field beneath
+  stops seeing keys, and gives it back to the previous holder the frame after
+  it closes.
+- **Confirm.** `confirm` is a dialog with a message and a row of buttons. It
+  returns the index chosen, closing itself, `CANCELLED` on the frame it is
+  closed without a choice (escape, close button or scrim), and `NO_CHOICE`
+  otherwise.
+- **Ids.** A modal is the id scope of its widgets:
+  `driver.find(?d, "Delete file/Delete")`.
+
 ## Charts
 
-`blit.chart` plots plain arrays into a rect you give it, in the current local
-space, and returns a `Hover` for the value under the cursor:
+`blit.chart` plots columns of values into a rect you give it, in the current
+local space, and returns a `Hover` for the value under the cursor:
 
 ```mach
 var energy: [64]f32;   # filled by you, oldest first
 var income: [64]f32;
 var series: [2]blit.chart.Series;
-series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
-series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, 64, blit.chart.options());
-if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
+series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 64);
+series[0].fill = 1;
+series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 64);
+val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, blit.chart.options());
+if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.x, hov.value
 
-blit.chart.bars(?ctx, "net", x, y, w, h, ?net[0], count, blit.chart.options());
-blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
+# profiler samples: u64 timestamps at uneven spacing, a counter that holds between them
+var t:     [256]u64;
+var bytes: [256]u64;
+var heap:  blit.chart.Series = blit.chart.series(blit.chart.u64s(?bytes[0]), n);
+heap.x     = blit.chart.u64s(?t[0]);
+heap.shape = blit.chart.STEP;
+
+blit.chart.bars(?ctx, "net", x, y, w, h, blit.chart.f32s(?net[0]), count, blit.chart.options());
+blit.chart.sparkline(?ctx, "spark", x, y, w, h, series[0]);
 ```
 
-- **Line.** One or more series share x: sample `i` of every series sits at the
-  same x, the first at the plot's left edge and the last at its right. A series
-  with `fill` set fills the area between its line and zero.
+- **Columns.** A `Column` is values of `F32`, `F64` or `U64` at `data + i *
+  stride`, so packed arrays (`f32s`, `f64s`, `u64s`) and fields of an array of
+  records (a stride of the record's size) plot alike, without copying.
+- **Line.** Each series has its own `count` and, optionally, an `x` column of
+  ascending positions, so spacing may be uneven and series need not share
+  samples. Without `x`, sample `i` sits at `x = i`. `shape = STEP` holds each
+  value until the next sample. A series with `fill` set fills the area between
+  its line and zero.
 - **Bars.** One bar per value in equal slots, up from zero when positive and
-  down when negative.
-- **Sparkline.** A compact line fitted to its values, with no axes, for a row or
-  a cell.
-- **Axes.** `Options.y` is the value range, fixed when `lo < hi` and otherwise
-  fitted to the values and widened to whole ticks (bars always hold zero).
-  `Options.x` is what the first and last sample stand for, labelling x, and the
-  sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
-  labels come from the glyph source, with k, M, G or T for large steps.
-  `Options.axes = 0` gives the whole rect to the plot.
+  down when negative. `Options.flush = 1` draws them with no gap.
+- **Sparkline.** A compact series fitted to its values, with no axes, for a row
+  or a cell. It keeps the series' x, shape and fill.
+- **Exact values.** `Num` holds one exact value, `Num.f{f64}` or `Num.u{u64}`.
+  An axis whose values are all u64 keeps an exact origin and steps its ticks in
+  whole numbers, so timestamps and counters past 2^53 label and read out to the
+  last digit. Hovers report `x` and `value` as `Num`.
+- **Axes.** `Options.y` and `Options.x` are `Axis` records: fixed with
+  `blit.chart.fixed(lo, hi)`, else fitted to the values. A fitted y axis is
+  widened to whole ticks (linear bars always hold zero), a fitted x axis spans
+  the samples edge to edge. `log = 1` spaces either axis by powers of ten, with
+  a tick per decade or per few; values at or below zero sit at its floor. Bars
+  label their first and last bar with a fixed `Options.x`, their index
+  otherwise. Ticks step by 1, 2 or 5 times a power of ten and labels come from
+  the glyph source, with k, M, G or T for large steps. `Options.axes = 0` gives
+  the whole rect to the plot.
 - **Hover.** A chart takes its id from its key and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
-  widget. A line reports the sample nearest the cursor and the series nearest it
-  there, bars report the slot under the cursor, and both draw a read-out of the
-  value inside the plot. A sparkline reports and marks its sample.
+  widget. A line reads, in each series, the sample nearest the cursor (for a
+  step series the one whose value holds there) and reports the series nearest
+  the cursor, bars report the slot under the cursor, and both draw a read-out
+  of the value inside the plot. A sparkline reports and marks its sample.
+- **Caller's cursor.** While a line chart is not hovered, `Options.cursor`
+  places its vertical guide, marker and read-out at `cursor.x` on
+  `cursor.series`. Feeding one chart's `Hover` (`x` and `series`) to the others
+  keeps a cursor in step across charts, and a playhead is the same call.
 - **Crisp at any scale.** A line is one quad per screen pixel column, the
-  polyline swept by a square brush of `line_w`, so no sample is ever skipped
-  when samples outnumber pixels. Columns, rules, bars and labels land on whole
+  path swept by a square brush of `line_w`, so no sample is ever skipped when
+  samples outnumber pixels. Columns, rules, bars and labels land on whole
   screen pixels, and every length is a theme metric at the context's scale.
 - **Plain quads.** Charts emit through the painter like every widget, clipped to
   their rect and to any clip or sub-surface they sit in, and allocate nothing
@@ -1058,7 +1240,8 @@ click is always the one visibly on top.
   on a layer of band `b`, in screen coordinates with the clip reset to the
   screen, and `pop_band` returns. Each band picks the slot by its rule: a flat
   band shares one slot, a nesting band (popups, modals) stacks a child one
-  slot above a parent of the same band, and an ordered band (windows) takes
+  slot above a parent of the same band or, opened inside a higher band, one
+  slot above its parent in that band, and an ordered band (windows) takes
   the slot given, a window's z. `end()` composes the draw list by layer,
   keeping call order within a layer, so a popup opened early in the frame
   still paints over a window called after it, and sibling popups share a
@@ -1160,6 +1343,49 @@ segment count follows their size on screen and the interface scale.
   gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
   `rounded_rect_gradient` and `fill_path_gradient`.
 - **Colors.** `blit.draw.hex(0xRRGGBB, alpha)` sits beside `blit.draw.rgba`.
+
+## Icons
+
+`blit.icon` is a set of icons drawn from path data, with no font or image
+behind them, so they scale to any size and take any color: `PLAY`, `PAUSE`,
+`STEP`, `STOP`, `CLOSE`, `CHEVRON_UP`, `CHEVRON_DOWN`, `CHEVRON_LEFT`,
+`CHEVRON_RIGHT`, `PLUS`, `MINUS`, `SEARCH`, `SETTINGS`, `HELP`, `PIN` and the
+dock drop targets `DOCK_CENTER`, `DOCK_LEFT`, `DOCK_RIGHT`, `DOCK_TOP` and
+`DOCK_BOTTOM`.
+
+```mach
+blit.context.icon_at(?ctx, blit.icon.SETTINGS, x, y, 24.0::f32, look.text);
+blit.widget.button(?ctx, blit.icon.STR_PLAY);   # an icon for a label
+blit.widget.button(?ctx, "\xF3\xB0\x80\x82 step"); # inline with text
+```
+
+- **Path data.** An icon (`blit.icon.Icon`) is a flat `f32` stream of path
+  commands and the box it was drawn in. Each command is its verb
+  (`blit.path.MOVE`, `LINE`, `QUAD`, `CUBIC` or `CLOSE`, as a float) followed
+  by its coordinates: two for a move or line, four for a quadratic (control,
+  then end), six for a cubic (both controls, then end) and none for a close.
+  It is filled by the nonzero rule, scaled from its box to the size drawn.
+  The built-ins sit on a `blit.icon.BOX` (16) square, their contours meeting
+  without overlapping.
+- **Drawing.** `icon_at(?ctx, id, x, y, size, c)` draws an icon `size` pixels
+  tall with its box's top-left at `(x, y)`, feathered and clipped like any
+  path. `icon_width(?ctx, id, size)` is the width it takes.
+- **Inline with text.** Every icon id is a codepoint, `blit.icon.CODEPOINT_BASE`
+  (U+F0000) plus the id, in supplementary private use area A. Text holding
+  one draws the icon in place, a line tall (the style's ascent and descent),
+  tinted with the text, and measures it the same way, so labels, buttons and
+  every other text call take icons with no change. `blit.icon.STR_*` is each
+  built-in as a UTF-8 string, and `blit.icon.encode(id, ?buf[0], 4)` writes any
+  id's. A codepoint in that range with no icon goes to the glyph source as
+  before.
+- **Your own icons.** `blit.context.add_icon(?ctx, icon)` registers an icon in
+  the same form, in a box of any size, copying its data, and returns its id,
+  from `blit.icon.APP_FIRST` (0x1000) up, so a later built-in never moves it.
+  Malformed data or an empty box is refused.
+  ```mach
+  val TRI: [10]f32 = [10]f32{0.0, 0.0, 0.0, 1.0, 24.0, 12.0, 1.0, 0.0, 24.0, 4.0};
+  val id: opt[u32] = blit.context.add_icon(?ctx, blit.icon.Icon{data: ?TRI[0], n: 10, w: 24.0::f32, h: 24.0::f32});
+  ```
 
 ## Rendering
 
