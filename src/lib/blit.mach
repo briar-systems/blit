@@ -30,6 +30,7 @@ fwd blit.context;
 fwd blit.state;
 fwd blit.text;
 fwd blit.widget;
+fwd blit.editor;
 fwd blit.tree;
 fwd blit.textarea;
 fwd blit.list;

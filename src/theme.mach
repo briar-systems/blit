@@ -1856,6 +1856,7 @@ test table__names_every_field_of_every_record {
     var rows: usize = 0;
     var bad:  u8    = 0;
     $each f in $fields(Theme) {
+        if (str_equals(f.name, "styles") && $size_of(f.type) != KINDS::usize * $size_of(Style)) { bad = 4; }
         if (!str_equals(f.name, "styles")) {
             var ok: bool = has_row(GROUP_PALETTE, f.name, f.offset) || has_row(GROUP_METRICS, f.name, f.offset);
             ok = ok || has_row(GROUP_PLOT, f.name, f.offset);
@@ -1874,7 +1875,7 @@ test table__names_every_field_of_every_record {
         rows = rows + 1;
     }
     if (bad != 0)            { ret bad::i32 + 1; }
-    if (rows != FIELD_COUNT) { ret 5; }
+    if (rows != FIELD_COUNT) { ret 6; }
     ret 0;
 }
 
