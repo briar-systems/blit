@@ -885,6 +885,65 @@ test tree__a_change_by_input_or_code_shows_in_the_frame_after {
     ret 0;
 }
 
+# the top and bottom of every vertex drawn in pure red, the caret's ink in
+# tree__caret_follows_the_caption_not_the_line
+#[testing]
+fun red_span(d: *driver.Driver, top: *f32, bottom: *f32) {
+    val vs: *draw.Vert = context.draw_verts(?d.ctx);
+    @top    = 1000000.0::f32;
+    @bottom = -1000000.0::f32;
+    var i: usize = 0;
+    for (i < context.draw_count(?d.ctx)) {
+        val v: draw.Vert = vs[i];
+        if (v.r == 1.0::f32 && v.g == 0.0::f32 && v.b == 0.0::f32 && v.a == 1.0::f32) {
+            if (v.y < @top)    { @top = v.y; }
+            if (v.y > @bottom) { @bottom = v.y; }
+        }
+        i = i + 1;
+    }
+}
+
+test tree__caret_follows_the_caption_not_the_line {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var f: Fake;
+    fake(?f, 1, 0);
+    var d:  driver.Driver;
+    val ie: err[allo.Error] = driver.init(?d, ?a, 400.0::f32, 400.0::f32, fake_ui, (?f)::ptr);
+    if (sel ie.err) { ret 1; }
+    val t:    *theme.Theme    = context.theme_of(?d.ctx);
+    val mark: opt[theme.Path] = theme.path(t, "tree_item.*.mark");
+    val size: opt[theme.Path] = theme.path(t, "tree_item.min_w");
+    if (sel mark.none) { ret 2; }
+    if (sel size.none) { ret 2; }
+    theme.set_path(t, mark.some, theme.of_color(draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32)));
+
+    # a larger body style: the caret spans the caption's line top to its
+    # baseline, never its descent and gap
+    if (!context.set_style(?d.ctx, font.STYLE_BODY, font.Style{source: 0, size: 3.0::f32})) { ret 3; }
+    driver.steps(?d, 2);
+    val r: opt[context.Area] = driver.rect(?d, top_id(?f, 0));
+    if (sel r.none) { ret 4; }
+    val m:      gly.LineMetrics = font.line(context.font_of(?d.ctx), font.STYLE_BODY, 1.0::f32);
+    val lh:     f32             = gly.line_height(m);
+    val line:   f32             = r.some.y0 + (r.some.y1 - r.some.y0 - lh) / 2.0::f32;
+    var top:    f32             = 0.0::f32;
+    var bottom: f32             = 0.0::f32;
+    red_span(?d, ?top, ?bottom);
+    if (top != line || bottom != line + m.ascent) { ret 5; }
+
+    # the tree item style's min_w sizes it whatever the text
+    theme.set_path(t, size.some, theme.of_length(6.0::f32));
+    driver.step(?d);
+    red_span(?d, ?top, ?bottom);
+    if (bottom - top != 6.0::f32) { ret 6; }
+
+    val freed: err[allo.Error] = driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
 test tree__selects_one_and_many {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
