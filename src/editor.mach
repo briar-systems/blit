@@ -9,8 +9,6 @@
 # writes the text wherever its themes live, so blit never touches a file.
 
 use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;

@@ -53,10 +53,11 @@
 # scrolls it by wheel and scrollbar when it is taller than the region, and a
 # section is a collapsible heading that groups the rows beneath it.
 #
-# every color and length a widget draws with comes from the context's theme
-# (see blit.theme), each length multiplied by the context's interface scale,
-# so a theme or a scale changes the whole interface and no widget holds a
-# color or a size of its own.
+# every color and length a widget draws with comes from its kind's style in
+# the context's theme (see blit.theme), painted in the state it is in through
+# context.box, each length multiplied by the context's interface scale, so a
+# theme, an override (see blit.style) or a scale changes the interface and no
+# widget holds a color or a size of its own.
 
 use std.types.bool.bool;
 use std.types.bool.false;

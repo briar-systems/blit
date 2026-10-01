@@ -349,3 +349,58 @@ test theme__loads_and_saves_with_classes {
     val f2: err[allo.Error] = context.free(?back);
     ret 0;
 }
+
+# whether a vertex of the frame's draw list has a premultiplied color's red
+# and alpha, and how far down the lowest one lies
+#[testing]
+fun reaches(ctx: *context.Context, r: f32, a: f32, low: *f32) bool {
+    val p:     *draw.Vert = context.draw_verts(ctx);
+    var found: bool       = false;
+    var i:     usize      = 0;
+    for (i < context.draw_count(ctx)) {
+        if (p[i].r == r && p[i].a == a) {
+            if (!found || p[i].y > @low) { @low = p[i].y; }
+            found = true;
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+test box__paints_its_shadow_gradient_and_outline {
+    var a:   allo.Allocator;
+    var ctx: context.Context;
+    if (!made(?ctx, ?a)) { ret 1; }
+    val top: draw.Color = draw.rgba(1.0::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val bot: draw.Color = draw.rgba(0.5::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    val rim: draw.Color = draw.rgba(0.25::f32, 0.0::f32, 0.0::f32, 1.0::f32);
+    # pushes made between frames are undone by begin, so push inside one
+    var in: input.Input;
+    context.begin(?ctx, in, 100.0::f32, 100.0::f32);
+    push_color(?ctx, "tooltip.normal.fill", top);
+    push_color(?ctx, "tooltip.normal.fill_to", bot);
+    push_color(?ctx, "tooltip.normal.border", rim);
+    push_length(?ctx, "tooltip.normal.border_w", 2.0::f32);
+    push_color(?ctx, "tooltip.normal.shadow", draw.rgba(0.0::f32, 0.0::f32, 1.0::f32, 0.5::f32));
+    push_length(?ctx, "tooltip.shadow_y", 6.0::f32);
+    context.box(?ctx, th.TOOLTIP, th.NORMAL, 10.0::f32, 10.0::f32, 50.0::f32, 30.0::f32);
+    var low: f32 = 0.0::f32;
+    # the face runs from its fill at the top to fill_to at the bottom
+    if (!reaches(?ctx, 1.0::f32, 1.0::f32, ?low)) { ret 2; }
+    if (low > 10.0::f32)                          { ret 3; }
+    if (!reaches(?ctx, 0.5::f32, 1.0::f32, ?low)) { ret 4; }
+    if (low < 30.0::f32)                          { ret 5; }
+    # the outline, and the shadow below the box by its offset
+    if (!reaches(?ctx, 0.25::f32, 1.0::f32, ?low)) { ret 6; }
+    var deep: f32        = 0.0::f32;
+    val p:    *draw.Vert = context.draw_verts(?ctx);
+    var i:    usize      = 0;
+    for (i < context.draw_count(?ctx)) {
+        if (p[i].b > 0.0::f32 && p[i].y > deep) { deep = p[i].y; }
+        i = i + 1;
+    }
+    if (deep < 35.0::f32) { ret 7; }
+    context.end(?ctx);
+    val f: err[allo.Error] = context.free(?ctx);
+    ret 0;
+}
