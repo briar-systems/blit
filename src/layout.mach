@@ -27,6 +27,15 @@
 #
 # a frame also measures what it holds: need_w and need_h are the natural size
 # of its content, which a stack fitted to its content takes the next frame.
+#
+# a flow is a frame laid out along x that wraps: an item that would pass the
+# right edge of a row already holding one starts the next row, a row gap below
+# the bottom of the row before. a row is as tall as its tallest item, and its
+# items size and align across against that height, as the flow's owner read it
+# for the row from last frame (row_len). an item wider than a whole row takes
+# the row alone, at the row's width, and cuts its own content to it. fill and
+# frac along x take the rest of the row or a fraction of it. a flow whose width
+# is open never wraps, so its natural width is its items in one row.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -97,6 +106,25 @@ pub rec Stack {
     item_h: Size;
 }
 
+# the options a flow opens with
+# ---
+# align:   where its items sit across their row's height
+# gap:     pixels between items in a row
+# row_gap: pixels between rows
+# w:       how the flow's own width is sized in its parent, auto for fill
+# h:       how the flow's own height is sized in its parent, auto for fit
+# item_w:  the width rule its items take unless they say otherwise, auto for each widget's own
+# item_h:  the height rule its items take unless they say otherwise, auto for each widget's own
+pub rec Flow {
+    align:   Align;
+    gap:     f32;
+    row_gap: f32;
+    w:       Size;
+    h:       Size;
+    item_w:  Size;
+    item_h:  Size;
+}
+
 # one level of layout, in the local pixels of the space it was opened in
 # ---
 # axis:        the direction items advance in
@@ -132,6 +160,14 @@ pub rec Stack {
 # rule_w:      the frame's own width rule in its parent
 # rule_h:      the frame's own height rule in its parent
 # hidden:      1 when the frame lays out only to measure, drawing and claiming nothing
+# flow:        1 when items wrap onto rows (see rows)
+# row_gap:     pixels between a flow's rows
+# row:         the flow's current row, from 0
+# row_n:       items placed in the current row
+# row_len:     height the current row measured last frame, 0 when not known
+# next_len:    height the next row measured last frame, 0 when not known
+# done_h:      natural height of the row the last wrap closed
+# synced:      rows whose measures the frame's owner has read, row + 1 once current
 pub rec Frame {
     axis:        Axis;
     align:       Align;
@@ -166,6 +202,14 @@ pub rec Frame {
     rule_w:      Size;
     rule_h:      Size;
     hidden:      u8;
+    flow:        u8;
+    row_gap:     f32;
+    row:         usize;
+    row_n:       usize;
+    row_len:     f32;
+    next_len:    f32;
+    done_h:      f32;
+    synced:      usize;
 }
 
 # a placed item: its rect and what it adds to its frame's measure
@@ -179,6 +223,7 @@ pub rec Frame {
 # weight: fill weight along the frame's axis, 0 when the item does not fill
 # fit_w:  1 when the width is the natural width because nothing else sized it
 # fit_h:  1 when the height is the natural height because nothing else sized it
+# wrap:   1 when the item starts a flow's next row
 pub rec Item {
     x:      f32;
     y:      f32;
@@ -189,6 +234,7 @@ pub rec Item {
     weight: f32;
     fit_w:  u8;
     fit_h:  u8;
+    wrap:   u8;
 }
 
 # the rule deferring to the frame and the widget
@@ -259,6 +305,42 @@ pub fun column(x: f32, y: f32, w: f32, h: f32, gap: f32) Frame {
     f.y   = y;
     ret f;
 }
+
+# a flow's options: start-aligned, gap pixels between items and row_gap
+# between rows, filling its parent's width and fitting its content's height
+# ---
+# gap:     pixels between items in a row
+# row_gap: pixels between rows
+pub fun flow(gap: f32, row_gap: f32) Flow {
+    var s: Flow;
+    s.gap     = gap;
+    s.row_gap = row_gap;
+    ret s;
+}
+
+# a frame flowing items into rows w wide from (x, y), growing down with them
+#
+# the width is open when w is not positive: the items share one row.
+# ---
+# x:       left in local pixels
+# y:       top in local pixels
+# w:       width in pixels, not positive for one row that never wraps
+# gap:     pixels between items in a row
+# row_gap: pixels between rows
+pub fun rows(x: f32, y: f32, w: f32, gap: f32, row_gap: f32) Frame {
+    var f: Frame = column(x, y, w, 0.0::f32, gap);
+    if (w <= 0.0::f32) { f.open = f.open | OPEN_W; }
+    f.axis    = Axis.horizontal{};
+    f.flow    = 1;
+    f.row_gap = row_gap;
+    f.line_y0 = y;
+    f.line_y1 = y;
+    ret f;
+}
+
+# how far past a row's edge an item may reach and still fit, a sixty-fourth of
+# a pixel, so float rounding of the pen never wraps an item that fits exactly
+val ROW_SLACK: f32 = 0.015625;
 
 fun maxf(a: f32, b: f32) f32 {
     if (a > b) { ret a; }
@@ -356,6 +438,10 @@ pub fun resolve(f: *Frame, sw: Size, sh: Size, nat_w: f32, nat_h: f32) Item {
     val wide: bool = (f.open & OPEN_W) == 0;
     val tall: bool = (f.open & OPEN_H) == 0;
 
+    if (f.flow != 0) {
+        in_row(f, ?it, rw, rh, nat_w, nat_h);
+        ret it;
+    }
     if (across(f)) {
         it.x = f.x;
         it.w = along(f, rw, nat_w, f.w, x1 - f.x, wide, ?it.fit_w);
@@ -382,11 +468,69 @@ pub fun resolve(f: *Frame, sw: Size, sh: Size, nat_w: f32, nat_h: f32) Item {
     ret it;
 }
 
+# the rect of the next item in a flow: at the pen, or at the start of the next
+# row when it would pass the edge of a row already holding an item
+fun in_row(f: *Frame, it: *Item, rw: Size, rh: Size, nat_w: f32, nat_h: f32) {
+    val x1:   f32  = f.x0 + f.w;
+    val wide: bool = (f.open & OPEN_W) == 0;
+    var top:  f32  = f.y;
+    var len:  f32  = f.row_len;
+    it.x = f.x;
+    it.w = along(f, rw, nat_w, f.w, x1 - f.x, wide, ?it.fit_w);
+    if (wide && f.row_n > 0 && it.x + it.w > x1 + ROW_SLACK) {
+        it.wrap = 1;
+        it.x    = f.x0;
+        top     = f.line_y1 + f.row_gap;
+        len     = f.next_len;
+        it.w    = along(f, rw, nat_w, f.w, f.w, wide, ?it.fit_w);
+    }
+    if (wide && it.w > f.w) { it.w = f.w; }
+    it.h = over(f, rh, nat_h, len, ?it.fit_h);
+    it.y = top + offset(f, len, it.h);
+}
+
+# place an item in a flow's row, starting the next row when it wraps
+fun commit_row(f: *Frame, it: Item) {
+    if (it.wrap != 0) {
+        f.done_h   = f.line_h;
+        f.need_h   = f.need_h + f.row_gap;
+        f.y        = f.line_y1 + f.row_gap;
+        f.line_y0  = f.y;
+        f.line_y1  = f.y;
+        f.line_w   = 0.0::f32;
+        f.line_h   = 0.0::f32;
+        f.row      = f.row + 1;
+        f.row_n    = 0;
+        f.row_len  = f.next_len;
+        f.next_len = 0.0::f32;
+    }
+    if (f.bare == 0) {
+        if (f.items > 0) { f.need_w = f.need_w + f.gap; }
+        if (f.row_n > 0) { f.line_w = f.line_w + f.gap; }
+    }
+    f.bare   = 0;
+    f.need_w = f.need_w + it.nat_w;
+    f.line_w = f.line_w + it.nat_w;
+    if (it.nat_h > f.line_h) {
+        f.need_h = f.need_h + it.nat_h - f.line_h;
+        f.line_h = it.nat_h;
+    }
+    f.line_x1 = it.x + it.w;
+    f.line_y1 = maxf(f.line_y1, it.y + it.h);
+    f.x       = it.x + it.w + f.gap;
+    f.row_n   = f.row_n + 1;
+    f.items   = f.items + 1;
+}
+
 # place an item resolve gave, moving the pen past it and adding it to the measure
 # ---
 # f:  frame
 # it: the item
 pub fun commit(f: *Frame, it: Item) {
+    if (f.flow != 0) {
+        commit_row(f, it);
+        ret;
+    }
     val spaced: bool = f.items > 0 && f.bare == 0;
     f.bare = 0;
     if (across(f)) {
@@ -582,5 +726,70 @@ test layout__same_line_and_skip {
     skip(?c, 6.0::f32, true);
     skip(?c, 10.0::f32, false);
     if (c.y != 40.0::f32 || c.need_h != 40.0::f32) { ret 5; }
+    ret 0;
+}
+
+test layout__flow_wraps_rows_and_gives_a_wide_item_the_row {
+    # 100 wide, 4 between items, 6 between rows
+    var f: Frame = rows(0.0::f32, 0.0::f32, 100.0::f32, 4.0::f32, 6.0::f32);
+    val a: Item  = resolve(?f, fit(), fit(), 40.0::f32, 10.0::f32);
+    commit(?f, a);
+    # 44 + 56 meets the edge exactly and stays
+    val b: Item = resolve(?f, fit(), fit(), 56.0::f32, 16.0::f32);
+    if (b.wrap != 0 || b.x != 44.0::f32 || b.y != 0.0::f32) { ret 1; }
+    commit(?f, b);
+    # the next wraps below the row's tallest item
+    val c: Item = resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32);
+    if (c.wrap != 1 || c.x != 0.0::f32 || c.y != 22.0::f32) { ret 2; }
+    commit(?f, c);
+    if (f.row != 1 || f.done_h != 16.0::f32) { ret 3; }
+    # wider than a row: it wraps and takes the row, cut to its width
+    val d: Item = resolve(?f, fit(), fit(), 150.0::f32, 8.0::f32);
+    if (d.wrap != 1 || d.x != 0.0::f32 || d.y != 36.0::f32 || d.w != 100.0::f32) { ret 4; }
+    commit(?f, d);
+    # and the item after it starts the row below
+    val e: Item = resolve(?f, fill(1.0::f32), fit(), 10.0::f32, 8.0::f32);
+    if (e.wrap != 1 || e.y != 50.0::f32 || e.w != 100.0::f32) { ret 5; }
+    commit(?f, e);
+
+    # the natural width is the items in one row, the height the rows stacked
+    if (f.need_w != 40.0::f32 + 56.0::f32 + 10.0::f32 + 150.0::f32 + 10.0::f32 + 16.0::f32) { ret 6; }
+    if (f.need_h != 16.0::f32 + 8.0::f32 * 3.0::f32 + 18.0::f32)                            { ret 7; }
+
+    # a first item wider than the row has nothing to wrap from
+    var g: Frame = rows(0.0::f32, 0.0::f32, 100.0::f32, 4.0::f32, 6.0::f32);
+    val h: Item  = resolve(?g, fit(), fit(), 150.0::f32, 8.0::f32);
+    if (h.wrap != 0 || h.w != 100.0::f32) { ret 8; }
+
+    # an open width never wraps or cuts
+    var o: Frame = rows(0.0::f32, 0.0::f32, 0.0::f32, 4.0::f32, 6.0::f32);
+    commit(?o, resolve(?o, fit(), fit(), 150.0::f32, 8.0::f32));
+    val k: Item = resolve(?o, fit(), fit(), 150.0::f32, 8.0::f32);
+    if (k.wrap != 0 || k.x != 154.0::f32 || k.w != 150.0::f32) { ret 9; }
+    ret 0;
+}
+
+test layout__flow_aligns_items_in_their_row {
+    # each row as tall as last frame measured it
+    var f: Frame = rows(0.0::f32, 0.0::f32, 100.0::f32, 4.0::f32, 6.0::f32);
+    f.align    = Align.center{};
+    f.row_len  = 20.0::f32;
+    f.next_len = 12.0::f32;
+    val a: Item = resolve(?f, fit(), fit(), 60.0::f32, 8.0::f32);
+    if (a.y != 6.0::f32) { ret 1; }
+    commit(?f, a);
+    commit(?f, resolve(?f, fit(), fit(), 30.0::f32, 20.0::f32));
+    # the wrapped item centers in the next row's height
+    val b: Item = resolve(?f, fit(), fit(), 60.0::f32, 8.0::f32);
+    if (b.wrap != 1 || b.y != 28.0::f32) { ret 2; }
+    commit(?f, b);
+    if (f.row_len != 12.0::f32 || f.next_len != 0.0::f32) { ret 3; }
+
+    # stretch and fill across take the row's height
+    f.align = Align.stretch{};
+    if (resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32).h != 12.0::f32)          { ret 4; }
+    if (resolve(?f, fit(), fill(1.0::f32), 10.0::f32, 8.0::f32).h != 12.0::f32) { ret 5; }
+    f.align = Align.end{};
+    if (resolve(?f, fit(), fit(), 10.0::f32, 8.0::f32).y != 26.0::f32 + 4.0::f32) { ret 6; }
     ret 0;
 }
