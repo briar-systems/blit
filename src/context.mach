@@ -104,7 +104,6 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.collections.set;
 use vec: std.collections.vector;
-use std.math.float.sqrt_f32;
 use std.text.utf8;
 
 # capacity the clip, origin, layer and id stacks and the collision list start
