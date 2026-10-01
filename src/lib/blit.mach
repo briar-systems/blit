@@ -33,6 +33,7 @@ fwd blit.chart;
 fwd blit.controls;
 fwd blit.payload;
 fwd blit.dnd;
+fwd blit.tabs;
 fwd blit.driver;
 
 # blit library version
