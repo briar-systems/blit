@@ -120,16 +120,18 @@ val CODE_CAP: usize = 32768;
 # name: what the list of sections calls it
 # show: draws its widgets in the gallery's middle column
 # root: draws what it keeps outside the gallery, every frame, nil for none
-# user: its state, handed to show and root
-# code: its source
-# len:  bytes of source
+# user:  its state, handed to show and root
+# code:  its source
+# len:   bytes of source
+# moves: it animates on its own, so it asks for frames while shown and idle
 rec Section {
-    name: str;
-    show: fun(*blit.context.Context, ptr);
-    root: fun(*blit.context.Context, ptr);
-    user: ptr;
-    code: *u8;
-    len:  usize;
+    name:  str;
+    show:  fun(*blit.context.Context, ptr);
+    root:  fun(*blit.context.Context, ptr);
+    user:  ptr;
+    code:  *u8;
+    len:   usize;
+    moves: bool;
 }
 
 # every section's state
@@ -189,7 +191,7 @@ pub rec Gallery {
 
 # a section of the table
 fun sec(name: str, show: fun(*blit.context.Context, ptr), root: fun(*blit.context.Context, ptr), user: ptr, code: *u8, len: usize) Section {
-    ret Section{name: name, show: show, root: root, user: user, code: code, len: len};
+    ret Section{name: name, show: show, root: root, user: user, code: code, len: len, moves: false};
 }
 
 # set the gallery up: every section's state and the table that lists them
@@ -257,6 +259,9 @@ pub fun make(g: *Gallery, a: *allo.Allocator) bool {
     g.secs[23] = sec("Keyboard", keyboard.show, nil, (?s.keyboard)::ptr, ?CODE_KEYBOARD[0], $length_of(CODE_KEYBOARD));
     g.secs[24] = sec("Disabled", disabled.show, nil, (?s.disabled)::ptr, ?CODE_DISABLED[0], $length_of(CODE_DISABLED));
     g.secs[25] = sec("Inspector", inspector.show, nil, (?s.inspector)::ptr, ?CODE_INSPECTOR[0], $length_of(CODE_INSPECTOR));
+
+    # the busy progress bar runs for as long as it is drawn
+    g.secs[3].moves = true;
 
     var k: usize = 0;
     for (k < COUNT) {
@@ -374,7 +379,8 @@ pub fun nav_row(d: *blit.driver.Driver, k: usize) u64 {
 }
 
 # visit every section, settling each, then come back to the first: true
-# when every section was drawn whole with no id drawn twice
+# when every section was drawn whole with no id drawn twice, and every
+# section that does not move came to rest
 pub fun script(d: *blit.driver.Driver, g: *Gallery) bool {
     blit.driver.step(d);
     blit.driver.settle(d);
@@ -382,7 +388,8 @@ pub fun script(d: *blit.driver.Driver, g: *Gallery) bool {
     for (k < COUNT) {
         val row: u64 = nav_row(d, k);
         if (!blit.driver.click(d, row)) { ret false; }
-        blit.driver.settle(d);
+        val ran: usize = blit.driver.settle(d);
+        if (ran == blit.driver.SETTLE_MAX && !g.secs[k].moves) { ret false; }
         blit.driver.step(d);
         if (g.nav.selected != k)                  { ret false; }
         if (blit.context.ok(?d.ctx) == 0)         { ret false; }
