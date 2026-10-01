@@ -1,8 +1,8 @@
 # an interface inspector: a window, built with blit, showing what the
 # context knows about the frame it is drawn in
 #
-# it shows the frame's hovered, hot, active and focused ids, its claims by
-# layer band, its id collisions, its draw list's counts and runs, the
+# it shows the frame's hovered, hot, active and focused ids, its tab stops
+# in focus order, its claims by layer band, its id collisions, its draw list's counts and runs, the
 # windows and their z order, every dock space's tree, and every entry of
 # the state store, as a tree (see blit.tree). hovering an entry outlines its
 # rect on the surface, in the tooltips band above everything but a drag.
@@ -37,6 +37,7 @@ use blit.draw;
 use blit.driver;
 use blit.hit;
 use bid: blit.id;
+use blit.input;
 use blit.state;
 use blit.store;
 use blit.theme;
@@ -63,16 +64,18 @@ val SPACE:     u64 = 8;
 val NODE:      u64 = 9;
 val DOCKED:    u64 = 10;
 val ENTRY:     u64 = 11;
+val STOP:      u64 = 12;
 
 # the top level, in order
 val SEC_FRAME:      u64   = 0;
-val SEC_LAYERS:     u64   = 1;
-val SEC_COLLISIONS: u64   = 2;
-val SEC_DRAW:       u64   = 3;
-val SEC_WINDOWS:    u64   = 4;
-val SEC_DOCK:       u64   = 5;
-val SEC_STORE:      u64   = 6;
-val SECTIONS:       usize = 7;
+val SEC_FOCUS:      u64   = 1;
+val SEC_LAYERS:     u64   = 2;
+val SEC_COLLISIONS: u64   = 3;
+val SEC_DRAW:       u64   = 4;
+val SEC_WINDOWS:    u64   = 5;
+val SEC_DOCK:       u64   = 6;
+val SEC_STORE:      u64   = 7;
+val SECTIONS:       usize = 8;
 
 # the frame's facts, in order
 val FACT_SCREEN: u64   = 0;
@@ -111,6 +114,7 @@ rec Kept {
 # hits:   indices of those claims grouped by band
 # starts: where each band's claims begin in hits, COUNT + 1 of them
 # runs:   the app's runs before show, the one still accumulating last
+# stops:  the app's tab stops before show, in focus order
 # verts:  vertices the app drew before show
 # idx:    indices the app drew before show
 # coll:   collisions recorded before show
@@ -129,6 +133,7 @@ pub rec Inspector {
     hits:   vec.Vector[u32];
     starts: [9]usize;
     runs:   vec.Vector[context.Run];
+    stops:  vec.Vector[context.Stop];
     verts:  usize;
     idx:    usize;
     coll:   usize;
@@ -151,6 +156,7 @@ pub fun init(i: *Inspector, a: *allo.Allocator) {
     i.tree.mode = tree.SELECT_NONE;
     i.hits      = vec.init[u32](a);
     i.runs      = vec.init[context.Run](a);
+    i.stops     = vec.init[context.Stop](a);
     i.wins      = vec.init[u64](a);
     i.spaces    = vec.init[u64](a);
     i.docked    = vec.init[u64](a);
@@ -178,6 +184,8 @@ pub fun free(i: *Inspector) err[allo.Error] {
     if (sel f.err) { first = f; }
     val g: err[allo.Error] = vec.dnit[u64](?i.vals);
     if (sel g.err) { first = g; }
+    val h: err[allo.Error] = vec.dnit[context.Stop](?i.stops);
+    if (sel h.err) { first = h; }
     ret first;
 }
 
@@ -265,6 +273,14 @@ fun snapshot(ctx: *context.Context, i: *Inspector) {
         keep[context.Run](ctx, ?i.runs, p);
     }
 
+    # the tab stops, in the order tab moves through them
+    vec.clear[context.Stop](?i.stops);
+    var t: usize = 0;
+    for (t < ctx.stops_len) {
+        keep[context.Stop](ctx, ?i.stops, ctx.stops[t]);
+        t = t + 1;
+    }
+
     vec.clear[u64](?i.wins);
     vec.clear[u64](?i.spaces);
     vec.clear[u64](?i.docked);
@@ -341,6 +357,7 @@ fun count(user: ptr, h: u64) usize {
     if (w == SECTION) {
         val s: u64 = val_of(i, h);
         if (s == SEC_FRAME)      { ret FACTS; }
+        if (s == SEC_FOCUS)      { ret i.stops.len; }
         if (s == SEC_LAYERS)     { ret band.COUNT::usize; }
         if (s == SEC_COLLISIONS) { ret i.coll; }
         if (s == SEC_DRAW)       { ret i.runs.len; }
@@ -500,7 +517,12 @@ fun section_label(o: *Out, i: *Inspector, s: u64) {
         put_s(o, "Frame");
         ret;
     }
-    if (s == SEC_LAYERS) {
+    if (s == SEC_FOCUS) {
+        put_s(o, "Focus order (");
+        put_u(o, i.stops.len::u64);
+        put_s(o, " stops");
+    }
+    or (s == SEC_LAYERS) {
         put_s(o, "Layers and claims (");
         put_u(o, i.claims::u64);
     }
@@ -564,6 +586,8 @@ fun fact_label(o: *Out, ctx: *context.Context, f: u64) {
     or (f == FACT_FOCUS) {
         put_s(o, "focus  ");
         put_id(o, ctx.focus);
+        if (context.focus_visible(ctx)) { put_s(o, "  ring"); }
+        if (context.typing(ctx))        { put_s(o, "  typing"); }
     }
     or {
         put_s(o, "complete ");
@@ -607,6 +631,25 @@ fun claim_label(o: *Out, c: hit.Claim) {
     put_layer(o, (c.key >> 32)::u32);
     put_s(o, "  ");
     put_rect(o, c.x0, c.y0, c.x1, c.y1);
+}
+
+# the label of one tab stop
+fun stop_label(o: *Out, ctx: *context.Context, k: usize, st: context.Stop) {
+    put_u(o, k::u64);
+    put_s(o, "  ");
+    put_id(o, st.id);
+    put_s(o, "  ");
+    put_layer(o, st.layer);
+    if (st.group != 0) {
+        put_s(o, "  group ");
+        put_x(o, st.group);
+        if (st.axis == context.AXIS_ROW)    { put_s(o, " row"); }
+        if (st.axis == context.AXIS_COLUMN) { put_s(o, " column"); }
+        if (st.axis == context.AXIS_BOTH)   { put_s(o, " both"); }
+    }
+    if ((st.flags & context.NAV_ARROWS) != 0) { put_s(o, "  arrows"); }
+    if ((st.flags & context.NAV_TEXT) != 0)   { put_s(o, "  text"); }
+    if (st.id == ctx.focus)                   { put_s(o, "  focused"); }
 }
 
 # the label of one run
@@ -723,6 +766,10 @@ fun child(user: ptr, h: u64, k: usize, it: *tree.Item) {
             it.handle = handle(i, FACT, k::u64);
             fact_label(?o, ctx, k::u64);
         }
+        or (s == SEC_FOCUS) {
+            it.handle = handle(i, STOP, k::u64);
+            stop_label(?o, ctx, k, i.stops.data[k]);
+        }
         or (s == SEC_LAYERS) {
             it.handle = handle(i, BAND, k::u64);
             it.leaf   = false;
@@ -826,6 +873,10 @@ fun rect_for(i: *Inspector, h: u64) opt[context.Area] {
         }
         if (!found) { ret opt[context.Area].none{}; }
         ret opt[context.Area].some{r};
+    }
+    if (w == STOP) {
+        val st: context.Stop = i.stops.data[v::usize];
+        ret opt[context.Area].some{context.Area{x0: st.x0, y0: st.y0, x1: st.x1, y1: st.y1}};
     }
     if (w == RUN) {
         val r: context.Run = i.runs.data[v::usize];
@@ -997,6 +1048,15 @@ test show__lists_the_frame_and_outlines_a_hovered_entry {
         k       = k + 1;
     }
     if (!str_equals(driver.text_of(?d, row), ?line[0])) { ret 4; }
+
+    # the app's tab stops show in focus order, the one tab reached marked
+    driver.key(?d, input.KEY_TAB, 0);
+    val order: u64 = tree.node_id(t, SEC_FOCUS);
+    tree.set_open(?d.ctx, ?p.i.tree, order, true);
+    driver.step(?d);
+    val first: u64 = tree.node_id(order, 0);
+    if (!driver.drawn(?d, first) || p.i.stops.len == 0) { ret 10; }
+    if (p.i.stops.data[0].id != d.ctx.focus)            { ret 11; }
 
     # hovering it outlines the button's rect in the tooltips band
     if (!driver.hover(?d, row)) { ret 5; }
