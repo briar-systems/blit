@@ -421,14 +421,14 @@ Baseline at 0.9.0 on an AMD Ryzen 7 5800X3D, to compare later work against:
 
 ```
 scene          srgb    us/frame  vertices  runs  allocs   srgb cost
-dense panel    off        294.2      5298     1       0
-dense panel    on         296.9      5298     1       0   +0.9%
-10k row list   off        124.1      1704     1       0
-10k row list   on         124.9      1704     1       0   +0.6%
-100k chart     off       1926.2     15738     1       0
-100k chart     on        1953.8     15738     1       0   +1.4%
-windows        off        279.6      5472     1       0
-windows        on         280.5      5472     1       0   +0.3%
+dense panel    off        292.4      5298     1       0
+dense panel    on         295.6      5298     1       0   +1.0%
+10k row list   off        123.6      1704     1       0
+10k row list   on         124.1      1704     1       0   +0.4%
+100k chart     off       1924.6     15738     1       0
+100k chart     on        1966.7     15738     1       0   +2.1%
+windows        off        273.9      5472     1       0
+windows        on         277.5      5472     1       0   +1.3%
 ```
 
 ## Conventions

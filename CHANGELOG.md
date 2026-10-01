@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A local benchmark (#103): `demo/bench` times a dense panel, a 10,000 row list, a 100,000 sample chart and overlapping windows with sRGB off and on, and prints frame time, vertices, runs and allocations. It is never a CI job, and the README records a baseline.
+
+### Changed
+- sRGB output converts each distinct colour once (#103): a small cache on the context (`blit.draw.LinearCache`) holds each authored colour's linear conversion, so the Newton iteration leaves the per-quad path. Output is bit-identical, and the dense panel with sRGB on costs about 1% over off.
+
 ### Fixed
 - The clip, origin and layer stacks and the span list grow with the frame (#97): `CLIP_DEPTH` and `RUN_DEPTH` are initial capacities, not limits, so deep nesting and many spans no longer restore stale clips and origins or draw with the wrong texture and layer. An allocation failure sets `oom`.
 
