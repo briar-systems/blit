@@ -13,6 +13,7 @@ fwd blit.atlas;
 fwd blit.bitmap;
 fwd blit.draw;
 fwd blit.path;
+fwd blit.icon;
 fwd blit.font;
 fwd blit.glyph;
 fwd blit.input;

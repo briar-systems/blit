@@ -28,7 +28,7 @@ blit.context.end(?ctx);
 ```
 
 `use blit;` binds the surface; reach everything through its submodule:
-`blit.draw`, `blit.path`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
+`blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
 `blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.theme`, `blit.context`, `blit.state`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.driver`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
 
@@ -797,7 +797,8 @@ blit.menu.end_menu(?ctx, ?cm);
   `open_context`.
 - **Items.** An `Item` carries a label, a `Shortcut` shown at its right, a
   check (`*u8`, flipped when it fires, nil when it is not checkable), an icon
-  drawn before the label (text, nil for none) and a disabled flag.
+  drawn before the label (text, such as a `blit.icon.STR_*` icon, nil for
+  none) and a disabled flag.
 - **Shortcuts.** An item fires when its key is pressed with exactly its
   modifiers, open or closed, and stays quiet while another widget holds the
   keyboard (`context.typing`). `MOD_PRIMARY` is the platform's command key:
@@ -815,43 +816,68 @@ blit.menu.end_menu(?ctx, ?cm);
 
 ## Charts
 
-`blit.chart` plots plain arrays into a rect you give it, in the current local
-space, and returns a `Hover` for the value under the cursor:
+`blit.chart` plots columns of values into a rect you give it, in the current
+local space, and returns a `Hover` for the value under the cursor:
 
 ```mach
 var energy: [64]f32;   # filled by you, oldest first
 var income: [64]f32;
 var series: [2]blit.chart.Series;
-series[0] = blit.chart.Series{values: ?energy[0], fill: 1};
-series[1] = blit.chart.Series{values: ?income[0], fill: 0};
-val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, 64, blit.chart.options());
-if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.value
+series[0]      = blit.chart.series(blit.chart.f32s(?energy[0]), 64);
+series[0].fill = 1;
+series[1]      = blit.chart.series(blit.chart.f32s(?income[0]), 64);
+val hov: blit.chart.Hover = blit.chart.line(?ctx, "energy", x, y, w, h, ?series[0], 2, blit.chart.options());
+if (hov.hot != 0) { ... }   # hov.index, hov.series, hov.x, hov.value
 
-blit.chart.bars(?ctx, "net", x, y, w, h, ?net[0], count, blit.chart.options());
-blit.chart.sparkline(?ctx, "spark", x, y, w, h, ?energy[0], 64);
+# profiler samples: u64 timestamps at uneven spacing, a counter that holds between them
+var t:     [256]u64;
+var bytes: [256]u64;
+var heap:  blit.chart.Series = blit.chart.series(blit.chart.u64s(?bytes[0]), n);
+heap.x     = blit.chart.u64s(?t[0]);
+heap.shape = blit.chart.STEP;
+
+blit.chart.bars(?ctx, "net", x, y, w, h, blit.chart.f32s(?net[0]), count, blit.chart.options());
+blit.chart.sparkline(?ctx, "spark", x, y, w, h, series[0]);
 ```
 
-- **Line.** One or more series share x: sample `i` of every series sits at the
-  same x, the first at the plot's left edge and the last at its right. A series
-  with `fill` set fills the area between its line and zero.
+- **Columns.** A `Column` is values of `F32`, `F64` or `U64` at `data + i *
+  stride`, so packed arrays (`f32s`, `f64s`, `u64s`) and fields of an array of
+  records (a stride of the record's size) plot alike, without copying.
+- **Line.** Each series has its own `count` and, optionally, an `x` column of
+  ascending positions, so spacing may be uneven and series need not share
+  samples. Without `x`, sample `i` sits at `x = i`. `shape = STEP` holds each
+  value until the next sample. A series with `fill` set fills the area between
+  its line and zero.
 - **Bars.** One bar per value in equal slots, up from zero when positive and
-  down when negative.
-- **Sparkline.** A compact line fitted to its values, with no axes, for a row or
-  a cell.
-- **Axes.** `Options.y` is the value range, fixed when `lo < hi` and otherwise
-  fitted to the values and widened to whole ticks (bars always hold zero).
-  `Options.x` is what the first and last sample stand for, labelling x, and the
-  sample index when not fixed. Ticks step by 1, 2 or 5 times a power of ten and
-  labels come from the glyph source, with k, M, G or T for large steps.
-  `Options.axes = 0` gives the whole rect to the plot.
+  down when negative. `Options.flush = 1` draws them with no gap.
+- **Sparkline.** A compact series fitted to its values, with no axes, for a row
+  or a cell. It keeps the series' x, shape and fill.
+- **Exact values.** `Num` holds one exact value, `Num.f{f64}` or `Num.u{u64}`.
+  An axis whose values are all u64 keeps an exact origin and steps its ticks in
+  whole numbers, so timestamps and counters past 2^53 label and read out to the
+  last digit. Hovers report `x` and `value` as `Num`.
+- **Axes.** `Options.y` and `Options.x` are `Axis` records: fixed with
+  `blit.chart.fixed(lo, hi)`, else fitted to the values. A fitted y axis is
+  widened to whole ticks (linear bars always hold zero), a fitted x axis spans
+  the samples edge to edge. `log = 1` spaces either axis by powers of ten, with
+  a tick per decade or per few; values at or below zero sit at its floor. Bars
+  label their first and last bar with a fixed `Options.x`, their index
+  otherwise. Ticks step by 1, 2 or 5 times a power of ten and labels come from
+  the glyph source, with k, M, G or T for large steps. `Options.axes = 0` gives
+  the whole rect to the plot.
 - **Hover.** A chart takes its id from its key and claims its plot, so it
   reads out only when it is the topmost claimant under the cursor, like any
-  widget. A line reports the sample nearest the cursor and the series nearest it
-  there, bars report the slot under the cursor, and both draw a read-out of the
-  value inside the plot. A sparkline reports and marks its sample.
+  widget. A line reads, in each series, the sample nearest the cursor (for a
+  step series the one whose value holds there) and reports the series nearest
+  the cursor, bars report the slot under the cursor, and both draw a read-out
+  of the value inside the plot. A sparkline reports and marks its sample.
+- **Caller's cursor.** While a line chart is not hovered, `Options.cursor`
+  places its vertical guide, marker and read-out at `cursor.x` on
+  `cursor.series`. Feeding one chart's `Hover` (`x` and `series`) to the others
+  keeps a cursor in step across charts, and a playhead is the same call.
 - **Crisp at any scale.** A line is one quad per screen pixel column, the
-  polyline swept by a square brush of `line_w`, so no sample is ever skipped
-  when samples outnumber pixels. Columns, rules, bars and labels land on whole
+  path swept by a square brush of `line_w`, so no sample is ever skipped when
+  samples outnumber pixels. Columns, rules, bars and labels land on whole
   screen pixels, and every length is a theme metric at the context's scale.
 - **Plain quads.** Charts emit through the painter like every widget, clipped to
   their rect and to any clip or sub-surface they sit in, and allocate nothing
@@ -972,6 +998,49 @@ segment count follows their size on screen and the interface scale.
   gradient in local space, clamped beyond its ends, drawn by `quad_gradient`,
   `rounded_rect_gradient` and `fill_path_gradient`.
 - **Colors.** `blit.draw.hex(0xRRGGBB, alpha)` sits beside `blit.draw.rgba`.
+
+## Icons
+
+`blit.icon` is a set of icons drawn from path data, with no font or image
+behind them, so they scale to any size and take any color: `PLAY`, `PAUSE`,
+`STEP`, `STOP`, `CLOSE`, `CHEVRON_UP`, `CHEVRON_DOWN`, `CHEVRON_LEFT`,
+`CHEVRON_RIGHT`, `PLUS`, `MINUS`, `SEARCH`, `SETTINGS`, `HELP`, `PIN` and the
+dock drop targets `DOCK_CENTER`, `DOCK_LEFT`, `DOCK_RIGHT`, `DOCK_TOP` and
+`DOCK_BOTTOM`.
+
+```mach
+blit.context.icon_at(?ctx, blit.icon.SETTINGS, x, y, 24.0::f32, look.text);
+blit.widget.button(?ctx, blit.icon.STR_PLAY);   # an icon for a label
+blit.widget.button(?ctx, "\xF3\xB0\x80\x82 step"); # inline with text
+```
+
+- **Path data.** An icon (`blit.icon.Icon`) is a flat `f32` stream of path
+  commands and the box it was drawn in. Each command is its verb
+  (`blit.path.MOVE`, `LINE`, `QUAD`, `CUBIC` or `CLOSE`, as a float) followed
+  by its coordinates: two for a move or line, four for a quadratic (control,
+  then end), six for a cubic (both controls, then end) and none for a close.
+  It is filled by the nonzero rule, scaled from its box to the size drawn.
+  The built-ins sit on a `blit.icon.BOX` (16) square, their contours meeting
+  without overlapping.
+- **Drawing.** `icon_at(?ctx, id, x, y, size, c)` draws an icon `size` pixels
+  tall with its box's top-left at `(x, y)`, feathered and clipped like any
+  path. `icon_width(?ctx, id, size)` is the width it takes.
+- **Inline with text.** Every icon id is a codepoint, `blit.icon.CODEPOINT_BASE`
+  (U+F0000) plus the id, in supplementary private use area A. Text holding
+  one draws the icon in place, a line tall (the style's ascent and descent),
+  tinted with the text, and measures it the same way, so labels, buttons and
+  every other text call take icons with no change. `blit.icon.STR_*` is each
+  built-in as a UTF-8 string, and `blit.icon.encode(id, ?buf[0], 4)` writes any
+  id's. A codepoint in that range with no icon goes to the glyph source as
+  before.
+- **Your own icons.** `blit.context.add_icon(?ctx, icon)` registers an icon in
+  the same form, in a box of any size, copying its data, and returns its id,
+  from `blit.icon.APP_FIRST` (0x1000) up, so a later built-in never moves it.
+  Malformed data or an empty box is refused.
+  ```mach
+  val TRI: [10]f32 = [10]f32{0.0, 0.0, 0.0, 1.0, 24.0, 12.0, 1.0, 0.0, 24.0, 4.0};
+  val id: opt[u32] = blit.context.add_icon(?ctx, blit.icon.Icon{data: ?TRI[0], n: 10, w: 24.0::f32, h: 24.0::f32});
+  ```
 
 ## Rendering
 
