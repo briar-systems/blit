@@ -93,7 +93,7 @@ pub val KIND_TOOLTIP: u32 = theme.TOOLTIP;
 # border:   outline, transparent for none
 # border_w: outline width in pixels
 # text:     text drawn on it
-# pad:      space between its edges and its content, in pixels
+# pad:      space between each edge and its content, in pixels
 # corner:   corner radius in pixels
 pub rec Chrome {
     kind:     u32;
@@ -101,7 +101,7 @@ pub rec Chrome {
     border:   draw.Color;
     border_w: f32;
     text:     draw.Color;
-    pad:      f32;
+    pad:      theme.Edges;
     corner:   f32;
 }
 
@@ -197,7 +197,7 @@ pub fun chrome(ctx: *context.Context, kind: u32) Chrome {
     c.fill     = p.fill;
     c.border   = p.border;
     c.border_w = context.px(ctx, p.border_w);
-    c.pad      = context.px(ctx, s.pad.l);
+    c.pad      = context.px_edges(ctx, s.pad);
     c.corner   = context.px(ctx, s.radius.tl);
     ret c;
 }
@@ -337,7 +337,7 @@ pub fun begin_id(ctx: *context.Context, id: u64, o: Overlay) Shown {
     s.ch = context.split(ctx, 2);
     context.set_channel(ctx, s.ch, 1);
 
-    var f: layout.Frame = layout.column(s.x0 + c.pad, s.y0 + c.pad, m.w - c.pad * 2.0::f32, 0.0::f32, context.px(ctx, context.look_of(ctx, theme.LAYOUT).margin.b));
+    var f: layout.Frame = layout.column(s.x0 + c.pad.l, s.y0 + c.pad.t, m.w - c.pad.l - c.pad.r, 0.0::f32, context.px(ctx, context.look_of(ctx, theme.LAYOUT).margin.b));
     f.open  = layout.OPEN_W | layout.OPEN_H;
     f.align = o.align;
     context.push_layout(ctx, f);
@@ -355,8 +355,8 @@ pub fun end(ctx: *context.Context, s: Shown) {
     var w: f32           = 0.0::f32;
     var h: f32           = 0.0::f32;
     if (f.items > 0) {
-        w = f.need_w + c.pad * 2.0::f32;
-        h = f.need_h + c.pad * 2.0::f32;
+        w = f.need_w + c.pad.l + c.pad.r;
+        h = f.need_h + c.pad.t + c.pad.b;
     }
     context.pop_layout(ctx);
 
@@ -475,6 +475,38 @@ test overlay__anchors_fits_and_lets_input_through {
     if (drv.at(?d, p.hud.x1 - 1.0::f32, r.y0 + 1.0::f32) != world)            { ret 9; }
     val idle: opt[f64] = context.next_frame(?d.ctx);
     if (!sel idle.none) { ret 10; }
+
+    val freed: err[allo.Error] = drv.free(?d);
+    if (sel freed.err) { ret 1; }
+    ret 0;
+}
+
+test overlay__pads_each_side_from_its_style {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var p: Probe;
+    var d: drv.Driver;
+    if (!probe(?d, ?a, ?p)) { ret 1; }
+    drv.steps(?d, 2);
+    val go0: opt[context.Area] = drv.rect(?d, drv.find(?d, "hud/go"));
+    if (sel go0.none) { ret 2; }
+    val w0: f32 = p.hud.x1 - p.hud.x0;
+    val h0: f32 = p.hud.y1 - p.hud.y0;
+    val dx: f32 = go0.some.x0 - p.hud.x0;
+    val dy: f32 = go0.some.y0 - p.hud.y0;
+
+    # left 6, top 3, right 10, bottom 5: the box grows by their sums and the
+    # content moves in by the left and top
+    val t:   *theme.Theme    = context.theme_of(?d.ctx);
+    val pad: opt[theme.Path] = theme.path(t, "overlay.pad");
+    if (sel pad.none) { ret 3; }
+    theme.set_path(t, pad.some, theme.of_edges(theme.Edges{l: 6.0::f32, t: 3.0::f32, r: 10.0::f32, b: 5.0::f32}));
+    drv.steps(?d, 2);
+    val go1: opt[context.Area] = drv.rect(?d, drv.find(?d, "hud/go"));
+    if (sel go1.none)                                                                       { ret 4; }
+    if (p.hud.x1 - p.hud.x0 != w0 + 16.0::f32 || p.hud.y1 - p.hud.y0 != h0 + 8.0::f32)      { ret 5; }
+    if (go1.some.x0 - p.hud.x0 != dx + 6.0::f32 || go1.some.y0 - p.hud.y0 != dy + 3.0::f32) { ret 6; }
 
     val freed: err[allo.Error] = drv.free(?d);
     if (sel freed.err) { ret 1; }
