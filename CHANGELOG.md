@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-02
+
+### Changed
+- An overlay's padding reads all four sides from its style's `pad`, as a window's does (#207), for overlays, tooltips and toasts. `overlay.Chrome.pad` is now a `theme.Edges` instead of one `f32`. The built-in themes pad every side equally, so their look is unchanged.
+
 ## [0.12.0] - 2026-10-01
 
 ### Added
