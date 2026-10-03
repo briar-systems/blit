@@ -270,9 +270,9 @@ fun opacity(age: f64, seconds: f64) f32 {
 fun card(ctx: *context.Context, c: overlay.Chrome, s: str) {
     val tw: f32          = context.text_width(ctx, s);
     val lh: f32          = context.line_height(ctx);
-    val r:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), tw + c.pad * 2.0::f32, lh + c.pad * 2.0::f32);
+    val r:  context.Area = widget.place(ctx, layout.fit(), layout.fit(), tw + c.pad.l + c.pad.r, lh + c.pad.t + c.pad.b);
     overlay.paint(ctx, c, r.x0, r.y0, r.x1, r.y1);
-    context.text_at(ctx, s, r.x0 + c.pad, r.y0 + c.pad, c.text);
+    context.text_at(ctx, s, r.x0 + c.pad.l, r.y0 + c.pad.t, c.text);
 }
 
 # show the stack's toasts at an anchor of the surface, and drop the ones
