@@ -11,7 +11,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.error.err;
 
-use blit;
+use blit.lib.blit;
 
 # the path the section fills and strokes
 # ---

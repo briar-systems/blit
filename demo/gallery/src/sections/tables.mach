@@ -8,7 +8,7 @@
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # rows in the table
 val ROWS: usize = 10000;

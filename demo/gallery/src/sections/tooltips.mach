@@ -4,7 +4,7 @@
 # after a delay, asking for that frame through wake_at, follows the pointer
 # or sits under the widget, claims nothing and stays on the surface.
 
-use blit;
+use blit.lib.blit;
 
 pub rec State {
     x: u8;

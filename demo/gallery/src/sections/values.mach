@@ -4,7 +4,7 @@
 # across a cell, shift to go fine, double click or enter to type a value.
 # blit.color.picker edits a colour in hue, saturation and value.
 
-use blit;
+use blit.lib.blit;
 
 # what the editors edit
 # ---

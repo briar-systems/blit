@@ -9,7 +9,7 @@
 
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # the gallery's inspector, which the section toggles
 pub rec State {

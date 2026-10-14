@@ -7,7 +7,7 @@
 
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # what the lists keep
 # ---

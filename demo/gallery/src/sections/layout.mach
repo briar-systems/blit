@@ -12,7 +12,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 
-use blit;
+use blit.lib.blit;
 
 # what the layout's widgets edit
 # ---
