@@ -9,7 +9,7 @@ use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # the built-ins' names, in id order
 val NAMES: [20]str = [20]str{

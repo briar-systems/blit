@@ -20,7 +20,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # frames run before timing, so caches and buffers have settled
 val WARMUP: usize = 20;

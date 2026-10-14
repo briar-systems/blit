@@ -9,7 +9,7 @@
 
 use std.types.bool.false;
 
-use blit;
+use blit.lib.blit;
 
 # what the section animates
 # ---

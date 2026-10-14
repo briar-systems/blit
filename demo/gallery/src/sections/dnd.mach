@@ -9,7 +9,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # the layers, reordered by dragging one onto another, and the bin
 # ---

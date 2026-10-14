@@ -8,7 +8,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 
-use blit;
+use blit.lib.blit;
 
 # what the tabs keep
 # ---

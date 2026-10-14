@@ -18,7 +18,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
-use blit;
+use blit.lib.blit;
 
 # the panel's state, kept across frames
 # ---

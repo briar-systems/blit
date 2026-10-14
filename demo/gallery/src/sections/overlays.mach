@@ -8,7 +8,7 @@
 
 use std.types.bool.false;
 
-use blit;
+use blit.lib.blit;
 
 # the HUD and the note
 # ---

@@ -6,7 +6,7 @@
 use std.types.size.usize;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # what the controls edit
 # ---

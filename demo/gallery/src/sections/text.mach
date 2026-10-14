@@ -12,7 +12,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.string.str;
 
-use blit;
+use blit.lib.blit;
 
 # what the fields edit
 # ---
