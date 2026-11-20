@@ -8,7 +8,7 @@ uploads and renders the resulting vertices and indices, so blit stays out of
 the windowing and rendering.
 
 ```mach
-use blit;
+use blit.lib.blit;
 
 # once, at startup (fallible calls return err[allocator.Error]):
 val made: err[allocator.Error] = blit.context.init(?ctx, ?a);
@@ -27,7 +27,7 @@ blit.context.end(?ctx);
 # indices, and draw each run with its texture and scissor.
 ```
 
-`use blit;` binds the surface; reach everything through its submodule:
+`use blit.lib.blit;` binds the surface as `blit`; reach everything through its submodule:
 `blit.draw`, `blit.path`, `blit.icon`, `blit.glyph`, `blit.bitmap`, `blit.font`, `blit.atlas`,
 `blit.input`, `blit.layout`, `blit.hit`, `blit.band`, `blit.interact`, `blit.field`, `blit.edit`, `blit.ease`, `blit.writer`, `blit.theme`, `blit.style`, `blit.context`, `blit.state`, `blit.anim`, `blit.text`, `blit.widget`, `blit.menu`, `blit.controls`, `blit.value`, `blit.color`, `blit.table`, `blit.textarea`, `blit.chart`, `blit.payload`, `blit.dnd`, `blit.tabs`, `blit.dock`, `blit.driver`, `blit.editor`, `blit.inspect`. A submodule can also be
 imported directly, e.g. `use w: blit.widget;`.
@@ -237,7 +237,7 @@ blit.style.pop(?ctx);
 
 ### Themes as TOML
 
-Themes are TOML, read with `std.data.toml` and written with `blit.writer`.
+Themes are TOML, read with the [mach-toml](https://github.com/briar-systems/mach-toml) package and written with `blit.writer`.
 `blit.style.load_theme(?ctx, text)` replaces the context's theme with one a
 document describes, and reads its classes, so a running interface reloads its
 look whenever the host reads the file again. `save_theme(?ctx)` writes the
@@ -1078,7 +1078,7 @@ the simplest use of `blit.interact.hit`.
 ## Windows
 
 ```mach
-use blit;
+use blit.lib.blit;
 
 # once: windows save and load with the state store
 blit.widget.persist_windows(?ctx);
@@ -1331,7 +1331,7 @@ entry, so a widget never reads another's bytes.
   document, a `[<name>.<id>]` table per entry that the kind's save hook fills
   through `put_int`, `put_float`, `put_bool` and `put_str`. The text stays the
   context's until the next save. `load(?ctx, text)` reads such a document
-  through `std.data.toml`, zeroes each entry and runs the kind's load hook over
+  through mach-toml, zeroes each entry and runs the kind's load hook over
   its table. Tables of unregistered kinds are skipped. A load hook copies any
   string it keeps, since the parsed document is freed when `load` returns.
   `keep[T](?ctx, 1)` loads a registered kind's entries pinned, for state that
@@ -2007,8 +2007,8 @@ mach test .
 ```
 
 `demo/harness/` is its own project with a path dependency on this checkout. It
-drives a headless frame end to end through a bare `use blit;` and prints the
-vertex, index and run counts and atlas pages. It takes std from this checkout's `dep/std`, so
+drives a headless frame end to end through the `use blit.lib.blit;` surface and prints the
+vertex, index and run counts and atlas pages. It takes std and toml from this checkout's `dep/std` and `dep/toml`, so
 pull the root first:
 
 ```
