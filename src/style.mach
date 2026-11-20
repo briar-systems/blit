@@ -37,7 +37,10 @@ use th:   blit.theme;
 use tw:   blit.writer;
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
+use toml_error: toml.error;
+use toml_parse: toml.parse;
+use toml_tree:  toml.tree;
+use toml_value: toml.value;
 
 # override every field a path names with a value until the matching pop
 #
@@ -208,17 +211,17 @@ pub fun push_class(ctx: *context.Context, id: u32) bool {
 # text: the document
 # ret:  ok, or why the document was refused
 pub fun load_theme(ctx: *context.Context, text: str) err[th.LoadError] {
-    val pr: res[toml.Table, toml.TomlError] = toml.parse(ctx.a, text);
+    val pr: res[toml_value.Table, toml_error.TomlError] = toml_parse.parse(ctx.a, text);
     if (sel pr.err) { ret err[th.LoadError].err{th.LoadError.toml{pr.err}}; }
-    var root: toml.Table = pr.ok;
+    var root: toml_value.Table = pr.ok;
     sheet.unwind(?ctx.sheet, ?ctx.theme);
     val read: err[th.LoadError] = th.read(?ctx.theme, ?root);
     var out:  err[th.LoadError] = read;
     if (sel read.ok) { out = sheet.read_classes(?ctx.sheet, ?ctx.theme, ?root); }
-    val d: err[allo.Error] = toml.dnit(ctx.a, ?root);
+    val d: err[allo.Error] = toml_tree.dnit(ctx.a, ?root);
     if (sel read.ok) { context.redraw(ctx); }
     if (sel out.err) { ret out; }
-    if (sel d.err)   { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{d.err}}}; }
+    if (sel d.err)   { ret err[th.LoadError].err{th.LoadError.toml{toml_error.TomlError.alloc{d.err}}}; }
     ret out;
 }
 

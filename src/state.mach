@@ -10,7 +10,7 @@
 #
 # a kind of state registers a name and a save and a load hook to persist.
 # save writes every entry of a registered kind into one TOML document, a
-# [<name>.<id>] table per entry, and load reads one back through std.data.toml.
+# [<name>.<id>] table per entry, and load reads one back through mach-toml.
 #
 # the store is one owner among several: a widget taking a caller-owned record
 # (Scroll, List, Field) keeps it, so an app can still own its state.
@@ -24,7 +24,9 @@ use std.types.string.str;
 
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 use blit.context;
 use blit.input;
@@ -123,7 +125,7 @@ pub fun each[T](ctx: *context.Context, f: fun(*T, ptr), user: ptr) {
 # register T for persistence under a name
 #
 # save writes T's fields through the writer's put_* calls, and load reads them
-# from the entry's table with std.data.toml's getters into a zeroed T. strings
+# from the entry's table with mach-toml's getters (toml.lookup) into a zeroed T. strings
 # a load hook reads are freed once load returns, so it copies what it keeps.
 # registering T again replaces its hooks.
 # ---
@@ -132,7 +134,7 @@ pub fun each[T](ctx: *context.Context, f: fun(*T, ptr), user: ptr) {
 # save: writes one entry
 # load: reads one entry
 # ret:  ok, taken when another type holds the name, or the registry's refusal
-pub fun register[T](ctx: *context.Context, name: str, save: fun(*T, *store.Writer), load: fun(*T, *toml.Table)) err[store.Error] {
+pub fun register[T](ctx: *context.Context, name: str, save: fun(*T, *store.Writer), load: fun(*T, *toml_value.Table)) err[store.Error] {
     var k: store.Kind;
     k.kind  = $type_id(T);
     k.name  = name;
@@ -170,8 +172,8 @@ pub fun save(ctx: *context.Context) res[str, allo.Error] {
 # ctx:  context
 # text: the document, NUL-terminated
 # ret:  ok, or the failure, positioned in the text where it has a position
-pub fun load(ctx: *context.Context, text: str) err[toml.TomlError] {
-    val e: err[toml.TomlError] = store.load(?ctx.store, text);
+pub fun load(ctx: *context.Context, text: str) err[toml_error.TomlError] {
+    val e: err[toml_error.TomlError] = store.load(?ctx.store, text);
     context.redraw(ctx);
     ret e;
 }
@@ -195,13 +197,13 @@ fun pane_save(p: *Pane, w: *store.Writer) {
 }
 
 #[testing]
-fun pane_load(p: *Pane, t: *toml.Table) {
-    val x: opt[f64]  = toml.get_float(t, "x");
-    val y: opt[f64]  = toml.get_float(t, "y");
-    val o: opt[bool] = toml.get_bool(t, "open");
+fun pane_load(p: *Pane, t: *toml_value.Table) {
+    val x: opt[f64]  = toml_lookup.get_float(t, "x");
+    val y: opt[f64]  = toml_lookup.get_float(t, "y");
+    val o: opt[bool] = toml_lookup.get_bool(t, "open");
     if (sel x.some) { p.x = x.some::f32; }
     if (sel y.some) { p.y = y.some::f32; }
-    if (sel o.some) { p.open = o.some; }
+    if (sel o.some) { p.open = o.some::u8; }
 }
 
 #[testing]
@@ -211,9 +213,9 @@ fun note_save(n: *Note, w: *store.Writer) {
 }
 
 #[testing]
-fun note_load(n: *Note, t: *toml.Table) {
-    val v: opt[i64] = toml.get_int(t, "n");
-    val s: opt[str] = toml.get_str(t, "the text");
+fun note_load(n: *Note, t: *toml_value.Table) {
+    val v: opt[i64] = toml_lookup.get_int(t, "n");
+    val s: opt[str] = toml_lookup.get_str(t, "the text");
     if (sel v.some) { n.n = v.some; }
     if (sel s.some) {
         var i: usize = 0;
@@ -324,7 +326,7 @@ test save__load_round_trips_two_kinds {
     if (sel je.err) { ret 1; }
     register[Pane](?dst, "pane", pane_save, pane_load);
     register[Note](?dst, "note", note_save, note_load);
-    val ld: err[toml.TomlError] = load(?dst, doc.ok);
+    val ld: err[toml_error.TomlError] = load(?dst, doc.ok);
     if (sel ld.err) { ret 5; }
 
     val lp: *Pane = get[Pane](?dst, 3);
@@ -335,7 +337,7 @@ test save__load_round_trips_two_kinds {
     if (ln.text[3] != 'b' || ln.text[4] != 0)                         { ret 9; }
 
     # an entry key that is not an id is refused where it stands
-    val bad: err[toml.TomlError] = load(?dst, "[pane.x]\n");
+    val bad: err[toml_error.TomlError] = load(?dst, "[pane.x]\n");
     if (sel bad.ok) { ret 10; }
 
     val f0: err[allo.Error] = context.free(?src);

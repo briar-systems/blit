@@ -11,8 +11,8 @@
 # persistence is per kind: a kind registers a name and a save and a load hook.
 # save writes one TOML document holding a [<kind>.<id>] table per entry of a
 # registered kind, each table filled by the kind's save hook through a Writer.
-# load reads such a document through std.data.toml and runs each kind's load
-# hook over a zeroed entry. std.data.toml only parses, so the emitter is
+# load reads such a document through the toml package (mach-toml) and runs
+# each kind's load hook over a zeroed entry. that package only parses, so the emitter is
 # blit.writer.
 
 use std.types.error.err;
@@ -25,8 +25,12 @@ use std.types.string.str_equals;
 use tw:   blit.writer;
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
 use std.memory;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_parse:  toml.parse;
+use toml_tree:   toml.tree;
+use toml_value:  toml.value;
 
 # bytes of scratch state handed back for a refused entry, the largest state
 # type an entry can hold
@@ -78,7 +82,7 @@ pub rec Entry {
 pub def SaveFun: fun(ptr, *Writer);
 
 # a kind's load hook: read the entry's fields from its table
-pub def LoadFun: fun(ptr, *toml.Table);
+pub def LoadFun: fun(ptr, *toml_value.Table);
 
 # a registered kind of entry, the unit of persistence
 # ---
@@ -498,19 +502,19 @@ fun parse_id(s: str) opt[u64] {
 }
 
 # load every entry of one kind's table
-fun load_kind(s: *Store, kd: *Kind, t: *toml.Table) err[toml.TomlError] {
+fun load_kind(s: *Store, kd: *Kind, t: *toml_value.Table) err[toml_error.TomlError] {
     var i: usize = 0;
-    for (i < toml.table_len(t)) {
-        val ko: opt[str]         = toml.table_key(t, i);
-        val vo: opt[*toml.Value] = toml.table_value(t, i);
-        if (sel ko.none) { ret err[toml.TomlError].ok{}; }
-        if (sel vo.none) { ret err[toml.TomlError].ok{}; }
-        val v:  *toml.Value = vo.some;
-        val id: opt[u64]    = parse_id(ko.some);
-        if (sel id.none)              { ret err[toml.TomlError].err{toml.TomlError.syntax{v.key.at}}; }
-        if (v.tag != toml.TYPE_TABLE) { ret err[toml.TomlError].err{toml.TomlError.conflict{v.span.at}}; }
+    for (i < toml_lookup.table_len(t)) {
+        val ko: opt[str]               = toml_lookup.table_key(t, i);
+        val vo: opt[*toml_value.Value] = toml_lookup.table_value(t, i);
+        if (sel ko.none) { ret err[toml_error.TomlError].ok{}; }
+        if (sel vo.none) { ret err[toml_error.TomlError].ok{}; }
+        val v:  *toml_value.Value = vo.some;
+        val id: opt[u64]          = parse_id(ko.some);
+        if (sel id.none)                    { ret err[toml_error.TomlError].err{toml_error.TomlError.syntax{v.key.at}}; }
+        if (v.tag != toml_value.TYPE_TABLE) { ret err[toml_error.TomlError].err{toml_error.TomlError.conflict{v.span.at}}; }
         val p: res[ptr, allo.Error] = slot(s, id.some, kd.kind, kd.size, kd.align);
-        if (sel p.err) { ret err[toml.TomlError].err{toml.TomlError.alloc{p.err}}; }
+        if (sel p.err) { ret err[toml_error.TomlError].err{toml_error.TomlError.alloc{p.err}}; }
         memory.raw_zero(p.ok, kd.size);
         kd.load(p.ok, ?v.data.table);
         if (kd.keep != 0) {
@@ -519,7 +523,7 @@ fun load_kind(s: *Store, kd: *Kind, t: *toml.Table) err[toml.TomlError] {
         }
         i = i + 1;
     }
-    ret err[toml.TomlError].ok{};
+    ret err[toml_error.TomlError].ok{};
 }
 
 # read a document save wrote, loading every entry of a registered kind
@@ -532,22 +536,22 @@ fun load_kind(s: *Store, kd: *Kind, t: *toml.Table) err[toml.TomlError] {
 # text: the document, NUL-terminated
 # ret:  ok, the parse's failure, a key that is not an id (syntax at the key), an
 #       entry that is not a table (conflict at the value), or a refused entry
-pub fun load(s: *Store, text: str) err[toml.TomlError] {
-    val pr: res[toml.Table, toml.TomlError] = toml.parse(s.a, text);
-    if (sel pr.err) { ret err[toml.TomlError].err{pr.err}; }
-    var root: toml.Table          = pr.ok;
-    var out:  err[toml.TomlError] = err[toml.TomlError].ok{};
-    var i:    usize               = 0;
-    for (i < toml.table_len(?root)) {
-        val ko: opt[str]         = toml.table_key(?root, i);
-        val vo: opt[*toml.Value] = toml.table_value(?root, i);
+pub fun load(s: *Store, text: str) err[toml_error.TomlError] {
+    val pr: res[toml_value.Table, toml_error.TomlError] = toml_parse.parse(s.a, text);
+    if (sel pr.err) { ret err[toml_error.TomlError].err{pr.err}; }
+    var root: toml_value.Table          = pr.ok;
+    var out:  err[toml_error.TomlError] = err[toml_error.TomlError].ok{};
+    var i:    usize                     = 0;
+    for (i < toml_lookup.table_len(?root)) {
+        val ko: opt[str]               = toml_lookup.table_key(?root, i);
+        val vo: opt[*toml_value.Value] = toml_lookup.table_value(?root, i);
         if (sel ko.none) { brk; }
         if (sel vo.none) { brk; }
-        val kd: *Kind       = kind_named(s, ko.some);
-        val v:  *toml.Value = vo.some;
+        val kd: *Kind             = kind_named(s, ko.some);
+        val v:  *toml_value.Value = vo.some;
         if (kd != nil) {
-            if (v.tag != toml.TYPE_TABLE) {
-                out = err[toml.TomlError].err{toml.TomlError.conflict{v.span.at}};
+            if (v.tag != toml_value.TYPE_TABLE) {
+                out = err[toml_error.TomlError].err{toml_error.TomlError.conflict{v.span.at}};
                 brk;
             }
             out = load_kind(s, kd, ?v.data.table);
@@ -555,6 +559,6 @@ pub fun load(s: *Store, text: str) err[toml.TomlError] {
         }
         i = i + 1;
     }
-    val d: err[allo.Error] = toml.dnit(s.a, ?root);
+    val d: err[allo.Error] = toml_tree.dnit(s.a, ?root);
     ret out;
 }

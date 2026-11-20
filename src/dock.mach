@@ -66,7 +66,9 @@ use std.types.string.str_len;
 
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 use blit.band;
 use blit.context;
@@ -1474,8 +1476,8 @@ fun put_id(w: *state.Writer, key: str, id: u64) {
 }
 
 # read an id put_id wrote, 0 when there is none
-fun get_id(t: *toml.Table, key: str) u64 {
-    val v: opt[i64] = toml.get_int(t, key);
+fun get_id(t: *toml_value.Table, key: str) u64 {
+    val v: opt[i64] = toml_lookup.get_int(t, key);
     if (sel v.some) { ret v.some:~u64; }
     ret 0;
 }
@@ -1486,7 +1488,7 @@ fun space_save(sp: *SpaceState, w: *state.Writer) {
     state.put_int(w, "next", sp.next:~i64);
 }
 
-fun space_load(sp: *SpaceState, t: *toml.Table) {
+fun space_load(sp: *SpaceState, t: *toml_value.Table) {
     sp.root    = get_id(t, "root");
     sp.central = get_id(t, "central");
     sp.next    = get_id(t, "next");
@@ -1502,16 +1504,16 @@ fun node_save(n: *Node, w: *state.Writer) {
     put_id(w, "front", n.front);
 }
 
-fun node_load(n: *Node, t: *toml.Table) {
+fun node_load(n: *Node, t: *toml_value.Table) {
     n.space  = get_id(t, "space");
     n.parent = get_id(t, "parent");
     n.a      = get_id(t, "a");
     n.b      = get_id(t, "b");
     n.front  = get_id(t, "front");
-    val ax: opt[i64] = toml.get_int(t, "axis");
+    val ax: opt[i64] = toml_lookup.get_int(t, "axis");
     if (sel ax.some && ax.some == AXIS_Y::i64) { n.axis = AXIS_Y; }
     n.ratio = 0.5::f32;
-    val r: opt[f64] = toml.get_float(t, "ratio");
+    val r: opt[f64] = toml_lookup.get_float(t, "ratio");
     if (sel r.some) { n.ratio = r.some::f32; }
 }
 
@@ -1521,10 +1523,10 @@ fun docked_save(dk: *widget.Docked, w: *state.Writer) {
     state.put_float(w, "rank", dk.rank);
 }
 
-fun docked_load(dk: *widget.Docked, t: *toml.Table) {
+fun docked_load(dk: *widget.Docked, t: *toml_value.Table) {
     dk.id   = get_id(t, "id");
     dk.node = get_id(t, "node");
-    val r: opt[f64] = toml.get_float(t, "rank");
+    val r: opt[f64] = toml_lookup.get_float(t, "rank");
     if (sel r.some) { dk.rank = r.some; }
 }
 
@@ -1950,7 +1952,7 @@ test space__layout_saves_and_loads {
     if (!app(?e, ?al, ?bp)) { ret 1; }
     persist(?e.ctx);
     widget.persist_windows(?e.ctx);
-    val ld: err[toml.TomlError] = state.load(?e.ctx, doc.ok);
+    val ld: err[toml_error.TomlError] = state.load(?e.ctx, doc.ok);
     if (sel ld.err) { ret 5; }
     state.set_max_age(?e.ctx, 1);
     bp.hide = true;

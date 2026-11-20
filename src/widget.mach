@@ -107,7 +107,9 @@ use rich_text: blit.text;
 use blit.theme;
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 # a kind's style, overrides included
 fun look(ctx: *context.Context, kind: u32) *theme.Style {
@@ -1998,16 +2000,16 @@ fun window_save(st: *WindowState, w: *state.Writer) {
 }
 
 # read a window's state from its table, placed once it holds a rect
-fun window_load(st: *WindowState, t: *toml.Table) {
-    val x: opt[f64]  = toml.get_float(t, "x");
-    val y: opt[f64]  = toml.get_float(t, "y");
-    val w: opt[f64]  = toml.get_float(t, "w");
-    val h: opt[f64]  = toml.get_float(t, "h");
-    val z: opt[i64]  = toml.get_int(t, "z");
-    val c: opt[bool] = toml.get_bool(t, "closed");
-    val f: opt[bool] = toml.get_bool(t, "collapsed");
-    val p: opt[bool] = toml.get_bool(t, "pinned");
-    val l: opt[bool] = toml.get_bool(t, "locked");
+fun window_load(st: *WindowState, t: *toml_value.Table) {
+    val x: opt[f64]  = toml_lookup.get_float(t, "x");
+    val y: opt[f64]  = toml_lookup.get_float(t, "y");
+    val w: opt[f64]  = toml_lookup.get_float(t, "w");
+    val h: opt[f64]  = toml_lookup.get_float(t, "h");
+    val z: opt[i64]  = toml_lookup.get_int(t, "z");
+    val c: opt[bool] = toml_lookup.get_bool(t, "closed");
+    val f: opt[bool] = toml_lookup.get_bool(t, "collapsed");
+    val p: opt[bool] = toml_lookup.get_bool(t, "pinned");
+    val l: opt[bool] = toml_lookup.get_bool(t, "locked");
     if (sel x.some) {
         if (sel y.some) {
             if (sel w.some) {
@@ -2024,10 +2026,10 @@ fun window_load(st: *WindowState, t: *toml.Table) {
     if (sel z.some) {
         if (z.some > 0) { st.z = z.some::u64; }
     }
-    if (sel c.some) { st.closed = c.some; }
-    if (sel f.some) { st.collapsed = f.some; }
-    if (sel p.some) { st.pinned = p.some; }
-    if (sel l.some) { st.locked = l.some; }
+    if (sel c.some) { st.closed = c.some::u8; }
+    if (sel f.some) { st.collapsed = f.some::u8; }
+    if (sel p.some) { st.pinned = p.some::u8; }
+    if (sel l.some) { st.locked = l.some::u8; }
 }
 
 # the windows the store keeps, gathered to be renumbered
@@ -2208,23 +2210,23 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         context.wake_at(ctx, ctx.in.time);
     }
 
-    val drag_id:  u64 = bid.child(r.id, "#drag");
-    val col_id:   u64 = bid.child(r.id, "#collapse");
-    val close_id: u64 = bid.child(r.id, "#close");
-    val movable:  u8  = ((win.flags & WINDOW_NO_MOVE) == 0 && st.locked == 0);
-    val sizable:  u8  = ((win.flags & (WINDOW_NO_RESIZE | WINDOW_AUTO_SIZE)) == 0 && st.locked == 0);
+    val drag_id:  u64  = bid.child(r.id, "#drag");
+    val col_id:   u64  = bid.child(r.id, "#collapse");
+    val close_id: u64  = bid.child(r.id, "#close");
+    val movable:  bool = ((win.flags & WINDOW_NO_MOVE) == 0 && st.locked == 0);
+    val sizable:  bool = ((win.flags & (WINDOW_NO_RESIZE | WINDOW_AUTO_SIZE)) == 0 && st.locked == 0);
 
     # follow a drag or a resize from where the window stood at the press,
     # before claiming, so the claims match where the window paints
     var dx: f32;
     var dy: f32;
-    if (movable != 0 && interact.drag(ctx, drag_id, ?dx, ?dy)) {
+    if (movable && interact.drag(ctx, drag_id, ?dx, ?dy)) {
         val grab: *Grab = state.get[Grab](ctx, drag_id);
         st.x = grab.x + dx;
         st.y = grab.y + dy;
     }
     var g: usize = 0;
-    for (sizable != 0 && g < 8) {
+    for (sizable && g < 8) {
         val m:   u32 = GRIPS[g];
         val gid: u64 = grip_id(r.id, m);
         if (interact.drag(ctx, gid, ?dx, ?dy)) {
@@ -2255,10 +2257,10 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
     val x1: f32 = st.x + st.w;
     val y0: f32 = st.y;
     if (th > 0.0::f32) {
-        val ty1:   f32 = y0 + th;
-        var dx1:   f32 = x1;
-        val close: u8  = (win.flags & WINDOW_NO_CLOSE) == 0;
-        if (close != 0) { dx1 = x1 - th; }
+        val ty1:   f32  = y0 + th;
+        var dx1:   f32  = x1;
+        val close: bool = (win.flags & WINDOW_NO_CLOSE) == 0;
+        if (close) { dx1 = x1 - th; }
         val tin: theme.Edges = inset(ctx, theme.WINDOW_TITLE);
         r.need_w = th + tin.l + tin.r + label_width(ctx, win.title) + (x1 - dx1);
 
@@ -2279,7 +2281,7 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
         interact.end_group(ctx, chrome);
 
         val hd: interact.Hit = interact.hit(ctx, drag_id, x0 + th, y0, dx1, ty1, input.BUTTON_LEFT);
-        if (movable != 0) {
+        if (movable) {
             if (hd.pressed) {
                 val grab: *Grab = state.get[Grab](ctx, drag_id);
                 grab.x = st.x;
@@ -2330,11 +2332,11 @@ pub fun begin_window(ctx: *context.Context, win: Window) WindowArea {
 # while another tab is selected
 fun begin_docked(ctx: *context.Context, win: Window, r: WindowArea, dk: *Docked) WindowArea {
     var out:  WindowArea = r;
-    val bare: u8         = (win.flags & WINDOW_NO_TITLE) != 0;
-    val shut: u8         = (win.flags & WINDOW_NO_CLOSE) == 0;
+    val bare: bool       = (win.flags & WINDOW_NO_TITLE) != 0;
+    val shut: bool       = (win.flags & WINDOW_NO_CLOSE) == 0;
     var th:   f32        = row_h(ctx);
-    if (bare != 0) { th = 0.0::f32; }
-    dock_note(ctx, dk, win.title, bare, shut, maxf(win.min_w, th * 3.0::f32), maxf(win.min_h, th));
+    if (bare) { th = 0.0::f32; }
+    dock_note(ctx, dk, win.title, bare::u8, shut::u8, maxf(win.min_w, th * 3.0::f32), maxf(win.min_h, th));
     if (dk.front == 0 || !dock_placed(ctx, dk)) { ret out; }
 
     out.shown  = 1;
@@ -4051,7 +4053,7 @@ test dropdown__two_open_in_two_windows {
 # a frame holding popup A with a button, and popup B opened inside A, whose
 # button covers part of A's
 #[testing]
-fun frame_nested(ctx: *context.Context, in: input.Input, a_hit: *u8, b_hit: *u8, a_gone: *u8, b_gone: *u8) {
+fun frame_nested(ctx: *context.Context, in: input.Input, a_hit: *bool, b_hit: *bool, a_gone: *u8, b_gone: *u8) {
     context.begin(ctx, in, 200.0::f32, 200.0::f32);
     val pa: Popup = begin_popup(ctx, "A", 1, 0.0::f32, 0.0::f32, 100.0::f32);
     @a_hit = button(ctx, "a");
@@ -4072,10 +4074,10 @@ test popup__nested_resolve_to_innermost {
     val ie:  err[allo.Error] = context.init(?ctx, ?a);
     if (sel ie.err) { ret 1; }
 
-    var ah: u8 = 0;
-    var bh: u8 = 0;
-    var ag: u8 = 0;
-    var bg: u8 = 0;
+    var ah: bool = false;
+    var bh: bool = false;
+    var ag: u8   = 0;
+    var bg: u8   = 0;
 
     # button a spans y [0, 16), button b spans y [10, 26): click the overlap
     frame_nested(?ctx, input_at(50.0::f32, 12.0::f32, 0), ?ah, ?bh, ?ag, ?bg);
@@ -4416,7 +4418,7 @@ test window__state_survives_save_and_load {
     if (sel je.err) { ret 1; }
     val rd: err[state.Error] = persist_windows(?dst);
     if (sel rd.err) { ret 2; }
-    val ld: err[toml.TomlError] = state.load(?dst, doc.ok);
+    val ld: err[toml_error.TomlError] = state.load(?dst, doc.ok);
     if (sel ld.err) { ret 4; }
 
     # the loaded state wins over the rect the calls declare, and a window

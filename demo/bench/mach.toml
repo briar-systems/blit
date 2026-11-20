@@ -1,55 +1,51 @@
 [project]
 id      = "bench"
 version = "0.1.0"
-mach    = "^6"
+mach    = "^7"
 src     = "src"
-out     = "out/{target.name}/{profile.name}"
+work    = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa     = "x86_64"
-os      = "linux"
-abi     = "sysv64"
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
 
 [target.windows-x86_64]
-isa = "x86_64"
-os  = "windows"
-abi = "win64"
+arch = "x86_64"
+sys  = "windows"
+abi  = "win64"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os  = "darwin"
-abi = "sysv64"
+arch = "x86_64"
+sys  = "darwin"
+abi  = "sysv64"
 
 [target.linux-arm64]
-isa = "aarch64"
-os  = "linux"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "linux"
+abi  = "aapcs64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os  = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "darwin"
+abi  = "darwinpcs"
 
 [profile.debug]
-opt           = 0
-debug         = true
-simd          = "scalarize"
-vectorize     = false
-float_reassoc = false
-default       = true
+optimize = false
+debug    = true
+simd     = "scalarize"
+default  = true
 
 [profile.release]
-opt           = 2
-debug         = false
-simd          = "scalarize"
-vectorize     = true
-float_reassoc = false
+optimize = true
+debug    = false
+simd     = "scalarize"
 
 [artifact.bench]
 kind    = "bin"
 default = true
 entry   = "bin/main.mach"
-out     = "bin/bench{artifact.suffix}"
+out     = "{project.work}/bin/bench{artifact.suffix}"
 targets = ["*"]
 link    = []
 need    = []
@@ -57,6 +53,9 @@ need    = []
 [dep.blit]
 path = "../.."
 
-# blit's own committed pin, so the demo builds against exactly the std blit does
+# blit's own committed pins, so the demo builds against exactly the std and toml blit does
 [dep.std]
 path = "../../dep/std"
+
+[dep.toml]
+path = "../../dep/toml"

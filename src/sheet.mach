@@ -30,8 +30,10 @@ use tw:   blit.writer;
 use allo: std.allocator;
 use std.allocator.page;
 use vec: std.collections.vector;
-use std.data.toml;
 use std.memory;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 # a field's value saved by an override, restored by its pop
 # ---
@@ -380,26 +382,26 @@ pub fun push_class(s: *Sheet, t: *th.Theme, id: u32) bool {
 # t:    the theme the paths name fields of
 # root: the parsed document
 # ret:  ok, or why a class was refused, with the classes before it read
-pub fun read_classes(s: *Sheet, t: *th.Theme, root: *toml.Table) err[th.LoadError] {
-    val co: opt[*toml.Value] = toml.get(root, "class");
+pub fun read_classes(s: *Sheet, t: *th.Theme, root: *toml_value.Table) err[th.LoadError] {
+    val co: opt[*toml_value.Value] = toml_lookup.get(root, "class");
     if (sel co.none) { ret err[th.LoadError].ok{}; }
-    val cv: *toml.Value = co.some;
-    if (cv.tag != toml.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.unknown{cv.key.at}}; }
+    val cv: *toml_value.Value = co.some;
+    if (cv.tag != toml_value.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.unknown{cv.key.at}}; }
     var i: usize = 0;
-    for (i < toml.table_len(?cv.data.table)) {
-        val ko: opt[str]         = toml.table_key(?cv.data.table, i);
-        val vo: opt[*toml.Value] = toml.table_value(?cv.data.table, i);
+    for (i < toml_lookup.table_len(?cv.data.table)) {
+        val ko: opt[str]               = toml_lookup.table_key(?cv.data.table, i);
+        val vo: opt[*toml_value.Value] = toml_lookup.table_value(?cv.data.table, i);
         if (sel ko.none) { brk; }
         if (sel vo.none) { brk; }
-        val v: *toml.Value = vo.some;
-        if (v.tag != toml.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.value{v.span.at}}; }
+        val v: *toml_value.Value = vo.some;
+        if (v.tag != toml_value.TYPE_TABLE) { ret err[th.LoadError].err{th.LoadError.value{v.span.at}}; }
         val id: res[u32, allo.Error] = add_class(s, ko.some);
-        if (sel id.err) { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{id.err}}}; }
+        if (sel id.err) { ret err[th.LoadError].err{th.LoadError.toml{toml_error.TomlError.alloc{id.err}}}; }
         class_clear(s, id.ok);
         var j: usize = 0;
-        for (j < toml.table_len(?v.data.table)) {
-            val k2: opt[str]         = toml.table_key(?v.data.table, j);
-            val v2: opt[*toml.Value] = toml.table_value(?v.data.table, j);
+        for (j < toml_lookup.table_len(?v.data.table)) {
+            val k2: opt[str]               = toml_lookup.table_key(?v.data.table, j);
+            val v2: opt[*toml_value.Value] = toml_lookup.table_value(?v.data.table, j);
             if (sel k2.none) { brk; }
             if (sel v2.none) { brk; }
             val p: opt[th.Path] = th.path(t, k2.some);
@@ -408,7 +410,7 @@ pub fun read_classes(s: *Sheet, t: *th.Theme, root: *toml.Table) err[th.LoadErro
             val x:    opt[th.Value] = th.read_value(unit, v2.some);
             if (sel x.none) { ret err[th.LoadError].err{th.LoadError.value{v2.some.span.at}}; }
             val set: err[allo.Error] = class_set(s, id.ok, k2.some, unit, x.some);
-            if (sel set.err) { ret err[th.LoadError].err{th.LoadError.toml{toml.TomlError.alloc{set.err}}}; }
+            if (sel set.err) { ret err[th.LoadError].err{th.LoadError.toml{toml_error.TomlError.alloc{set.err}}}; }
             j = j + 1;
         }
         i = i + 1;

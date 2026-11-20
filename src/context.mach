@@ -3749,7 +3749,7 @@ pub fun line(ctx: *Context, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: draw.
 # c:      color
 pub fun polyline(ctx: *Context, pts: *draw.Point, n: usize, closed: bool, w: f32, join: u8, c: draw.Color) {
     tess.begin(?ctx.sc);
-    tess.contour(?ctx.sc, closed);
+    tess.contour(?ctx.sc, closed::u8);
     var i: usize = 0;
     for (i < n) {
         tess.point(?ctx.sc, pts[i].x + ctx.lx, pts[i].y + ctx.ly);

@@ -27,6 +27,7 @@
 # claims its plot, so its read-out follows the same topmost-claimant routing as
 # every widget. nothing is allocated: a chart only pushes vertices.
 
+use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -152,7 +153,7 @@ pub rec Hover {
 # step: coordinate between ticks, a whole number on a u or log axis
 # tame: 1 when every value drawn on the axis is known to land on a pixel f32 holds exactly
 rec Scale {
-    u:    u8;
+    u:    bool;
     log:  u8;
     org:  u64;
     lo:   f64;
@@ -160,7 +161,7 @@ rec Scale {
     p0:   f32;
     p1:   f32;
     step: f64;
-    tame: u8;
+    tame: bool;
 }
 
 # a chart's resolved layout, in local pixels
@@ -483,7 +484,7 @@ fun tick_step(s: *Scale, want: f64) f64 {
 }
 
 # whether an axis asks for a fixed range
-fun is_fixed(a: Axis) u8 {
+fun is_fixed(a: Axis) bool {
     if (sel a.lo.none || sel a.hi.none) { ret 0; }
     if (sel a.lo.u) {
         if (sel a.hi.u) { ret u_of(a.lo) < u_of(a.hi); }
@@ -997,13 +998,13 @@ rec Map {
     data:   *u8;
     kind:   u8;
     stride: usize;
-    u:      u8;
+    u:      bool;
     log:    u8;
     org:    u64;
     floor:  f64;
     base:   f64;
     k:      f64;
-    tame:   u8;
+    tame:   bool;
 }
 
 # a column mapped onto a scale
@@ -1871,21 +1872,21 @@ fun bare() Options {
 
 # whether a value is the f64 f
 #[testing]
-fun is_f(v: Num, f: f64) u8 {
+fun is_f(v: Num, f: f64) bool {
     if (sel v.f) { ret v.f == f; }
     ret 0;
 }
 
 # whether a value is the u64 u
 #[testing]
-fun is_u(v: Num, u: u64) u8 {
+fun is_u(v: Num, u: u64) bool {
     if (sel v.u) { ret v.u == u; }
     ret 0;
 }
 
 # whether the text at a reads s
 #[testing]
-fun reads(a: *u8, s: str) u8 {
+fun reads(a: *u8, s: str) bool {
     var i: usize = 0;
     for (s[i] != 0) {
         if (a[i] != s[i]) { ret 0; }

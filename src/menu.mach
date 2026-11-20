@@ -335,7 +335,7 @@ pub fun shortcut_text(s: Shortcut, buf: *u8, cap: usize) usize {
     if (s.code == 0) { ret 0; }
     var n: usize = 0;
     if ((s.mods & MOD_PRIMARY) != 0) {
-        $if ($mach.build.os == $mach.os.darwin) {
+        $if ($mach.build.sys == $mach.sys.darwin) {
             n = put(buf, cap, n, "Cmd+");
         }
         $or {
@@ -346,7 +346,7 @@ pub fun shortcut_text(s: Shortcut, buf: *u8, cap: usize) usize {
     if ((s.mods & input.MOD_ALT) != 0)   { n = put(buf, cap, n, "Alt+"); }
     if ((s.mods & input.MOD_SHIFT) != 0) { n = put(buf, cap, n, "Shift+"); }
     if ((s.mods & input.MOD_SUPER) != 0) {
-        $if ($mach.build.os == $mach.os.darwin) {
+        $if ($mach.build.sys == $mach.sys.darwin) {
             n = put(buf, cap, n, "Cmd+");
         }
         $or {
@@ -1152,7 +1152,7 @@ test menu__shortcuts_fire_closed_and_stay_quiet_while_typing {
     if (buf[0] != 'C' || buf[11] != 'S' || buf[12] != 0)                                          { ret 6; }
     if (shortcut_text(keys(input.KEY_DELETE, 0), ?buf[0], SHORTCUT_TEXT) != 3)                    { ret 7; }
     val n: usize = shortcut_text(keys('Z', MOD_PRIMARY | input.MOD_SHIFT), ?buf[0], SHORTCUT_TEXT);
-    $if ($mach.build.os == $mach.os.darwin) {
+    $if ($mach.build.sys == $mach.sys.darwin) {
         if (n != 11 || buf[0] != 'C' || buf[1] != 'm') { ret 10; }
     }
     $or {

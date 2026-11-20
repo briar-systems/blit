@@ -7,13 +7,14 @@
 # an id, and a kind registered with save and load hooks persists as TOML.
 
 use allo: std.allocator;
-use std.data.toml;
 use std.types.bool.bool;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 use blit.lib.blit;
 
@@ -56,8 +57,8 @@ fun clicks_save(c: *Clicks, w: *blit.state.Writer) {
 }
 
 # read a row's state from its table
-fun clicks_load(c: *Clicks, t: *toml.Table) {
-    val n: opt[i64] = toml.get_int(t, "clicks");
+fun clicks_load(c: *Clicks, t: *toml_value.Table) {
+    val n: opt[i64] = toml_lookup.get_int(t, "clicks");
     if (sel n.some) { c.clicks = n.some::u64; }
 }
 

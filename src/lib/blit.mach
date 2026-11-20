@@ -2,8 +2,9 @@
 #
 # widgets accumulate a draw list of textured, colored triangles and report
 # interaction; the consumer feeds input each frame, calls widget functions,
-# then uploads and renders the draw list. project id is `blit`, so `use blit;`
-# reaches each submodule under its short name, e.g. blit.widget.button.
+# then uploads and renders the draw list. `use blit.lib.blit;` binds this
+# surface as `blit`, which reaches each submodule under its short name, e.g.
+# blit.widget.button.
 
 use std.types.string.str;
 # links the startup entrypoint so `mach test` over this library produces a binary.

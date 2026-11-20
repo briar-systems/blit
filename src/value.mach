@@ -397,7 +397,7 @@ fun dec_put(s: *Sink, x: Dec) {
             }
         }
         put(s, 'e');
-        var w: io.Writer                 = io.Writer{ctx: s::ptr, f_write: sink_write};
+        var w: io.Writer                 = io.Writer{ctx: s::ptr, fn_write: sink_write};
         val r: res[usize, io.WriteError] = fmt.write_i64(?w, x.e - 1);
         ret;
     }
@@ -426,7 +426,7 @@ fun dec_put(s: *Sink, x: Dec) {
 
 # the shortest text std.format gives an f64, into s
 fun put_f64(s: *Sink, v: f64) {
-    var w: io.Writer                 = io.Writer{ctx: s::ptr, f_write: sink_write};
+    var w: io.Writer                 = io.Writer{ctx: s::ptr, fn_write: sink_write};
     val r: res[usize, io.WriteError] = fmt.write_f64(?w, v);
 }
 
@@ -510,7 +510,7 @@ fun most(a: i64, b: i64) i64 {
 # ret: the text, in out
 pub fun format(k: u8, v: Num, out: *u8) str {
     var s: Sink      = Sink{buf: out, cap: TEXT_CAP, len: 0};
-    var w: io.Writer = io.Writer{ctx: (?s)::ptr, f_write: sink_write};
+    var w: io.Writer = io.Writer{ctx: (?s)::ptr, fn_write: sink_write};
     out[0] = 0;
     if (signed(k)) {
         val r: res[usize, io.WriteError] = fmt.write_i64(?w, v.i);

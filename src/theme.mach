@@ -61,8 +61,12 @@ use blit.ease;
 use tw:   blit.writer;
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
 use std.memory;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_parse:  toml.parse;
+use toml_tree:   toml.tree;
+use toml_value:  toml.value;
 
 # how many series colors a theme holds
 pub val SERIES: usize = 8;
@@ -1904,16 +1908,16 @@ pub fun copy(dst: *Theme, src: *Theme) err[allo.Error] {
 # value:   a value does not fit its field
 # base:    base names no built-in theme
 pub tag LoadError: u8 {
-    toml:    toml.TomlError;
+    toml:    toml_error.TomlError;
     unknown: usize;
     value:   usize;
     base:    usize;
 }
 
 # a number as a float, or none
-fun number(v: *toml.Value) opt[f32] {
-    if (v.tag == toml.TYPE_FLOAT)   { ret opt[f32].some{v.data.float::f32}; }
-    if (v.tag == toml.TYPE_INTEGER) { ret opt[f32].some{v.data.integer::f32}; }
+fun number(v: *toml_value.Value) opt[f32] {
+    if (v.tag == toml_value.TYPE_FLOAT)   { ret opt[f32].some{v.data.float::f32}; }
+    if (v.tag == toml_value.TYPE_INTEGER) { ret opt[f32].some{v.data.integer::f32}; }
     ret opt[f32].none{};
 }
 
@@ -1960,20 +1964,20 @@ pub fun parse_hex(s: str) opt[draw.Color] {
 }
 
 # a color: a hex string, or an array of three or four numbers in [0, 1]
-fun read_color(v: *toml.Value) opt[Value] {
-    if (v.tag == toml.TYPE_STRING) {
+fun read_color(v: *toml_value.Value) opt[Value] {
+    if (v.tag == toml_value.TYPE_STRING) {
         val c: opt[draw.Color] = parse_hex(v.data.string);
         if (sel c.none) { ret opt[Value].none{}; }
         ret opt[Value].some{of_color(c.some)};
     }
-    if (v.tag != toml.TYPE_ARRAY) { ret opt[Value].none{}; }
-    val n: usize = toml.array_len(?v.data.array);
+    if (v.tag != toml_value.TYPE_ARRAY) { ret opt[Value].none{}; }
+    val n: usize = toml_lookup.array_len(?v.data.array);
     if (n != 3 && n != 4) { ret opt[Value].none{}; }
     var o: Value;
     o.v[3] = 1.0::f32;
     var i: usize = 0;
     for (i < n) {
-        val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+        val e: opt[*toml_value.Value] = toml_lookup.array_get(?v.data.array, i);
         if (sel e.none) { ret opt[Value].none{}; }
         val f: opt[f32] = number(e.some);
         if (sel f.none) { ret opt[Value].none{}; }
@@ -1988,14 +1992,14 @@ fun read_color(v: *toml.Value) opt[Value] {
 # unit: UNIT_*
 # v:    the TOML value
 # ret:  the value, or none when it does not fit the unit
-pub fun read_value(unit: u8, v: *toml.Value) opt[Value] {
+pub fun read_value(unit: u8, v: *toml_value.Value) opt[Value] {
     if (unit == UNIT_COLOR) { ret read_color(v); }
-    if (unit == UNIT_QUAD && v.tag == toml.TYPE_ARRAY) {
-        if (toml.array_len(?v.data.array) != 4) { ret opt[Value].none{}; }
+    if (unit == UNIT_QUAD && v.tag == toml_value.TYPE_ARRAY) {
+        if (toml_lookup.array_len(?v.data.array) != 4) { ret opt[Value].none{}; }
         var o: Value;
         var i: usize = 0;
         for (i < 4) {
-            val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+            val e: opt[*toml_value.Value] = toml_lookup.array_get(?v.data.array, i);
             if (sel e.none) { ret opt[Value].none{}; }
             val f: opt[f32] = number(e.some);
             if (sel f.none) { ret opt[Value].none{}; }
@@ -2018,18 +2022,18 @@ pub fun read_value(unit: u8, v: *toml.Value) opt[Value] {
 
 # write a value to every field a path names, an array of colors to an array
 # field element by element
-fun apply(t: *Theme, p: Path, v: *toml.Value) err[LoadError] {
+fun apply(t: *Theme, p: Path, v: *toml_value.Value) err[LoadError] {
     val f: Field = FIELDS[p.field];
-    if (f.count > 1 && p.elem == ANY_ELEM && v.tag == toml.TYPE_ARRAY && f.unit == UNIT_COLOR) {
-        val first:  opt[*toml.Value] = toml.array_get(?v.data.array, 0);
-        var colors: bool             = false;
-        if (sel first.some) { colors = first.some.tag != toml.TYPE_INTEGER && first.some.tag != toml.TYPE_FLOAT; }
+    if (f.count > 1 && p.elem == ANY_ELEM && v.tag == toml_value.TYPE_ARRAY && f.unit == UNIT_COLOR) {
+        val first:  opt[*toml_value.Value] = toml_lookup.array_get(?v.data.array, 0);
+        var colors: bool                   = false;
+        if (sel first.some) { colors = first.some.tag != toml_value.TYPE_INTEGER && first.some.tag != toml_value.TYPE_FLOAT; }
         if (colors) {
-            val n: usize = toml.array_len(?v.data.array);
+            val n: usize = toml_lookup.array_len(?v.data.array);
             if (n > f.count) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
             var i: usize = 0;
             for (i < n) {
-                val e: opt[*toml.Value] = toml.array_get(?v.data.array, i);
+                val e: opt[*toml_value.Value] = toml_lookup.array_get(?v.data.array, i);
                 if (sel e.none) { ret err[LoadError].err{LoadError.value{v.span.at}}; }
                 val c: opt[Value] = read_color(e.some);
                 if (sel c.none) { ret err[LoadError].err{LoadError.value{e.some.span.at}}; }
@@ -2051,9 +2055,9 @@ fun apply(t: *Theme, p: Path, v: *toml.Value) err[LoadError] {
 }
 
 # the key of a table entry and its value
-fun entry(tb: *toml.Table, i: usize, key: *str, v: **toml.Value) bool {
-    val ko: opt[str]         = toml.table_key(tb, i);
-    val vo: opt[*toml.Value] = toml.table_value(tb, i);
+fun entry(tb: *toml_value.Table, i: usize, key: *str, v: **toml_value.Value) bool {
+    val ko: opt[str]               = toml_lookup.table_key(tb, i);
+    val vo: opt[*toml_value.Value] = toml_lookup.table_value(tb, i);
     if (sel ko.none) { ret false; }
     if (sel vo.none) { ret false; }
     @key = ko.some;
@@ -2068,7 +2072,7 @@ val PASS_FIELDS:  u8 = 1;
 val PASS_FOLLOWS: u8 = 2;
 
 # apply the fields of one top-level table that belong to a pass
-fun read_table(t: *Theme, top: str, tb: *toml.Table, pass: u8) err[LoadError] {
+fun read_table(t: *Theme, top: str, tb: *toml_value.Table, pass: u8) err[LoadError] {
     var segs: [3]str;
     var lens: [3]usize;
     segs[0] = top;
@@ -2077,17 +2081,17 @@ fun read_table(t: *Theme, top: str, tb: *toml.Table, pass: u8) err[LoadError] {
     val is_tok: bool    = sel g.some && (g.some == GROUP_PALETTE || g.some == GROUP_METRICS);
     if (is_tok != (pass == PASS_TOKENS)) { ret err[LoadError].ok{}; }
     var i: usize = 0;
-    for (i < toml.table_len(tb)) {
+    for (i < toml_lookup.table_len(tb)) {
         var key: str;
-        var v:   *toml.Value;
+        var v:   *toml_value.Value;
         if (!entry(tb, i, ?key, ?v)) { brk; }
         segs[1] = key;
         lens[1] = str_len(key);
-        if (v.tag == toml.TYPE_TABLE && sel g.none) {
+        if (v.tag == toml_value.TYPE_TABLE && sel g.none) {
             var j: usize = 0;
-            for (j < toml.table_len(?v.data.table)) {
+            for (j < toml_lookup.table_len(?v.data.table)) {
                 var k2: str;
-                var v2: *toml.Value;
+                var v2: *toml_value.Value;
                 if (!entry(?v.data.table, j, ?k2, ?v2)) { brk; }
                 segs[2] = k2;
                 lens[2] = str_len(k2);
@@ -2132,11 +2136,11 @@ fun in_pass(p: Path, pass: u8) bool {
 # t:    the theme, replaced only when the document is accepted
 # root: the parsed document
 # ret:  ok, or why the document was refused
-pub fun read(t: *Theme, root: *toml.Table) err[LoadError] {
+pub fun read(t: *Theme, root: *toml_value.Table) err[LoadError] {
     var w: Theme;
     w.a = t.a;
     val c: err[allo.Error] = copy(?w, t);
-    if (sel c.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{c.err}}}; }
+    if (sel c.err) { ret err[LoadError].err{LoadError.toml{toml_error.TomlError.alloc{c.err}}}; }
     val e: err[LoadError] = read_into(?w, root);
     if (sel e.ok) {
         val keep: Theme = @t;
@@ -2148,25 +2152,25 @@ pub fun read(t: *Theme, root: *toml.Table) err[LoadError] {
 }
 
 # read a document into a working theme
-fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
+fun read_into(t: *Theme, root: *toml_value.Table) err[LoadError] {
     default(t);
-    val bo: opt[*toml.Value] = toml.get(root, "base");
+    val bo: opt[*toml_value.Value] = toml_lookup.get(root, "base");
     if (sel bo.some) {
-        val bv: *toml.Value = bo.some;
-        if (bv.tag != toml.TYPE_STRING)  { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
-        if (!builtin(t, bv.data.string)) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
+        val bv: *toml_value.Value = bo.some;
+        if (bv.tag != toml_value.TYPE_STRING) { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
+        if (!builtin(t, bv.data.string))      { ret err[LoadError].err{LoadError.base{bv.span.at}}; }
     }
     val before: Theme = @t;
     var pass:   u8    = PASS_TOKENS;
     for (pass <= PASS_FOLLOWS) {
         var i: usize = 0;
-        for (i < toml.table_len(root)) {
+        for (i < toml_lookup.table_len(root)) {
             var key: str;
-            var v:   *toml.Value;
+            var v:   *toml_value.Value;
             if (!entry(root, i, ?key, ?v)) { brk; }
             i = i + 1;
             if (str_equals(key, "base") || str_equals(key, "class")) { cnt; }
-            if (v.tag != toml.TYPE_TABLE)                            { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
+            if (v.tag != toml_value.TYPE_TABLE)                      { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
             val g:  opt[u8]  = group_named(key, str_len(key));
             val ko: opt[u32] = kind_named(t, key, str_len(key));
             if (sel g.none && sel ko.none) { ret err[LoadError].err{LoadError.unknown{v.key.at}}; }
@@ -2185,13 +2189,13 @@ fun read_into(t: *Theme, root: *toml.Table) err[LoadError] {
 # text: the document
 # ret:  ok, or why the document was refused
 pub fun load(t: *Theme, text: str) err[LoadError] {
-    val pr: res[toml.Table, toml.TomlError] = toml.parse(t.a, text);
+    val pr: res[toml_value.Table, toml_error.TomlError] = toml_parse.parse(t.a, text);
     if (sel pr.err) { ret err[LoadError].err{LoadError.toml{pr.err}}; }
-    var root: toml.Table      = pr.ok;
-    val e:    err[LoadError]  = read(t, ?root);
-    val d:    err[allo.Error] = toml.dnit(t.a, ?root);
+    var root: toml_value.Table = pr.ok;
+    val e:    err[LoadError]   = read(t, ?root);
+    val d:    err[allo.Error]  = toml_tree.dnit(t.a, ?root);
     if (sel e.err) { ret e; }
-    if (sel d.err) { ret err[LoadError].err{LoadError.toml{toml.TomlError.alloc{d.err}}}; }
+    if (sel d.err) { ret err[LoadError].err{LoadError.toml{toml_error.TomlError.alloc{d.err}}}; }
     ret err[LoadError].ok{};
 }
 

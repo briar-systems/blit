@@ -53,8 +53,10 @@ use std.types.string.str;
 
 use allo: std.allocator;
 use std.allocator.page;
-use std.data.toml;
 use std.memory;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_value:  toml.value;
 
 use blit.context;
 use blit.dnd;
@@ -961,15 +963,15 @@ fun column_save(cs: *ColumnState, w: *state.Writer) {
     state.put_bool(w, "hidden", cs.hidden);
 }
 
-fun column_load(cs: *ColumnState, tb: *toml.Table) {
-    val wo: opt[f64]  = toml.get_float(tb, "width");
-    val po: opt[i64]  = toml.get_int(tb, "pos");
-    val ho: opt[bool] = toml.get_bool(tb, "hidden");
+fun column_load(cs: *ColumnState, tb: *toml_value.Table) {
+    val wo: opt[f64]  = toml_lookup.get_float(tb, "width");
+    val po: opt[i64]  = toml_lookup.get_int(tb, "pos");
+    val ho: opt[bool] = toml_lookup.get_bool(tb, "hidden");
     if (sel wo.some) { cs.width = wo.some::f32; }
     if (sel po.some) {
         if (po.some >= 0) { cs.pos = po.some::u32; }
     }
-    if (sel ho.some) { cs.hidden = ho.some; }
+    if (sel ho.some) { cs.hidden = ho.some::u8; }
     cs.set    = 1;
     cs.custom = 1;
 }
@@ -979,9 +981,9 @@ fun table_save(st: *TableState, w: *state.Writer) {
     state.put_int(w, "dir", st.dir::i64);
 }
 
-fun table_load(st: *TableState, tb: *toml.Table) {
-    val so: opt[i64] = toml.get_int(tb, "sort");
-    val dr: opt[i64] = toml.get_int(tb, "dir");
+fun table_load(st: *TableState, tb: *toml_value.Table) {
+    val so: opt[i64] = toml_lookup.get_int(tb, "sort");
+    val dr: opt[i64] = toml_lookup.get_int(tb, "dir");
     if (sel so.some) { st.sort = so.some:~u64; }
     if (sel dr.some) {
         if (dr.some >= 0 && dr.some <= 2) { st.dir = dr.some::u8; }
@@ -1370,7 +1372,7 @@ test table__column_layout_survives_a_save_and_load {
     var q: Probe;
     var e: drv.Driver;
     if (!probe(?e, ?a, ?q, 10, 0)) { ret 1; }
-    val ld: err[toml.TomlError] = state.load(?e.ctx, doc.ok);
+    val ld: err[toml_error.TomlError] = state.load(?e.ctx, doc.ok);
     if (sel ld.err) { ret 5; }
     drv.step(?e);
     if (q.cols[0].w != 60.0::f32 || q.cols[0].pos != 2 || q.cols[0].x != 80.0::f32) { ret 6; }

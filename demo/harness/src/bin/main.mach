@@ -1,4 +1,4 @@
-# drives a headless blit frame through a bare `use blit;` and prints its vertex
+# drives a headless blit frame through the `use blit.lib.blit;` surface and prints its vertex
 # count, spans and atlas pages
 
 use allo: std.allocator;

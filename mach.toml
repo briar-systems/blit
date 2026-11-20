@@ -1,59 +1,60 @@
 [project]
 id      = "blit"
 version = "0.13.0"
-mach    = "^6"
+mach    = "^7"
 src     = "src"
-out     = "out/{target.name}/{profile.name}"
+work    = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa     = "x86_64"
-os      = "linux"
-abi     = "sysv64"
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
 
 [target.windows-x86_64]
-isa = "x86_64"
-os  = "windows"
-abi = "win64"
+arch = "x86_64"
+sys  = "windows"
+abi  = "win64"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os  = "darwin"
-abi = "sysv64"
+arch = "x86_64"
+sys  = "darwin"
+abi  = "sysv64"
 
 [target.linux-arm64]
-isa = "aarch64"
-os  = "linux"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "linux"
+abi  = "aapcs64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os  = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "darwin"
+abi  = "darwinpcs"
 
 [profile.debug]
-opt           = 0
-debug         = true
-simd          = "scalarize"
-vectorize     = false
-float_reassoc = false
-default       = true
+optimize = false
+debug    = true
+simd     = "scalarize"
+default  = true
 
 [profile.release]
-opt           = 2
-debug         = false
-simd          = "scalarize"
-vectorize     = true
-float_reassoc = false
+optimize = true
+debug    = false
+simd     = "scalarize"
 
 [artifact.blit]
 kind    = "static"
 default = true
+export = true
 entry   = "lib/blit.mach"
-out     = "lib/blit"
+out     = "{project.work}/lib/libblit{artifact.suffix}"
 targets = ["*"]
 link    = []
 need    = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+ref = "branch/dev"
+
+[dep.toml]
+git = "https://github.com/briar-systems/mach-toml"
+ref = "branch/dev"
